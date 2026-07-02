@@ -1,10 +1,4 @@
 # Scripts
 
-本目录用于放置：
-
-- PostgreSQL 平台包获取与校验脚本
-- pgvector 平台包构建与校验脚本
-- 开发数据库启动脚本
-- 安装包内容校验脚本
-
-脚本在对应里程碑实现时加入。
+- `check-env.ps1`：Windows 开发环境检查；加 `-BuildProbe` 执行完整构建验证。
+- `check-env.sh`：macOS/Linux 开发环境检查；加 `--build` 执行完整构建验证。

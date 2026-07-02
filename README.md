@@ -46,3 +46,17 @@ Codex 开始工作前依次阅读：
 2. `CURRENT_TASK.md`
 3. `PROJECT_PLAN.md`
 4. 当前任务引用的文档
+
+## 环境检查
+
+Windows：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check-env.ps1
+```
+
+macOS：
+
+```bash
+bash ./scripts/check-env.sh
+```
