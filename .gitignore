@@ -1,0 +1,14 @@
+node_modules/
+dist/
+target/
+.vite/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+apps/desktop/src-tauri/binaries/**/postgres/
+apps/desktop/src-tauri/binaries/**/pgvector/
+.local/

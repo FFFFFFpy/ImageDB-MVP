@@ -1,0 +1,14 @@
+CREATE INDEX idx_import_runs_state ON import_runs(state);
+CREATE INDEX idx_import_albums_run_state ON import_albums(import_run_id, state);
+CREATE INDEX idx_import_images_album ON import_images(import_album_id);
+CREATE INDEX idx_import_images_blake3 ON import_images(blake3) WHERE blake3 IS NOT NULL;
+CREATE INDEX idx_import_images_pixel_hash ON import_images(pixel_hash) WHERE pixel_hash IS NOT NULL;
+CREATE INDEX idx_library_images_album ON library_images(album_id);
+CREATE INDEX idx_library_images_blake3 ON library_images(blake3);
+CREATE INDEX idx_library_images_pixel_hash ON library_images(pixel_hash) WHERE pixel_hash IS NOT NULL;
+CREATE INDEX idx_duplicate_candidates_run ON duplicate_candidates(import_run_id);
+CREATE INDEX idx_duplicate_candidates_source ON duplicate_candidates(source_image_id);
+CREATE INDEX idx_duplicate_candidates_decision ON duplicate_candidates(decision) WHERE decision IS NULL;
+CREATE INDEX idx_file_transactions_state ON file_transactions(state);
+CREATE INDEX idx_file_operations_transaction_state ON file_operations(transaction_id, state);
+CREATE INDEX idx_audit_events_run_created ON audit_events(import_run_id, created_at);
