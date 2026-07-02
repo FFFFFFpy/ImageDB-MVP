@@ -5,6 +5,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 const PORT_FILE: &str = "postgres_port";
 const CREDENTIAL_FILE: &str = "postgres_credentials";
@@ -61,6 +62,34 @@ impl PostgresManager {
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
 
+        let exe_suffix = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+
+        if let Ok(env_bin) = std::env::var("IMAGEDB_POSTGRES_BIN") {
+            let base = PathBuf::from(&env_bin);
+            let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
+            let initdb = base.join(format!("initdb{exe_suffix}"));
+            let psql = base.join(format!("psql{exe_suffix}"));
+            if pg_ctl.exists() && initdb.exists() && psql.exists() {
+                self.pg_ctl = Some(pg_ctl);
+                self.initdb = Some(initdb);
+                self.psql = Some(psql);
+                self.diagnostics.push(format!(
+                    "Found PostgreSQL binaries via IMAGEDB_POSTGRES_BIN: {}",
+                    base.display()
+                ));
+                return;
+            }
+            self.diagnostics.push(format!(
+                "IMAGEDB_POSTGRES_BIN='{}' is set but missing pg_ctl/initdb/psql; \
+                 falling back to default search",
+                base.display()
+            ));
+        }
+
         let search_paths: Vec<PathBuf> = vec![
             {
                 let mut p = exe_dir.clone().unwrap_or_default();
@@ -74,12 +103,6 @@ impl PostgresManager {
             #[cfg(target_os = "windows")]
             PathBuf::from("C:\\Program Files\\PostgreSQL\\16\\bin"),
         ];
-
-        let exe_suffix = if cfg!(target_os = "windows") {
-            ".exe"
-        } else {
-            ""
-        };
 
         for base in &search_paths {
             let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
@@ -167,11 +190,15 @@ impl PostgresManager {
     }
 
     pub fn connection_string(&self) -> String {
+        self.connection_string_for_database(&self.database)
+    }
+
+    fn connection_string_for_database(&self, database: &str) -> String {
         let mut parts = vec![
             format!("host=127.0.0.1"),
             format!("port={}", self.port),
             format!("user={}", self.username),
-            format!("dbname={}", self.database),
+            format!("dbname={database}"),
         ];
         if let Some(ref pw) = self.password {
             parts.push(format!("password={pw}"));
@@ -218,28 +245,6 @@ impl PostgresManager {
         })
     }
 
-    fn save_credentials(&self) -> Result<(), AppError> {
-        let path = self.credential_file_path();
-        let password = self.password.as_deref().unwrap_or("");
-        let content = format!("{}:{}", self.username, password);
-        std::fs::write(&path, content).map_err(|e| {
-            AppError::Internal(format!(
-                "cannot write credential file {}: {e}",
-                path.display()
-            ))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| AppError::Internal(format!("cannot set credential file permissions: {e}")),
-            )?;
-        }
-
-        Ok(())
-    }
-
     fn read_saved_port(&self) -> Option<u16> {
         let path = self.port_file_path();
         std::fs::read_to_string(&path)
@@ -267,12 +272,11 @@ impl PostgresManager {
         })
     }
 
-    fn psql_command(&self, psql: &std::path::Path) -> Command {
-        let mut cmd = Command::new(psql);
-        if let Some(ref pw) = self.password {
-            cmd.env("PGPASSWORD", pw);
-        }
-        cmd
+    fn cluster_files_exist(&self) -> bool {
+        self.data_dir.join("PG_VERSION").is_file()
+            && self.data_dir.join("base").is_dir()
+            && self.data_dir.join("global").is_dir()
+            && self.data_dir.join("pg_wal").is_dir()
     }
 
     pub async fn initialize(&mut self) -> Result<PostgresProbeResult, AppError> {
@@ -290,23 +294,68 @@ impl PostgresManager {
         }
 
         if !self.data_dir.exists() {
-            std::fs::create_dir_all(&self.data_dir).map_err(|e| {
+            let parent_dir = self.data_dir.parent().ok_or_else(|| {
                 AppError::Internal(format!(
-                    "cannot create data directory {}: {e}",
+                    "data directory {} has no parent",
                     self.data_dir.display()
                 ))
             })?;
-            self.diagnostics.push(format!(
-                "Created data directory: {}",
-                self.data_dir.display()
-            ));
+            std::fs::create_dir_all(parent_dir).map_err(|e| {
+                AppError::Internal(format!(
+                    "cannot create parent directory {}: {e}",
+                    parent_dir.display()
+                ))
+            })?;
 
             self.port = Self::find_free_port()?;
             self.password = Some(Self::generate_password());
-            self.save_port()?;
-            self.save_credentials()?;
+
+            // initdb requires its target data directory to be empty. Our port
+            // and credential files must therefore live in a sibling staging
+            // directory until initdb finishes.
+            let staging_dir = parent_dir.join("postgres_staging");
+            if staging_dir.exists() {
+                std::fs::remove_dir_all(&staging_dir).map_err(|e| {
+                    AppError::Internal(format!(
+                        "cannot clean staging directory {}: {e}",
+                        staging_dir.display()
+                    ))
+                })?;
+            }
+            std::fs::create_dir_all(&staging_dir).map_err(|e| {
+                AppError::Internal(format!(
+                    "cannot create staging directory {}: {e}",
+                    staging_dir.display()
+                ))
+            })?;
+
+            let staged_port = staging_dir.join(PORT_FILE);
+            let staged_credentials = staging_dir.join(CREDENTIAL_FILE);
+            std::fs::write(&staged_port, self.port.to_string()).map_err(|e| {
+                AppError::Internal(format!(
+                    "cannot write staged port file {}: {e}",
+                    staged_port.display()
+                ))
+            })?;
+            let password_for_staging = self.password.clone().unwrap_or_default();
+            let staged_credential_content = format!("{}:{}", self.username, password_for_staging);
+            std::fs::write(&staged_credentials, staged_credential_content).map_err(|e| {
+                AppError::Internal(format!(
+                    "cannot write staged credential file {}: {e}",
+                    staged_credentials.display()
+                ))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &staged_credentials,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
 
             let Some(initdb) = self.initdb.as_ref() else {
+                let _ = std::fs::remove_dir_all(&staging_dir);
                 self.diagnostics
                     .push("initdb binary missing during initialization".to_string());
                 return Ok(PostgresProbeResult {
@@ -322,8 +371,9 @@ impl PostgresManager {
             };
 
             let password = self.password.clone().unwrap_or_default();
-            let pwfile = self.data_dir.join("initdb_pwfile");
+            let pwfile = staging_dir.join("initdb_pwfile");
             if let Err(e) = std::fs::write(&pwfile, password.as_bytes()) {
+                let _ = std::fs::remove_dir_all(&staging_dir);
                 self.diagnostics.push(format!(
                     "cannot write initdb pwfile {}: {e}",
                     pwfile.display()
@@ -357,6 +407,7 @@ impl PostgresManager {
                     &format!("--username={}", self.username),
                     &format!("--pwfile={pwfile_str}"),
                 ])
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
@@ -366,6 +417,10 @@ impl PostgresManager {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                // Restore the empty-directory contract so a retry can call
+                // initdb again without manual cleanup.
+                let _ = std::fs::remove_dir_all(&self.data_dir);
+                let _ = std::fs::remove_dir_all(&staging_dir);
                 self.diagnostics.push(format!("initdb failed: {stderr}"));
                 return Ok(PostgresProbeResult {
                     available: true,
@@ -380,6 +435,44 @@ impl PostgresManager {
             }
             self.diagnostics
                 .push("initdb completed successfully".to_string());
+
+            if !self.cluster_files_exist() {
+                let _ = std::fs::remove_dir_all(&self.data_dir);
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                self.diagnostics.push(format!(
+                    "initdb did not create a complete PostgreSQL cluster in {}",
+                    self.data_dir.display()
+                ));
+                return Ok(PostgresProbeResult {
+                    available: true,
+                    managed: false,
+                    pgvector_available: false,
+                    port: Some(self.port),
+                    data_dir: Some(self.data_dir.display().to_string()),
+                    database_created: false,
+                    connection_ok: false,
+                    diagnostics: self.diagnostics.clone(),
+                });
+            }
+
+            let final_port = self.data_dir.join(PORT_FILE);
+            let final_credentials = self.data_dir.join(CREDENTIAL_FILE);
+            std::fs::rename(&staged_port, &final_port).map_err(|e| {
+                AppError::Internal(format!("cannot move port file into data dir: {e}"))
+            })?;
+            std::fs::rename(&staged_credentials, &final_credentials).map_err(|e| {
+                AppError::Internal(format!("cannot move credential file into data dir: {e}"))
+            })?;
+            let _ = std::fs::remove_dir_all(&staging_dir);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &final_credentials,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
         } else {
             if self.port == 0 {
                 self.port = self
@@ -428,34 +521,42 @@ impl PostgresManager {
         };
         let port_str = self.port.to_string();
         let data_dir_str = Self::path_to_str(&self.data_dir)?;
+        let log_file = self.data_dir.join("postgres.log");
+        let log_file_str = Self::path_to_str(&log_file)?;
 
         let listen_opts = format!("-p {port_str} -h 127.0.0.1");
 
-        let output = Command::new(pg_ctl)
+        let status = Command::new(pg_ctl)
             .args([
                 "start",
                 "-D",
                 &data_dir_str,
+                "-l",
+                &log_file_str,
                 "-o",
                 &listen_opts,
                 "-w",
                 "-t",
                 "10",
             ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
             .await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            if stderr.contains("already running") || stderr.contains("already started") {
+        if !status.success() {
+            let log_tail = std::fs::read_to_string(&log_file)
+                .ok()
+                .map(|s| s.lines().rev().take(20).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_else(|| "<no postgres log output>".to_string());
+            if log_tail.contains("already running") || log_tail.contains("already started") {
                 self.diagnostics
                     .push("PostgreSQL server already running".to_string());
                 self.server_running = true;
             } else {
                 self.diagnostics
-                    .push(format!("pg_ctl start failed: {stderr}"));
+                    .push(format!("pg_ctl start failed; log tail: {log_tail}"));
                 return Ok(PostgresProbeResult {
                     available: true,
                     managed: false,
@@ -490,123 +591,137 @@ impl PostgresManager {
     }
 
     async fn create_database(&mut self) -> bool {
-        let psql = match self.psql.as_ref() {
-            Some(p) => p,
-            None => {
+        let conn_str = self.connection_string_for_database("postgres");
+        let (client, conn) = match timeout(
+            Duration::from_secs(15),
+            tokio_postgres::connect(&conn_str, tokio_postgres::NoTls),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
                 self.diagnostics
-                    .push("psql binary not available".to_string());
+                    .push(format!("connect to postgres database failed: {e}"));
+                return false;
+            }
+            Err(_) => {
+                self.diagnostics
+                    .push("connect to postgres database timed out".to_string());
                 return false;
             }
         };
-        let port_str = self.port.to_string();
-
-        let check = self
-            .psql_command(psql)
-            .args([
-                "-h",
-                "127.0.0.1",
-                "-p",
-                &port_str,
-                "-U",
-                &self.username,
-                "-d",
-                "postgres",
-                "-tc",
-                "SELECT 1 FROM pg_database WHERE datname='imagedb'",
-            ])
-            .output()
-            .await;
-
-        match check {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.trim() == "1" {
-                    self.diagnostics
-                        .push("Database 'imagedb' already exists".to_string());
-                    return true;
-                }
+        let handle = tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("PostgreSQL postgres-db connection lost: {e}");
             }
-            _ => {}
-        }
+        });
 
-        let create = self
-            .psql_command(psql)
-            .args([
-                "-h",
-                "127.0.0.1",
-                "-p",
-                &port_str,
-                "-U",
-                &self.username,
-                "-d",
-                "postgres",
-                "-c",
-                &format!("CREATE DATABASE {}", self.database),
-            ])
-            .output()
-            .await;
-
-        match create {
-            Ok(output) if output.status.success() => {
+        let exists = match timeout(
+            Duration::from_secs(15),
+            client.query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+                &[&self.database],
+            ),
+        )
+        .await
+        {
+            Ok(Ok(row)) => Ok(row.get::<_, bool>(0)),
+            Err(e) => {
                 self.diagnostics
-                    .push(format!("Created database '{}'", self.database));
+                    .push(format!("database existence check timed out: {e}"));
+                handle.abort();
+                return false;
+            }
+            Ok(Err(e)) => Err(e),
+        };
+
+        match exists {
+            Ok(true) => {
+                self.diagnostics
+                    .push(format!("Database '{}' already exists", self.database));
+                handle.abort();
                 true
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                self.diagnostics
-                    .push(format!("CREATE DATABASE failed: {stderr}"));
-                false
+            Ok(false) => {
+                let sql = format!("CREATE DATABASE {}", self.database);
+                match timeout(Duration::from_secs(15), client.batch_execute(&sql)).await {
+                    Err(_) => {
+                        self.diagnostics
+                            .push("CREATE DATABASE timed out".to_string());
+                        handle.abort();
+                        false
+                    }
+                    Ok(Ok(())) => {
+                        self.diagnostics
+                            .push(format!("Created database '{}'", self.database));
+                        handle.abort();
+                        true
+                    }
+                    Ok(Err(e)) => {
+                        self.diagnostics
+                            .push(format!("CREATE DATABASE failed: {e}"));
+                        handle.abort();
+                        false
+                    }
+                }
             }
             Err(e) => {
-                self.diagnostics.push(format!("psql command failed: {e}"));
+                self.diagnostics
+                    .push(format!("database existence check failed: {e}"));
+                handle.abort();
                 false
             }
         }
     }
 
     pub async fn check_pgvector(&mut self) -> bool {
-        let psql = match self.psql.as_ref() {
-            Some(p) => p,
-            None => {
+        let conn_str = self.connection_string();
+        let (client, conn) = match timeout(
+            Duration::from_secs(15),
+            tokio_postgres::connect(&conn_str, tokio_postgres::NoTls),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
                 self.diagnostics
-                    .push("psql binary not available".to_string());
+                    .push(format!("pgvector check connection failed: {e}"));
+                return false;
+            }
+            Err(_) => {
+                self.diagnostics
+                    .push("pgvector check connection timed out".to_string());
                 return false;
             }
         };
-        let port_str = self.port.to_string();
-
-        let output = self
-            .psql_command(psql)
-            .args([
-                "-h",
-                "127.0.0.1",
-                "-p",
-                &port_str,
-                "-U",
-                &self.username,
-                "-d",
-                &self.database,
-                "-c",
-                "CREATE EXTENSION IF NOT EXISTS vector",
-            ])
-            .output()
-            .await;
-
-        match output {
-            Ok(output) if output.status.success() => {
-                self.diagnostics
-                    .push("pgvector extension enabled".to_string());
-                true
+        let handle = tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("PostgreSQL pgvector-check connection lost: {e}");
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        });
+
+        match timeout(
+            Duration::from_secs(15),
+            client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector"),
+        )
+        .await
+        {
+            Err(_) => {
                 self.diagnostics
-                    .push(format!("pgvector not available: {stderr}"));
+                    .push("pgvector extension creation timed out".to_string());
+                handle.abort();
                 false
             }
-            Err(e) => {
-                self.diagnostics.push(format!("pgvector check failed: {e}"));
+            Ok(Ok(())) => {
+                self.diagnostics
+                    .push("pgvector extension enabled".to_string());
+                handle.abort();
+                true
+            }
+            Ok(Err(e)) => {
+                self.diagnostics
+                    .push(format!("pgvector not available: {e}"));
+                handle.abort();
                 false
             }
         }
@@ -663,10 +778,12 @@ impl PostgresManager {
 
     pub async fn shutdown(&mut self) -> Result<(), AppError> {
         if let Some(pg_ctl) = &self.pg_ctl {
-            if self.data_dir.exists() && self.server_running {
+            let has_postmaster = self.data_dir.join("postmaster.pid").exists();
+            if self.data_dir.exists() && (self.server_running || has_postmaster) {
                 let data_dir_str = Self::path_to_str(&self.data_dir)?;
                 let output = Command::new(pg_ctl)
                     .args(["stop", "-D", &data_dir_str, "-m", "fast", "-w"])
+                    .stdin(Stdio::null())
                     .output()
                     .await?;
 
@@ -797,7 +914,11 @@ mod tests {
         std::fs::create_dir_all(&mgr.data_dir).unwrap();
         mgr.username = "imagedb".to_string();
         mgr.password = Some("testpassword42".to_string());
-        mgr.save_credentials().unwrap();
+        std::fs::write(
+            mgr.data_dir.join(CREDENTIAL_FILE),
+            format!("{}:{}", mgr.username, mgr.password.as_deref().unwrap_or("")),
+        )
+        .unwrap();
 
         let (user, pass) = mgr.read_saved_credentials().unwrap();
         assert_eq!(user, "imagedb");
@@ -809,5 +930,94 @@ mod tests {
         let pw = PostgresManager::generate_password();
         assert_eq!(pw.len(), 24);
         assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// Real PostgreSQL + pgvector integration test.
+    ///
+    /// Runs only when `IMAGEDB_POSTGRES_BIN` is set to a directory containing
+    /// pg_ctl, initdb, and psql. Without the env var, the test returns
+    /// immediately (and still passes) so `cargo test` remains green on
+    /// machines that do not have a PostgreSQL binary available.
+    ///
+    /// Invocation:
+    ///   IMAGEDB_POSTGRES_BIN=/path/to/pgsql/bin cargo test \
+    ///       --manifest-path apps/desktop/src-tauri/Cargo.toml \
+    ///       real_pgvector_full_lifecycle -- --ignored --test-threads=1
+    #[tokio::test]
+    #[ignore]
+    async fn real_pgvector_full_lifecycle() {
+        use crate::infrastructure::postgres::MigrationRunner;
+
+        let _bin_dir = match std::env::var("IMAGEDB_POSTGRES_BIN") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real PostgreSQL lifecycle test");
+                return;
+            }
+        };
+
+        let run = async {
+            let tmp = TempDir::new().expect("create tempfile dir");
+            let app_data = tmp.path().join("app_data");
+            std::fs::create_dir_all(&app_data).expect("create app_data dir");
+
+            let mut mgr = PostgresManager::new(&app_data);
+            assert!(
+                mgr.binaries_available(),
+                "binaries should be found via IMAGEDB_POSTGRES_BIN; diagnostics: {:?}",
+                mgr.diagnostics()
+            );
+
+            let result = mgr.initialize().await.expect("initialize #1");
+            assert!(result.available);
+            assert!(result.managed);
+            assert!(result.connection_ok);
+            assert!(result.pgvector_available);
+
+            let (client, handle) = mgr.connect().await.expect("connect #1");
+            let mut client = client;
+            let applied = MigrationRunner::run_pending(&mut client)
+                .await
+                .expect("run_pending #1");
+            assert!(!applied.is_empty());
+
+            let version = MigrationRunner::current_version(&client)
+                .await
+                .expect("current_version #1");
+            assert_eq!(version.as_deref(), Some("0002_indexes"));
+
+            drop(client);
+            handle.abort();
+            mgr.shutdown().await.expect("shutdown #1");
+
+            let mut mgr2 = PostgresManager::new(&app_data);
+            assert!(mgr2.binaries_available());
+
+            let result2 = mgr2.initialize().await.expect("initialize #2");
+            assert!(result2.managed);
+            assert!(result2.connection_ok);
+            assert!(result2.pgvector_available);
+
+            let (client2, handle2) = mgr2.connect().await.expect("connect #2");
+            let mut client2 = client2;
+            let newly_applied = MigrationRunner::run_pending(&mut client2)
+                .await
+                .expect("run_pending #2");
+            assert!(newly_applied.is_empty(), "unexpected: {newly_applied:?}");
+
+            let version2 = MigrationRunner::current_version(&client2)
+                .await
+                .expect("current_version #2");
+            assert_eq!(version2.as_deref(), Some("0002_indexes"));
+
+            drop(client2);
+            handle2.abort();
+            mgr2.shutdown().await.expect("shutdown #2");
+        };
+
+        match tokio::time::timeout(std::time::Duration::from_secs(120), run).await {
+            Ok(()) => {}
+            Err(_) => panic!("real_pgvector_full_lifecycle timed out after 120s"),
+        }
     }
 }

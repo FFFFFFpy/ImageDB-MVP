@@ -24,12 +24,12 @@ foundation on which Milestone 2 (image scanning pipeline) will build.
 
 **PostgreSQL lifecycle (`infrastructure/postgres/`)**
 
-- `manager.rs` - Full lifecycle: binary discovery, directory creation, initdb with
-  MD5 auth via a dedicated password-only pwfile (the username:password credential
-  store is NOT reused as the initdb pwfile), pg_ctl start/stop, credential
-  generation, port persistence, health checks, pgvector detection, tokio-postgres
-  connection. All `psql` invocations set the `PGPASSWORD` environment variable so
-  they authenticate against the MD5-auth cluster without prompts.
+- `manager.rs` - Full lifecycle: binary discovery including
+  `IMAGEDB_POSTGRES_BIN`, initdb with MD5 auth via a dedicated password-only
+  pwfile, staged persistence of port/credentials after cluster creation,
+  pg_ctl start/stop, credential generation, port reuse, health checks,
+  pgvector enablement, and tokio-postgres connections for database creation and
+  extension checks.
 - `migration.rs` - Embedded migration runner using `include_str!` for SQL files.
   Creates a `schema_migrations` tracking table, applies pending migrations in
   transactions, supports empty and existing databases.
@@ -149,9 +149,10 @@ foundation on which Milestone 2 (image scanning pipeline) will build.
 | `pnpm install`           | OK                                                                |
 | `pnpm typecheck`         | OK - 0 errors                                                     |
 | `pnpm test:unit`         | OK - 4/4 tests pass                                               |
-| `pnpm rust:test`         | OK - 36/36 tests pass                                             |
+| `pnpm rust:test`         | OK - 36 tests pass, 1 real DB lifecycle test ignored by default   |
 | `pnpm rust:clippy`       | OK - 0 warnings                                                   |
 | `pnpm build`             | OK - release exe built                                            |
+| real PostgreSQL lifecycle test | OK - PostgreSQL 18.4 + pgvector 0.8.3 init, migrate, shutdown, restart |
 | release exe smoke launch | OK - imagedb-desktop.exe started and stayed running for 5 seconds |
 
 ## Test results
@@ -160,7 +161,7 @@ foundation on which Milestone 2 (image scanning pipeline) will build.
 
 | Module                     | Tests                                                                                                                                        | Status |
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| postgres::manager          | 7 (binary diagnostic, port persistence, invalid port, init without binaries, connection string, credential persistence, password generation) | PASS   |
+| postgres::manager          | 8 (7 default tests plus ignored real PostgreSQL lifecycle test) | PASS   |
 | postgres::migration        | 2 (embedded SQL verification, version ordering)                                                                                              | PASS   |
 | services::database_service | 5 (parse_postgres_major: standard, future 18, 19devel, old 13, malformed)                                                                    | PASS   |
 | settings                   | 3 (defaults, save/reload, corrupt recovery)                                                                                                  | PASS   |
@@ -184,8 +185,12 @@ foundation on which Milestone 2 (image scanning pipeline) will build.
   passes and returns a clear diagnostic when binaries are missing.
 - Migration embedding: `test_migrations_embedded` passes and verifies SQL files
   are embedded via `include_str!`.
-- Migration runner: code compiles and links; runtime execution requires a
-  PostgreSQL binary.
+- Real managed lifecycle: with `IMAGEDB_POSTGRES_BIN` pointing to
+  `.local/db-tools/postgresql-18.4/pgsql/bin`, the ignored integration test
+  creates a PostgreSQL 18.4 cluster, enables pgvector 0.8.3, creates the
+  `imagedb` database, runs migrations through `0002_indexes`, shuts down,
+  restarts from the same data directory, reconnects, and confirms no migrations
+  need to be re-applied.
 
 ## Post-review fixes applied in this revision
 
@@ -203,12 +208,11 @@ submission:
    `initdb_pwfile` is now written inside the data directory with Unix 0600
    permissions, removed immediately after `initdb` returns. The persistent
    credential store continues to store `username:password` for application use.
-3. **`PGPASSWORD` on psql invocations.** The managed cluster is initialized with
-   `--auth=md5`, which requires a password. All `psql`-based commands
-   (`create_database`, `check_pgvector`, and the existence-check probe) now go
-   through a new `psql_command()` helper that sets `PGPASSWORD` in the child
-   environment when a password is known. The tokio-postgres path already passes
-   the password in the connection string and was unaffected.
+3. **Runtime database operations use tokio-postgres.** The managed cluster is
+   initialized with `--auth=md5`, and application database creation plus
+   pgvector enablement now use tokio-postgres with bounded timeouts instead of
+   invoking `psql`, avoiding interactive password prompts and child-process
+   hangs.
 4. **External version check accepts any major >= 14.** The previous code matched
    `"PostgreSQL 14"` through `"PostgreSQL 17"` literally, which would reject
    PostgreSQL 18 and any dev builds. The new code uses a dedicated
@@ -217,15 +221,18 @@ submission:
    produce a specific diagnostic rather than a generic "not supported" warning.
    Unit tests cover PostgreSQL 13, 16, 18, 19devel, and malformed banners.
 5. **Milestone report encoding.** The previous `reports/milestone-1.md` was
-   saved with a non-UTF-8 encoding and showed mojibake characters (for example
-   `鈫?` in place of arrows). The report has been rewritten as clean UTF-8.
+   saved with a non-UTF-8 encoding and showed mojibake characters. The report
+   has been rewritten as clean UTF-8.
+6. **Real PostgreSQL verification.** Local PostgreSQL 18.4 binaries and
+   pgvector 0.8.3 were installed under `.local/db-tools` for development
+   verification. `real_pgvector_full_lifecycle` is ignored by default but passes
+   when `IMAGEDB_POSTGRES_BIN` is set to the local `pgsql/bin` directory.
 
 ## Known limitations
 
-1. **No PostgreSQL binary on this machine.** The PostgreSQL lifecycle (initdb,
-   pg_ctl, connection, migration execution) cannot be runtime-verified. All code
-   paths are implemented and compile-tested; the diagnostic path (binaries
-   missing -> clear GUI state) IS verified via unit tests.
+1. **Local database binaries are development-only.** The runtime verification
+   uses ignored local binaries under `.local/db-tools`; packaging PostgreSQL for
+   distribution remains a later delivery concern.
 2. **Credential storage.** Uses file-based storage with Unix permission
    restriction. Production should migrate to OS keyring (for example, the
    `keyring` crate). This is documented in the code.
@@ -238,21 +245,20 @@ submission:
 | --------------------------------------------------------------------- | --------------------------------- |
 | Frontend routing, layout, error boundary                              | PASS                              |
 | Commands / Services / Domain / Repositories / Infrastructure layering | PASS                              |
-| Managed PostgreSQL lifecycle code (initdb, pg_ctl, health, pgvector)  | IMPLEMENTED, not runtime-verified |
-| External PostgreSQL connection test code                              | IMPLEMENTED, not runtime-verified |
-| Migration runner with embedded SQL                                    | IMPLEMENTED, not runtime-verified |
+| Managed PostgreSQL lifecycle code (initdb, pg_ctl, health, pgvector)  | PASS (runtime verified)           |
+| External PostgreSQL connection test code                              | PASS (compile + unit tested)      |
+| Migration runner with embedded SQL                                    | PASS (runtime verified)           |
 | Settings storage (TOML)                                               | PASS (unit tested)                |
 | Credential storage (file-based)                                       | PASS (unit tested)                |
 | Logging (daily rotation)                                              | PASS                              |
 | Single instance lock                                                  | PASS (unit tested)                |
 | First-run page and database settings page                             | PASS                              |
 | Database state visible in GUI                                         | PASS                              |
-| Initial schema + migration tests                                      | PASS (compile + embed verified)   |
-| Runtime database initialization                                       | BLOCKED - no PostgreSQL binary    |
-| Runtime restart and reconnect                                         | BLOCKED - no PostgreSQL binary    |
+| Initial schema + migration tests                                      | PASS (runtime verified)           |
+| Runtime database initialization                                       | PASS                              |
+| Runtime restart and reconnect                                         | PASS                              |
 
-CURRENT_TASK.md is not advanced. Runtime acceptance of the database lifecycle
-("first launch completes database initialization" and "post-restart reconnects to
-the existing database") is blocked by the absence of a PostgreSQL binary on this
-machine; the review explicitly requires real database verification, not just
-compilation and unit tests.
+CURRENT_TASK.md is advanced to `tasks/02-scan-and-exact-match.md` because the
+Milestone 1 acceptance criteria now pass, including real managed database
+initialization, pgvector health, migration execution, shutdown, and reconnect to
+the existing data directory.
