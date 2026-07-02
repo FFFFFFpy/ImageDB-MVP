@@ -1,2 +1,8 @@
 packages:
   - apps/*
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - baseline-browser-mapping@2.10.41
+  - electron-to-chromium@1.5.384
+  - picomatch@4.0.5

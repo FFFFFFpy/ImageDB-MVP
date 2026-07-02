@@ -1,5 +1,9 @@
-# 当前任务
+# Current Task
 
-执行：`tasks/00-technical-probe.md`
+Executing: tasks/01-app-and-database.md
 
-完成并满足该任务全部验收条件后，更新本文件指向下一任务。
+Once this task passes all acceptance criteria, update this file to point to the next task.
+
+> Milestone 0 technical probe prototype is complete. Report: reports/milestone-0.md.
+> Milestone 0 validates the technology stack integration (React + Tauri + Rust + image fingerprinting + file transaction safety).
+> Known limitation: PostgreSQL and pgvector were NOT runtime-verified because no PostgreSQL binary is installed on this machine. Database lifecycle acceptance (auto-init, data reuse, pgvector health) remains pending until a PostgreSQL binary is available.

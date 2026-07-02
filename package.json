@@ -15,10 +15,5 @@
   },
   "devDependencies": {
     "prettier": "^3.0.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
   }
 }
