@@ -4,9 +4,10 @@ import { api } from '../lib/ipc/api';
 interface DashboardPageProps {
   needsOnboarding: boolean;
   onGoOnboarding: () => void;
+  onGoScan: () => void;
 }
 
-export function DashboardPage({ needsOnboarding, onGoOnboarding }: DashboardPageProps) {
+export function DashboardPage({ needsOnboarding, onGoOnboarding, onGoScan }: DashboardPageProps) {
   const dbStatus = useQuery({
     queryKey: ['database-status'],
     queryFn: api.getDatabaseStatus,
@@ -61,13 +62,12 @@ export function DashboardPage({ needsOnboarding, onGoOnboarding }: DashboardPage
         </div>
       </div>
 
-      <section className="coming-soon">
-        <h2>即将推出的功能</h2>
-        <ul>
-          <li>新建导入 - 选择源目录，开始图集分析</li>
-          <li>导入历史 - 查看已完成的导入记录</li>
-          <li>图库浏览 - 浏览已入库的图集</li>
-        </ul>
+      <section className="scan-action-section">
+        <h2>新建导入</h2>
+        <p>选择源目录，扫描图集并检测精确重复。</p>
+        <button className="btn-primary" onClick={onGoScan}>
+          开始导入
+        </button>
       </section>
     </div>
   );

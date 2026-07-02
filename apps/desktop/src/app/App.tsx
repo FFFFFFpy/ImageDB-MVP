@@ -6,6 +6,7 @@ import { api } from '../lib/ipc/api';
 import { DashboardPage } from '../pages/DashboardPage';
 import { OnboardingPage } from '../pages/OnboardingPage';
 import { ProbesPage } from '../pages/ProbesPage';
+import { ScanPage } from '../pages/ScanPage';
 import { SettingsPage } from '../pages/SettingsPage';
 
 export function App() {
@@ -34,8 +35,10 @@ export function App() {
             <DashboardPage
               needsOnboarding={needsOnboarding}
               onGoOnboarding={() => navigate('onboarding')}
+              onGoScan={() => navigate('scan')}
             />
           )}
+          {route === 'scan' && <ScanPage />}
           {route === 'settings' && <SettingsPage />}
           {route === 'probes' && <ProbesPage />}
         </Layout>

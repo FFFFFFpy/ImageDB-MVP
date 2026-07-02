@@ -9,6 +9,7 @@ interface LayoutProps {
 
 const NAV_ITEMS: { route: Route; label: string }[] = [
   { route: 'dashboard', label: '工作台' },
+  { route: 'scan', label: '新建导入' },
   { route: 'settings', label: '设置' },
   { route: 'probes', label: '技术探针' },
 ];

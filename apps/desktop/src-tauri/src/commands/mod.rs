@@ -1,9 +1,11 @@
 mod database;
 mod probe;
+pub mod scan;
 mod settings_cmd;
 
 pub use database::*;
 pub use probe::*;
+pub use scan::*;
 pub use settings_cmd::*;
 
 #[tauri::command]

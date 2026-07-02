@@ -90,6 +90,7 @@ test('renders dashboard page with title', () => {
 test('renders sidebar navigation', () => {
   renderApp();
   expect(screen.getByRole('button', { name: '工作台' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '新建导入' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '设置' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '技术探针' })).toBeInTheDocument();
 });

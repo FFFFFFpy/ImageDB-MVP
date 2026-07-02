@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod import_repository;
+
 use crate::error::AppError;
 use serde_json::Value;
 use tokio_postgres::Client;

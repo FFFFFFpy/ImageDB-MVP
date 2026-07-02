@@ -88,3 +88,22 @@ export interface AllProbeResults {
   fingerprint: ImageFingerprintProbeResult;
   file_transaction: FileTransactionProbeResult;
 }
+
+export interface ScanProgress {
+  state: string;
+  import_run_id: string | null;
+  current_stage: string;
+  current_album: string | null;
+  processed_images: number;
+  total_albums: number;
+  total_images: number;
+  duplicate_count: number;
+  error_count: number;
+  errors: string[];
+}
+
+export interface ScanSourceInfo {
+  path: string;
+  albums: string[];
+  album_count: number;
+}

@@ -8,6 +8,8 @@ import type {
   PostgresProbeResult,
   ImageFingerprintProbeResult,
   FileTransactionProbeResult,
+  ScanProgress,
+  ScanSourceInfo,
 } from './types';
 
 export const api = {
@@ -36,4 +38,13 @@ export const api = {
   probeFileTransaction: () => invoke<FileTransactionProbeResult>('probe_file_transaction'),
 
   runAllProbes: () => invoke<AllProbeResults>('run_all_probes'),
+
+  validateSourceDirectory: (sourceRoot: string) =>
+    invoke<ScanSourceInfo>('validate_source_directory', { sourceRoot }),
+
+  startScan: (sourceRoot: string) => invoke<string>('start_scan', { sourceRoot }),
+
+  cancelScan: () => invoke<string>('cancel_scan'),
+
+  getScanProgress: () => invoke<ScanProgress>('get_scan_progress'),
 };

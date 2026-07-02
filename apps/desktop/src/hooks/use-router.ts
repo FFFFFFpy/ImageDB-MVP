@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 
-export type Route = 'onboarding' | 'dashboard' | 'settings' | 'probes';
+export type Route = 'onboarding' | 'dashboard' | 'settings' | 'probes' | 'scan';
 
 function getRouteFromHash(): Route {
   const hash = window.location.hash.slice(1) || '/';
@@ -11,6 +11,8 @@ function getRouteFromHash(): Route {
       return 'settings';
     case '/probes':
       return 'probes';
+    case '/scan':
+      return 'scan';
     default:
       return 'dashboard';
   }

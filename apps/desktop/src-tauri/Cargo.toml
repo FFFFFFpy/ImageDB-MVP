@@ -9,6 +9,9 @@ edition = "2021"
 name = "imagedb_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+real-db-tests = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
