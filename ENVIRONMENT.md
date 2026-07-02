@@ -1,5 +1,7 @@
 # 开发环境检查
 
+Codex 桌面版可以直接选择本项目目录作为工作目录。Codex CLI 是可选工具，不属于开发环境前置条件。
+
 ## Windows
 
 在项目根目录打开 PowerShell：
@@ -34,7 +36,7 @@ bash ./scripts/check-env.sh --build
 
 - Git
 - Node.js 22 或 24
-- pnpm 10
+- pnpm 10.34.4
 - Rust stable
 - rustfmt
 - clippy

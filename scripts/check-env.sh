@@ -69,6 +69,7 @@ required_files=(
   apps/desktop/package.json
   apps/desktop/src-tauri/Cargo.toml
   apps/desktop/src-tauri/tauri.conf.json
+  apps/desktop/src-tauri/icons/icon.ico
   AGENTS.md
   CURRENT_TASK.md
 )
@@ -83,9 +84,9 @@ else
 fi
 
 if has_cmd codex; then
-  check PASS "Codex CLI" "$(codex --version 2>/dev/null | head -n 1)"
+  check INFO "Codex CLI（可选）" "$(codex --version 2>/dev/null | head -n 1)"
 else
-  check FAIL "Codex CLI" "未找到 codex 命令"
+  check INFO "Codex CLI（可选）" "未安装；使用 Codex 桌面版不需要安装 CLI"
 fi
 
 if has_cmd git; then

@@ -1,7 +1,20 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$BuildProbe
 )
+
+# Windows PowerShell 5.1 defaults to a legacy console code page.
+# Force UTF-8 so Node/pnpm/Vitest output remains readable.
+try {
+    & chcp.com 65001 *> $null
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [Console]::InputEncoding = $Utf8NoBom
+    [Console]::OutputEncoding = $Utf8NoBom
+    $OutputEncoding = $Utf8NoBom
+}
+catch {
+    # Encoding setup is best-effort and must not block the environment check.
+}
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -103,6 +116,7 @@ $RequiredFiles = @(
     'apps/desktop/package.json',
     'apps/desktop/src-tauri/Cargo.toml',
     'apps/desktop/src-tauri/tauri.conf.json',
+    'apps/desktop/src-tauri/icons/icon.ico',
     'AGENTS.md',
     'CURRENT_TASK.md'
 )
@@ -114,13 +128,13 @@ else {
     Add-Check 'FAIL' '项目结构' ("缺失: " + ($MissingFiles -join ', '))
 }
 
-# Codex CLI
+# Codex 使用方式
 $CodexVersion = Get-CommandOutput 'codex' @('--version')
 if ($CodexVersion) {
-    Add-Check 'PASS' 'Codex CLI' $CodexVersion
+    Add-Check 'INFO' 'Codex CLI（可选）' $CodexVersion
 }
 else {
-    Add-Check 'FAIL' 'Codex CLI' '未找到 codex 命令'
+    Add-Check 'INFO' 'Codex CLI（可选）' '未安装；使用 Codex 桌面版不需要安装 CLI'
 }
 
 # Git
@@ -190,38 +204,49 @@ else {
 
 # Rust
 $RustupVersion = Get-CommandOutput 'rustup' @('--version')
-if ($RustupVersion) { Add-Check 'PASS' 'rustup' (($RustupVersion -split "`n")[0]) } else { Add-Check 'FAIL' 'rustup' '未找到 rustup' }
+if ($RustupVersion) {
+    Add-Check 'PASS' 'rustup' (($RustupVersion -split "`n")[0])
 
-$RustcVersion = Get-CommandOutput 'rustc' @('--version')
-if ($RustcVersion) { Add-Check 'PASS' 'rustc' $RustcVersion } else { Add-Check 'FAIL' 'rustc' '未找到 rustc' }
+    $RustcVersion = Get-CommandOutput 'rustc' @('--version')
+    if ($RustcVersion) { Add-Check 'PASS' 'rustc' $RustcVersion } else { Add-Check 'FAIL' 'rustc' 'rustup 已存在，但未找到 rustc' }
 
-$CargoVersion = Get-CommandOutput 'cargo' @('--version')
-if ($CargoVersion) { Add-Check 'PASS' 'cargo' $CargoVersion } else { Add-Check 'FAIL' 'cargo' '未找到 cargo' }
+    $CargoVersion = Get-CommandOutput 'cargo' @('--version')
+    if ($CargoVersion) { Add-Check 'PASS' 'cargo' $CargoVersion } else { Add-Check 'FAIL' 'cargo' 'rustup 已存在，但未找到 cargo' }
 
-$Toolchain = Get-CommandOutput 'rustup' @('show', 'active-toolchain')
-if ($Toolchain) {
-    if ($Toolchain -match 'stable' -and $Toolchain -match 'windows-msvc') {
-        Add-Check 'PASS' 'Rust 工具链' $Toolchain
+    $Toolchain = Get-CommandOutput 'rustup' @('show', 'active-toolchain')
+    if ($Toolchain) {
+        if ($Toolchain -match 'stable' -and $Toolchain -match 'windows-msvc') {
+            Add-Check 'PASS' 'Rust 工具链' $Toolchain
+        }
+        else {
+            Add-Check 'FAIL' 'Rust 工具链' "$Toolchain；需要 stable-x86_64-pc-windows-msvc"
+        }
     }
     else {
-        Add-Check 'FAIL' 'Rust 工具链' "$Toolchain；需要 stable-msvc"
+        Add-Check 'FAIL' 'Rust 工具链' '未检测到活动工具链'
     }
+
+    $RustfmtVersion = Get-CommandOutput 'cargo' @('fmt', '--version')
+    if ($RustfmtVersion) { Add-Check 'PASS' 'rustfmt' $RustfmtVersion } else { Add-Check 'FAIL' 'rustfmt' '缺失；执行: rustup component add rustfmt' }
+
+    $ClippyVersion = Get-CommandOutput 'cargo' @('clippy', '--version')
+    if ($ClippyVersion) { Add-Check 'PASS' 'clippy' $ClippyVersion } else { Add-Check 'FAIL' 'clippy' '缺失；执行: rustup component add clippy' }
 }
-
-$RustfmtVersion = Get-CommandOutput 'cargo' @('fmt', '--version')
-if ($RustfmtVersion) { Add-Check 'PASS' 'rustfmt' $RustfmtVersion } else { Add-Check 'FAIL' 'rustfmt' '缺失；执行: rustup component add rustfmt' }
-
-$ClippyVersion = Get-CommandOutput 'cargo' @('clippy', '--version')
-if ($ClippyVersion) { Add-Check 'PASS' 'clippy' $ClippyVersion } else { Add-Check 'FAIL' 'clippy' '缺失；执行: rustup component add clippy' }
+else {
+    Add-Check 'FAIL' 'Rust 工具链' '未安装 rustup；安装后会同时提供 rustc 和 cargo'
+    Add-Check 'INFO' 'rustfmt / clippy' '将在安装 Rust 后通过 rustup component add rustfmt clippy 安装'
+}
 
 # Visual Studio C++ Build Tools
 $VsWhereCandidates = @(
-    "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
-    "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
-) | Where-Object { $_ -and (Test-Path $_) }
+    @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe",
+        "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+)
 
 if ($VsWhereCandidates.Count -gt 0) {
-    $VsWhere = $VsWhereCandidates[0]
+    $VsWhere = [string]$VsWhereCandidates[0]
     $VsPath = (& $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null | Select-Object -First 1)
     if ($VsPath) {
         Add-Check 'PASS' 'Visual Studio C++ Build Tools' $VsPath

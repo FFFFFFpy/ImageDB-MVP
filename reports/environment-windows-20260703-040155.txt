@@ -1,0 +1,27 @@
+﻿ImageDB-MVP Windows 环境检查
+项目目录: D:\MyProjects\Agent\ImageDB-MVP
+检查时间: 2026-07-03 04:01:55 +08:00
+
+[INFO] Windows - Microsoft Windows 11 专业版 10.0.26200 / AMD64
+[INFO] PowerShell - 5.1.26100.8457
+[PASS] 项目结构 - 关键文件齐全
+[INFO] Codex CLI（可选） - 未安装；使用 Codex 桌面版不需要安装 CLI
+[PASS] Git - git version 2.54.0.windows.1
+[WARN] Git 长路径 - 建议执行: git config --global core.longpaths true
+[PASS] Git 提交身份 - Helw <471372574@qq.com>
+[PASS] Node.js - v24.16.0（支持范围 22/24）
+[PASS] npm - 11.13.0
+[FAIL] pnpm - 未找到 pnpm 10；可执行: npm install -g pnpm@10
+[FAIL] rustup - 未找到 rustup
+[FAIL] rustc - 未找到 rustc
+[FAIL] cargo - 未找到 cargo
+[FAIL] rustfmt - 缺失；执行: rustup component add rustfmt
+[FAIL] clippy - 缺失；执行: rustup component add clippy
+[FAIL] Visual Studio C++ Build Tools - 未安装“使用 C++ 的桌面开发”组件
+[PASS] Windows SDK - 10.0.26100.0
+[PASS] WebView2 Runtime - C:\Program Files (x86)\Microsoft\EdgeWebView\Application\149.0.4022.98\msedgewebview2.exe
+[PASS] 可用磁盘空间 - 370.7 GB
+[INFO] 系统 PostgreSQL - 未安装或不在 PATH；不阻塞技术探针
+
+汇总: PASS=8 WARN=1 FAIL=7
+报告: D:\MyProjects\Agent\ImageDB-MVP\reports\environment-windows-20260703-040155.txt
