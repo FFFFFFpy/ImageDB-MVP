@@ -8,6 +8,33 @@ vi.mock('@tauri-apps/api/core', () => ({
     if (cmd === 'get_app_status') {
       return Promise.resolve('Rust Core 已连接');
     }
+    if (cmd === 'get_settings') {
+      return Promise.resolve({
+        database_mode: 'managed_local',
+        library_root: null,
+        external_host: null,
+        external_port: null,
+        external_database: null,
+        external_username: null,
+        first_run_completed: true,
+      });
+    }
+    if (cmd === 'get_database_status') {
+      return Promise.resolve({
+        mode: 'managed_local',
+        status: 'connected',
+        managed_config: {
+          data_dir: '/tmp/pgdata',
+          port: 5432,
+          username: 'imagedb',
+          database: 'imagedb',
+        },
+        external_config: null,
+        pgvector_available: true,
+        migration_version: '0002_indexes',
+        diagnostics: [],
+      });
+    }
     if (cmd === 'probe_postgres') {
       return Promise.resolve({
         available: false,
@@ -55,24 +82,26 @@ function renderApp() {
   );
 }
 
-test('renders probe page title', () => {
+test('renders dashboard page with title', () => {
   renderApp();
-  expect(screen.getByText('技术探针 - Milestone 0')).toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: '工作台' })).toBeInTheDocument();
 });
 
-test('renders connection test button', () => {
+test('renders sidebar navigation', () => {
   renderApp();
-  expect(screen.getByRole('button', { name: '连接测试' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '工作台' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '设置' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '技术探针' })).toBeInTheDocument();
 });
 
-test('renders all probe tabs', () => {
+test('renders ImageDB brand in sidebar', () => {
   renderApp();
-  expect(screen.getByRole('button', { name: '数据库' })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: '图片指纹' })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: '文件事务' })).toBeInTheDocument();
+  expect(screen.getByText('ImageDB')).toBeInTheDocument();
 });
 
-test('renders run all probes button', () => {
+test('renders status cards section', () => {
   renderApp();
-  expect(screen.getByRole('button', { name: '运行全部探针' })).toBeInTheDocument();
+  expect(screen.getByText('数据库')).toBeInTheDocument();
+  expect(screen.getByText('pgvector')).toBeInTheDocument();
+  expect(screen.getByText('迁移')).toBeInTheDocument();
 });

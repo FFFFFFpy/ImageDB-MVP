@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use rand::Rng;
 use serde::Serialize;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -6,6 +7,9 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 const PORT_FILE: &str = "postgres_port";
+const CREDENTIAL_FILE: &str = "postgres_credentials";
+const DEFAULT_USERNAME: &str = "imagedb";
+const DEFAULT_DATABASE: &str = "imagedb";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PostgresProbeResult {
@@ -22,25 +26,33 @@ pub struct PostgresProbeResult {
 pub struct PostgresManager {
     data_dir: PathBuf,
     port: u16,
+    username: String,
+    database: String,
+    password: Option<String>,
     pg_ctl: Option<PathBuf>,
     initdb: Option<PathBuf>,
     psql: Option<PathBuf>,
     diagnostics: Vec<String>,
+    server_running: bool,
 }
 
-#[allow(dead_code)]
 impl PostgresManager {
     pub fn new(app_data_dir: &std::path::Path) -> Self {
         let data_dir = app_data_dir.join("postgres_data");
         let mut mgr = Self {
             data_dir,
             port: 0,
+            username: DEFAULT_USERNAME.to_string(),
+            database: DEFAULT_DATABASE.to_string(),
+            password: None,
             pg_ctl: None,
             initdb: None,
             psql: None,
             diagnostics: Vec::new(),
+            server_running: false,
         };
         mgr.locate_binaries();
+        mgr.load_saved_config();
         mgr
     }
 
@@ -120,8 +132,55 @@ impl PostgresManager {
         }
     }
 
+    fn load_saved_config(&mut self) {
+        if let Some(port) = self.read_saved_port() {
+            self.port = port;
+        }
+        if let Some((username, password)) = self.read_saved_credentials() {
+            self.username = username;
+            self.password = Some(password);
+        }
+    }
+
     pub fn binaries_available(&self) -> bool {
         self.pg_ctl.is_some() && self.initdb.is_some() && self.psql.is_some()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    pub fn is_server_running(&self) -> bool {
+        self.server_running
+    }
+
+    pub fn connection_string(&self) -> String {
+        let mut parts = vec![
+            format!("host=127.0.0.1"),
+            format!("port={}", self.port),
+            format!("user={}", self.username),
+            format!("dbname={}", self.database),
+        ];
+        if let Some(ref pw) = self.password {
+            parts.push(format!("password={pw}"));
+        }
+        parts.join(" ")
+    }
+
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
     }
 
     fn find_free_port() -> Result<u16, AppError> {
@@ -134,8 +193,22 @@ impl PostgresManager {
         Ok(port)
     }
 
+    fn generate_password() -> String {
+        let mut rng = rand::thread_rng();
+        let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            .chars()
+            .collect();
+        (0..24)
+            .map(|_| chars[rng.gen_range(0..chars.len())])
+            .collect()
+    }
+
     fn port_file_path(&self) -> PathBuf {
         self.data_dir.join(PORT_FILE)
+    }
+
+    fn credential_file_path(&self) -> PathBuf {
+        self.data_dir.join(CREDENTIAL_FILE)
     }
 
     fn save_port(&self) -> Result<(), AppError> {
@@ -145,11 +218,44 @@ impl PostgresManager {
         })
     }
 
+    fn save_credentials(&self) -> Result<(), AppError> {
+        let path = self.credential_file_path();
+        let password = self.password.as_deref().unwrap_or("");
+        let content = format!("{}:{}", self.username, password);
+        std::fs::write(&path, content).map_err(|e| {
+            AppError::Internal(format!(
+                "cannot write credential file {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| AppError::Internal(format!("cannot set credential file permissions: {e}")),
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn read_saved_port(&self) -> Option<u16> {
         let path = self.port_file_path();
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| s.trim().parse::<u16>().ok())
+    }
+
+    fn read_saved_credentials(&self) -> Option<(String, String)> {
+        let path = self.credential_file_path();
+        let content = std::fs::read_to_string(&path).ok()?;
+        let parts: Vec<&str> = content.trim().splitn(2, ':').collect();
+        if parts.len() == 2 && !parts[0].is_empty() {
+            Some((parts[0].to_string(), parts[1].to_string()))
+        } else {
+            None
+        }
     }
 
     fn path_to_str(path: &std::path::Path) -> Result<String, AppError> {
@@ -159,6 +265,14 @@ impl PostgresManager {
                 path.display()
             ))
         })
+    }
+
+    fn psql_command(&self, psql: &std::path::Path) -> Command {
+        let mut cmd = Command::new(psql);
+        if let Some(ref pw) = self.password {
+            cmd.env("PGPASSWORD", pw);
+        }
+        cmd
     }
 
     pub async fn initialize(&mut self) -> Result<PostgresProbeResult, AppError> {
@@ -176,14 +290,21 @@ impl PostgresManager {
         }
 
         if !self.data_dir.exists() {
-            self.port = Self::find_free_port()?;
-            self.save_port()?;
-
-            std::fs::create_dir_all(&self.data_dir)?;
+            std::fs::create_dir_all(&self.data_dir).map_err(|e| {
+                AppError::Internal(format!(
+                    "cannot create data directory {}: {e}",
+                    self.data_dir.display()
+                ))
+            })?;
             self.diagnostics.push(format!(
                 "Created data directory: {}",
                 self.data_dir.display()
             ));
+
+            self.port = Self::find_free_port()?;
+            self.password = Some(Self::generate_password());
+            self.save_port()?;
+            self.save_credentials()?;
 
             let Some(initdb) = self.initdb.as_ref() else {
                 self.diagnostics
@@ -199,20 +320,49 @@ impl PostgresManager {
                     diagnostics: self.diagnostics.clone(),
                 });
             };
+
+            let password = self.password.clone().unwrap_or_default();
+            let pwfile = self.data_dir.join("initdb_pwfile");
+            if let Err(e) = std::fs::write(&pwfile, password.as_bytes()) {
+                self.diagnostics.push(format!(
+                    "cannot write initdb pwfile {}: {e}",
+                    pwfile.display()
+                ));
+                return Ok(PostgresProbeResult {
+                    available: true,
+                    managed: false,
+                    pgvector_available: false,
+                    port: Some(self.port),
+                    data_dir: Some(self.data_dir.display().to_string()),
+                    database_created: false,
+                    connection_ok: false,
+                    diagnostics: self.diagnostics.clone(),
+                });
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&pwfile, std::fs::Permissions::from_mode(0o600));
+            }
+
             let data_dir_str = Self::path_to_str(&self.data_dir)?;
+            let pwfile_str = pwfile.display().to_string();
             let output = Command::new(initdb)
                 .args([
                     "-D",
                     &data_dir_str,
                     "--no-locale",
                     "--encoding=UTF8",
-                    "--auth=trust",
-                    "--username=imagedb",
+                    "--auth=md5",
+                    &format!("--username={}", self.username),
+                    &format!("--pwfile={pwfile_str}"),
                 ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
                 .await?;
+
+            let _remove_pw = std::fs::remove_file(&pwfile);
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -261,7 +411,7 @@ impl PostgresManager {
         self.start_server().await
     }
 
-    async fn start_server(&mut self) -> Result<PostgresProbeResult, AppError> {
+    pub async fn start_server(&mut self) -> Result<PostgresProbeResult, AppError> {
         let Some(pg_ctl) = self.pg_ctl.as_ref() else {
             self.diagnostics
                 .push("pg_ctl binary missing during server startup".to_string());
@@ -299,22 +449,29 @@ impl PostgresManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if stderr.contains("already running") || stderr.contains("already started") {
+                self.diagnostics
+                    .push("PostgreSQL server already running".to_string());
+                self.server_running = true;
+            } else {
+                self.diagnostics
+                    .push(format!("pg_ctl start failed: {stderr}"));
+                return Ok(PostgresProbeResult {
+                    available: true,
+                    managed: false,
+                    pgvector_available: false,
+                    port: Some(self.port),
+                    data_dir: Some(self.data_dir.display().to_string()),
+                    database_created: false,
+                    connection_ok: false,
+                    diagnostics: self.diagnostics.clone(),
+                });
+            }
+        } else {
             self.diagnostics
-                .push(format!("pg_ctl start failed: {stderr}"));
-            return Ok(PostgresProbeResult {
-                available: true,
-                managed: false,
-                pgvector_available: false,
-                port: Some(self.port),
-                data_dir: Some(self.data_dir.display().to_string()),
-                database_created: false,
-                connection_ok: false,
-                diagnostics: self.diagnostics.clone(),
-            });
+                .push(format!("PostgreSQL started on port {port_str}"));
+            self.server_running = true;
         }
-
-        self.diagnostics
-            .push(format!("PostgreSQL started on port {port_str}"));
 
         let db_created = self.create_database().await;
         let pgvector_ok = self.check_pgvector().await;
@@ -343,14 +500,15 @@ impl PostgresManager {
         };
         let port_str = self.port.to_string();
 
-        let check = Command::new(psql)
+        let check = self
+            .psql_command(psql)
             .args([
                 "-h",
                 "127.0.0.1",
                 "-p",
                 &port_str,
                 "-U",
-                "imagedb",
+                &self.username,
                 "-d",
                 "postgres",
                 "-tc",
@@ -371,18 +529,19 @@ impl PostgresManager {
             _ => {}
         }
 
-        let create = Command::new(psql)
+        let create = self
+            .psql_command(psql)
             .args([
                 "-h",
                 "127.0.0.1",
                 "-p",
                 &port_str,
                 "-U",
-                "imagedb",
+                &self.username,
                 "-d",
                 "postgres",
                 "-c",
-                "CREATE DATABASE imagedb",
+                &format!("CREATE DATABASE {}", self.database),
             ])
             .output()
             .await;
@@ -390,7 +549,7 @@ impl PostgresManager {
         match create {
             Ok(output) if output.status.success() => {
                 self.diagnostics
-                    .push("Created database 'imagedb'".to_string());
+                    .push(format!("Created database '{}'", self.database));
                 true
             }
             Ok(output) => {
@@ -406,7 +565,7 @@ impl PostgresManager {
         }
     }
 
-    async fn check_pgvector(&mut self) -> bool {
+    pub async fn check_pgvector(&mut self) -> bool {
         let psql = match self.psql.as_ref() {
             Some(p) => p,
             None => {
@@ -417,16 +576,17 @@ impl PostgresManager {
         };
         let port_str = self.port.to_string();
 
-        let output = Command::new(psql)
+        let output = self
+            .psql_command(psql)
             .args([
                 "-h",
                 "127.0.0.1",
                 "-p",
                 &port_str,
                 "-U",
-                "imagedb",
+                &self.username,
                 "-d",
-                "imagedb",
+                &self.database,
                 "-c",
                 "CREATE EXTENSION IF NOT EXISTS vector",
             ])
@@ -452,11 +612,8 @@ impl PostgresManager {
         }
     }
 
-    async fn test_connection(&mut self) -> bool {
-        let conn_str = format!(
-            "host=127.0.0.1 port={} user=imagedb dbname=imagedb",
-            self.port
-        );
+    pub async fn test_connection(&mut self) -> bool {
+        let conn_str = self.connection_string();
 
         match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
             Ok((client, conn)) => {
@@ -487,9 +644,26 @@ impl PostgresManager {
         }
     }
 
+    pub async fn connect(
+        &self,
+    ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), AppError> {
+        let conn_str = self.connection_string();
+        let (client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| AppError::PostgresUnavailable(format!("connect failed: {e}")))?;
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("PostgreSQL connection lost: {e}");
+            }
+        });
+
+        Ok((client, handle))
+    }
+
     pub async fn shutdown(&mut self) -> Result<(), AppError> {
         if let Some(pg_ctl) = &self.pg_ctl {
-            if self.data_dir.exists() {
+            if self.data_dir.exists() && self.server_running {
                 let data_dir_str = Self::path_to_str(&self.data_dir)?;
                 let output = Command::new(pg_ctl)
                     .args(["stop", "-D", &data_dir_str, "-m", "fast", "-w"])
@@ -498,6 +672,7 @@ impl PostgresManager {
 
                 if output.status.success() {
                     self.diagnostics.push("PostgreSQL stopped".to_string());
+                    self.server_running = false;
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                     self.diagnostics
@@ -506,14 +681,6 @@ impl PostgresManager {
             }
         }
         Ok(())
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    pub fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
     }
 }
 
@@ -594,5 +761,53 @@ mod tests {
         assert!(!result.available);
         assert!(!result.managed);
         assert!(result.port.is_none());
+    }
+
+    #[test]
+    fn test_connection_string_format() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = PostgresManager {
+            data_dir: tmp.path().to_path_buf(),
+            port: 15432,
+            username: "testuser".to_string(),
+            database: "testdb".to_string(),
+            password: Some("secret123".to_string()),
+            pg_ctl: None,
+            initdb: None,
+            psql: None,
+            diagnostics: Vec::new(),
+            server_running: false,
+        };
+
+        let conn_str = mgr.connection_string();
+        assert!(conn_str.contains("host=127.0.0.1"));
+        assert!(conn_str.contains("port=15432"));
+        assert!(conn_str.contains("user=testuser"));
+        assert!(conn_str.contains("dbname=testdb"));
+        assert!(conn_str.contains("password=secret123"));
+    }
+
+    #[test]
+    fn test_credential_persistence() {
+        let tmp = TempDir::new().unwrap();
+        let isolated = tmp.path().join("isolated_app_data");
+        std::fs::create_dir_all(&isolated).unwrap();
+
+        let mut mgr = PostgresManager::new(&isolated);
+        std::fs::create_dir_all(&mgr.data_dir).unwrap();
+        mgr.username = "imagedb".to_string();
+        mgr.password = Some("testpassword42".to_string());
+        mgr.save_credentials().unwrap();
+
+        let (user, pass) = mgr.read_saved_credentials().unwrap();
+        assert_eq!(user, "imagedb");
+        assert_eq!(pass, "testpassword42");
+    }
+
+    #[test]
+    fn test_generate_password_length() {
+        let pw = PostgresManager::generate_password();
+        assert_eq!(pw.len(), 24);
+        assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 }

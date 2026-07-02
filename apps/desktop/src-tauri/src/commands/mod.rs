@@ -1,6 +1,10 @@
+mod database;
 mod probe;
+mod settings_cmd;
 
+pub use database::*;
 pub use probe::*;
+pub use settings_cmd::*;
 
 #[tauri::command]
 pub async fn get_app_status() -> Result<String, String> {
