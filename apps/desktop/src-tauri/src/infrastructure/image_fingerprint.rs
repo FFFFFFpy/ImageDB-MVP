@@ -1,3 +1,4 @@
+use crate::domain::import_state::TransformType;
 use crate::error::AppError;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat};
@@ -24,6 +25,36 @@ pub struct ImageFingerprintProbeResult {
     pub fingerprints: Vec<ImageFingerprint>,
     pub diagnostics: Vec<String>,
     pub success: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PerceptualHashes {
+    pub gradient: String,
+    pub block: String,
+    pub median: String,
+}
+
+impl PerceptualHashes {
+    #[allow(dead_code)]
+    pub fn to_bytes(&self) -> PerceptualHashBytes {
+        PerceptualHashBytes {
+            gradient: hex_to_bytes(&self.gradient),
+            block: hex_to_bytes(&self.block),
+            median: hex_to_bytes(&self.median),
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub struct PerceptualHashBytes {
+    pub gradient: Vec<u8>,
+    pub block: Vec<u8>,
+    pub median: Vec<u8>,
+}
+
+pub struct TransformVariant {
+    pub transform: TransformType,
+    pub hashes: PerceptualHashes,
 }
 
 const HASH_SIZE: u32 = 8;
@@ -64,6 +95,103 @@ pub fn fingerprint_image(path: &Path) -> Result<ImageFingerprint, AppError> {
         median_hash,
         block_hash,
     })
+}
+
+pub fn fingerprint_image_with_transforms(
+    path: &Path,
+) -> Result<(ImageFingerprint, Vec<TransformVariant>), AppError> {
+    let file_bytes = std::fs::read(path)?;
+    let file_size = file_bytes.len() as u64;
+
+    let blake3_hash = compute_blake3(&file_bytes);
+    let img = image::load_from_memory(&file_bytes)?;
+    let (width, height) = img.dimensions();
+    let format = detect_format(&file_bytes);
+
+    let oriented = apply_orientation(&img);
+    let rgba = oriented.to_rgba8();
+    let pixel_hash = compute_pixel_hash(&rgba);
+
+    let gray = oriented.to_luma8();
+    let resized = image::imageops::resize(&gray, HASH_SIZE, HASH_SIZE, FilterType::Lanczos3);
+
+    let gradient_hash = compute_gradient_hash(&resized);
+    let block_hash = compute_block_hash(&gray, 8);
+    let median_hash = compute_median_hash(&resized);
+
+    let fp = ImageFingerprint {
+        fingerprint_version: FINGERPRINT_VERSION,
+        file_path: path.display().to_string(),
+        format,
+        width,
+        height,
+        file_size,
+        blake3: blake3_hash,
+        pixel_hash,
+        gradient_hash,
+        median_hash,
+        block_hash,
+    };
+
+    let variants = compute_transform_variants(&resized);
+
+    Ok((fp, variants))
+}
+
+pub fn compute_transform_variants(small_gray_8x8: &image::GrayImage) -> Vec<TransformVariant> {
+    TransformType::ALL
+        .iter()
+        .map(|&transform| {
+            let transformed = transform_gray_8x8(small_gray_8x8, transform);
+            let hashes = compute_perceptual_hashes_8x8(&transformed);
+            TransformVariant { transform, hashes }
+        })
+        .collect()
+}
+
+pub fn compute_perceptual_hashes_8x8(small_gray: &image::GrayImage) -> PerceptualHashes {
+    let gradient = compute_gradient_hash(small_gray);
+    let median = compute_median_hash(small_gray);
+    let upscaled = image::imageops::resize(small_gray, 64, 64, FilterType::Nearest);
+    let block = compute_block_hash(&upscaled, 8);
+    PerceptualHashes {
+        gradient,
+        block,
+        median,
+    }
+}
+
+pub fn hash_hamming_distance(a: &str, b: &str) -> u32 {
+    let bytes_a = hex_to_bytes(a);
+    let bytes_b = hex_to_bytes(b);
+    let min_len = bytes_a.len().min(bytes_b.len());
+    let mut distance: u32 = 0;
+    for i in 0..min_len {
+        distance += (bytes_a[i] ^ bytes_b[i]).count_ones();
+    }
+    distance += ((bytes_a.len() as i64 - bytes_b.len() as i64).unsigned_abs() as u32) * 8;
+    distance
+}
+
+fn transform_gray_8x8(img: &image::GrayImage, transform: TransformType) -> image::GrayImage {
+    let size = 8u32;
+    let mut out = image::GrayImage::new(size, size);
+    for y in 0..size {
+        for x in 0..size {
+            let (sx, sy) = match transform {
+                TransformType::Identity => (x, y),
+                TransformType::Rot90 => (y, size - 1 - x),
+                TransformType::Rot180 => (size - 1 - x, size - 1 - y),
+                TransformType::Rot270 => (size - 1 - y, x),
+                TransformType::FlipH => (size - 1 - x, y),
+                TransformType::FlipV => (x, size - 1 - y),
+                TransformType::Transpose => (y, x),
+                TransformType::Transverse => (size - 1 - y, size - 1 - x),
+            };
+            out.put_pixel(x, y, *img.get_pixel(sx, sy));
+        }
+    }
+    out
 }
 
 fn detect_format(bytes: &[u8]) -> String {
@@ -210,6 +338,13 @@ fn bits_to_hex(bits: &[bool]) -> String {
         hex.push(char::from_digit(nibble as u32, 16).unwrap_or('0'));
     }
     hex
+}
+
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
 }
 
 pub fn run_probe(fixture_dir: &Path) -> ImageFingerprintProbeResult {
@@ -477,6 +612,169 @@ mod tests {
         let result = run_probe(tmp.path());
         assert!(result.success);
         assert!(!result.fingerprints.is_empty());
+    }
+
+    #[test]
+    fn test_hamming_distance_identical() {
+        assert_eq!(hash_hamming_distance("deadbeef", "deadbeef"), 0);
+        assert_eq!(hash_hamming_distance("0000", "0000"), 0);
+        assert_eq!(hash_hamming_distance("ffff", "ffff"), 0);
+    }
+
+    #[test]
+    fn test_hamming_distance_single_bit() {
+        assert_eq!(hash_hamming_distance("0000", "0001"), 1);
+        assert_eq!(hash_hamming_distance("0000", "8000"), 1);
+    }
+
+    #[test]
+    fn test_hamming_distance_all_different() {
+        assert_eq!(hash_hamming_distance("0000", "ffff"), 16);
+    }
+
+    #[test]
+    fn test_hamming_distance_symmetric() {
+        let a = "abcdef01";
+        let b = "12345678";
+        assert_eq!(hash_hamming_distance(a, b), hash_hamming_distance(b, a));
+    }
+
+    #[test]
+    fn test_transform_variants_count() {
+        let img = make_test_image();
+        let gray = DynamicImage::ImageRgb8(img).to_luma8();
+        let small = image::imageops::resize(&gray, HASH_SIZE, HASH_SIZE, FilterType::Lanczos3);
+        let variants = compute_transform_variants(&small);
+        assert_eq!(variants.len(), 8);
+    }
+
+    #[test]
+    fn test_transform_identity_matches_canonical() {
+        let img = make_test_image();
+        let gray = DynamicImage::ImageRgb8(img).to_luma8();
+        let small = image::imageops::resize(&gray, HASH_SIZE, HASH_SIZE, FilterType::Lanczos3);
+        let variants = compute_transform_variants(&small);
+        let identity = &variants[0];
+        assert_eq!(
+            identity.transform,
+            crate::domain::import_state::TransformType::Identity
+        );
+        let canonical = compute_perceptual_hashes_8x8(&small);
+        assert_eq!(identity.hashes.gradient, canonical.gradient);
+        assert_eq!(identity.hashes.block, canonical.block);
+        assert_eq!(identity.hashes.median, canonical.median);
+    }
+
+    #[test]
+    fn test_transform_rot180_double_rot90() {
+        let img = make_test_image();
+        let gray = DynamicImage::ImageRgb8(img).to_luma8();
+        let small = image::imageops::resize(&gray, HASH_SIZE, HASH_SIZE, FilterType::Lanczos3);
+
+        let rot90 = transform_gray_8x8(&small, crate::domain::import_state::TransformType::Rot90);
+        let rot180_via_double90 =
+            transform_gray_8x8(&rot90, crate::domain::import_state::TransformType::Rot90);
+        let rot180 = transform_gray_8x8(&small, crate::domain::import_state::TransformType::Rot180);
+
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                assert_eq!(
+                    rot180_via_double90.get_pixel(x, y).0[0],
+                    rot180.get_pixel(x, y).0[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_perceptual_hashes_deterministic() {
+        let img = make_test_image();
+        let gray = DynamicImage::ImageRgb8(img).to_luma8();
+        let small = image::imageops::resize(&gray, HASH_SIZE, HASH_SIZE, FilterType::Lanczos3);
+        let h1 = compute_perceptual_hashes_8x8(&small);
+        let h2 = compute_perceptual_hashes_8x8(&small);
+        assert_eq!(h1.gradient, h2.gradient);
+        assert_eq!(h1.block, h2.block);
+        assert_eq!(h1.median, h2.median);
+    }
+
+    #[test]
+    fn test_fingerprint_with_transforms() {
+        let tmp = TempDir::new().unwrap();
+        generate_test_samples(tmp.path()).unwrap();
+        let path = tmp.path().join("test-sample.png");
+        let (fp, variants) = fingerprint_image_with_transforms(&path).unwrap();
+        assert!(!fp.gradient_hash.is_empty());
+        assert!(!fp.block_hash.is_empty());
+        assert!(!fp.median_hash.is_empty());
+        assert_eq!(variants.len(), 8);
+        assert_eq!(variants[0].hashes.gradient, fp.gradient_hash);
+    }
+
+    #[test]
+    fn test_scaled_image_perceptual_similarity() {
+        let tmp = TempDir::new().unwrap();
+        let original = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([
+                ((x * 4) % 256) as u8,
+                ((y * 4) % 256) as u8,
+                (((x + y) * 2) % 256) as u8,
+            ])
+        });
+        let p1 = tmp.path().join("original.png");
+        original.save(&p1).unwrap();
+
+        let scaled = image::imageops::resize(&original, 128, 128, FilterType::Lanczos3);
+        let p2 = tmp.path().join("scaled.png");
+        scaled.save(&p2).unwrap();
+
+        let fp1 = fingerprint_image(&p1).unwrap();
+        let fp2 = fingerprint_image(&p2).unwrap();
+
+        let grad_dist = hash_hamming_distance(&fp1.gradient_hash, &fp2.gradient_hash);
+        let block_dist = hash_hamming_distance(&fp1.block_hash, &fp2.block_hash);
+        let median_dist = hash_hamming_distance(&fp1.median_hash, &fp2.median_hash);
+
+        assert!(
+            grad_dist + block_dist + median_dist < 30,
+            "scaled image should be perceptually similar: grad={grad_dist} block={block_dist} median={median_dist}"
+        );
+    }
+
+    #[test]
+    fn test_mirrored_image_recallable_via_transforms() {
+        let tmp = TempDir::new().unwrap();
+        let img = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([
+                ((x * 4) % 256) as u8,
+                ((y * 4) % 256) as u8,
+                (((x + y) * 2) % 256) as u8,
+            ])
+        });
+        let p1 = tmp.path().join("original.png");
+        img.save(&p1).unwrap();
+
+        let flipped = image::imageops::flip_horizontal(&img);
+        let p2 = tmp.path().join("flipped.png");
+        flipped.save(&p2).unwrap();
+
+        let (_, variants1) = fingerprint_image_with_transforms(&p1).unwrap();
+        let (_, variants2) = fingerprint_image_with_transforms(&p2).unwrap();
+
+        let mut best_total = u32::MAX;
+        for v1 in &variants1 {
+            for v2 in &variants2 {
+                let g = hash_hamming_distance(&v1.hashes.gradient, &v2.hashes.gradient);
+                let b = hash_hamming_distance(&v1.hashes.block, &v2.hashes.block);
+                let m = hash_hamming_distance(&v1.hashes.median, &v2.hashes.median);
+                best_total = best_total.min(g + b + m);
+            }
+        }
+
+        assert!(
+            best_total < 20,
+            "mirrored image should be recallable via transforms, best_total={best_total}"
+        );
     }
 }
 

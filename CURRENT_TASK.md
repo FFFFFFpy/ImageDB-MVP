@@ -1,6 +1,6 @@
 # Current Task
 
-Executing: tasks/03-perceptual-match.md
+Executing: tasks/04-review-gui.md
 
 Once this task passes all acceptance criteria, update this file to point to the next task.
 
@@ -9,3 +9,4 @@ Once this task passes all acceptance criteria, update this file to point to the 
 > Milestone 1 app skeleton and database foundation is complete. Report: reports/milestone-1.md.
 > Managed PostgreSQL runtime verification passed with local PostgreSQL 18.4 and pgvector 0.8.3 binaries under .local/db-tools.
 > Milestone 2 scan and exact duplicate detection is complete. Report: reports/milestone-2.md.
+> Milestone 3 perceptual similarity detection is complete. Report: reports/milestone-3.md.

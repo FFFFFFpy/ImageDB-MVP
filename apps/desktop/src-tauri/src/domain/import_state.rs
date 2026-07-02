@@ -139,6 +139,8 @@ impl fmt::Display for DuplicateScope {
 pub enum MatchType {
     FileExact,
     PixelExact,
+    PerceptualNear,
+    PerceptualSimilar,
 }
 
 impl fmt::Display for MatchType {
@@ -146,8 +148,156 @@ impl fmt::Display for MatchType {
         match self {
             Self::FileExact => write!(f, "file_exact"),
             Self::PixelExact => write!(f, "pixel_exact"),
+            Self::PerceptualNear => write!(f, "perceptual_near"),
+            Self::PerceptualSimilar => write!(f, "perceptual_similar"),
         }
     }
+}
+
+impl MatchType {
+    #[allow(dead_code)]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "file_exact" => Some(Self::FileExact),
+            "pixel_exact" => Some(Self::PixelExact),
+            "perceptual_near" => Some(Self::PerceptualNear),
+            "perceptual_similar" => Some(Self::PerceptualSimilar),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransformType {
+    Identity,
+    Rot90,
+    Rot180,
+    Rot270,
+    FlipH,
+    FlipV,
+    Transpose,
+    Transverse,
+}
+
+impl TransformType {
+    pub const ALL: [Self; 8] = [
+        Self::Identity,
+        Self::Rot90,
+        Self::Rot180,
+        Self::Rot270,
+        Self::FlipH,
+        Self::FlipV,
+        Self::Transpose,
+        Self::Transverse,
+    ];
+}
+
+impl fmt::Display for TransformType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Identity => "identity",
+            Self::Rot90 => "rot90",
+            Self::Rot180 => "rot180",
+            Self::Rot270 => "rot270",
+            Self::FlipH => "flip_h",
+            Self::FlipV => "flip_v",
+            Self::Transpose => "transpose",
+            Self::Transverse => "transverse",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl TransformType {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "identity" => Some(Self::Identity),
+            "rot90" => Some(Self::Rot90),
+            "rot180" => Some(Self::Rot180),
+            "rot270" => Some(Self::Rot270),
+            "flip_h" => Some(Self::FlipH),
+            "flip_v" => Some(Self::FlipV),
+            "transpose" => Some(Self::Transpose),
+            "transverse" => Some(Self::Transverse),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Decision {
+    AutoDuplicate,
+    Review,
+}
+
+impl fmt::Display for Decision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AutoDuplicate => write!(f, "auto_duplicate"),
+            Self::Review => write!(f, "review"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DecisionSource {
+    ExactRule,
+    PerceptualRule,
+}
+
+impl fmt::Display for DecisionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExactRule => write!(f, "exact_rule"),
+            Self::PerceptualRule => write!(f, "perceptual_rule"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MatchingStrategy {
+    Strict,
+    Balanced,
+    Loose,
+}
+
+impl fmt::Display for MatchingStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Strict => write!(f, "strict"),
+            Self::Balanced => write!(f, "balanced"),
+            Self::Loose => write!(f, "loose"),
+        }
+    }
+}
+
+impl MatchingStrategy {
+    pub fn perceptual_thresholds(self) -> PerceptualThresholds {
+        match self {
+            Self::Strict => PerceptualThresholds {
+                near_max_distance: 4,
+                similar_max_total: 12,
+                auto_decide: true,
+            },
+            Self::Balanced => PerceptualThresholds {
+                near_max_distance: 8,
+                similar_max_total: 24,
+                auto_decide: true,
+            },
+            Self::Loose => PerceptualThresholds {
+                near_max_distance: 12,
+                similar_max_total: 40,
+                auto_decide: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PerceptualThresholds {
+    pub near_max_distance: i32,
+    pub similar_max_total: i32,
+    pub auto_decide: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,7 +340,7 @@ pub struct ScanSourceInfo {
 
 pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 
-pub const SCAN_POLICY_VERSION: &str = "1.0";
+pub const SCAN_POLICY_VERSION: &str = "2.0";
 
 #[cfg(test)]
 mod tests {
@@ -225,5 +375,56 @@ mod tests {
             Some(ImportImageState::Fingerprinted)
         );
         assert_eq!(ImportImageState::from_str_opt("unknown"), None);
+    }
+
+    #[test]
+    fn match_type_round_trip() {
+        for mt in [
+            MatchType::FileExact,
+            MatchType::PixelExact,
+            MatchType::PerceptualNear,
+            MatchType::PerceptualSimilar,
+        ] {
+            assert_eq!(MatchType::from_str_opt(&mt.to_string()), Some(mt));
+        }
+        assert_eq!(MatchType::from_str_opt("bogus"), None);
+    }
+
+    #[test]
+    fn transform_type_round_trip() {
+        for tt in TransformType::ALL {
+            assert_eq!(TransformType::from_str_opt(&tt.to_string()), Some(tt));
+        }
+        assert_eq!(TransformType::from_str_opt("bogus"), None);
+    }
+
+    #[test]
+    fn decision_display() {
+        assert_eq!(Decision::AutoDuplicate.to_string(), "auto_duplicate");
+        assert_eq!(Decision::Review.to_string(), "review");
+    }
+
+    #[test]
+    fn decision_source_display() {
+        assert_eq!(DecisionSource::ExactRule.to_string(), "exact_rule");
+        assert_eq!(
+            DecisionSource::PerceptualRule.to_string(),
+            "perceptual_rule"
+        );
+    }
+
+    #[test]
+    fn matching_strategy_thresholds() {
+        let strict = MatchingStrategy::Strict.perceptual_thresholds();
+        let balanced = MatchingStrategy::Balanced.perceptual_thresholds();
+        let loose = MatchingStrategy::Loose.perceptual_thresholds();
+
+        assert!(strict.near_max_distance < balanced.near_max_distance);
+        assert!(balanced.near_max_distance < loose.near_max_distance);
+        assert!(strict.similar_max_total < balanced.similar_max_total);
+        assert!(balanced.similar_max_total < loose.similar_max_total);
+        assert!(strict.auto_decide);
+        assert!(balanced.auto_decide);
+        assert!(!loose.auto_decide);
     }
 }

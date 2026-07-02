@@ -1,9 +1,12 @@
 use crate::domain::import_state::{
-    DecodeState, DuplicateScope, ImportAlbumState, ImportImageState, ImportRunState, MatchType,
-    ScanProgress, SUPPORTED_IMAGE_EXTENSIONS,
+    Decision, DecisionSource, DecodeState, DuplicateScope, ImportAlbumState, ImportImageState,
+    ImportRunState, MatchType, MatchingStrategy, ScanProgress, TransformType,
+    SUPPORTED_IMAGE_EXTENSIONS,
 };
 use crate::error::AppError;
-use crate::infrastructure::image_fingerprint;
+use crate::infrastructure::image_fingerprint::{
+    fingerprint_image_with_transforms, hash_hamming_distance, TransformVariant,
+};
 use crate::infrastructure::postgres::PostgresManager;
 use crate::infrastructure::settings::SettingsStore;
 use crate::repositories::import_repository::{
@@ -52,8 +55,35 @@ struct FingerprintedData {
     format: String,
     blake3_bytes: Vec<u8>,
     pixel_hash_bytes: Vec<u8>,
+    gradient_hash_bytes: Vec<u8>,
+    block_hash_bytes: Vec<u8>,
+    median_hash_bytes: Vec<u8>,
     blake3_hex: String,
     pixel_hash_hex: String,
+    transform_variants: Vec<TransformVariant>,
+}
+
+struct PerceptualHex {
+    gradient: String,
+    block: String,
+    median: String,
+}
+
+impl PerceptualHex {
+    fn from_bytes(
+        gradient: &Option<Vec<u8>>,
+        block: &Option<Vec<u8>>,
+        median: &Option<Vec<u8>>,
+    ) -> Option<Self> {
+        match (gradient, block, median) {
+            (Some(g), Some(b), Some(m)) => Some(Self {
+                gradient: bytes_to_hex(g),
+                block: bytes_to_hex(b),
+                median: bytes_to_hex(m),
+            }),
+            _ => None,
+        }
+    }
 }
 
 async fn emit_progress(
@@ -84,6 +114,10 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
         .step_by(2)
         .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
         .collect()
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn scan_directory_for_albums(source_root: &Path) -> Result<Vec<AlbumEntry>, AppError> {
@@ -145,10 +179,185 @@ fn scan_album_for_images(
     Ok(images)
 }
 
+struct PerceptualEvidence {
+    gradient_distance: i32,
+    block_distance: i32,
+    median_distance: i32,
+    transform_type: TransformType,
+    confidence: f64,
+}
+
+impl PerceptualEvidence {
+    fn total_distance(&self) -> i32 {
+        self.gradient_distance + self.block_distance + self.median_distance
+    }
+}
+
+fn compare_perceptual_intra(
+    a: &FingerprintedData,
+    b: &FingerprintedData,
+    thresholds: crate::domain::import_state::PerceptualThresholds,
+) -> Option<PerceptualEvidence> {
+    let max_total = thresholds.similar_max_total;
+    let mut best: Option<PerceptualEvidence> = None;
+
+    for va in &a.transform_variants {
+        for vb in &b.transform_variants {
+            let gd = hash_hamming_distance(&va.hashes.gradient, &vb.hashes.gradient) as i32;
+            let bd = hash_hamming_distance(&va.hashes.block, &vb.hashes.block) as i32;
+            let md = hash_hamming_distance(&va.hashes.median, &vb.hashes.median) as i32;
+            let total = gd + bd + md;
+
+            if total > max_total {
+                continue;
+            }
+
+            let rel_transform = compose_transform(va.transform, vb.transform);
+            let evidence = PerceptualEvidence {
+                gradient_distance: gd,
+                block_distance: bd,
+                median_distance: md,
+                transform_type: rel_transform,
+                confidence: 1.0 - (total as f64 / 192.0),
+            };
+
+            let is_better = best
+                .as_ref()
+                .map(|prev| total < prev.total_distance())
+                .unwrap_or(true);
+
+            if is_better {
+                best = Some(evidence);
+            }
+        }
+    }
+
+    best
+}
+
+fn compare_perceptual_library(
+    import_fp: &FingerprintedData,
+    lib_hex: &PerceptualHex,
+    thresholds: crate::domain::import_state::PerceptualThresholds,
+) -> Option<PerceptualEvidence> {
+    let max_total = thresholds.similar_max_total;
+    let mut best: Option<PerceptualEvidence> = None;
+
+    for variant in &import_fp.transform_variants {
+        let gd = hash_hamming_distance(&variant.hashes.gradient, &lib_hex.gradient) as i32;
+        let bd = hash_hamming_distance(&variant.hashes.block, &lib_hex.block) as i32;
+        let md = hash_hamming_distance(&variant.hashes.median, &lib_hex.median) as i32;
+        let total = gd + bd + md;
+
+        if total > max_total {
+            continue;
+        }
+
+        let evidence = PerceptualEvidence {
+            gradient_distance: gd,
+            block_distance: bd,
+            median_distance: md,
+            transform_type: variant.transform,
+            confidence: 1.0 - (total as f64 / 192.0),
+        };
+
+        let is_better = best
+            .as_ref()
+            .map(|prev| total < prev.total_distance())
+            .unwrap_or(true);
+
+        if is_better {
+            best = Some(evidence);
+        }
+    }
+
+    best
+}
+
+fn classify_perceptual(
+    evidence: &PerceptualEvidence,
+    thresholds: crate::domain::import_state::PerceptualThresholds,
+) -> (MatchType, Option<Decision>, Option<DecisionSource>) {
+    let max_each = evidence
+        .gradient_distance
+        .max(evidence.block_distance)
+        .max(evidence.median_distance);
+    let is_near = max_each <= thresholds.near_max_distance;
+
+    let match_type = if is_near {
+        MatchType::PerceptualNear
+    } else {
+        MatchType::PerceptualSimilar
+    };
+
+    let (decision, source) = if thresholds.auto_decide && is_near {
+        (
+            Some(Decision::AutoDuplicate),
+            Some(DecisionSource::PerceptualRule),
+        )
+    } else {
+        (None, None)
+    };
+
+    (match_type, decision, source)
+}
+
+fn compose_transform(a: TransformType, b: TransformType) -> TransformType {
+    if a == b && a != TransformType::Identity {
+        match a {
+            TransformType::Rot90 | TransformType::Rot270 => return TransformType::Rot180,
+            TransformType::Rot180 => return TransformType::Identity,
+            TransformType::FlipH | TransformType::FlipV => return TransformType::Identity,
+            TransformType::Transpose | TransformType::Transverse => return TransformType::Identity,
+            _ => {}
+        }
+    }
+    if b == TransformType::Identity {
+        return a;
+    }
+    if a == TransformType::Identity {
+        return b;
+    }
+    let m_a = transform_matrix(a);
+    let m_b = transform_matrix(b);
+    let m = [
+        m_a[0] * m_b[0] + m_a[1] * m_b[2],
+        m_a[0] * m_b[1] + m_a[1] * m_b[3],
+        m_a[2] * m_b[0] + m_a[3] * m_b[2],
+        m_a[2] * m_b[1] + m_a[3] * m_b[3],
+    ];
+    matrix_to_transform(m)
+}
+
+fn transform_matrix(t: TransformType) -> [i32; 4] {
+    match t {
+        TransformType::Identity => [1, 0, 0, 1],
+        TransformType::Rot90 => [0, -1, 1, 0],
+        TransformType::Rot180 => [-1, 0, 0, -1],
+        TransformType::Rot270 => [0, 1, -1, 0],
+        TransformType::FlipH => [-1, 0, 0, 1],
+        TransformType::FlipV => [1, 0, 0, -1],
+        TransformType::Transpose => [0, 1, 1, 0],
+        TransformType::Transverse => [0, -1, -1, 0],
+    }
+}
+
+fn matrix_to_transform(m: [i32; 4]) -> TransformType {
+    for t in TransformType::ALL {
+        if transform_matrix(t) == m {
+            return t;
+        }
+    }
+    TransformType::Identity
+}
+
 fn fingerprint_image_sync(path: &Path) -> Result<FingerprintedData, AppError> {
-    let fp = image_fingerprint::fingerprint_image(path)?;
+    let (fp, variants) = fingerprint_image_with_transforms(path)?;
     let blake3_bytes = hex_to_bytes(&fp.blake3);
     let pixel_hash_bytes = hex_to_bytes(&fp.pixel_hash);
+    let gradient_hash_bytes = hex_to_bytes(&fp.gradient_hash);
+    let block_hash_bytes = hex_to_bytes(&fp.block_hash);
+    let median_hash_bytes = hex_to_bytes(&fp.median_hash);
     Ok(FingerprintedData {
         file_size: fp.file_size,
         width: fp.width,
@@ -156,8 +365,12 @@ fn fingerprint_image_sync(path: &Path) -> Result<FingerprintedData, AppError> {
         format: fp.format,
         blake3_bytes,
         pixel_hash_bytes,
+        gradient_hash_bytes,
+        block_hash_bytes,
+        median_hash_bytes,
         blake3_hex: fp.blake3,
         pixel_hash_hex: fp.pixel_hash,
+        transform_variants: variants,
     })
 }
 
@@ -347,6 +560,9 @@ pub async fn run_scan(
                             decode_state: DecodeState::Decoded,
                             blake3: Some(fp.blake3_bytes.clone()),
                             pixel_hash: Some(fp.pixel_hash_bytes.clone()),
+                            gradient_hash: Some(fp.gradient_hash_bytes.clone()),
+                            block_hash: Some(fp.block_hash_bytes.clone()),
+                            median_hash: Some(fp.median_hash_bytes.clone()),
                             fingerprint_version: Some("1".to_string()),
                             state: ImportImageState::Fingerprinted,
                         },
@@ -379,6 +595,9 @@ pub async fn run_scan(
                             decode_state: DecodeState::Failed,
                             blake3: None,
                             pixel_hash: None,
+                            gradient_hash: None,
+                            block_hash: None,
+                            median_hash: None,
                             fingerprint_version: None,
                             state: ImportImageState::Failed,
                         },
@@ -440,6 +659,9 @@ pub async fn run_scan(
             .push(entry);
     }
 
+    let strategy = MatchingStrategy::Balanced;
+    let thresholds = strategy.perceptual_thresholds();
+
     for images in album_groups.values() {
         if cancelled.load(Ordering::Relaxed) {
             break;
@@ -465,6 +687,13 @@ pub async fn run_scan(
                             match_type: MatchType::FileExact,
                             blake3_equal: true,
                             pixel_hash_equal: a.fp.pixel_hash_hex == b.fp.pixel_hash_hex,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
                         },
                     )
                     .await?;
@@ -483,12 +712,48 @@ pub async fn run_scan(
                             match_type: MatchType::PixelExact,
                             blake3_equal: false,
                             pixel_hash_equal: true,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
                         },
                     )
                     .await?;
                     duplicate_count += 1;
                     progress.duplicate_count = duplicate_count;
                     emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                } else {
+                    if let Some(evidence) = compare_perceptual_intra(&a.fp, &b.fp, thresholds) {
+                        let (match_type, decision, source) =
+                            classify_perceptual(&evidence, thresholds);
+                        ImportRepository::insert_duplicate_candidate(
+                            &client,
+                            NewDuplicateCandidate {
+                                import_run_id,
+                                source_image_id: a.image_db_id,
+                                candidate_source_image_id: Some(b.image_db_id),
+                                candidate_library_image_id: None,
+                                scope: DuplicateScope::IntraAlbum,
+                                match_type,
+                                blake3_equal: false,
+                                pixel_hash_equal: false,
+                                gradient_distance: Some(evidence.gradient_distance),
+                                block_distance: Some(evidence.block_distance),
+                                median_distance: Some(evidence.median_distance),
+                                transform_type: Some(evidence.transform_type.to_string()),
+                                confidence: Some(evidence.confidence),
+                                decision,
+                                decision_source: source,
+                            },
+                        )
+                        .await?;
+                        duplicate_count += 1;
+                        progress.duplicate_count = duplicate_count;
+                        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                    }
                 }
             }
         }
@@ -524,6 +789,13 @@ pub async fn run_scan(
                             match_type: MatchType::FileExact,
                             blake3_equal: true,
                             pixel_hash_equal: pixel_exact,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
                         },
                     )
                     .await?;
@@ -542,12 +814,57 @@ pub async fn run_scan(
                             match_type: MatchType::PixelExact,
                             blake3_equal: false,
                             pixel_hash_equal: true,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
                         },
                     )
                     .await?;
                     duplicate_count += 1;
                     progress.duplicate_count = duplicate_count;
                     emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                } else {
+                    let lib_hex = PerceptualHex::from_bytes(
+                        &lib.gradient_hash,
+                        &lib.block_hash,
+                        &lib.median_hash,
+                    );
+                    if let Some(lib_hex) = lib_hex {
+                        if let Some(evidence) =
+                            compare_perceptual_library(&entry.fp, &lib_hex, thresholds)
+                        {
+                            let (match_type, decision, source) =
+                                classify_perceptual(&evidence, thresholds);
+                            ImportRepository::insert_duplicate_candidate(
+                                &client,
+                                NewDuplicateCandidate {
+                                    import_run_id,
+                                    source_image_id: entry.image_db_id,
+                                    candidate_source_image_id: None,
+                                    candidate_library_image_id: Some(lib.id),
+                                    scope: DuplicateScope::Library,
+                                    match_type,
+                                    blake3_equal: false,
+                                    pixel_hash_equal: false,
+                                    gradient_distance: Some(evidence.gradient_distance),
+                                    block_distance: Some(evidence.block_distance),
+                                    median_distance: Some(evidence.median_distance),
+                                    transform_type: Some(evidence.transform_type.to_string()),
+                                    confidence: Some(evidence.confidence),
+                                    decision,
+                                    decision_source: source,
+                                },
+                            )
+                            .await?;
+                            duplicate_count += 1;
+                            progress.duplicate_count = duplicate_count;
+                            emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                        }
+                    }
                 }
             }
         }
@@ -759,6 +1076,10 @@ mod tests {
         assert!(!fp.pixel_hash_hex.is_empty());
         assert!(!fp.blake3_bytes.is_empty());
         assert!(!fp.pixel_hash_bytes.is_empty());
+        assert!(!fp.gradient_hash_bytes.is_empty());
+        assert!(!fp.block_hash_bytes.is_empty());
+        assert!(!fp.median_hash_bytes.is_empty());
+        assert_eq!(fp.transform_variants.len(), 8);
     }
 
     #[test]
@@ -849,6 +1170,132 @@ mod tests {
         assert!(SUPPORTED_IMAGE_EXTENSIONS.contains(&"webp"));
         assert!(!SUPPORTED_IMAGE_EXTENSIONS.contains(&"bmp"));
         assert!(!SUPPORTED_IMAGE_EXTENSIONS.contains(&"gif"));
+    }
+
+    #[test]
+    fn test_strategy_determinism() {
+        let t1 = MatchingStrategy::Balanced.perceptual_thresholds();
+        let t2 = MatchingStrategy::Balanced.perceptual_thresholds();
+        assert_eq!(t1.near_max_distance, t2.near_max_distance);
+        assert_eq!(t1.similar_max_total, t2.similar_max_total);
+        assert_eq!(t1.auto_decide, t2.auto_decide);
+    }
+
+    #[test]
+    fn test_classify_perceptual_near_auto() {
+        let thresholds = MatchingStrategy::Strict.perceptual_thresholds();
+        let evidence = PerceptualEvidence {
+            gradient_distance: 2,
+            block_distance: 1,
+            median_distance: 2,
+            transform_type: TransformType::Identity,
+            confidence: 0.95,
+        };
+        let (mt, dec, src) = classify_perceptual(&evidence, thresholds);
+        assert_eq!(mt, MatchType::PerceptualNear);
+        assert_eq!(dec, Some(Decision::AutoDuplicate));
+        assert_eq!(src, Some(DecisionSource::PerceptualRule));
+    }
+
+    #[test]
+    fn test_classify_perceptual_loose_review() {
+        let thresholds = MatchingStrategy::Loose.perceptual_thresholds();
+        let evidence = PerceptualEvidence {
+            gradient_distance: 5,
+            block_distance: 5,
+            median_distance: 5,
+            transform_type: TransformType::Identity,
+            confidence: 0.8,
+        };
+        let (mt, dec, src) = classify_perceptual(&evidence, thresholds);
+        assert_eq!(mt, MatchType::PerceptualNear);
+        assert_eq!(dec, None);
+        assert_eq!(src, None);
+    }
+
+    #[test]
+    fn test_classify_perceptual_similar() {
+        let thresholds = MatchingStrategy::Balanced.perceptual_thresholds();
+        let evidence = PerceptualEvidence {
+            gradient_distance: 10,
+            block_distance: 6,
+            median_distance: 7,
+            transform_type: TransformType::Rot90,
+            confidence: 0.7,
+        };
+        let (mt, dec, src) = classify_perceptual(&evidence, thresholds);
+        assert_eq!(mt, MatchType::PerceptualSimilar);
+        assert_eq!(dec, None);
+        assert_eq!(src, None);
+    }
+
+    #[test]
+    fn test_compare_perceptual_intra_identical() {
+        let tmp = TempDir::new().unwrap();
+        let path = create_test_image(tmp.path(), "img.png");
+        let fp1 = fingerprint_image_sync(&path).unwrap();
+        let fp2 = fingerprint_image_sync(&path).unwrap();
+        let thresholds = MatchingStrategy::Strict.perceptual_thresholds();
+        let evidence = compare_perceptual_intra(&fp1, &fp2, thresholds);
+        assert!(evidence.is_some());
+        let ev = evidence.unwrap();
+        assert_eq!(ev.gradient_distance, 0);
+        assert_eq!(ev.block_distance, 0);
+        assert_eq!(ev.median_distance, 0);
+    }
+
+    #[test]
+    fn test_compare_perceptual_intra_different() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut img1 = image::RgbImage::new(64, 64);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let v = if (x + y) % 2 == 0 { 255 } else { 0 };
+                img1.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+        let p1 = tmp.path().join("checker.png");
+        img1.save(&p1).unwrap();
+
+        let mut img2 = image::RgbImage::new(64, 64);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let v = if x < 32 { 200 } else { 50 };
+                img2.put_pixel(x, y, image::Rgb([v, v, v]));
+            }
+        }
+        let p2 = tmp.path().join("split.png");
+        img2.save(&p2).unwrap();
+
+        let fp1 = fingerprint_image_sync(&p1).unwrap();
+        let fp2 = fingerprint_image_sync(&p2).unwrap();
+        let thresholds = MatchingStrategy::Strict.perceptual_thresholds();
+        let evidence = compare_perceptual_intra(&fp1, &fp2, thresholds);
+        assert!(
+            evidence.is_none(),
+            "different images should not match under strict thresholds"
+        );
+    }
+
+    #[test]
+    fn test_compose_transform_identity() {
+        for t in TransformType::ALL {
+            assert_eq!(compose_transform(t, TransformType::Identity), t);
+            assert_eq!(compose_transform(TransformType::Identity, t), t);
+        }
+    }
+
+    #[test]
+    fn test_compose_transform_inverse() {
+        assert_eq!(
+            compose_transform(TransformType::FlipH, TransformType::FlipH),
+            TransformType::Identity
+        );
+        assert_eq!(
+            compose_transform(TransformType::Rot180, TransformType::Rot180),
+            TransformType::Identity
+        );
     }
 
     /// Real PostgreSQL + filesystem scan integration test.
@@ -949,6 +1396,9 @@ mod tests {
                     decode_state: DecodeState::Decoded,
                     blake3: Some(fp.blake3_bytes.clone()),
                     pixel_hash: Some(fp.pixel_hash_bytes.clone()),
+                    gradient_hash: Some(fp.gradient_hash_bytes.clone()),
+                    block_hash: Some(fp.block_hash_bytes.clone()),
+                    median_hash: Some(fp.median_hash_bytes.clone()),
                     fingerprint_version: Some("1".to_string()),
                     state: ImportImageState::Fingerprinted,
                 },
@@ -979,6 +1429,13 @@ mod tests {
                             match_type: MatchType::FileExact,
                             blake3_equal: true,
                             pixel_hash_equal: pixel_exact,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
                         },
                     )
                     .await
@@ -996,6 +1453,13 @@ mod tests {
                             match_type: MatchType::PixelExact,
                             blake3_equal: false,
                             pixel_hash_equal: true,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
                         },
                     )
                     .await

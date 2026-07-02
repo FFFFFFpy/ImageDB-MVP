@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::domain::import_state::{
-    DecodeState, DuplicateScope, ImportAlbumState, ImportImageState, ImportRunState, MatchType,
-    SCAN_POLICY_VERSION,
+    Decision, DecisionSource, DecodeState, DuplicateScope, ImportAlbumState, ImportImageState,
+    ImportRunState, MatchType, SCAN_POLICY_VERSION,
 };
 use crate::error::AppError;
 use tokio_postgres::Client;
@@ -47,6 +47,9 @@ pub struct LibraryImageRow {
     pub file_size: i64,
     pub blake3: Vec<u8>,
     pub pixel_hash: Option<Vec<u8>>,
+    pub gradient_hash: Option<Vec<u8>>,
+    pub block_hash: Option<Vec<u8>>,
+    pub median_hash: Option<Vec<u8>>,
 }
 
 pub struct NewImportImage {
@@ -61,6 +64,9 @@ pub struct NewImportImage {
     pub decode_state: DecodeState,
     pub blake3: Option<Vec<u8>>,
     pub pixel_hash: Option<Vec<u8>>,
+    pub gradient_hash: Option<Vec<u8>>,
+    pub block_hash: Option<Vec<u8>>,
+    pub median_hash: Option<Vec<u8>>,
     pub fingerprint_version: Option<String>,
     pub state: ImportImageState,
 }
@@ -74,6 +80,13 @@ pub struct NewDuplicateCandidate {
     pub match_type: MatchType,
     pub blake3_equal: bool,
     pub pixel_hash_equal: bool,
+    pub gradient_distance: Option<i32>,
+    pub block_distance: Option<i32>,
+    pub median_distance: Option<i32>,
+    pub transform_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub decision: Option<Decision>,
+    pub decision_source: Option<DecisionSource>,
 }
 
 impl ImportRepository {
@@ -228,8 +241,9 @@ impl ImportRepository {
                 "INSERT INTO import_images
                  (id, import_album_id, source_path, relative_path, file_size, modified_at,
                   width, height, format, decode_state, blake3, pixel_hash,
+                  gradient_hash, block_hash, median_hash,
                   fingerprint_version, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
                 &[
                     &id,
                     &new_image.album_id,
@@ -243,6 +257,9 @@ impl ImportRepository {
                     &ds,
                     &new_image.blake3,
                     &new_image.pixel_hash,
+                    &new_image.gradient_hash,
+                    &new_image.block_hash,
+                    &new_image.median_hash,
                     &new_image.fingerprint_version,
                     &st,
                 ],
@@ -294,13 +311,18 @@ impl ImportRepository {
         let id = Uuid::new_v4();
         let scope_str = candidate.scope.to_string();
         let match_str = candidate.match_type.to_string();
+        let decision_str = candidate.decision.as_ref().map(|d| d.to_string());
+        let source_str = candidate.decision_source.as_ref().map(|s| s.to_string());
         client
             .execute(
                 "INSERT INTO duplicate_candidates
                  (id, import_run_id, source_image_id, candidate_source_image_id,
                   candidate_library_image_id, scope, match_type,
-                  blake3_equal, pixel_hash_equal, rule_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  blake3_equal, pixel_hash_equal,
+                  gradient_distance, block_distance, median_distance,
+                  transform_type, confidence,
+                  decision, decision_source, rule_version)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
                 &[
                     &id,
                     &candidate.import_run_id,
@@ -311,6 +333,13 @@ impl ImportRepository {
                     &match_str,
                     &candidate.blake3_equal,
                     &candidate.pixel_hash_equal,
+                    &candidate.gradient_distance,
+                    &candidate.block_distance,
+                    &candidate.median_distance,
+                    &candidate.transform_type,
+                    &candidate.confidence,
+                    &decision_str,
+                    &source_str,
                     &SCAN_POLICY_VERSION.to_string(),
                 ],
             )
@@ -326,7 +355,7 @@ impl ImportRepository {
     ) -> Result<Vec<LibraryImageRow>, AppError> {
         let rows = client
             .query(
-                "SELECT id, file_size, blake3, pixel_hash FROM library_images",
+                "SELECT id, file_size, blake3, pixel_hash, gradient_hash, block_hash, median_hash FROM library_images",
                 &[],
             )
             .await
@@ -339,6 +368,9 @@ impl ImportRepository {
                 file_size: r.get("file_size"),
                 blake3: r.get("blake3"),
                 pixel_hash: r.get("pixel_hash"),
+                gradient_hash: r.get("gradient_hash"),
+                block_hash: r.get("block_hash"),
+                median_hash: r.get("median_hash"),
             })
             .collect())
     }
