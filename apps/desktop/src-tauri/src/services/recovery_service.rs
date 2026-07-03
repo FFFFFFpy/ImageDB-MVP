@@ -20,12 +20,14 @@ use crate::repositories::import_repository::{
     FileTransactionFullRow, ImportRepository, PlanImageRow,
 };
 use crate::services::commit_service::{
-    build_manifest, commit_library_records_transaction, normalize_relative_path, read_manifest,
-    stream_copy_with_hash, sync_parent_dir, validate_and_hash_frozen_plan,
-    verify_source_snapshot_or_conflict, verify_staging_set, write_synced_then_rename,
+    build_manifest, commit_library_records_transaction, detect_extra_published_files,
+    normalize_relative_path, read_manifest_with_hash, stream_copy_with_hash, sync_parent_dir,
+    validate_and_hash_frozen_plan, verify_source_snapshot_or_conflict, verify_staging_set,
+    write_synced_then_rename,
 };
 use crate::services::source_snapshot_service::load_source_album_snapshot;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -130,7 +132,10 @@ pub async fn scan_recoverable_transactions(
             target_exists,
             manifest_exists,
             plan_id: None,
-            plan_hash: tx.plan_hash.as_ref().map(|b| hex(b)),
+            plan_hash: tx
+                .plan_hash
+                .as_ref()
+                .map(|b| crate::services::commit_service::bytes_to_hex(b)),
             last_error: tx.last_error.clone(),
             diagnostics: diags,
         });
@@ -372,10 +377,6 @@ async fn set_recovery_required(
         completed_at: None,
         changed,
     })
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Attempt to recover a single transaction based on its current state.
@@ -855,36 +856,14 @@ async fn resume_publishing(
     }
 
     // Target exists: verify manifest matches → published; else conflict.
+    // The hash is computed over the on-disk bytes (never re-serialized) and
+    // compared against file_transactions.manifest_hash if persisted.
     if publish_dir.exists() {
-        match read_manifest(&publish_dir) {
-            Ok(manifest)
-                if manifest.transaction_id == tx.id.to_string()
-                    && manifest.plan_id == plan_id.to_string() =>
-            {
-                ImportRepository::update_file_transaction_state(
-                    client,
-                    tx.id,
-                    &TransactionState::Published,
-                    None,
-                )
-                .await?;
-                return resume_db_commit(
-                    client,
-                    tx,
-                    plan_id,
-                    plan_hash,
-                    library_root,
-                    library_root_id,
-                    import_run_id,
-                    album_relative_path,
-                    plan_album,
-                    plan_images,
-                )
-                .await;
-            }
-            _ => {
+        let (manifest, raw_hash) = match read_manifest_with_hash(&publish_dir) {
+            Ok(pair) => pair,
+            Err(e) => {
                 let msg = format!(
-                    "conflict: target {} exists with mismatched/missing manifest",
+                    "conflict: target {} has unreadable/unparseable manifest: {e}",
                     publish_dir.display()
                 );
                 ImportRepository::update_file_transaction_state(
@@ -896,7 +875,97 @@ async fn resume_publishing(
                 .await?;
                 return Ok((TransactionState::Conflict.to_string(), false, msg));
             }
+        };
+        let mut conflict: Option<String> = None;
+        if manifest.transaction_id != tx.id.to_string() {
+            conflict = Some(format!(
+                "manifest transaction_id {} != tx {}",
+                manifest.transaction_id, tx.id
+            ));
+        } else if manifest.plan_id != plan_id.to_string() {
+            conflict = Some(format!(
+                "manifest plan_id {} != expected {}",
+                manifest.plan_id, plan_id
+            ));
+        } else if manifest.import_run_id != import_run_id.to_string() {
+            conflict = Some(format!(
+                "manifest import_run_id {} != expected {}",
+                manifest.import_run_id, import_run_id
+            ));
+        } else if manifest.import_album_id != tx.import_album_id.to_string() {
+            conflict = Some(format!(
+                "manifest import_album_id {} != expected {}",
+                manifest.import_album_id, tx.import_album_id
+            ));
+        } else if manifest.library_root_id != library_root_id.to_string() {
+            conflict = Some(format!(
+                "manifest library_root_id {} != expected {}",
+                manifest.library_root_id, library_root_id
+            ));
+        } else if manifest.album_relative_path != album_relative_path {
+            conflict = Some(format!(
+                "manifest album_relative_path '{}' != expected '{}'",
+                manifest.album_relative_path, album_relative_path
+            ));
+        } else if manifest.schema_version
+            != crate::services::commit_service::MANIFEST_SCHEMA_VERSION
+        {
+            conflict = Some(format!(
+                "manifest schema_version {} != expected {}",
+                manifest.schema_version,
+                crate::services::commit_service::MANIFEST_SCHEMA_VERSION
+            ));
+        } else if manifest.plan_hash != crate::services::commit_service::bytes_to_hex(plan_hash) {
+            conflict = Some(format!(
+                "manifest plan_hash {} != expected {}",
+                manifest.plan_hash,
+                crate::services::commit_service::bytes_to_hex(plan_hash)
+            ));
+        } else if let Some(stored) = &tx.manifest_hash {
+            if stored != &raw_hash {
+                conflict = Some(format!(
+                    "manifest_hash mismatch: stored {} raw-byte {}",
+                    crate::services::commit_service::bytes_to_hex(stored),
+                    crate::services::commit_service::bytes_to_hex(&raw_hash)
+                ));
+            }
+        } else {
+            conflict = Some("transaction has no manifest_hash".to_string());
         }
+        if let Some(msg) = conflict {
+            let full = format!(
+                "conflict: target {} exists with mismatched manifest: {msg}",
+                publish_dir.display()
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&full),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, full));
+        }
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Published,
+            None,
+        )
+        .await?;
+        return resume_db_commit(
+            client,
+            tx,
+            plan_id,
+            plan_hash,
+            library_root,
+            library_root_id,
+            import_run_id,
+            album_relative_path,
+            plan_album,
+            plan_images,
+        )
+        .await;
     }
 
     // Neither staging nor target — must re-stage from source.
@@ -1023,7 +1092,7 @@ async fn resume_db_commit(
     plan_hash: &[u8],
     library_root: &Path,
     library_root_id: Uuid,
-    _import_run_id: Uuid,
+    import_run_id: Uuid,
     album_relative_path: &str,
     plan_album: crate::repositories::import_repository::PlanAlbumRow,
     plan_images: &[PlanImageRow],
@@ -1042,10 +1111,14 @@ async fn resume_db_commit(
         .await?;
         return Ok((TransactionState::Conflict.to_string(), false, msg));
     }
-    let manifest = match read_manifest(&publish_dir) {
-        Ok(m) if m.transaction_id == tx.id.to_string() => m,
-        _ => {
-            let msg = "published manifest missing or transaction id mismatch".to_string();
+    // Read the manifest from disk along with its raw-byte BLAKE3. Recovery
+    // must NEVER re-serialize the manifest — the on-disk bytes are the only
+    // authoritative input, and the hash must match both
+    // `file_transactions.manifest_hash` and `library_albums.manifest_hash`.
+    let (manifest, manifest_hash) = match read_manifest_with_hash(&publish_dir) {
+        Ok(pair) => pair,
+        Err(e) => {
+            let msg = format!("published manifest unreadable/unparseable: {e}");
             ImportRepository::update_file_transaction_state(
                 client,
                 tx.id,
@@ -1056,6 +1129,282 @@ async fn resume_db_commit(
             return Ok((TransactionState::Conflict.to_string(), false, msg));
         }
     };
+    if manifest.transaction_id != tx.id.to_string() {
+        let msg = format!(
+            "manifest transaction_id {} != tx {}",
+            manifest.transaction_id, tx.id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.plan_id != plan_id.to_string() {
+        let msg = format!(
+            "manifest plan_id {} != expected {}",
+            manifest.plan_id, plan_id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.import_run_id != import_run_id.to_string() {
+        let msg = format!(
+            "manifest import_run_id {} != expected {}",
+            manifest.import_run_id, import_run_id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.import_album_id != tx.import_album_id.to_string() {
+        let msg = format!(
+            "manifest import_album_id {} != expected {}",
+            manifest.import_album_id, tx.import_album_id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.library_root_id != library_root_id.to_string() {
+        let msg = format!(
+            "manifest library_root_id {} != expected {}",
+            manifest.library_root_id, library_root_id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.album_relative_path != album_relative_path {
+        let msg = format!(
+            "manifest album_relative_path '{}' != expected '{}'",
+            manifest.album_relative_path, album_relative_path
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.plan_hash != crate::services::commit_service::bytes_to_hex(plan_hash) {
+        let msg = format!(
+            "manifest plan_hash {} != expected {}",
+            manifest.plan_hash,
+            crate::services::commit_service::bytes_to_hex(plan_hash)
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.schema_version != crate::services::commit_service::MANIFEST_SCHEMA_VERSION {
+        let msg = format!(
+            "manifest schema_version {} != expected {}",
+            manifest.schema_version,
+            crate::services::commit_service::MANIFEST_SCHEMA_VERSION
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    // If a prior manifest_hash was persisted on the transaction, the raw
+    // on-disk bytes must still match — otherwise the manifest was tampered
+    // with between the original commit and this recovery run.
+    match &tx.manifest_hash {
+        Some(stored) if stored == &manifest_hash => {}
+        Some(stored) => {
+            let msg = format!(
+                "manifest_hash mismatch during recovery: stored {} raw-byte {}",
+                crate::services::commit_service::bytes_to_hex(stored),
+                crate::services::commit_service::bytes_to_hex(&manifest_hash)
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+        None => {
+            let msg = "transaction has no manifest_hash".to_string();
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+    }
+
+    if manifest.image_count != plan_images.len() as u32 {
+        let msg = format!(
+            "manifest image_count {} != plan {}",
+            manifest.image_count,
+            plan_images.len()
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.images.len() != plan_images.len() {
+        let msg = format!(
+            "manifest images array length {} != plan {}",
+            manifest.images.len(),
+            plan_images.len()
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    let mut manifest_by_rel = HashMap::new();
+    for entry in &manifest.images {
+        if manifest_by_rel
+            .insert(entry.relative_path.clone(), entry)
+            .is_some()
+        {
+            let msg = format!(
+                "manifest has duplicate relative_path '{}'",
+                entry.relative_path
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+    }
+    let mut seen_rels = HashSet::new();
+    for img in plan_images {
+        let target_rel = normalize_relative_path(&img.target_relative_path)?;
+        seen_rels.insert(target_rel.clone());
+        let Some(entry) = manifest_by_rel.get(&target_rel) else {
+            let msg = format!("file {target_rel} missing from manifest");
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        };
+        if entry.source_path != img.source_path {
+            let msg = format!(
+                "manifest source_path mismatch for {target_rel}: manifest '{}' plan '{}'",
+                entry.source_path, img.source_path
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+        if entry.file_size != img.expected_file_size {
+            let msg = format!(
+                "manifest file_size mismatch for {target_rel}: manifest {} plan {}",
+                entry.file_size, img.expected_file_size
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+        if entry.blake3 != crate::services::commit_service::bytes_to_hex(&img.expected_blake3) {
+            let msg = format!("manifest blake3 mismatch for {target_rel}");
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+    }
+    for rel in manifest_by_rel.keys() {
+        if !seen_rels.contains(rel) {
+            let msg = format!("manifest has extra entry not in frozen plan: {rel}");
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+    }
+    if let Some(msg) = detect_extra_published_files(&publish_dir, &seen_rels).await {
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+
     let published_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
     if !published_manifest.exists() {
         let msg = format!(
@@ -1077,13 +1426,6 @@ async fn resume_db_commit(
         &published_manifest.display().to_string(),
     )
     .await?;
-    let manifest_hash = blake3::hash(
-        serde_json::to_string_pretty(&manifest)
-            .unwrap_or_default()
-            .as_bytes(),
-    )
-    .as_bytes()
-    .to_vec();
 
     // Verify every published file still matches (content may have changed).
     for img in plan_images {

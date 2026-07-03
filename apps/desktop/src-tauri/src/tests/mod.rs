@@ -12,3 +12,7 @@ mod protocol_integration;
 #[cfg(test)]
 #[cfg(feature = "real-db-tests")]
 mod reconcile_integration;
+
+#[cfg(test)]
+#[cfg(feature = "real-db-tests")]
+mod manifest_validation_integration;

@@ -48,7 +48,7 @@ pub const PREVIEW_MAX_PIXELS: u64 = 8_000_000;
 #[allow(dead_code)]
 pub const PREVIEW_MAX_SOURCE_BYTES: u64 = 80 * 1024 * 1024;
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
+pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -154,17 +154,24 @@ fn check_target_path_conflicts(images: &[PlanImageRow]) -> Result<(), AppError> 
     Ok(())
 }
 
-/// Read and parse a published manifest from disk.
-pub(crate) fn read_manifest(dir: &Path) -> Result<AlbumManifest, AppError> {
+/// Read, parse, and BLAKE3-hash a published manifest from disk using the
+/// on-disk bytes verbatim. The hash covers the exact byte sequence that was
+/// written by `commit_single_album` / `publish_from_staging` — re-serializing
+/// is forbidden because JSON whitespace is not canonical and would produce
+/// a different hash from the persisted `file_transactions.manifest_hash`.
+///
+pub(crate) fn read_manifest_with_hash(dir: &Path) -> Result<(AlbumManifest, Vec<u8>), AppError> {
     let manifest_path = dir.join(".imagedb").join(".imagedb-manifest.json");
-    let json = std::fs::read_to_string(&manifest_path).map_err(|e| {
+    let raw = std::fs::read(&manifest_path).map_err(|e| {
         AppError::Internal(format!(
             "cannot read manifest {}: {e}",
             manifest_path.display()
         ))
     })?;
-    serde_json::from_str(&json)
-        .map_err(|e| AppError::Internal(format!("cannot parse manifest: {e}")))
+    let hash = blake3::hash(&raw).as_bytes().to_vec();
+    let manifest: AlbumManifest = serde_json::from_slice(&raw)
+        .map_err(|e| AppError::Internal(format!("cannot parse manifest: {e}")))?;
+    Ok((manifest, hash))
 }
 
 pub async fn run_import_commit(
@@ -1714,8 +1721,14 @@ pub enum IdempotencyVerdict {
 
 /// Rule 12: complete idempotency verification. Returns `AlreadyCommitted`
 /// only when every piece of evidence matches — transaction id, plan id, plan
-/// hash, manifest hash, the published directory + parseable manifest, every
-/// file's path/size/BLAKE3, and the DB album + image records.
+/// hash, the raw-byte manifest hash, schema version, every identity field
+/// inside the manifest, the published directory + manifest + every file's
+/// path/size/BLAKE3 (no extra files), file_operations rows, and the DB
+/// album + image records.
+///
+/// The manifest hash is computed over the on-disk bytes verbatim, never over
+/// a re-serialization, so a whitespace/content edit of the manifest file is
+/// detected as a mismatch.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_complete_evidence(
     client: &Client,
@@ -1727,6 +1740,9 @@ pub async fn verify_complete_evidence(
     album_relative_path: &str,
     images: &[PlanImageRow],
 ) -> Result<IdempotencyVerdict, AppError> {
+    let import_run_id = existing_tx.import_run_id;
+    let import_album_id = existing_tx.import_album_id;
+
     let tx_state = match TransactionState::parse(&existing_tx.state) {
         Ok(s) => s,
         Err(_) => {
@@ -1771,15 +1787,41 @@ pub async fn verify_complete_evidence(
         )));
     }
 
-    // Manifest must parse and match.
-    let manifest = match read_manifest(&publish_dir) {
-        Ok(m) => m,
+    // Manifest must parse from raw bytes and its raw-byte BLAKE3 must match
+    // the persisted manifest_hash. Re-serialization is forbidden here.
+    let (manifest, raw_manifest_hash) = match read_manifest_with_hash(&publish_dir) {
+        Ok(pair) => pair,
         Err(e) => {
             return Ok(IdempotencyVerdict::Conflict(format!(
                 "manifest unreadable/unparseable: {e}"
             )));
         }
     };
+    match &existing_tx.manifest_hash {
+        Some(stored) => {
+            if stored != &raw_manifest_hash {
+                return Ok(IdempotencyVerdict::Conflict(format!(
+                    "manifest_hash mismatch: stored {} raw-byte {}",
+                    bytes_to_hex(stored),
+                    bytes_to_hex(&raw_manifest_hash)
+                )));
+            }
+        }
+        None => {
+            return Ok(IdempotencyVerdict::Conflict(
+                "transaction has no manifest_hash".to_string(),
+            ));
+        }
+    }
+
+    // Strict identity: every frozen field inside the manifest must agree
+    // with the transaction row, the frozen plan, and the call parameters.
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest schema_version {} != expected {}",
+            manifest.schema_version, MANIFEST_SCHEMA_VERSION
+        )));
+    }
     if manifest.transaction_id != existing_tx.id.to_string() {
         return Ok(IdempotencyVerdict::Conflict(format!(
             "manifest transaction_id {} != persisted {}",
@@ -1792,28 +1834,36 @@ pub async fn verify_complete_evidence(
             manifest.plan_id, plan_id
         )));
     }
-    match &existing_tx.manifest_hash {
-        Some(stored) => {
-            let recomputed = blake3::hash(
-                serde_json::to_string_pretty(&manifest)
-                    .unwrap_or_default()
-                    .as_bytes(),
-            )
-            .as_bytes()
-            .to_vec();
-            if stored != &recomputed {
-                return Ok(IdempotencyVerdict::Conflict(format!(
-                    "manifest_hash mismatch: stored {} recomputed {}",
-                    bytes_to_hex(stored),
-                    bytes_to_hex(&recomputed)
-                )));
-            }
-        }
-        None => {
-            return Ok(IdempotencyVerdict::Conflict(
-                "transaction has no manifest_hash".to_string(),
-            ));
-        }
+    if manifest.plan_hash != bytes_to_hex(plan_hash) {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest plan_hash {} != expected {}",
+            manifest.plan_hash,
+            bytes_to_hex(plan_hash)
+        )));
+    }
+    if manifest.import_run_id != import_run_id.to_string() {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest import_run_id {} != expected {}",
+            manifest.import_run_id, import_run_id
+        )));
+    }
+    if manifest.import_album_id != import_album_id.to_string() {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest import_album_id {} != expected {}",
+            manifest.import_album_id, import_album_id
+        )));
+    }
+    if manifest.library_root_id != library_root_id.to_string() {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest library_root_id {} != expected {}",
+            manifest.library_root_id, library_root_id
+        )));
+    }
+    if manifest.album_relative_path != album_relative_path {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest album_relative_path '{}' != expected '{}'",
+            manifest.album_relative_path, album_relative_path
+        )));
     }
     if manifest.image_count != images.len() as u32 {
         return Ok(IdempotencyVerdict::Conflict(format!(
@@ -1822,14 +1872,63 @@ pub async fn verify_complete_evidence(
             images.len()
         )));
     }
+    if manifest.images.len() != images.len() {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest images array length {} != plan {}",
+            manifest.images.len(),
+            images.len()
+        )));
+    }
 
-    // Every expected file must exist on disk with the right size + BLAKE3.
+    // Build a manifest-by-relative lookup and verify every plan image has a
+    // manifest entry with matching source_path / file_size / blake3. Then
+    // verify every manifest entry is also in the plan (no extras).
     let mut manifest_by_rel: HashMap<String, &AlbumManifestImage> = HashMap::new();
     for m in &manifest.images {
-        manifest_by_rel.insert(m.relative_path.clone(), m);
+        if manifest_by_rel.insert(m.relative_path.clone(), m).is_some() {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "manifest has duplicate relative_path '{}'",
+                m.relative_path
+            )));
+        }
     }
+
+    // Every expected file must exist on disk with the right size + BLAKE3,
+    // AND every manifest entry must resolve to a plan image with matching
+    // source_path / file_size / blake3. Track seen rels so we can detect
+    // extra on-disk entries below.
+    let mut seen_rels: std::collections::HashSet<String> = std::collections::HashSet::new();
     for img in images {
         let target_rel = normalize_relative_path(&img.target_relative_path)?;
+        seen_rels.insert(target_rel.clone());
+
+        let m_entry = match manifest_by_rel.get(&target_rel) {
+            Some(e) => e,
+            None => {
+                return Ok(IdempotencyVerdict::Conflict(format!(
+                    "file {} missing from manifest",
+                    target_rel
+                )));
+            }
+        };
+        if m_entry.source_path != img.source_path {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "manifest source_path mismatch for {target_rel}: manifest '{}' plan '{}'",
+                m_entry.source_path, img.source_path
+            )));
+        }
+        if m_entry.file_size != img.expected_file_size {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "manifest file_size mismatch for {target_rel}: manifest {} plan {}",
+                m_entry.file_size, img.expected_file_size
+            )));
+        }
+        if m_entry.blake3 != bytes_to_hex(&img.expected_blake3) {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "manifest blake3 mismatch for {target_rel}"
+            )));
+        }
+
         let file_path = publish_dir.join(&target_rel);
         let meta = match tokio::fs::metadata(&file_path).await {
             Ok(m) => m,
@@ -1846,20 +1945,6 @@ pub async fn verify_complete_evidence(
                 file_path.display(),
                 img.expected_file_size,
                 meta.len()
-            )));
-        }
-        let m_entry = match manifest_by_rel.get(&target_rel) {
-            Some(e) => e,
-            None => {
-                return Ok(IdempotencyVerdict::Conflict(format!(
-                    "file {} missing from manifest",
-                    target_rel
-                )));
-            }
-        };
-        if m_entry.blake3 != bytes_to_hex(&img.expected_blake3) {
-            return Ok(IdempotencyVerdict::Conflict(format!(
-                "manifest blake3 mismatch for {target_rel}"
             )));
         }
         // Recompute the on-disk BLAKE3.
@@ -1897,6 +1982,92 @@ pub async fn verify_complete_evidence(
         }
     }
 
+    // No extra manifest entries beyond the plan set (already implied by
+    // length equality above, but be explicit for defense-in-depth).
+    for rel in manifest_by_rel.keys() {
+        if !seen_rels.contains(rel) {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "manifest has extra entry not in frozen plan: {rel}"
+            )));
+        }
+    }
+
+    // No extra on-disk files beyond the plan + management files. Allowed
+    // names inside the publish dir: the plan images plus `.imagedb/` and
+    // `.imagedb/.imagedb-manifest.json`.
+    if let Some(msg) = detect_extra_published_files(&publish_dir, &seen_rels).await {
+        return Ok(IdempotencyVerdict::Conflict(msg));
+    }
+
+    // file_operations rows must cover the plan images exactly and match
+    // expected_size / expected_blake3 / target_path for this transaction.
+    let ops = ImportRepository::get_file_operations(client, existing_tx.id).await?;
+    if ops.len() != images.len() {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "file_operations count {} != plan {}",
+            ops.len(),
+            images.len()
+        )));
+    }
+    let mut ops_by_target: HashMap<
+        String,
+        &crate::repositories::import_repository::FileOperationRow,
+    > = HashMap::new();
+    for op in &ops {
+        let rel = match Path::new(&op.target_path).strip_prefix(&publish_dir) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => {
+                return Ok(IdempotencyVerdict::Conflict(format!(
+                    "file_operation target_path outside published album: {}",
+                    op.target_path
+                )));
+            }
+        };
+        // Guard against duplicate ops targeting the same rel.
+        if ops_by_target.insert(rel.clone(), op).is_some() {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "file_operations has duplicate target_path for rel '{rel}'"
+            )));
+        }
+    }
+    for img in images {
+        let target_rel = normalize_relative_path(&img.target_relative_path)?;
+        let op = match ops_by_target.get(&target_rel) {
+            Some(o) => o,
+            None => {
+                return Ok(IdempotencyVerdict::Conflict(format!(
+                    "file_operation missing for {target_rel}"
+                )));
+            }
+        };
+        if op.expected_size != img.expected_file_size {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "file_operation expected_size mismatch for {target_rel}: op {} plan {}",
+                op.expected_size, img.expected_file_size
+            )));
+        }
+        if op.expected_blake3 != img.expected_blake3 {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "file_operation expected_blake3 mismatch for {target_rel}"
+            )));
+        }
+        let expected_target = publish_dir.join(&target_rel).display().to_string();
+        if op.target_path != expected_target {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "file_operation target_path mismatch for {target_rel}: op '{}' expected '{}'",
+                op.target_path, expected_target
+            )));
+        }
+    }
+    // No extra ops beyond the plan set (length already equal, but be explicit).
+    for rel in ops_by_target.keys() {
+        if !seen_rels.contains(rel) {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "file_operation has extra target_path not in frozen plan: {rel}"
+            )));
+        }
+    }
+
     // DB records must exist and match.
     let Some(lib_album) =
         ImportRepository::get_library_album(client, library_root_id, album_relative_path).await?
@@ -1916,6 +2087,11 @@ pub async fn verify_complete_evidence(
             "library_album.plan_hash mismatch".to_string(),
         ));
     }
+    if lib_album.manifest_hash != raw_manifest_hash {
+        return Ok(IdempotencyVerdict::Conflict(
+            "library_album.manifest_hash != raw-byte manifest hash".to_string(),
+        ));
+    }
     if lib_album.image_count != images.len() as i32 {
         return Ok(IdempotencyVerdict::Conflict(format!(
             "library_album.image_count {} != plan {}",
@@ -1931,14 +2107,15 @@ pub async fn verify_complete_evidence(
             images.len()
         )));
     }
-    let mut db_by_rel: HashMap<String, Vec<u8>> = db_images
+    let mut db_by_rel: HashMap<String, (i64, Vec<u8>)> = db_images
         .iter()
-        .map(|r| (r.relative_path.clone(), r.blake3.clone()))
+        .map(|r| (r.relative_path.clone(), (r.file_size, r.blake3.clone())))
         .collect();
     for img in images {
         let target_rel = normalize_relative_path(&img.target_relative_path)?;
         match db_by_rel.remove(&target_rel) {
-            Some(db_blake3) if db_blake3 == img.expected_blake3 => {}
+            Some((size, blake3))
+                if blake3 == img.expected_blake3 && size == img.expected_file_size => {}
             _ => {
                 return Ok(IdempotencyVerdict::Conflict(format!(
                     "library_image record mismatch for {target_rel}"
@@ -1948,6 +2125,65 @@ pub async fn verify_complete_evidence(
     }
 
     Ok(IdempotencyVerdict::AlreadyCommitted)
+}
+
+/// Walk the published album directory and reject any regular file that is
+/// neither a plan image nor the canonical manifest. Directories are allowed
+/// only as containers; every regular file under them must still be planned.
+/// Returns `Some(conflict_message)` on the first conflict.
+pub(crate) async fn detect_extra_published_files(
+    publish_dir: &Path,
+    plan_rels: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let mut stack: Vec<PathBuf> = vec![publish_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(e) => e,
+            Err(_) => return Some(format!("cannot read_dir {}", dir.display())),
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(_) => return Some(format!("read_dir error at {}", dir.display())),
+            };
+            let ft = match entry.file_type().await {
+                Ok(ft) => ft,
+                Err(_) => return Some(format!("file_type failed for {}", entry.path().display())),
+            };
+            let path = entry.path();
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ft.is_file() {
+                return Some(format!(
+                    "unexpected non-regular file in published album: {}",
+                    path.display()
+                ));
+            }
+            // Compute the relative path inside publish_dir (normalized to `/`).
+            let rel = match path.strip_prefix(publish_dir) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => return Some(format!("strip_prefix failed for {}", path.display())),
+            };
+            // Management files are allowed.
+            if rel == ".imagedb/.imagedb-manifest.json" || rel == ".imagedb-manifest.json" {
+                continue;
+            }
+            if rel.starts_with(".imagedb/") {
+                return Some(format!(
+                    "unexpected management file in published album: {rel}"
+                ));
+            }
+            if !plan_rels.contains(&rel) {
+                return Some(format!(
+                    "extra file in published album not in frozen plan: {rel}"
+                ));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2232,7 +2468,7 @@ mod tests {
         assert!(publish_dir.exists());
         assert!(publish_dir.join("photo1.png").exists());
         // Manifest lives inside the published dir now.
-        let manifest = read_manifest(&publish_dir).unwrap();
+        let (manifest, _raw_hash) = read_manifest_with_hash(&publish_dir).unwrap();
         assert_eq!(manifest.image_count, 2);
 
         // Idempotent rerun: second commit skips the album.
