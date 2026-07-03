@@ -216,3 +216,32 @@ export interface CommitResult {
   errors: string[];
   state: string;
 }
+
+export interface RecoveryDiagnostic {
+  transaction_id: string;
+  import_run_id: string;
+  import_album_id: string;
+  current_state: string;
+  staging_path: string | null;
+  target_path: string | null;
+  manifest_path: string | null;
+  staging_exists: boolean;
+  target_exists: boolean;
+  manifest_exists: boolean;
+  plan_hash: string | null;
+  last_error: string | null;
+  diagnostics: string[];
+}
+
+export interface RecoveryOutcome {
+  transaction_id: string;
+  final_state: string;
+  recovered: boolean;
+  message: string;
+}
+
+export interface ReverifyResult {
+  transaction_id: string;
+  verdict: 'already_committed' | 'conflict' | 'resume' | string;
+  message: string;
+}

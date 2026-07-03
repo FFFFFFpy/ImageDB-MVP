@@ -112,23 +112,23 @@ import runs, and a real-time analysis progress page with cancellation support.
 
 ## Modified files
 
-| File                                  | Change                                                 |
-| ------------------------------------- | ------------------------------------------------------ |
-| `src-tauri/Cargo.toml`                | Added `real-db-tests` feature for ignored real DB scan integration test |
-| `src-tauri/src/lib.rs`                | Registered 4 new scan commands                         |
-| `src-tauri/src/state.rs`              | Added ScanState and ScanHandle to AppState             |
-| `src-tauri/src/domain/mod.rs`         | Added import_state module                              |
-| `src-tauri/src/repositories/mod.rs`   | Added import_repository module                         |
-| `src-tauri/src/services/mod.rs`       | Added scan_service module                              |
-| `src-tauri/src/commands/mod.rs`       | Added scan module                                      |
-| `src/hooks/use-router.ts`             | Added scan route                                       |
-| `src/components/Layout.tsx`           | Added scan nav item                                    |
-| `src/app/App.tsx`                     | Added ScanPage route                                   |
-| `src/app/App.test.tsx`                | Added assertion for scan nav button                    |
-| `src/pages/DashboardPage.tsx`         | Added import action, onGoScan prop                     |
-| `src/lib/ipc/types.ts`                | Added ScanProgress, ScanSourceInfo types               |
-| `src/lib/ipc/api.ts`                  | Added scan API methods                                 |
-| `src/styles/global.css`               | Added scan page styles                                 |
+| File                                | Change                                                                  |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| `src-tauri/Cargo.toml`              | Added `real-db-tests` feature for ignored real DB scan integration test |
+| `src-tauri/src/lib.rs`              | Registered 4 new scan commands                                          |
+| `src-tauri/src/state.rs`            | Added ScanState and ScanHandle to AppState                              |
+| `src-tauri/src/domain/mod.rs`       | Added import_state module                                               |
+| `src-tauri/src/repositories/mod.rs` | Added import_repository module                                          |
+| `src-tauri/src/services/mod.rs`     | Added scan_service module                                               |
+| `src-tauri/src/commands/mod.rs`     | Added scan module                                                       |
+| `src/hooks/use-router.ts`           | Added scan route                                                        |
+| `src/components/Layout.tsx`         | Added scan nav item                                                     |
+| `src/app/App.tsx`                   | Added ScanPage route                                                    |
+| `src/app/App.test.tsx`              | Added assertion for scan nav button                                     |
+| `src/pages/DashboardPage.tsx`       | Added import action, onGoScan prop                                      |
+| `src/lib/ipc/types.ts`              | Added ScanProgress, ScanSourceInfo types                                |
+| `src/lib/ipc/api.ts`                | Added scan API methods                                                  |
+| `src/styles/global.css`             | Added scan page styles                                                  |
 
 ## No migration changes
 
@@ -140,34 +140,34 @@ duplicate_candidates) are used as-is. No new migrations were needed.
 
 ### Commands run
 
-| Command | Result |
-| --- | --- |
-| `pnpm typecheck` | PASS |
-| `pnpm test:unit` | PASS - 4 frontend tests |
-| `pnpm rust:test` | PASS - 52 Rust tests, 1 ignored real PostgreSQL lifecycle test |
-| `pnpm rust:clippy` | PASS - `-D warnings` |
-| `pnpm build` | PASS - release executable built |
-| real PostgreSQL lifecycle test | PASS - managed init, pgvector, migrations, shutdown, restart |
+| Command                              | Result                                                             |
+| ------------------------------------ | ------------------------------------------------------------------ |
+| `pnpm typecheck`                     | PASS                                                               |
+| `pnpm test:unit`                     | PASS - 4 frontend tests                                            |
+| `pnpm rust:test`                     | PASS - 52 Rust tests, 1 ignored real PostgreSQL lifecycle test     |
+| `pnpm rust:clippy`                   | PASS - `-D warnings`                                               |
+| `pnpm build`                         | PASS - release executable built                                    |
+| real PostgreSQL lifecycle test       | PASS - managed init, pgvector, migrations, shutdown, restart       |
 | real scan duplicate persistence test | PASS - PostgreSQL + filesystem, feature-gated with `real-db-tests` |
-| release executable smoke launch | PASS - stayed running for 5 seconds |
+| release executable smoke launch      | PASS - stayed running for 5 seconds                                |
 
 ### Rust unit tests in scan_service.rs
 
-| Test                                             | Purpose                                           |
-| ------------------------------------------------ | ------------------------------------------------- |
-| test_scan_directory_for_albums                   | Discovers subdirectories as albums                 |
-| test_scan_album_for_images                       | Filters by supported extensions only               |
-| test_scan_empty_directory                        | Returns empty album list                           |
-| test_scan_nonexistent_directory                  | Returns error for missing path                     |
-| test_hex_to_bytes_roundtrip                      | Hex string to bytes conversion                     |
-| test_hex_to_bytes_empty                          | Empty hex produces empty bytes                     |
-| test_fingerprint_image_sync                      | Fingerprint produces valid hashes and dimensions   |
-| test_duplicate_detection_file_exact              | Exact copy has same BLAKE3                         |
-| test_duplicate_detection_renamed_file            | Renamed file has same BLAKE3                       |
-| test_duplicate_detection_pixel_identical_different_format | Different formats have different BLAKE3   |
-| test_validate_source_directory                   | Validation logic for valid/invalid paths            |
-| test_scan_source_info                            | Async source info discovery                        |
-| test_supported_extensions                        | Extension list correctness                          |
+| Test                                                      | Purpose                                          |
+| --------------------------------------------------------- | ------------------------------------------------ |
+| test_scan_directory_for_albums                            | Discovers subdirectories as albums               |
+| test_scan_album_for_images                                | Filters by supported extensions only             |
+| test_scan_empty_directory                                 | Returns empty album list                         |
+| test_scan_nonexistent_directory                           | Returns error for missing path                   |
+| test_hex_to_bytes_roundtrip                               | Hex string to bytes conversion                   |
+| test_hex_to_bytes_empty                                   | Empty hex produces empty bytes                   |
+| test_fingerprint_image_sync                               | Fingerprint produces valid hashes and dimensions |
+| test_duplicate_detection_file_exact                       | Exact copy has same BLAKE3                       |
+| test_duplicate_detection_renamed_file                     | Renamed file has same BLAKE3                     |
+| test_duplicate_detection_pixel_identical_different_format | Different formats have different BLAKE3          |
+| test_validate_source_directory                            | Validation logic for valid/invalid paths         |
+| test_scan_source_info                                     | Async source info discovery                      |
+| test_supported_extensions                                 | Extension list correctness                       |
 
 ### Real integration tests
 
@@ -181,13 +181,13 @@ duplicate_candidates) are used as-is. No new migrations were needed.
 
 ### Acceptance criteria mapping
 
-| Criterion                                               | Status                                                              |
-| ------------------------------------------------------- | ------------------------------------------------------------------- |
-| File rename is still recognized as duplicate             | PASS - BLAKE3 is file-content based, rename does not change it      |
-| Metadata-only change recognized by pixel hash            | PASS - pixel hash uses decoded RGBA, ignoring EXIF/metadata         |
-| Repeated scans do not create duplicate official records  | PASS - Milestone 2 never writes to library_images or library_albums |
-| Cancelled scans leave recoverable state                  | PASS - import_run state set to cancelled, all partial data persisted |
-| Analysis does not modify source files                    | PASS - scan is read-only (std::fs::read, no writes)                 |
+| Criterion                                               | Status                                                               |
+| ------------------------------------------------------- | -------------------------------------------------------------------- |
+| File rename is still recognized as duplicate            | PASS - BLAKE3 is file-content based, rename does not change it       |
+| Metadata-only change recognized by pixel hash           | PASS - pixel hash uses decoded RGBA, ignoring EXIF/metadata          |
+| Repeated scans do not create duplicate official records | PASS - Milestone 2 never writes to library_images or library_albums  |
+| Cancelled scans leave recoverable state                 | PASS - import_run state set to cancelled, all partial data persisted |
+| Analysis does not modify source files                   | PASS - scan is read-only (std::fs::read, no writes)                  |
 
 ## Known limitations
 

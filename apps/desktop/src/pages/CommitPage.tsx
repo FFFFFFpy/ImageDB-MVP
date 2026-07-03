@@ -20,8 +20,30 @@ function isTerminalProgress(progress: CommitProgress): boolean {
   return (
     progress.state === 'completed' ||
     progress.state === 'completed_with_errors' ||
-    progress.state === 'failed'
+    progress.state === 'failed' ||
+    progress.state === 'cancelled_pending_recovery'
   );
+}
+
+function stageLabel(stage: string | undefined): string {
+  if (!stage) return '准备中';
+  const map: Record<string, string> = {
+    preparing: '准备事务',
+    committing: '复制到 staging',
+    processing_album: '处理图集',
+    verifying: '验证 staging',
+    verified: '已验证',
+    publishing: '发布目录',
+    published: '已发布',
+    db_committing: '数据库确认',
+    library_committed: '已正式入库',
+    source_archiving: '源图集归档',
+    source_archived: '已完成',
+    done: '完成',
+    failed: '失败',
+    conflict: '发生冲突',
+  };
+  return map[stage] ?? stage;
 }
 
 export function CommitPage({ onNavigate }: CommitPageProps) {
@@ -224,27 +246,105 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
           {/* Detailed staging pipeline progress */}
           <div className="commit-pipeline">
-            <h3>Pipeline</h3>
+            <h3>流程</h3>
             <ul className="pipeline-steps">
-              <li className={progress?.current_stage === 'preparing' ? 'active' : 'done'}>
-                Prepare Transaction
+              <li
+                className={
+                  progress?.current_stage === 'preparing' ? 'active' : progress ? 'done' : ''
+                }
+              >
+                准备事务
               </li>
-              <li className={progress?.current_stage === 'committing' || progress?.current_stage === 'processing_album' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
-                Copy to Staging
+              <li
+                className={
+                  progress?.current_stage === 'committing' ||
+                  progress?.current_stage === 'processing_album'
+                    ? 'active'
+                    : progress?.current_stage === 'done' ||
+                        progress?.current_stage === 'verifying' ||
+                        progress?.current_stage === 'publishing' ||
+                        progress?.current_stage === 'db_committing' ||
+                        progress?.current_stage === 'library_committed' ||
+                        progress?.current_stage === 'source_archiving'
+                      ? 'done'
+                      : ''
+                }
+              >
+                复制到 staging
               </li>
-              <li className={progress?.current_stage === 'verifying' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
-                Verify Files
+              <li
+                className={
+                  progress?.current_stage === 'verifying'
+                    ? 'active'
+                    : progress &&
+                        [
+                          'verified',
+                          'publishing',
+                          'published',
+                          'db_committing',
+                          'library_committed',
+                          'source_archiving',
+                          'source_archived',
+                          'done',
+                        ].includes(progress.current_stage)
+                      ? 'done'
+                      : ''
+                }
+              >
+                验证 staging
               </li>
-              <li className={progress?.current_stage === 'publishing' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
-                Publish
+              <li
+                className={
+                  progress?.current_stage === 'publishing'
+                    ? 'active'
+                    : progress &&
+                        [
+                          'published',
+                          'db_committing',
+                          'library_committed',
+                          'source_archiving',
+                          'source_archived',
+                          'done',
+                        ].includes(progress.current_stage)
+                      ? 'done'
+                      : ''
+                }
+              >
+                发布目录
               </li>
-              <li className={progress?.current_stage === 'db_committing' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
-                Database Commit
+              <li
+                className={
+                  progress?.current_stage === 'db_committing'
+                    ? 'active'
+                    : progress &&
+                        [
+                          'library_committed',
+                          'source_archiving',
+                          'source_archived',
+                          'done',
+                        ].includes(progress.current_stage)
+                      ? 'done'
+                      : ''
+                }
+              >
+                数据库确认
               </li>
-              <li className={progress?.current_stage === 'archiving' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
-                Source Archive
+              <li
+                className={
+                  progress?.current_stage === 'source_archiving'
+                    ? 'active'
+                    : progress?.current_stage === 'source_archived' ||
+                        progress?.current_stage === 'done'
+                      ? 'done'
+                      : ''
+                }
+              >
+                源图集归档
               </li>
             </ul>
+            <div className="progress-details">
+              <div>当前阶段: {stageLabel(progress?.current_stage)}</div>
+            </div>
           </div>
 
           {progress && progress.errors.length > 0 && (
@@ -269,14 +369,16 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   }
 
   const isSuccess = progress?.state === 'completed';
+  const needsRecovery =
+    progress?.state === 'completed_with_errors' || progress?.state === 'cancelled_pending_recovery';
 
   return (
     <div className="commit-page">
-      <h1>Commit Result</h1>
+      <h1>提交结果</h1>
 
       <div className={`commit-result ${isSuccess ? 'success' : 'partial'}`}>
         <div className="result-status">
-          {isSuccess ? 'Import committed' : 'Import finished with issues'}
+          {isSuccess ? '导入已完成' : needsRecovery ? '部分完成，等待恢复' : '导入出现问题'}
         </div>
         <div className="commit-stats">
           <div className="stat-card">
@@ -285,7 +387,9 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
           </div>
           <div className="stat-card success">
             <div className="stat-value">
-              {(progress?.albums_completed ?? 0) - (progress?.albums_skipped ?? 0) - (progress?.albums_failed ?? 0)}
+              {(progress?.albums_completed ?? 0) -
+                (progress?.albums_skipped ?? 0) -
+                (progress?.albums_failed ?? 0)}
             </div>
             <div className="stat-label">Committed</div>
           </div>
@@ -306,7 +410,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
       {progress && progress.errors.length > 0 && (
         <div className="commit-errors">
-          <h3>Errors</h3>
+          <h3>错误</h3>
           <ul>
             {progress.errors.map((item, index) => (
               <li key={`${index}-${item}`}>{item}</li>
@@ -317,8 +421,13 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
       <div className="commit-actions">
         <button className="btn-primary" onClick={() => onNavigate('dashboard')}>
-          Back to Dashboard
+          返回工作台
         </button>
+        {needsRecovery && (
+          <button className="btn-secondary" onClick={() => onNavigate('recovery')}>
+            前往恢复
+          </button>
+        )}
       </div>
     </div>
   );

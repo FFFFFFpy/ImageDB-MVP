@@ -79,7 +79,7 @@ persisted with no auto-decision for later human review.
 ### Strategy thresholds
 
 | Strategy | near_max | similar_total | Auto-decide near |
-|----------|----------|---------------|------------------|
+| -------- | -------- | ------------- | ---------------- |
 | Strict   | 4 bits   | 12 bits       | Yes              |
 | Balanced | 8 bits   | 24 bits       | Yes              |
 | Loose    | 12 bits  | 40 bits       | No (review)      |
@@ -148,17 +148,17 @@ threshold across all three hashes.
 
 ## Execution commands
 
-| Command | Result |
-| --- | --- |
-| `pnpm install` | PASS - already up to date |
-| `pnpm typecheck` | PASS |
-| `pnpm test:unit` | PASS - 4 frontend tests |
-| `pnpm rust:test` | PASS - 76 Rust tests, 1 ignored PostgreSQL lifecycle test |
-| `pnpm rust:clippy` | PASS - `-D warnings` |
-| `pnpm build` | PASS - release executable built |
-| real PostgreSQL lifecycle test | PASS - managed init, pgvector, migrations, shutdown, restart |
-| real scan duplicate persistence test | PASS - `--features real-db-tests`, PostgreSQL + filesystem |
-| release executable smoke launch | PASS - stayed running for 5 seconds |
+| Command                              | Result                                                       |
+| ------------------------------------ | ------------------------------------------------------------ |
+| `pnpm install`                       | PASS - already up to date                                    |
+| `pnpm typecheck`                     | PASS                                                         |
+| `pnpm test:unit`                     | PASS - 4 frontend tests                                      |
+| `pnpm rust:test`                     | PASS - 76 Rust tests, 1 ignored PostgreSQL lifecycle test    |
+| `pnpm rust:clippy`                   | PASS - `-D warnings`                                         |
+| `pnpm build`                         | PASS - release executable built                              |
+| real PostgreSQL lifecycle test       | PASS - managed init, pgvector, migrations, shutdown, restart |
+| real scan duplicate persistence test | PASS - `--features real-db-tests`, PostgreSQL + filesystem   |
+| release executable smoke launch      | PASS - stayed running for 5 seconds                          |
 
 ## Known limitations
 

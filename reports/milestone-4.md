@@ -30,10 +30,12 @@ the final kept files.
 ### Repository (`repositories/import_repository.rs`)
 
 New row structs:
+
 - `ReviewCandidateRow`, `ReviewCandidateDetailRow`, `ReviewProgressRow`,
   `ImportPlanCandidateRow`, `ImportPlanImageRow`, `AlbumRow`.
 
 New methods on `ImportRepository`:
+
 - `get_review_candidates`: query manual-review candidates where
   `duplicate_candidates.decision IS NULL`, with album and persisted-decision
   joins.
@@ -72,6 +74,7 @@ New methods on `ImportRepository`:
 ### Commands (`commands/review.rs`)
 
 8 new Tauri commands:
+
 - `get_review_queue`: returns review candidate queue for an import run.
 - `get_review_candidate_detail`: returns full detail for one candidate.
 - `submit_review_decision`: persists a review decision.
@@ -105,6 +108,7 @@ New methods on `ImportRepository`:
 #### ReviewPage (`pages/ReviewPage.tsx`)
 
 Features:
+
 - Loads latest completed import run on mount.
 - Fetches review queue and progress via TanStack Query.
 - Filters undecided candidates and navigates through them sequentially.
@@ -174,17 +178,17 @@ Features:
 
 ## Execution commands
 
-| Command | Purpose |
-| --- | --- |
-| `pnpm typecheck` | TypeScript type checking |
-| `pnpm test:unit` | Frontend unit tests |
-| `pnpm rust:test` | Rust unit tests |
-| `pnpm rust:clippy` | Rust linter |
-| `pnpm build` | Full Tauri build |
-| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml real_pgvector_full_lifecycle -- --ignored --nocapture --test-threads=1` | Real PostgreSQL + pgvector lifecycle |
-| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests real_review_decision_persists_and_filters_plan -- --ignored --nocapture --test-threads=1` | Real PostgreSQL review persistence and plan filtering |
-| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests real_scan_persists_exact_duplicates -- --ignored --nocapture --test-threads=1` | Real scan/candidate regression |
-| Release executable smoke check | Started built exe, verified it stayed alive, then stopped it |
+| Command                                                                                                                                                                          | Purpose                                                      |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `pnpm typecheck`                                                                                                                                                                 | TypeScript type checking                                     |
+| `pnpm test:unit`                                                                                                                                                                 | Frontend unit tests                                          |
+| `pnpm rust:test`                                                                                                                                                                 | Rust unit tests                                              |
+| `pnpm rust:clippy`                                                                                                                                                               | Rust linter                                                  |
+| `pnpm build`                                                                                                                                                                     | Full Tauri build                                             |
+| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml real_pgvector_full_lifecycle -- --ignored --nocapture --test-threads=1`                                            | Real PostgreSQL + pgvector lifecycle                         |
+| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests real_review_decision_persists_and_filters_plan -- --ignored --nocapture --test-threads=1` | Real PostgreSQL review persistence and plan filtering        |
+| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests real_scan_persists_exact_duplicates -- --ignored --nocapture --test-threads=1`            | Real scan/candidate regression                               |
+| Release executable smoke check                                                                                                                                                   | Started built exe, verified it stayed alive, then stopped it |
 
 ## Known limitations
 

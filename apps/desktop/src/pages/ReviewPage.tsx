@@ -105,18 +105,13 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   });
 
   const queue = queueQuery.data ?? [];
-  const undecidedQueue = useMemo(
-    () => queue.filter((c) => !c.has_decision),
-    [queue]
-  );
+  const undecidedQueue = useMemo(() => queue.filter((c) => !c.has_decision), [queue]);
 
-  const currentCandidate: ReviewCandidateSummary | undefined =
-    undecidedQueue[currentIndex];
+  const currentCandidate: ReviewCandidateSummary | undefined = undecidedQueue[currentIndex];
 
   const detailQuery = useQuery({
     queryKey: ['reviewDetail', currentCandidate?.candidate_id],
-    queryFn: () =>
-      api.getReviewCandidateDetail(currentCandidate!.candidate_id),
+    queryFn: () => api.getReviewCandidateDetail(currentCandidate!.candidate_id),
     enabled: !!currentCandidate,
   });
 
@@ -159,13 +154,8 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   }, [currentCandidate?.candidate_id]);
 
   const submitDecision = useMutation({
-    mutationFn: ({
-      candidateId,
-      decision,
-    }: {
-      candidateId: string;
-      decision: ReviewDecision;
-    }) => api.submitReviewDecision(candidateId, decision),
+    mutationFn: ({ candidateId, decision }: { candidateId: string; decision: ReviewDecision }) =>
+      api.submitReviewDecision(candidateId, decision),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['reviewQueue'] });
       queryClient.invalidateQueries({ queryKey: ['reviewProgress'] });
@@ -192,7 +182,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
         // error handled by mutation
       }
     },
-    [currentCandidate, submitting, submitDecision, currentIndex, undecidedQueue.length]
+    [currentCandidate, submitting, submitDecision, currentIndex, undecidedQueue.length],
   );
 
   const handleSkipAlbum = useCallback(async () => {
@@ -287,7 +277,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
       setIsPanning(true);
       setPanStart({ x: e.clientX - view.offsetX, y: e.clientY - view.offsetY });
     },
-    [view.offsetX, view.offsetY]
+    [view.offsetX, view.offsetY],
   );
 
   const handleMouseMove = useCallback(
@@ -299,7 +289,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
         offsetY: e.clientY - panStart.y,
       }));
     },
-    [isPanning, panStart]
+    [isPanning, panStart],
   );
 
   const handleMouseUp = useCallback(() => {
@@ -327,7 +317,9 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
 
   const progress = progressQuery.data;
   const totalCandidates = progress?.total_review_candidates ?? 0;
-  const allDecided = (progress?.all_decided ?? false) || (queueQuery.isSuccess && undecidedQueue.length === 0 && totalCandidates > 0);
+  const allDecided =
+    (progress?.all_decided ?? false) ||
+    (queueQuery.isSuccess && undecidedQueue.length === 0 && totalCandidates > 0);
 
   if (totalCandidates === 0) {
     return (
@@ -335,7 +327,10 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
         <h1>Review</h1>
         <div className="empty-state">
           <h1>No Review Candidates</h1>
-          <p>This import run has no uncertain duplicate candidates to review. You can proceed directly to the import plan.</p>
+          <p>
+            This import run has no uncertain duplicate candidates to review. You can proceed
+            directly to the import plan.
+          </p>
           <div className="toolbar" style={{ justifyContent: 'center', marginTop: '1rem' }}>
             <button className="btn-primary" onClick={handleGeneratePlan}>
               Generate Import Plan
@@ -481,12 +476,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
               <div className="review-image-label">Source</div>
               <div className="review-image-container">
                 {leftPreview ? (
-                  <img
-                    src={leftPreview}
-                    alt="Source"
-                    style={imageStyle}
-                    draggable={false}
-                  />
+                  <img src={leftPreview} alt="Source" style={imageStyle} draggable={false} />
                 ) : (
                   <div className="review-image-placeholder">No preview</div>
                 )}
@@ -513,12 +503,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
                     />
                   ) : null
                 ) : rightPreview ? (
-                  <img
-                    src={rightPreview}
-                    alt="Candidate"
-                    style={imageStyle}
-                    draggable={false}
-                  />
+                  <img src={rightPreview} alt="Candidate" style={imageStyle} draggable={false} />
                 ) : (
                   <div className="review-image-placeholder">No preview</div>
                 )}
@@ -528,9 +513,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
 
           {overlayMode && (
             <div className="overlay-opacity-control">
-              <label>
-                Overlay Opacity: {Math.round(overlayOpacity * 100)}%
-              </label>
+              <label>Overlay Opacity: {Math.round(overlayOpacity * 100)}%</label>
               <input
                 type="range"
                 min="0"
@@ -578,7 +561,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
                           ? `${detail.candidate_library_image_width} x ${detail.candidate_library_image_height}`
                           : 'N/A'
                         : detail.candidate_source_image_width &&
-                          detail.candidate_source_image_height
+                            detail.candidate_source_image_height
                           ? `${detail.candidate_source_image_width} x ${detail.candidate_source_image_height}`
                           : 'N/A'}
                     </td>
@@ -659,11 +642,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
 
           <div className="review-actions">
             <div className="review-nav">
-              <button
-                className="btn-secondary"
-                onClick={handlePrev}
-                disabled={currentIndex === 0}
-              >
+              <button className="btn-secondary" onClick={handlePrev} disabled={currentIndex === 0}>
                 Previous
               </button>
               <button
@@ -711,7 +690,9 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
           </div>
 
           <div className="review-shortcuts-hint">
-            <span>Keyboard: 1-4 decide, Arrows navigate, O overlay, R reset view, Scroll zoom, Drag pan</span>
+            <span>
+              Keyboard: 1-4 decide, Arrows navigate, O overlay, R reset view, Scroll zoom, Drag pan
+            </span>
           </div>
         </>
       )}

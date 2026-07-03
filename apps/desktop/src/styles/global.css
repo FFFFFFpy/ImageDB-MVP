@@ -733,7 +733,7 @@ textarea {
   color: #6b7280;
 }
 
-.overlay-opacity-control input[type="range"] {
+.overlay-opacity-control input[type='range'] {
   flex: 1;
   max-width: 200px;
 }

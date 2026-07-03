@@ -144,31 +144,31 @@ foundation on which Milestone 2 (image scanning pipeline) will build.
 
 ## Commands run
 
-| Command                  | Result                                                            |
-| ------------------------ | ----------------------------------------------------------------- |
-| `pnpm install`           | OK                                                                |
-| `pnpm typecheck`         | OK - 0 errors                                                     |
-| `pnpm test:unit`         | OK - 4/4 tests pass                                               |
-| `pnpm rust:test`         | OK - 36 tests pass, 1 real DB lifecycle test ignored by default   |
-| `pnpm rust:clippy`       | OK - 0 warnings                                                   |
-| `pnpm build`             | OK - release exe built                                            |
+| Command                        | Result                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `pnpm install`                 | OK                                                                     |
+| `pnpm typecheck`               | OK - 0 errors                                                          |
+| `pnpm test:unit`               | OK - 4/4 tests pass                                                    |
+| `pnpm rust:test`               | OK - 36 tests pass, 1 real DB lifecycle test ignored by default        |
+| `pnpm rust:clippy`             | OK - 0 warnings                                                        |
+| `pnpm build`                   | OK - release exe built                                                 |
 | real PostgreSQL lifecycle test | OK - PostgreSQL 18.4 + pgvector 0.8.3 init, migrate, shutdown, restart |
-| release exe smoke launch | OK - imagedb-desktop.exe started and stayed running for 5 seconds |
+| release exe smoke launch       | OK - imagedb-desktop.exe started and stayed running for 5 seconds      |
 
 ## Test results
 
 ### Rust tests (36 total)
 
-| Module                     | Tests                                                                                                                                        | Status |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| postgres::manager          | 8 (7 default tests plus ignored real PostgreSQL lifecycle test) | PASS   |
-| postgres::migration        | 2 (embedded SQL verification, version ordering)                                                                                              | PASS   |
-| services::database_service | 5 (parse_postgres_major: standard, future 18, 19devel, old 13, malformed)                                                                    | PASS   |
-| settings                   | 3 (defaults, save/reload, corrupt recovery)                                                                                                  | PASS   |
-| secrets                    | 3 (store/load, missing key, delete)                                                                                                          | PASS   |
-| single_instance            | 3 (acquire, double-lock fails, release on drop)                                                                                              | PASS   |
-| image_fingerprint          | 8 (determinism, different-images, generate, probe)                                                                                           | PASS   |
-| file_transaction           | 5 (success, empty source, staging cleanup, faults)                                                                                           | PASS   |
+| Module                     | Tests                                                                     | Status |
+| -------------------------- | ------------------------------------------------------------------------- | ------ |
+| postgres::manager          | 8 (7 default tests plus ignored real PostgreSQL lifecycle test)           | PASS   |
+| postgres::migration        | 2 (embedded SQL verification, version ordering)                           | PASS   |
+| services::database_service | 5 (parse_postgres_major: standard, future 18, 19devel, old 13, malformed) | PASS   |
+| settings                   | 3 (defaults, save/reload, corrupt recovery)                               | PASS   |
+| secrets                    | 3 (store/load, missing key, delete)                                       | PASS   |
+| single_instance            | 3 (acquire, double-lock fails, release on drop)                           | PASS   |
+| image_fingerprint          | 8 (determinism, different-images, generate, probe)                        | PASS   |
+| file_transaction           | 5 (success, empty source, staging cleanup, faults)                        | PASS   |
 
 ### Frontend tests (4 total)
 
@@ -241,22 +241,22 @@ submission:
 
 ## Acceptance status
 
-| Criterion                                                             | Status                            |
-| --------------------------------------------------------------------- | --------------------------------- |
-| Frontend routing, layout, error boundary                              | PASS                              |
-| Commands / Services / Domain / Repositories / Infrastructure layering | PASS                              |
-| Managed PostgreSQL lifecycle code (initdb, pg_ctl, health, pgvector)  | PASS (runtime verified)           |
-| External PostgreSQL connection test code                              | PASS (compile + unit tested)      |
-| Migration runner with embedded SQL                                    | PASS (runtime verified)           |
-| Settings storage (TOML)                                               | PASS (unit tested)                |
-| Credential storage (file-based)                                       | PASS (unit tested)                |
-| Logging (daily rotation)                                              | PASS                              |
-| Single instance lock                                                  | PASS (unit tested)                |
-| First-run page and database settings page                             | PASS                              |
-| Database state visible in GUI                                         | PASS                              |
-| Initial schema + migration tests                                      | PASS (runtime verified)           |
-| Runtime database initialization                                       | PASS                              |
-| Runtime restart and reconnect                                         | PASS                              |
+| Criterion                                                             | Status                       |
+| --------------------------------------------------------------------- | ---------------------------- |
+| Frontend routing, layout, error boundary                              | PASS                         |
+| Commands / Services / Domain / Repositories / Infrastructure layering | PASS                         |
+| Managed PostgreSQL lifecycle code (initdb, pg_ctl, health, pgvector)  | PASS (runtime verified)      |
+| External PostgreSQL connection test code                              | PASS (compile + unit tested) |
+| Migration runner with embedded SQL                                    | PASS (runtime verified)      |
+| Settings storage (TOML)                                               | PASS (unit tested)           |
+| Credential storage (file-based)                                       | PASS (unit tested)           |
+| Logging (daily rotation)                                              | PASS                         |
+| Single instance lock                                                  | PASS (unit tested)           |
+| First-run page and database settings page                             | PASS                         |
+| Database state visible in GUI                                         | PASS                         |
+| Initial schema + migration tests                                      | PASS (runtime verified)      |
+| Runtime database initialization                                       | PASS                         |
+| Runtime restart and reconnect                                         | PASS                         |
 
 CURRENT_TASK.md is advanced to `tasks/02-scan-and-exact-match.md` because the
 Milestone 1 acceptance criteria now pass, including real managed database

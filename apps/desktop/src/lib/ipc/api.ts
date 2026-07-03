@@ -17,6 +17,9 @@ import type {
   ImagePreview,
   ReviewDecision,
   CommitProgress,
+  RecoveryDiagnostic,
+  RecoveryOutcome,
+  ReverifyResult,
 } from './types';
 
 export const api = {
@@ -73,8 +76,7 @@ export const api = {
   generateImportPlan: (importRunId: string) =>
     invoke<ImportPlan>('generate_import_plan', { importRunId }),
 
-  getLatestCompletedImportRun: () =>
-    invoke<string | null>('get_latest_completed_import_run'),
+  getLatestCompletedImportRun: () => invoke<string | null>('get_latest_completed_import_run'),
 
   getImagePreview: (candidateId: string, imageSide: string) =>
     invoke<ImagePreview>('get_image_preview', { candidateId, imageSide }),
@@ -82,9 +84,15 @@ export const api = {
   startImportCommit: (importRunId: string) =>
     invoke<string>('start_import_commit', { importRunId }),
 
-  cancelImportCommit: () =>
-    invoke<string>('cancel_import_commit'),
+  cancelImportCommit: () => invoke<string>('cancel_import_commit'),
 
-  getCommitProgress: () =>
-    invoke<CommitProgress>('get_commit_progress'),
+  getCommitProgress: () => invoke<CommitProgress>('get_commit_progress'),
+
+  scanRecoverableTransactions: () => invoke<RecoveryDiagnostic[]>('scan_recoverable_transactions'),
+
+  recoverTransaction: (transactionId: string) =>
+    invoke<RecoveryOutcome>('recover_transaction', { transactionId }),
+
+  reverifyTransaction: (transactionId: string) =>
+    invoke<ReverifyResult>('reverify_transaction', { transactionId }),
 };
