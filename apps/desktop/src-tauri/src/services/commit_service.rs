@@ -88,7 +88,7 @@ struct PlanAlbumCommit {
 ///
 /// Rejects absolute paths, `..` traversal, Windows drive letters, and empty
 /// components. Normalizes separators to `/`. Returns the normalized path.
-fn normalize_relative_path(rel: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_relative_path(rel: &str) -> Result<String, AppError> {
     let p = Path::new(rel);
     let mut parts: Vec<String> = Vec::new();
     for comp in p.components() {
@@ -150,7 +150,7 @@ fn check_target_path_conflicts(images: &[PlanImageRow]) -> Result<(), AppError> 
 }
 
 /// Read and parse a published manifest from disk.
-fn read_manifest(dir: &Path) -> Result<AlbumManifest, AppError> {
+pub(crate) fn read_manifest(dir: &Path) -> Result<AlbumManifest, AppError> {
     let manifest_path = dir.join(".imagedb").join(".imagedb-manifest.json");
     let json = std::fs::read_to_string(&manifest_path).map_err(|e| {
         AppError::Internal(format!(
@@ -468,7 +468,7 @@ fn validate_frozen_plan(
 /// Compute a deterministic BLAKE3 hash over the canonical serialized plan
 /// content. The canonical form sorts albums and images by target path and
 /// includes all fields that define the commit set.
-fn compute_plan_hash(frozen: &FrozenPlanRow) -> Result<Vec<u8>, AppError> {
+pub(crate) fn compute_plan_hash(frozen: &FrozenPlanRow) -> Result<Vec<u8>, AppError> {
     let mut canonical: Vec<u8> = Vec::new();
     canonical.extend_from_slice(frozen.import_run_id.as_bytes());
     canonical.extend_from_slice(frozen.library_root_id.as_bytes());
@@ -931,7 +931,7 @@ async fn commit_single_album(
 }
 
 /// Stream-copy a file while incrementally computing BLAKE3. Returns the hash.
-async fn stream_copy_with_hash(src: &Path, dst: &Path) -> Result<Vec<u8>, AppError> {
+pub(crate) async fn stream_copy_with_hash(src: &Path, dst: &Path) -> Result<Vec<u8>, AppError> {
     let mut src_file = tokio::fs::File::open(src)
         .await
         .map_err(|e| AppError::IoError(format!("cannot open source {}: {e}", src.display())))?;
@@ -963,7 +963,10 @@ async fn stream_copy_with_hash(src: &Path, dst: &Path) -> Result<Vec<u8>, AppErr
 
 /// Re-verify the staging file set: every expected file exists, has the right
 /// size, and matches its expected BLAKE3.
-async fn verify_staging_set(staging_dir: &Path, images: &[PlanImageRow]) -> Result<(), AppError> {
+pub(crate) async fn verify_staging_set(
+    staging_dir: &Path,
+    images: &[PlanImageRow],
+) -> Result<(), AppError> {
     for img in images {
         let target_rel = normalize_relative_path(&img.target_relative_path)?;
         let staged = staging_dir.join(&target_rel);
@@ -1008,7 +1011,7 @@ async fn verify_staging_set(staging_dir: &Path, images: &[PlanImageRow]) -> Resu
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_manifest(
+pub(crate) fn build_manifest(
     tx_id: &Uuid,
     plan_id: Uuid,
     plan_hash: &[u8],
@@ -1047,7 +1050,7 @@ fn build_manifest(
 
 /// Insert (or confirm) the library album + images in one DB transaction.
 #[allow(clippy::too_many_arguments)]
-async fn commit_library_records_transaction(
+pub(crate) async fn commit_library_records_transaction(
     client: &mut Client,
     library_root_id: Uuid,
     transaction_id: Uuid,
