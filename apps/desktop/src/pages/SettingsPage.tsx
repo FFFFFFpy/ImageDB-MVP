@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
+import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useState } from 'react';
 
 export function SettingsPage() {
@@ -56,8 +57,12 @@ export function SettingsPage() {
               <tbody>
                 <tr>
                   <td>状态</td>
-                  <td className={dbStatus.data.status === 'connected' ? 'status-ok' : ''}>
-                    {dbStatus.data.status}
+                  <td
+                    className={
+                      taggedStatusCode(dbStatus.data.status) === 'connected' ? 'status-ok' : ''
+                    }
+                  >
+                    {formatTaggedStatus(dbStatus.data.status)}
                   </td>
                 </tr>
                 <tr>
@@ -97,7 +102,7 @@ export function SettingsPage() {
                 <summary>诊断信息 ({dbStatus.data.diagnostics.length})</summary>
                 <ul>
                   {dbStatus.data.diagnostics.map((d, i) => (
-                    <li key={i}>{d}</li>
+                    <li key={i}>{formatDiagnostic(d)}</li>
                   ))}
                 </ul>
               </details>

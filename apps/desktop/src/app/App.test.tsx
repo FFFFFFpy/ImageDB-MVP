@@ -22,7 +22,7 @@ vi.mock('@tauri-apps/api/core', () => ({
     if (cmd === 'get_database_status') {
       return Promise.resolve({
         mode: 'managed_local',
-        status: 'connected',
+        status: { BinariesMissing: 'pg_ctl/initdb/psql not found' },
         managed_config: {
           data_dir: '/tmp/pgdata',
           port: 5432,
@@ -105,4 +105,9 @@ test('renders status cards section', () => {
   expect(screen.getByText('数据库')).toBeInTheDocument();
   expect(screen.getByText('pgvector')).toBeInTheDocument();
   expect(screen.getByText('迁移')).toBeInTheDocument();
+});
+
+test('renders tagged database status objects without crashing', async () => {
+  renderApp();
+  expect(await screen.findByText(/缺少 PostgreSQL 运行文件/)).toBeInTheDocument();
 });

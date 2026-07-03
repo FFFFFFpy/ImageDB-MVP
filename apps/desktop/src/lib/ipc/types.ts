@@ -1,11 +1,14 @@
+export type TaggedStatus = string | Record<string, string>;
+export type DiagnosticItem = string | number | boolean | null | Record<string, unknown>;
+
 export interface DatabaseState {
   mode: 'managed_local' | 'external' | null;
-  status: 'not_initialized' | 'initializing' | 'ready' | 'connected' | string;
+  status: TaggedStatus;
   managed_config: ManagedDbConfig | null;
   external_config: ExternalConnectionConfig | null;
   pgvector_available: boolean;
   migration_version: string | null;
-  diagnostics: string[];
+  diagnostics: DiagnosticItem[];
 }
 
 export interface ManagedDbConfig {
@@ -29,7 +32,7 @@ export interface ExternalCheckResult {
   version_ok: boolean;
   pgvector_available: boolean;
   can_create_tables: boolean;
-  diagnostics: string[];
+  diagnostics: DiagnosticItem[];
 }
 
 export interface AppSettings {
@@ -50,7 +53,7 @@ export interface PostgresProbeResult {
   data_dir: string | null;
   database_created: boolean;
   connection_ok: boolean;
-  diagnostics: string[];
+  diagnostics: DiagnosticItem[];
 }
 
 export interface ImageFingerprintEntry {
@@ -69,7 +72,7 @@ export interface ImageFingerprintEntry {
 
 export interface ImageFingerprintProbeResult {
   fingerprints: ImageFingerprintEntry[];
-  diagnostics: string[];
+  diagnostics: DiagnosticItem[];
   success: boolean;
 }
 
@@ -80,7 +83,7 @@ export interface FileTransactionProbeResult {
   published_files: string[];
   blake3_verified: boolean;
   manifest_path: string | null;
-  diagnostics: string[];
+  diagnostics: DiagnosticItem[];
 }
 
 export interface AllProbeResults {

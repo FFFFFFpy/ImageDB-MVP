@@ -1,6 +1,8 @@
 import { useMutation } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { useState } from 'react';
+import { formatDiagnostic } from '../lib/format';
+import type { DiagnosticItem } from '../lib/ipc/types';
 import type {
   PostgresProbeResult,
   ImageFingerprintProbeResult,
@@ -112,14 +114,14 @@ export function ProbesPage() {
   );
 }
 
-function DiagnosticsList({ items }: { items: string[] }) {
+function DiagnosticsList({ items }: { items: DiagnosticItem[] }) {
   if (items.length === 0) return null;
   return (
     <details className="diagnostics">
       <summary>诊断日志 ({items.length})</summary>
       <ul>
         {items.map((item, i) => (
-          <li key={i}>{item}</li>
+          <li key={i}>{formatDiagnostic(item)}</li>
         ))}
       </ul>
     </details>

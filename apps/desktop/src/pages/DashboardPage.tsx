@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
+import { formatTaggedStatus, taggedStatusCode } from '../lib/format';
 
 interface DashboardPageProps {
   needsOnboarding: boolean;
@@ -28,7 +29,7 @@ export function DashboardPage({ needsOnboarding, onGoOnboarding, onGoScan }: Das
     );
   }
 
-  const isConnected = dbStatus.data?.status === 'connected';
+  const isConnected = taggedStatusCode(dbStatus.data?.status) === 'connected';
 
   return (
     <div className="dashboard-page">
@@ -38,7 +39,7 @@ export function DashboardPage({ needsOnboarding, onGoOnboarding, onGoScan }: Das
         <div className={`status-card-dashboard ${isConnected ? 'ok' : 'warn'}`}>
           <h3>数据库</h3>
           <p className={isConnected ? 'status-ok' : 'status-warn'}>
-            {isConnected ? '已连接' : (dbStatus.data?.status ?? '加载中…')}
+            {isConnected ? '已连接' : formatTaggedStatus(dbStatus.data?.status)}
           </p>
           {dbStatus.data?.managed_config && (
             <p className="mono">

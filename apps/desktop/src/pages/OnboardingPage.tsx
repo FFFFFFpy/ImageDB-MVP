@@ -1,6 +1,7 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { DatabaseState } from '../lib/ipc/types';
+import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useState } from 'react';
 
 interface OnboardingPageProps {
@@ -15,13 +16,14 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
     queryFn: api.getDatabaseStatus,
     refetchInterval: 3000,
   });
+  const databaseState = dbStatus.data;
 
-  if (dbStatus.data?.status === 'connected') {
+  if (databaseState && taggedStatusCode(databaseState.status) === 'connected') {
     return (
       <div className="onboarding-page">
         <h1>数据库已就绪</h1>
         <p>数据库连接正常，可以开始使用 ImageDB。</p>
-        <DbStateSummary state={dbStatus.data} />
+        <DbStateSummary state={databaseState} />
         <button className="btn-primary" onClick={onComplete}>
           进入应用
         </button>
@@ -34,7 +36,7 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
       <h1>欢迎使用 ImageDB</h1>
       <p>请选择数据库模式以完成初始设置。</p>
 
-      {dbStatus.data && <DbStateSummary state={dbStatus.data} />}
+      {databaseState && <DbStateSummary state={databaseState} />}
 
       <div className="mode-cards">
         <div
@@ -60,20 +62,7 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
 }
 
 function DbStateSummary({ state }: { state: DatabaseState }) {
-  const statusLabel = () => {
-    switch (state.status) {
-      case 'connected':
-        return '已连接';
-      case 'ready':
-        return '就绪';
-      case 'not_initialized':
-        return '未初始化';
-      case 'initializing':
-        return '初始化中';
-      default:
-        return state.status;
-    }
-  };
+  const isConnected = taggedStatusCode(state.status) === 'connected';
 
   return (
     <div className="db-state-summary">
@@ -81,7 +70,7 @@ function DbStateSummary({ state }: { state: DatabaseState }) {
         <tbody>
           <tr>
             <td>状态</td>
-            <td className={state.status === 'connected' ? 'status-ok' : ''}>{statusLabel()}</td>
+            <td className={isConnected ? 'status-ok' : ''}>{formatTaggedStatus(state.status)}</td>
           </tr>
           {state.mode && (
             <tr>
@@ -108,7 +97,7 @@ function DbStateSummary({ state }: { state: DatabaseState }) {
           <summary>诊断信息 ({state.diagnostics.length})</summary>
           <ul>
             {state.diagnostics.map((d, i) => (
-              <li key={i}>{d}</li>
+              <li key={i}>{formatDiagnostic(d)}</li>
             ))}
           </ul>
         </details>
@@ -121,7 +110,7 @@ function ManagedSetup({ onComplete }: { onComplete: () => void }) {
   const init = useMutation({
     mutationFn: api.initializeManagedDatabase,
     onSuccess: (state) => {
-      if (state.status === 'connected') {
+      if (taggedStatusCode(state.status) === 'connected') {
         onComplete();
       }
     },
@@ -168,7 +157,7 @@ function ExternalSetup({ onComplete }: { onComplete: () => void }) {
         password: password || undefined,
       }),
     onSuccess: (state) => {
-      if (state.status === 'connected') {
+      if (taggedStatusCode(state.status) === 'connected') {
         onComplete();
       }
     },
@@ -238,7 +227,7 @@ function ExternalSetup({ onComplete }: { onComplete: () => void }) {
               <summary>诊断信息</summary>
               <ul>
                 {testConn.data.diagnostics.map((d, i) => (
-                  <li key={i}>{d}</li>
+                  <li key={i}>{formatDiagnostic(d)}</li>
                 ))}
               </ul>
             </details>
