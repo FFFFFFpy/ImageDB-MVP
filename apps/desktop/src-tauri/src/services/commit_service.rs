@@ -22,6 +22,7 @@ use crate::infrastructure::postgres::PostgresManager;
 use crate::repositories::import_repository::{
     FrozenPlanRow, ImportRepository, PlanAlbumRow, PlanImageRow, SnapshotFileRecord,
 };
+use crate::services::recovery_service::reconcile_import_run_state;
 use crate::services::source_snapshot_service::{
     load_source_album_snapshot, verify_source_snapshot_files,
 };
@@ -289,8 +290,6 @@ async fn execute_commit_pipeline(
     let mut albums_skipped = 0u32;
     let mut albums_failed = 0u32;
     let mut all_errors = Vec::new();
-    let mut recovery_required_detected = false;
-    let mut cleanup_required_detected = false;
 
     for (plan_album, images) in &frozen.albums {
         if cancelled.load(Ordering::Relaxed) {
@@ -329,7 +328,6 @@ async fn execute_commit_pipeline(
                     total_committed += result.images_committed;
                 }
                 if result.status == "cleanup_required" {
-                    cleanup_required_detected = true;
                     if let Some(error) = &result.error {
                         all_errors.push(error.clone());
                     }
@@ -338,7 +336,6 @@ async fn execute_commit_pipeline(
             }
             Err(e) => {
                 if let AppError::ResumeRequired(transaction_id) = e {
-                    recovery_required_detected = true;
                     let msg = format!(
                         "detected incomplete transaction {transaction_id}; route to recovery"
                     );
@@ -375,50 +372,91 @@ async fn execute_commit_pipeline(
             p.images_committed = total_committed;
             p.errors = all_errors.clone();
         }
+
+        // Mid-pipeline reconcile: after each album attempt, the parent run
+        // must already reflect the current transaction set. If this album
+        // just entered conflict or stayed active, the run must flip to
+        // recovery_required now, not at the end of the pipeline. The final
+        // reconcile at the bottom is the authoritative pass; this one is a
+        // correctness hook for progress observers.
+        reconcile_import_run_state(client, import_run_id).await?;
     }
 
-    let final_state = if recovery_required_detected || cleanup_required_detected {
-        ImportRepository::update_import_run_state(
-            client,
-            import_run_id,
-            &ImportRunState::RecoveryRequired,
-        )
-        .await?;
-        "recovery_required".to_string()
-    } else if albums_failed == 0 && !cancelled.load(Ordering::Relaxed) {
-        ImportRepository::update_import_run_state(
-            client,
-            import_run_id,
-            &ImportRunState::Completed,
-        )
-        .await?;
-        "completed".to_string()
-    } else if cancelled.load(Ordering::Relaxed) {
-        ImportRepository::update_import_run_state(
-            client,
-            import_run_id,
-            &ImportRunState::RecoveryRequired,
-        )
-        .await?;
+    // If the pipeline was cancelled, mark any still-active transactions as
+    // failed so the reconciler has a clean terminal set to reason about.
+    // Without this, a cancelled commit would leave transactions in
+    // `planned`/`staging`/etc and the reconciler would (correctly) refuse
+    // to promote the run to `completed`, but also wouldn't distinguish
+    // cancellation from a normal partial commit.
+    if cancelled.load(Ordering::Relaxed) {
+        let active = ImportRepository::get_all_transactions_for_run(client, import_run_id).await?;
+        for t in active {
+            if let Ok(s) = TransactionState::parse(&t.state) {
+                if !s.is_terminal() && s != TransactionState::Conflict {
+                    ImportRepository::update_file_transaction_state(
+                        client,
+                        t.id,
+                        &TransactionState::Failed,
+                        Some("commit cancelled by user"),
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    // Final authoritative run-state decision. The reconciler inspects
+    // every transaction against the frozen plan and writes the only state
+    // the product allows: `completed` iff every frozen-plan album is
+    // source_archived, `recovery_required` otherwise. This replaces the
+    // previous counter-based heuristic so a completed run cannot mask a
+    // surviving recoverable transaction.
+    let reconciled = reconcile_import_run_state(client, import_run_id).await?;
+
+    let final_state = if cancelled.load(Ordering::Relaxed) {
         "cancelled_pending_recovery".to_string()
     } else {
-        ImportRepository::update_import_run_error(
-            client,
-            import_run_id,
-            "commit_partial",
-            &format!(
-                "{albums_failed} album(s) failed, {} error(s)",
-                all_errors.len()
-            ),
-        )
-        .await?;
-        ImportRepository::update_import_run_state(
-            client,
-            import_run_id,
-            &ImportRunState::RecoveryRequired,
-        )
-        .await?;
-        "completed_with_errors".to_string()
+        match reconciled.state {
+            ImportRunState::Completed => {
+                if albums_failed == 0 && all_errors.is_empty() {
+                    "completed".to_string()
+                } else {
+                    "completed_with_errors".to_string()
+                }
+            }
+            ImportRunState::RecoveryRequired => {
+                if albums_failed > 0 {
+                    // Surface album-level failure counts on the run row for
+                    // operator diagnostics. The state itself was already
+                    // set by reconcile; this only writes error metadata
+                    // (deliberately not using update_import_run_error,
+                    // which would overwrite state to `failed` and undo
+                    // the reconciler's decision).
+                    client
+                        .execute(
+                            "UPDATE import_runs SET error_code = $1, error_message = $2 WHERE id = $3",
+                            &[
+                                &"commit_partial",
+                                &format!(
+                                    "{albums_failed} album(s) failed, {} error(s)",
+                                    all_errors.len()
+                                ),
+                                &import_run_id,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            AppError::Internal(format!(
+                                "failed to update partial commit diagnostics: {e}"
+                            ))
+                        })?;
+                    "completed_with_errors".to_string()
+                } else {
+                    "recovery_required".to_string()
+                }
+            }
+            other => other.to_string(),
+        }
     };
 
     Ok(CommitResult {

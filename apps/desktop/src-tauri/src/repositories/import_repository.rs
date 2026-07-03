@@ -203,7 +203,17 @@ pub struct FileTransactionRow {
     pub state: String,
 }
 
-// ── Frozen plan row types (immutable commit source of truth) ──────────
+/// Minimal transaction projection used by parent-run reconciliation.
+///
+/// Carries just enough to decide whether the parent `import_runs.state`
+/// must be `recovery_required` (conflict / active / failed / cancelled)
+/// or `completed` (every frozen-plan album reached `source_archived`).
+pub struct FileTransactionStateRow {
+    pub id: Uuid,
+    pub import_run_id: Uuid,
+    pub import_album_id: Uuid,
+    pub state: String,
+}
 
 /// A frozen plan album with its persisted target path.
 #[derive(Debug, Clone)]
@@ -398,6 +408,49 @@ impl ImportRepository {
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to update import run state: {e}")))?;
+        Ok(())
+    }
+
+    /// Update an import run's state with explicit control over `completed_at`.
+    ///
+    /// - `Some(ts)` writes the timestamp verbatim (used when reconcile
+    ///   determines the run is now `completed` and needs a stable value).
+    /// - `None` clears the timestamp (used when reconcile pulls a run back
+    ///   from `completed` to `recovery_required` so the row no longer claims
+    ///   the run finished).
+    ///
+    /// This is the only updater reconciliation uses, because the COALESCE
+    /// semantics of `update_import_run_state` cannot clear a previously set
+    /// `completed_at`.
+    pub async fn set_import_run_state(
+        client: &Client,
+        id: Uuid,
+        state: &ImportRunState,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        clear_completed_at: bool,
+    ) -> Result<(), AppError> {
+        let state_str = state.to_string();
+        if clear_completed_at {
+            client
+                .execute(
+                    "UPDATE import_runs SET state = $1, completed_at = NULL WHERE id = $2",
+                    &[&state_str, &id],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to clear import run completed_at: {e}"))
+                })?;
+        } else {
+            client
+                .execute(
+                    "UPDATE import_runs SET state = $1, completed_at = COALESCE($2, completed_at) WHERE id = $3",
+                    &[&state_str, &completed_at, &id],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to set import run state: {e}"))
+                })?;
+        }
         Ok(())
     }
 
@@ -1701,6 +1754,37 @@ impl ImportRepository {
                 plan_hash: r.get("plan_hash"),
                 manifest_hash: r.get("manifest_hash"),
                 last_error: r.get("last_error"),
+            })
+            .collect())
+    }
+
+    /// All file transactions for a given import run, projected to the
+    /// columns required by run-level reconciliation.
+    pub async fn get_all_transactions_for_run(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<FileTransactionStateRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, import_run_id, import_album_id, state
+                 FROM file_transactions
+                 WHERE import_run_id = $1
+                 ORDER BY started_at",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "failed to query transactions for run {import_run_id}: {e}"
+                ))
+            })?;
+        Ok(rows
+            .iter()
+            .map(|r| FileTransactionStateRow {
+                id: r.get("id"),
+                import_run_id: r.get("import_run_id"),
+                import_album_id: r.get("import_album_id"),
+                state: r.get("state"),
             })
             .collect())
     }

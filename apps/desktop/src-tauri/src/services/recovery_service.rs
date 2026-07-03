@@ -12,6 +12,7 @@
 //! unknown published directory — a mismatch surfaces as a `conflict` with
 //! full diagnostics instead of an automatic fix.
 #![allow(dead_code)]
+use crate::domain::import_state::ImportRunState;
 use crate::domain::state_machine::{self, FileOpState, TransactionState};
 use crate::error::AppError;
 use crate::infrastructure::postgres::PostgresManager;
@@ -137,6 +138,242 @@ pub async fn scan_recoverable_transactions(
     Ok(diagnostics)
 }
 
+/// Outcome of a single call to [`reconcile_import_run_state`].
+///
+/// `changed` is `true` only when the reconciler actually wrote a new state
+/// row; `false` means the persisted state already matched the computed
+/// verdict (the idempotent no-op case). Tests use this to assert stability
+/// across repeated calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciledRunState {
+    pub import_run_id: Uuid,
+    pub state: ImportRunState,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub changed: bool,
+}
+
+/// Reconcile the parent `import_runs` row against the union of its child
+/// `file_transactions` rows and the frozen plan's album set.
+///
+/// This is the *single authoritative decider* for the run state after any
+/// transaction outcome. Both the commit pipeline and the recovery service
+/// call it after every transaction state change so the parent run cannot
+/// drift into a state that contradicts its children.
+///
+/// # Rules (product-level invariants)
+///
+/// 1. Any `conflict` transaction → `recovery_required`.
+/// 2. Any active (non-terminal, non-conflict) transaction —
+///    `planned | staging | verifying | verified | publishing | published |
+///    db_committing | library_committed | source_archiving |
+///    cleanup_required` → `recovery_required`.
+/// 3. Any `failed` or `cancelled` transaction → `recovery_required`
+///    (current product semantics: no silent completion with unresolved
+///    transaction outcomes; promote to a real `failed` run path when one
+///    lands).
+/// 4. Every frozen-plan album has a `source_archived` transaction for its
+///    `import_album_id` → `completed` and `completed_at` is set. An empty
+///    frozen plan (no albums) also completes.
+/// 5. A run that has not yet reached the commit phase (`created`,
+///    `scanning`, `fingerprinting`, `detecting_duplicates`, `analyzing`,
+///    `review_required`, `ready_to_commit`) is left untouched — reconcile
+///    is meaningless before commit has been attempted.
+/// 6. Terminal states `cancelled` and `failed` are also left untouched:
+///    they are set by explicit user/system actions, not derived.
+///
+/// # Idempotency
+///
+/// Calling this function twice in a row with no intervening state changes
+/// produces the same result and sets `changed = false` on the second call.
+/// `completed_at` is only written when transitioning *into* `completed`;
+/// it is cleared when the run is pulled back to `recovery_required`.
+pub async fn reconcile_import_run_state(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<ReconciledRunState, AppError> {
+    let run = ImportRepository::get_import_run_by_id(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+
+    let current = match ImportRunState::from_str_opt(&run.state) {
+        Some(s) => s,
+        None => {
+            return Err(AppError::Internal(format!(
+                "import run {import_run_id} has unparseable state '{}'",
+                run.state
+            )));
+        }
+    };
+
+    // Runs that have not yet attempted commit, or that were explicitly
+    // cancelled/failed by the user, are not reconcilable. Leave them alone.
+    match current {
+        ImportRunState::Created
+        | ImportRunState::Scanning
+        | ImportRunState::Fingerprinting
+        | ImportRunState::DetectingDuplicates
+        | ImportRunState::Analyzing
+        | ImportRunState::ReviewRequired
+        | ImportRunState::ReadyToCommit
+        | ImportRunState::Cancelled
+        | ImportRunState::Failed => {
+            return Ok(ReconciledRunState {
+                import_run_id,
+                state: current,
+                completed_at: None,
+                changed: false,
+            });
+        }
+        ImportRunState::Committing
+        | ImportRunState::RecoveryRequired
+        | ImportRunState::Completed => {}
+    }
+
+    // Frozen plan is the album universe for this run. Prefer frozen; accept
+    // consumed for already-completed runs. A missing plan means commit was
+    // never attempted — leave the run state untouched.
+    let frozen = ImportRepository::load_frozen_plan(client, import_run_id).await?;
+    let Some(frozen) = frozen else {
+        return Ok(ReconciledRunState {
+            import_run_id,
+            state: current,
+            completed_at: None,
+            changed: false,
+        });
+    };
+
+    let transactions =
+        ImportRepository::get_all_transactions_for_run(client, import_run_id).await?;
+
+    // Empty frozen plan: commit was legitimately a no-op. Complete the run
+    // if it is still in a post-commit non-terminal state.
+    if frozen.albums.is_empty() {
+        let target = ImportRunState::Completed;
+        let changed = current != target;
+        if changed {
+            ImportRepository::set_import_run_state(
+                client,
+                import_run_id,
+                &target,
+                Some(chrono::Utc::now()),
+                false,
+            )
+            .await?;
+        }
+        return Ok(ReconciledRunState {
+            import_run_id,
+            state: target,
+            completed_at: Some(chrono::Utc::now()),
+            changed,
+        });
+    }
+
+    // Rule 1: any conflict forces recovery_required.
+    let has_conflict = transactions.iter().any(|t| {
+        matches!(
+            TransactionState::parse(&t.state),
+            Ok(TransactionState::Conflict)
+        )
+    });
+    if has_conflict {
+        return set_recovery_required(client, import_run_id, &current).await;
+    }
+
+    // Rule 2: any active (recoverable) transaction forces recovery_required.
+    let has_active = transactions.iter().any(|t| {
+        matches!(
+            TransactionState::parse(&t.state),
+            Ok(TransactionState::Planned
+                | TransactionState::Staging
+                | TransactionState::Verifying
+                | TransactionState::Verified
+                | TransactionState::Publishing
+                | TransactionState::Published
+                | TransactionState::DbCommitting
+                | TransactionState::LibraryCommitted
+                | TransactionState::SourceArchiving
+                | TransactionState::CleanupRequired)
+        )
+    });
+    if has_active {
+        return set_recovery_required(client, import_run_id, &current).await;
+    }
+
+    // Rule 3: any failed/cancelled transaction blocks completion.
+    let has_failed_or_cancelled = transactions.iter().any(|t| {
+        matches!(
+            TransactionState::parse(&t.state),
+            Ok(TransactionState::Failed | TransactionState::Cancelled)
+        )
+    });
+    if has_failed_or_cancelled {
+        return set_recovery_required(client, import_run_id, &current).await;
+    }
+
+    // Rule 4: every frozen-plan album must have reached source_archived.
+    let archived_album_ids: std::collections::HashSet<Uuid> = transactions
+        .iter()
+        .filter(|t| {
+            matches!(
+                TransactionState::parse(&t.state),
+                Ok(TransactionState::SourceArchived)
+            )
+        })
+        .map(|t| t.import_album_id)
+        .collect();
+
+    let all_archived = frozen
+        .albums
+        .iter()
+        .all(|(a, _)| archived_album_ids.contains(&a.import_album_id));
+
+    if all_archived {
+        let target = ImportRunState::Completed;
+        let changed = current != target;
+        let now = chrono::Utc::now();
+        if changed {
+            ImportRepository::set_import_run_state(
+                client,
+                import_run_id,
+                &target,
+                Some(now),
+                false,
+            )
+            .await?;
+        }
+        Ok(ReconciledRunState {
+            import_run_id,
+            state: target,
+            completed_at: Some(now),
+            changed,
+        })
+    } else {
+        // Some plan album has no transaction at all — commit was aborted
+        // mid-pipeline before a row was inserted. Recovery required.
+        set_recovery_required(client, import_run_id, &current).await
+    }
+}
+
+async fn set_recovery_required(
+    client: &Client,
+    import_run_id: Uuid,
+    current: &ImportRunState,
+) -> Result<ReconciledRunState, AppError> {
+    let target = ImportRunState::RecoveryRequired;
+    let changed = current != &target;
+    if changed {
+        // Clear completed_at: a run that is no longer completed must not
+        // carry a completed_at timestamp.
+        ImportRepository::set_import_run_state(client, import_run_id, &target, None, true).await?;
+    }
+    Ok(ReconciledRunState {
+        import_run_id,
+        state: target,
+        completed_at: None,
+        changed,
+    })
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -172,11 +409,16 @@ async fn recover_transaction_with_client(
     let tx = ImportRepository::get_file_transaction(client, transaction_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("transaction {transaction_id} not found")))?;
+    let import_run_id = tx.import_run_id;
 
     let current = match TransactionState::parse(&tx.state) {
         Ok(s) => s,
         Err(_) => {
             let state = tx.state.clone();
+            // Even for unparseable rows we still reconcile the parent run so
+            // a stray garbage-state transaction cannot leave the run stuck
+            // in `completed`.
+            reconcile_import_run_state(client, import_run_id).await?;
             return Ok(RecoveryOutcome {
                 transaction_id,
                 final_state: state.clone(),
@@ -186,31 +428,61 @@ async fn recover_transaction_with_client(
         }
     };
 
-    if current.is_terminal() {
-        return Ok(RecoveryOutcome {
-            transaction_id,
-            final_state: current.to_string(),
-            recovered: true,
-            message: "transaction already terminal".to_string(),
-        });
-    }
+    let outcome: Result<(String, bool, String), AppError> = if current.is_terminal() {
+        Ok((
+            current.to_string(),
+            true,
+            "transaction already terminal".to_string(),
+        ))
+    } else if current == TransactionState::Conflict {
+        Ok((
+            current.to_string(),
+            false,
+            "conflict requires manual resolution".to_string(),
+        ))
+    } else {
+        recover_active_transaction(client, transaction_id, &tx, current, import_run_id).await
+    };
 
-    if current == TransactionState::Conflict {
-        return Ok(RecoveryOutcome {
-            transaction_id,
-            final_state: current.to_string(),
-            recovered: false,
-            message: "conflict requires manual resolution".to_string(),
-        });
-    }
+    // Always reconcile the parent run after any transaction-level change
+    // (including no-op terminal/conflict paths). The reconciler decides
+    // whether this single transaction's new state promotes the run to
+    // `completed`, keeps it at `recovery_required`, or pulls a `completed`
+    // run back to `recovery_required`.
+    reconcile_import_run_state(client, import_run_id).await?;
 
+    let (final_state, recovered, message) = match outcome {
+        Ok(o) => o,
+        Err(e) => return Err(e),
+    };
+
+    Ok(RecoveryOutcome {
+        transaction_id,
+        final_state,
+        recovered,
+        message,
+    })
+}
+
+/// Drive a non-terminal, non-conflict transaction through its resume action.
+///
+/// Kept as a separate function so [`recover_transaction_with_client`] can
+/// always call [`reconcile_import_run_state`] at the bottom, regardless of
+/// whether the resume action succeeded, failed, or was bypassed.
+async fn recover_active_transaction(
+    client: &mut Client,
+    transaction_id: Uuid,
+    tx: &FileTransactionFullRow,
+    current: TransactionState,
+    import_run_id: Uuid,
+) -> Result<(String, bool, String), AppError> {
     // Load the frozen plan to know what files should exist.
-    let frozen = ImportRepository::load_frozen_plan(client, tx.import_run_id)
+    let frozen = ImportRepository::load_frozen_plan(client, import_run_id)
         .await?
         .ok_or_else(|| {
             AppError::Internal(format!(
                 "no frozen plan for run {} of transaction {transaction_id}",
-                tx.import_run_id
+                import_run_id
             ))
         })?;
 
@@ -235,82 +507,72 @@ async fn recover_transaction_with_client(
     let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
 
     // Dispatch by state.
-    let outcome = match current {
+    match current {
         TransactionState::Planned | TransactionState::Staging => {
             resume_staging(
                 client,
-                &tx,
+                tx,
                 &frozen.plan_id,
                 &validated_plan_hash,
                 &plan_images,
             )
-            .await?
+            .await
         }
         TransactionState::Verifying | TransactionState::Verified => {
             resume_verify_and_publish(
                 client,
-                &tx,
+                tx,
                 &frozen.plan_id,
                 &validated_plan_hash,
                 &library_root,
                 library_root_id,
-                tx.import_run_id,
+                import_run_id,
                 &album_relative_path,
                 plan_album,
                 &plan_images,
             )
-            .await?
+            .await
         }
         TransactionState::Publishing => {
             resume_publishing(
                 client,
-                &tx,
+                tx,
                 &frozen.plan_id,
                 &validated_plan_hash,
                 &library_root,
                 library_root_id,
-                tx.import_run_id,
+                import_run_id,
                 &album_relative_path,
                 plan_album,
                 &plan_images,
             )
-            .await?
+            .await
         }
         TransactionState::Published | TransactionState::DbCommitting => {
             resume_db_commit(
                 client,
-                &tx,
+                tx,
                 &frozen.plan_id,
                 &validated_plan_hash,
                 &library_root,
                 library_root_id,
-                tx.import_run_id,
+                import_run_id,
                 &album_relative_path,
                 plan_album,
                 &plan_images,
             )
-            .await?
+            .await
         }
         TransactionState::LibraryCommitted | TransactionState::SourceArchiving => {
-            resume_source_archive(client, &tx, &library_root, &album_relative_path).await?
+            resume_source_archive(client, tx, &library_root, &album_relative_path).await
         }
-        TransactionState::CleanupRequired => resume_cleanup(client, &tx, &library_root).await?,
-        _ => {
-            return Ok(RecoveryOutcome {
-                transaction_id,
-                final_state: current.to_string(),
-                recovered: false,
-                message: format!("no recovery action for state {}", current),
-            });
-        }
-    };
-
-    Ok(RecoveryOutcome {
-        transaction_id,
-        final_state: outcome.0,
-        recovered: outcome.1,
-        message: outcome.2,
-    })
+        TransactionState::CleanupRequired => resume_cleanup(client, tx, &library_root).await,
+        _ => Ok((
+            current.to_string(),
+            false,
+            format!("no recovery action for state {}", current),
+        )),
+    }
 }
 
 /// planned/staging: clean .part files, verify reusable staged files, resume
