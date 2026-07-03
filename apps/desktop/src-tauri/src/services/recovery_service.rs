@@ -1069,9 +1069,17 @@ async fn publish_from_staging(
     ImportRepository::update_file_transaction_state(client, tx.id, &published, None).await?;
 
     // Continue to DB commit.
+    let refreshed_tx = ImportRepository::get_file_transaction(client, tx.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "file transaction {} disappeared after publish",
+                tx.id
+            ))
+        })?;
     resume_db_commit(
         client,
-        tx,
+        &refreshed_tx,
         plan_id,
         plan_hash,
         library_root,
@@ -1495,7 +1503,55 @@ async fn resume_db_commit(
         .await?;
 
     // Continue to source archive.
-    resume_source_archive(client, tx, library_root, album_relative_path).await
+    let refreshed_tx = ImportRepository::get_file_transaction(client, tx.id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "file transaction {} disappeared after library commit",
+                tx.id
+            ))
+        })?;
+    resume_source_archive(client, &refreshed_tx, library_root, album_relative_path).await
+}
+
+/// Outcome of [`resolve_archive_entry_transition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchiveEntryAction {
+    /// Proceed with archiving; the transition has been validated and the
+    /// caller should persist the returned state before doing I/O.
+    BeginArchive(TransactionState),
+    /// The transaction is already fully archived; no I/O needed.
+    AlreadyArchived,
+}
+
+/// Decide the correct archive-entry transition from the **real** persisted
+/// transaction state. Pure function — no DB, no filesystem — so it can be
+/// unit-tested in isolation.
+///
+/// | persisted state     | action                          |
+/// |---------------------|---------------------------------|
+/// | `library_committed` | `archive` → `source_archiving`  |
+/// | `source_archiving`  | `retry_archive` → `source_archiving` |
+/// | `source_archived`   | already done (skip)             |
+/// | anything else       | `Err` — illegal for archive entry |
+fn resolve_archive_entry_transition(
+    current: TransactionState,
+) -> Result<ArchiveEntryAction, AppError> {
+    match current {
+        TransactionState::LibraryCommitted => {
+            let next = state_machine::transition_transaction(current, "archive")?;
+            Ok(ArchiveEntryAction::BeginArchive(next))
+        }
+        TransactionState::SourceArchiving => {
+            let next = state_machine::transition_transaction(current, "retry_archive")?;
+            Ok(ArchiveEntryAction::BeginArchive(next))
+        }
+        TransactionState::SourceArchived => Ok(ArchiveEntryAction::AlreadyArchived),
+        other => Err(AppError::Internal(format!(
+            "cannot enter source archive recovery from state '{other}'; \
+             expected library_committed, source_archiving, or source_archived"
+        ))),
+    }
 }
 
 /// library_committed/source_archiving: validate source and archive against
@@ -1534,17 +1590,22 @@ async fn resume_source_archive(
         return Ok((TransactionState::Conflict.to_string(), false, msg));
     }
 
-    // Idempotent: already archived.
-    if matches!(
-        TransactionState::parse(&tx.state),
-        Ok(TransactionState::SourceArchived)
-    ) {
-        return Ok((
-            TransactionState::SourceArchived.to_string(),
-            true,
-            "already archived".to_string(),
-        ));
-    }
+    // Resolve the correct archive-entry transition from the **real** persisted
+    // state. This handles library_committed (fresh archive), source_archiving
+    // (retry after interrupted rename), and source_archived (idempotent skip).
+    let parsed_state = TransactionState::parse(&tx.state)
+        .map_err(|e| AppError::Internal(format!("unparseable tx state '{}': {e}", tx.state)))?;
+    let entry = resolve_archive_entry_transition(parsed_state)?;
+    let archiving = match entry {
+        ArchiveEntryAction::AlreadyArchived => {
+            return Ok((
+                TransactionState::SourceArchived.to_string(),
+                true,
+                "already archived".to_string(),
+            ));
+        }
+        ArchiveEntryAction::BeginArchive(next) => next,
+    };
 
     // The source album root MUST come from the persisted import_albums row,
     // never from plan image parents. Commit and recovery share this rule so
@@ -1606,8 +1667,6 @@ async fn resume_source_archive(
     let source_exists = source_album_dir.exists();
     let archive_exists = archive_dir.exists();
 
-    let archiving =
-        state_machine::transition_transaction(TransactionState::LibraryCommitted, "archive")?;
     ImportRepository::update_file_transaction_state(client, tx.id, &archiving, None).await?;
 
     match (source_exists, archive_exists) {
@@ -1843,6 +1902,54 @@ mod tests {
                 Path::new("/src/AlbumA"),
                 Path::new("/src/albuma")
             ));
+        }
+    }
+
+    #[test]
+    fn archive_entry_from_library_committed() {
+        let action = resolve_archive_entry_transition(TransactionState::LibraryCommitted).unwrap();
+        assert_eq!(
+            action,
+            ArchiveEntryAction::BeginArchive(TransactionState::SourceArchiving)
+        );
+    }
+
+    #[test]
+    fn archive_entry_from_source_archiving_retry() {
+        let action = resolve_archive_entry_transition(TransactionState::SourceArchiving).unwrap();
+        assert_eq!(
+            action,
+            ArchiveEntryAction::BeginArchive(TransactionState::SourceArchiving)
+        );
+    }
+
+    #[test]
+    fn archive_entry_from_source_archived_is_noop() {
+        let action = resolve_archive_entry_transition(TransactionState::SourceArchived).unwrap();
+        assert_eq!(action, ArchiveEntryAction::AlreadyArchived);
+    }
+
+    #[test]
+    fn archive_entry_rejects_illegal_states() {
+        for state in &[
+            TransactionState::Planned,
+            TransactionState::Staging,
+            TransactionState::Verifying,
+            TransactionState::Verified,
+            TransactionState::Publishing,
+            TransactionState::Published,
+            TransactionState::DbCommitting,
+            TransactionState::CleanupRequired,
+            TransactionState::Conflict,
+            TransactionState::Failed,
+            TransactionState::Cancelled,
+        ] {
+            let err = resolve_archive_entry_transition(*state).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("cannot enter source archive recovery"),
+                "unexpected error for {state:?}: {msg}"
+            );
         }
     }
 }

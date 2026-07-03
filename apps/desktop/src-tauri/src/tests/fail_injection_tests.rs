@@ -272,7 +272,7 @@ async fn assert_recovered(pg_manager: Arc<Mutex<PostgresManager>>, library_root:
     };
     let tx_row = client
         .query_one(
-            "SELECT state FROM file_transactions WHERE import_album_id = (
+            "SELECT state, last_error FROM file_transactions WHERE import_album_id = (
                 SELECT id FROM import_albums WHERE source_name = 'album_a' LIMIT 1
             ) ORDER BY started_at DESC LIMIT 1",
             &[],
@@ -280,9 +280,10 @@ async fn assert_recovered(pg_manager: Arc<Mutex<PostgresManager>>, library_root:
         .await
         .unwrap();
     let state: String = tx_row.get(0);
+    let last_error: Option<String> = tx_row.get(1);
     assert_eq!(
         state, "source_archived",
-        "transaction should be fully recovered to source_archived, got {state}"
+        "transaction should be fully recovered to source_archived, got {state}; last_error={last_error:?}"
     );
 
     let publish_dir = library_root.join("Albums").join("album_a");

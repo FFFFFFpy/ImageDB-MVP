@@ -277,6 +277,7 @@ pub fn next_transaction_state(current: &str, action: &str) -> Result<&'static st
         ("db_committing", "retry") => Ok("db_committing"),
         ("library_committed", "retry") => Ok("library_committed"),
         ("source_archiving", "retry") => Ok("source_archiving"),
+        ("source_archiving", "retry_archive") => Ok("source_archiving"),
         ("cleanup_required", "clean") => Ok("cleanup_required"),
         ("cleanup_required", "cleaned") => Ok("source_archived"),
         _ => Err(StateError {
@@ -455,6 +456,37 @@ mod tests {
     fn transaction_invalid_transition() {
         let err = next_transaction_state("planned", "publish").unwrap_err();
         assert!(err.to_string().contains("planned"));
+    }
+
+    #[test]
+    fn transaction_retry_archive_from_source_archiving() {
+        assert_eq!(
+            next_transaction_state("source_archiving", "retry_archive").unwrap(),
+            "source_archiving"
+        );
+        let typed =
+            transition_transaction(TransactionState::SourceArchiving, "retry_archive").unwrap();
+        assert_eq!(typed, TransactionState::SourceArchiving);
+    }
+
+    #[test]
+    fn transaction_retry_archive_rejected_from_other_states() {
+        for state in &[
+            "planned",
+            "staging",
+            "verifying",
+            "verified",
+            "publishing",
+            "published",
+            "db_committing",
+            "library_committed",
+            "source_archived",
+        ] {
+            assert!(
+                next_transaction_state(state, "retry_archive").is_err(),
+                "retry_archive should not be defined from '{state}'"
+            );
+        }
     }
 
     #[test]
