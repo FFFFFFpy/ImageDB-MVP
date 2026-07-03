@@ -1299,13 +1299,13 @@ pub(crate) async fn sync_parent_dir(path: &Path) -> Result<(), AppError> {
     match tokio::fs::File::open(parent).await {
         Ok(dir) => match dir.sync_all().await {
             Ok(()) => Ok(()),
-            Err(e) if is_unsupported_dir_sync(&e) => Ok(()),
+            Err(e) if is_known_unsupported_dir_sync_error(&e) => Ok(()),
             Err(e) => Err(AppError::IoError(format!(
                 "parent directory sync failed for {}: {e}",
                 parent.display()
             ))),
         },
-        Err(e) if is_unsupported_dir_sync(&e) => Ok(()),
+        Err(e) if is_known_unsupported_dir_sync_error(&e) => Ok(()),
         Err(e) => Err(AppError::IoError(format!(
             "cannot open parent directory for sync {}: {e}",
             parent.display()
@@ -1313,11 +1313,45 @@ pub(crate) async fn sync_parent_dir(path: &Path) -> Result<(), AppError> {
     }
 }
 
-fn is_unsupported_dir_sync(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::Unsupported | ErrorKind::PermissionDenied | ErrorKind::Other
-    )
+/// Decide whether an I/O error from opening or `sync_all()`-ing a directory
+/// represents a *known, deterministic* "directory fsync is not supported by
+/// this platform/filesystem" signal that we may safely downgrade to success.
+///
+/// Only `ErrorKind::Unsupported` is accepted unconditionally. Otherwise we
+/// require a `raw_os_error` that is on the platform-specific whitelist of
+/// "invalid request / not supported" codes:
+///
+/// - Windows: `ERROR_INVALID_FUNCTION` (1), `ERROR_NOT_SUPPORTED` (50),
+///   `ERROR_INVALID_PARAMETER` (87).
+/// - Unix-like: `EINVAL` (22), `ENOSYS` (38), `EOPNOTSUPP` (45),
+///   `ENOTSUP` (95).
+///
+/// Every error without a whitelisted OS code (notably `PermissionDenied`,
+/// `NotFound`, `Interrupted`, `TimedOut`, `WouldBlock`, ...) is *not*
+/// downgraded and must propagate as a real `AppError::IoError`, so genuine
+/// network-drive / permission / I/O failures surface to the caller.
+fn is_known_unsupported_dir_sync_error(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    const UNSUPPORTED_DIR_SYNC_RAW_CODES: &[i32] = &[
+        1,  // ERROR_INVALID_FUNCTION
+        50, // ERROR_NOT_SUPPORTED
+        87, // ERROR_INVALID_PARAMETER
+    ];
+    #[cfg(not(windows))]
+    const UNSUPPORTED_DIR_SYNC_RAW_CODES: &[i32] = &[
+        22, // EINVAL
+        38, // ENOSYS
+        45, // EOPNOTSUPP (Linux)
+        95, // ENOTSUP (POSIX / macOS alias on some libcs)
+    ];
+
+    match e.kind() {
+        ErrorKind::Unsupported => true,
+        _ => match e.raw_os_error() {
+            Some(code) => UNSUPPORTED_DIR_SYNC_RAW_CODES.contains(&code),
+            None => false,
+        },
+    }
 }
 
 /// Re-verify the staging file set: every expected file exists, has the right
@@ -2820,5 +2854,94 @@ mod tests {
 
         // Using the album root must accept both.
         assert!(validate_plan_image_sources(&album_root, &imgs).is_ok());
+    }
+
+    // --- is_known_unsupported_dir_sync_error whitelist tests -----------------
+
+    #[cfg(windows)]
+    const DIR_SYNC_WHITELISTED_RAW_CODE: i32 = 87; // ERROR_INVALID_PARAMETER
+    #[cfg(not(windows))]
+    const DIR_SYNC_WHITELISTED_RAW_CODE: i32 = 22; // EINVAL
+    const DIR_SYNC_NON_WHITELISTED_RAW_CODE: i32 = 500; // not on any platform list
+
+    #[test]
+    fn unsupported_kind_downgrades_to_success() {
+        let err = std::io::Error::new(ErrorKind::Unsupported, "dir sync unsupported");
+        assert!(is_known_unsupported_dir_sync_error(&err));
+    }
+
+    #[test]
+    fn permission_denied_is_not_downgraded() {
+        // PermissionDenied used to be swallowed by the old helper; after the
+        // tightening it must propagate so real ACL failures surface.
+        let err = std::io::Error::new(ErrorKind::PermissionDenied, "acl denied");
+        assert!(!is_known_unsupported_dir_sync_error(&err));
+
+        // Same when the OS attached a raw code (e.g. Windows ERROR_ACCESS_DENIED=5).
+        let err_with_raw = std::io::Error::from_raw_os_error(5);
+        assert!(!is_known_unsupported_dir_sync_error(&err_with_raw));
+    }
+
+    #[test]
+    fn other_without_raw_os_error_is_not_downgraded() {
+        // Generic "Other" errors with no OS code are ambiguous and must NOT
+        // be treated as a known unsupported-dir-sync condition.
+        let err = std::io::Error::other("some opaque io failure");
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.raw_os_error().is_none());
+        assert!(!is_known_unsupported_dir_sync_error(&err));
+    }
+
+    #[test]
+    fn other_with_whitelisted_raw_os_error_downgrades() {
+        let err = std::io::Error::from_raw_os_error(DIR_SYNC_WHITELISTED_RAW_CODE);
+        assert!(is_known_unsupported_dir_sync_error(&err));
+    }
+
+    #[test]
+    fn other_with_non_whitelisted_raw_os_error_is_not_downgraded() {
+        let err = std::io::Error::from_raw_os_error(DIR_SYNC_NON_WHITELISTED_RAW_CODE);
+        // 500 is not on any whitelist; regardless of the kind stdlib maps it
+        // to, the helper must refuse to downgrade.
+        assert!(!is_known_unsupported_dir_sync_error(&err));
+    }
+
+    #[test]
+    fn non_whitelisted_kinds_are_not_downgraded() {
+        // Regression: the old helper used to accept any ErrorKind::Other,
+        // which included every error the OS couldn't classify. Now only
+        // explicitly supported kinds / codes are accepted.
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::BrokenPipe,
+        ] {
+            let err = std::io::Error::new(kind, "x");
+            assert!(
+                !is_known_unsupported_dir_sync_error(&err),
+                "kind {kind:?} should not downgrade"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_parent_dir_propagates_io_error_for_missing_parent() {
+        // A path whose parent does not exist must surface as AppError::IoError;
+        // it must NOT be silently swallowed as "unsupported dir sync".
+        let bogus =
+            std::path::PathBuf::from("__nonexistent_dir_imagedb_unit_test__/missing_child.bin");
+        let result = sync_parent_dir(&bogus).await;
+        let err = result.expect_err("expected IoError for missing parent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("io error"),
+            "expected AppError::IoError, got: {msg}"
+        );
+        assert!(
+            msg.contains("cannot open parent directory for sync"),
+            "unexpected error message: {msg}"
+        );
     }
 }
