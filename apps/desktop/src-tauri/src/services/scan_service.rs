@@ -777,15 +777,13 @@ pub async fn run_scan(
         }
     }
 
-    // Phase 3: Indexed historical library matching (no N×M full scan).
+    // Phase 2b: Cross-album exact duplicate detection within this run.
     //
-    // Instead of loading ALL library images and comparing each import image
-    // against each library image (N×M), we:
-    // 1. Batch query library images by BLAKE3 (indexed exact match).
-    // 2. Batch query library images by pixel_hash (indexed exact match).
-    // 3. For perceptual matching, query by perceptual band (bucketed recall).
-
-    // Collect all BLAKE3 hashes from import images.
+    // Two images in different albums of the same run can be exact duplicates.
+    // We batch-query all import images in this run sharing any BLAKE3 hash,
+    // then form duplicate candidate edges between images whose albums differ.
+    // The result is order-independent (candidates are deduplicated by the
+    // normalized-pair unique index from migration 0006).
     let all_blake3: Vec<Vec<u8>> = all_album_images
         .iter()
         .filter_map(|e| {
@@ -796,117 +794,47 @@ pub async fn run_scan(
             }
         })
         .collect();
-
-    // 1. Batch BLAKE3 exact match against library.
     if !all_blake3.is_empty() {
-        let matched_library =
-            ImportRepository::find_library_images_by_blake3(&client, &all_blake3).await?;
-
-        let mut blake3_to_lib: std::collections::HashMap<Vec<u8>, Vec<LibraryImageRow>> =
-            std::collections::HashMap::new();
-        for lib in &matched_library {
-            blake3_to_lib
-                .entry(lib.blake3.clone())
-                .or_default()
-                .push(lib.clone());
-        }
-
-        for entry in &all_album_images {
-            if cancelled.load(Ordering::Relaxed) {
-                break;
+        let siblings =
+            ImportRepository::find_sibling_images_by_blake3(&client, import_run_id, &all_blake3)
+                .await?;
+        if !siblings.is_empty() {
+            // Map blake3 -> list of (image_id, album_id, file_size) so we can
+            // pair every two distinct images that share a hash.
+            let mut by_hash: std::collections::HashMap<Vec<u8>, Vec<(Uuid, Uuid, i64)>> =
+                std::collections::HashMap::new();
+            for (id, album_id, file_size, b3) in &siblings {
+                by_hash
+                    .entry(b3.clone())
+                    .or_default()
+                    .push((*id, *album_id, *file_size));
             }
-            if let Some(libs) = blake3_to_lib.get(&entry.fp.blake3_bytes) {
-                for lib in libs {
-                    let pixel_exact = lib
-                        .pixel_hash
-                        .as_ref()
-                        .map(|ph| *ph == entry.fp.pixel_hash_bytes)
-                        .unwrap_or(false);
-
-                    ImportRepository::insert_duplicate_candidate(
-                        &client,
-                        NewDuplicateCandidate {
-                            import_run_id,
-                            source_image_id: entry.image_db_id,
-                            candidate_source_image_id: None,
-                            candidate_library_image_id: Some(lib.id),
-                            scope: DuplicateScope::Library,
-                            match_type: MatchType::FileExact,
-                            blake3_equal: true,
-                            pixel_hash_equal: pixel_exact,
-                            gradient_distance: None,
-                            block_distance: None,
-                            median_distance: None,
-                            transform_type: None,
-                            confidence: Some(1.0),
-                            decision: Some(Decision::AutoDuplicate),
-                            decision_source: Some(DecisionSource::ExactRule),
-                        },
-                    )
-                    .await?;
-                    duplicate_count += 1;
-                    progress.duplicate_count = duplicate_count;
-                    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
-                }
-            }
-        }
-    }
-
-    // 2. Perceptual matching via band-based recall (bounded candidates).
-    let max_perceptual_candidates: usize = 50;
-    for entry in &all_album_images {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        let bands = compute_perceptual_bands(&entry.fp);
-        let mut recalled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-
-        for (band_idx, band_val) in bands.iter().enumerate() {
-            if band_val.is_empty() {
-                continue;
-            }
-            let candidates = ImportRepository::find_library_images_by_perceptual_band(
-                &client,
-                band_idx as u8,
-                band_val,
-                max_perceptual_candidates,
-            )
-            .await?;
-            for lib in candidates {
-                if recalled.contains(&lib.id) {
-                    continue;
-                }
-                recalled.insert(lib.id);
-
-                let lib_hex = PerceptualHex::from_bytes(
-                    &lib.gradient_hash,
-                    &lib.block_hash,
-                    &lib.median_hash,
-                );
-                if let Some(lib_hex) = lib_hex {
-                    if let Some(evidence) =
-                        compare_perceptual_library(&entry.fp, &lib_hex, thresholds)
-                    {
-                        let (match_type, decision, source) =
-                            classify_perceptual(&evidence, thresholds);
+            for (_hash, group) in by_hash.iter() {
+                for i in 0..group.len() {
+                    for j in (i + 1)..group.len() {
+                        let (a_id, a_album, _) = group[i];
+                        let (b_id, b_album, _) = group[j];
+                        if a_album == b_album {
+                            continue; // intra-album already handled above
+                        }
                         ImportRepository::insert_duplicate_candidate(
                             &client,
                             NewDuplicateCandidate {
                                 import_run_id,
-                                source_image_id: entry.image_db_id,
-                                candidate_source_image_id: None,
-                                candidate_library_image_id: Some(lib.id),
-                                scope: DuplicateScope::Library,
-                                match_type,
-                                blake3_equal: false,
+                                source_image_id: a_id,
+                                candidate_source_image_id: Some(b_id),
+                                candidate_library_image_id: None,
+                                scope: DuplicateScope::CrossAlbum,
+                                match_type: MatchType::FileExact,
+                                blake3_equal: true,
                                 pixel_hash_equal: false,
-                                gradient_distance: Some(evidence.gradient_distance),
-                                block_distance: Some(evidence.block_distance),
-                                median_distance: Some(evidence.median_distance),
-                                transform_type: Some(evidence.transform_type.to_string()),
-                                confidence: Some(evidence.confidence),
-                                decision,
-                                decision_source: source,
+                                gradient_distance: None,
+                                block_distance: None,
+                                median_distance: None,
+                                transform_type: None,
+                                confidence: Some(1.0),
+                                decision: Some(Decision::AutoDuplicate),
+                                decision_source: Some(DecisionSource::ExactRule),
                             },
                         )
                         .await?;
@@ -919,6 +847,164 @@ pub async fn run_scan(
         }
     }
 
+    // Phase 3: Indexed historical library matching (no N×M full scan).
+    //
+    // Instead of loading ALL library images and comparing each import image
+    // against each library image (N×M), we:
+    // 1. Batch query library images by BLAKE3 (indexed exact match).
+    // 2. Batch query library images by pixel_hash (indexed exact match).
+    // 3. For perceptual matching, query by perceptual band (bucketed recall).
+
+    // 1. Batch BLAKE3 exact match against library.
+    //
+    // Rule: a library query failure must fail the run, NOT silently behave
+    // as an empty library. We wrap the library-matching phase so any DB error
+    // marks the run FAILED with a real error code before propagating.
+    let library_match: Result<(), AppError> = async {
+        if !all_blake3.is_empty() {
+            let matched_library =
+                ImportRepository::find_library_images_by_blake3(&client, &all_blake3).await?;
+
+            let mut blake3_to_lib: std::collections::HashMap<Vec<u8>, Vec<LibraryImageRow>> =
+                std::collections::HashMap::new();
+            for lib in &matched_library {
+                blake3_to_lib
+                    .entry(lib.blake3.clone())
+                    .or_default()
+                    .push(lib.clone());
+            }
+
+            for entry in &all_album_images {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(libs) = blake3_to_lib.get(&entry.fp.blake3_bytes) {
+                    for lib in libs {
+                        let pixel_exact = lib
+                            .pixel_hash
+                            .as_ref()
+                            .map(|ph| *ph == entry.fp.pixel_hash_bytes)
+                            .unwrap_or(false);
+
+                        ImportRepository::insert_duplicate_candidate(
+                            &client,
+                            NewDuplicateCandidate {
+                                import_run_id,
+                                source_image_id: entry.image_db_id,
+                                candidate_source_image_id: None,
+                                candidate_library_image_id: Some(lib.id),
+                                scope: DuplicateScope::Library,
+                                match_type: MatchType::FileExact,
+                                blake3_equal: true,
+                                pixel_hash_equal: pixel_exact,
+                                gradient_distance: None,
+                                block_distance: None,
+                                median_distance: None,
+                                transform_type: None,
+                                confidence: Some(1.0),
+                                decision: Some(Decision::AutoDuplicate),
+                                decision_source: Some(DecisionSource::ExactRule),
+                            },
+                        )
+                        .await?;
+                        duplicate_count += 1;
+                        progress.duplicate_count = duplicate_count;
+                        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                    }
+                }
+            }
+        }
+
+        // 2. Perceptual matching via band-based recall (bounded candidates).
+        let max_perceptual_candidates: usize = 50;
+        for entry in &all_album_images {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            let bands = compute_perceptual_bands(&entry.fp);
+            let mut recalled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+            for (band_idx, band_val) in bands.iter().enumerate() {
+                if band_val.is_empty() {
+                    continue;
+                }
+                let candidates = ImportRepository::find_library_images_by_perceptual_band(
+                    &client,
+                    band_idx as u8,
+                    band_val,
+                    max_perceptual_candidates,
+                )
+                .await?;
+                for lib in candidates {
+                    if recalled.contains(&lib.id) {
+                        continue;
+                    }
+                    recalled.insert(lib.id);
+
+                    let lib_hex = PerceptualHex::from_bytes(
+                        &lib.gradient_hash,
+                        &lib.block_hash,
+                        &lib.median_hash,
+                    );
+                    if let Some(lib_hex) = lib_hex {
+                        if let Some(evidence) =
+                            compare_perceptual_library(&entry.fp, &lib_hex, thresholds)
+                        {
+                            let (match_type, decision, source) =
+                                classify_perceptual(&evidence, thresholds);
+                            ImportRepository::insert_duplicate_candidate(
+                                &client,
+                                NewDuplicateCandidate {
+                                    import_run_id,
+                                    source_image_id: entry.image_db_id,
+                                    candidate_source_image_id: None,
+                                    candidate_library_image_id: Some(lib.id),
+                                    scope: DuplicateScope::Library,
+                                    match_type,
+                                    blake3_equal: false,
+                                    pixel_hash_equal: false,
+                                    gradient_distance: Some(evidence.gradient_distance),
+                                    block_distance: Some(evidence.block_distance),
+                                    median_distance: Some(evidence.median_distance),
+                                    transform_type: Some(evidence.transform_type.to_string()),
+                                    confidence: Some(evidence.confidence),
+                                    decision,
+                                    decision_source: source,
+                                },
+                            )
+                            .await?;
+                            duplicate_count += 1;
+                            progress.duplicate_count = duplicate_count;
+                            emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = library_match {
+        // Fail-stop: a library read failure must never look like "no matches".
+        ImportRepository::update_import_run_error(
+            &client,
+            import_run_id,
+            "LIBRARY_MATCH_FAILED",
+            &e.to_string(),
+        )
+        .await?;
+        progress.state = "failed".to_string();
+        progress.current_stage = "failed".to_string();
+        progress.errors.push(e.to_string());
+        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+        handle.abort();
+        return Ok(ScanProgress {
+            state: "failed".to_string(),
+            ..ScanProgress::idle()
+        });
+    }
+
     let statistics = serde_json::json!({
         "total_albums": progress.total_albums,
         "total_images": total_images,
@@ -926,20 +1012,29 @@ pub async fn run_scan(
         "error_count": errors.len(),
     });
     ImportRepository::update_import_run_statistics(&client, import_run_id, &statistics).await?;
-    ImportRepository::update_import_run_state(&client, import_run_id, &ImportRunState::Completed)
-        .await?;
 
-    progress.state = "completed".to_string();
-    progress.current_stage = "completed".to_string();
+    // Determine post-scan state: if any undecided duplicate candidates remain,
+    // the run needs review; otherwise it is ready to commit. The run is NOT
+    // marked Completed here — completion happens after commit + archive.
+    let review_progress = ImportRepository::get_review_progress(&client, import_run_id).await?;
+    let final_run_state = if review_progress.total > review_progress.decided {
+        ImportRunState::ReviewRequired
+    } else {
+        ImportRunState::ReadyToCommit
+    };
+    ImportRepository::update_import_run_state(&client, import_run_id, &final_run_state).await?;
+
+    progress.state = final_run_state.to_string();
+    progress.current_stage = final_run_state.to_string();
     progress.current_album = None;
     emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
 
     handle.abort();
 
     Ok(ScanProgress {
-        state: "completed".to_string(),
+        state: final_run_state.to_string(),
         import_run_id: Some(import_run_id.to_string()),
-        current_stage: "completed".to_string(),
+        current_stage: final_run_state.to_string(),
         current_album: None,
         processed_images: total_images,
         total_albums: progress.total_albums,

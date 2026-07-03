@@ -151,36 +151,72 @@ pub fn build_duplicate_groups(edges: &[DuplicateEdge]) -> Vec<DuplicateGroup> {
 /// Select a representative from a group of indices.
 ///
 /// Rules (in order of priority):
-/// 1. Prefer import images over library images (library images can't be "kept" in import).
-/// 2. Prefer decodable images over non-decodable.
-/// 3. For byte-identical images, use stable ID (lowest UUID) as tiebreaker.
-/// 4. For non-byte-identical, prefer higher quality (larger file size).
-/// 5. If quality difference is insufficient (within 10%), fall back to stable ID.
+/// 1. Prefer library (historical) images over new import images. When a new
+///    import image duplicates an existing library image, the library image is
+///    the "already-present" representative and the new import image is the one
+///    excluded. (This is the opposite of the original behavior, which kept the
+///    import image.)
+/// 2. Among images of the same kind, prefer byte-identical (blake3_equal)
+///    over perceptually-similar.
+/// 3. Use the stable lowest UUID as the final tiebreaker. This is
+///    deterministic and independent of input order, scan order, or candidate
+///    generation order.
+///
+/// Quality-based representative selection is intentionally NOT performed here:
+/// the duplicate-group builder receives only edge metadata (blake3/pixel
+/// equality, confidence), not reliable per-image quality data. Claims about
+/// quality-driven selection belong in the review layer, not here.
 fn select_representative(
     indices: &[usize],
     idx_is_import: &[bool],
-    _edges: &[DuplicateEdge],
+    edges: &[DuplicateEdge],
     id_to_idx: &HashMap<Uuid, usize>,
 ) -> usize {
-    // Rule 1: Prefer import images.
-    let import_indices: Vec<usize> = indices
+    // Rule 1: Prefer library images over import images.
+    let library_indices: Vec<usize> = indices
         .iter()
         .copied()
-        .filter(|&i| idx_is_import[i])
+        .filter(|&i| !idx_is_import[i])
         .collect();
-    let candidates: Vec<usize> = if import_indices.is_empty() {
+    let candidates: Vec<usize> = if library_indices.is_empty() {
+        // No library image in this group — fall back to import images.
         indices.to_vec()
     } else {
-        import_indices
+        library_indices
     };
 
     if candidates.len() == 1 {
         return candidates[0];
     }
 
-    // Rule 3: Use stable ID (lowest UUID) as tiebreaker.
-    // This is deterministic and independent of input order.
-    *candidates
+    // Rule 2: among same-kind candidates, prefer those that are
+    // byte-identical to at least one other image in the group.
+    let byte_identical: std::collections::HashSet<usize> = edges
+        .iter()
+        .filter(|e| e.blake3_equal)
+        .flat_map(|e| {
+            let a = id_to_idx.get(&e.image_a).copied();
+            let b = id_to_idx.get(&e.image_b).copied();
+            [a, b].into_iter().flatten()
+        })
+        .collect();
+    let has_byte_identical = candidates.iter().any(|i| byte_identical.contains(i));
+    let narrowed: Vec<usize> = if has_byte_identical {
+        candidates
+            .iter()
+            .copied()
+            .filter(|i| byte_identical.contains(i))
+            .collect()
+    } else {
+        candidates
+    };
+
+    if narrowed.len() == 1 {
+        return narrowed[0];
+    }
+
+    // Rule 3: stable lowest UUID tiebreaker (deterministic, order-independent).
+    *narrowed
         .iter()
         .min_by_key(|&&idx| idx_to_id(idx, id_to_idx))
         .unwrap()
@@ -314,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn library_image_not_preferred_as_representative() {
+    fn library_image_preferred_as_representative() {
         let import_img = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let lib_img = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
         let edges = vec![DuplicateEdge {
@@ -329,8 +365,43 @@ mod tests {
 
         let groups = build_duplicate_groups(&edges);
         assert_eq!(groups.len(), 1);
-        // Import image should be the representative.
-        assert_eq!(groups[0].representative_id, import_img);
-        assert!(groups[0].representative_is_import);
+        // Library (historical) image must be the representative; the new
+        // import image is the one excluded.
+        assert_eq!(groups[0].representative_id, lib_img);
+        assert!(!groups[0].representative_is_import);
+
+        // The excluded set must contain the import image, not the library one.
+        let excluded = compute_excluded_ids(&groups);
+        assert!(excluded.contains(&import_img));
+        assert!(!excluded.contains(&lib_img));
+    }
+
+    #[test]
+    fn library_image_representative_with_higher_import_uuid() {
+        // Even when the import image has a lower UUID, the library image wins.
+        let import_img = Uuid::parse_str("00000000-0000-0000-0000-000000000009").unwrap();
+        let lib_img = Uuid::parse_str("00000000-0000-0000-0000-0000000000ff").unwrap();
+        let edges = vec![DuplicateEdge {
+            image_a: import_img,
+            image_b: lib_img,
+            a_is_import: true,
+            b_is_import: false,
+            confidence: 1.0,
+            blake3_equal: true,
+            pixel_hash_equal: true,
+        }];
+        let groups = build_duplicate_groups(&edges);
+        assert_eq!(groups[0].representative_id, lib_img);
+    }
+
+    #[test]
+    fn intra_album_pair_keeps_lowest_uuid() {
+        // Two import images (intra-album): no library image, so the stable
+        // lowest UUID wins.
+        let a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let edges = vec![make_edge(a, b, true, 1.0)];
+        let groups = build_duplicate_groups(&edges);
+        assert_eq!(groups[0].representative_id, a);
     }
 }
