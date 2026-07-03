@@ -1,8 +1,11 @@
 # Current Task
 
-Executing: tasks/06-recovery.md
+Executing: tasks/07-external-postgres.md
 
-Once this task passes all acceptance criteria, update this file to point to the next task.
+The M5/M6 core fix and refactor on branch `core_fix_m5_m6_refactor` is
+complete. All 12 phases landed, verified against real PostgreSQL + the
+real filesystem, and committed locally (no push). See
+reports/core-fix-M5-M6-final.md for the final report.
 
 > Milestone 0 technical probe prototype is complete. Report: reports/milestone-0.md.
 > Milestone 0 validates the technology stack integration (React + Tauri + Rust + image fingerprinting + file transaction safety).
@@ -11,4 +14,4 @@ Once this task passes all acceptance criteria, update this file to point to the 
 > Milestone 2 scan and exact duplicate detection is complete. Report: reports/milestone-2.md.
 > Milestone 3 perceptual similarity detection is complete. Report: reports/milestone-3.md.
 > Milestone 4 human review GUI is complete. Report: reports/milestone-4.md.
-> Milestone 5 formal import loop is complete. Report: reports/milestone-5.md.
+> Milestone 5 formal import loop is complete (re-verified during the core fix). Report: reports/milestone-5.md.
