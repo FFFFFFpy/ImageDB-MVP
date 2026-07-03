@@ -530,7 +530,7 @@ pub(crate) fn compute_plan_hash(frozen: &FrozenPlanRow) -> Result<Vec<u8>, AppEr
 }
 
 /// Compare two paths case-insensitively on Windows and exactly elsewhere.
-fn path_eq(a: &Path, b: &Path) -> bool {
+pub(crate) fn path_eq(a: &Path, b: &Path) -> bool {
     if cfg!(target_os = "windows") {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
@@ -910,59 +910,71 @@ async fn commit_single_album(
     maybe_fault(CommitFaultPoint::AfterDbCommit, "after DB commit")?;
 
     // ── Phase 6: source archive (separate recoverable stage). ──
-    let source_dir = Path::new(&images[0].source_path)
+    // The source album root MUST come from the persisted import_albums row,
+    // never from images[0].source_path.parent(). This keeps commit and
+    // recovery aligned on one authoritative path and correctly handles
+    // albums whose plan images span multiple subdirectories.
+    let import_album = ImportRepository::get_import_album_by_id(client, plan_album.import_album_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "import_album {} missing; cannot determine source album directory",
+                plan_album.import_album_id
+            ))
+        })?;
+    if import_album.source_path.is_empty() {
+        return Err(AppError::Internal(format!(
+            "import_album {} has empty source_path",
+            plan_album.import_album_id
+        )));
+    }
+    let source_album_dir = PathBuf::from(&import_album.source_path);
+
+    validate_plan_image_sources(&source_album_dir, &images)?;
+
+    let archive_base = source_album_dir
         .parent()
-        .map(PathBuf::from);
-    if let Some(source_album_dir) = source_dir {
-        if source_album_dir.exists() {
-            #[cfg(feature = "fail-injection")]
-            maybe_fault(
-                CommitFaultPoint::BeforeSourceArchive,
-                "before source archive",
-            )?;
+        .unwrap_or_else(|| Path::new("."))
+        .join(".imagedb-processed");
+    let archive_dir = archive_base
+        .join(tx_id.to_string())
+        .join(&album_relative_path);
 
-            let archive_base = source_album_dir
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(".imagedb-processed");
-            let archive_dir = archive_base
-                .join(tx_id.to_string())
-                .join(&album_relative_path);
+    if source_album_dir.exists() {
+        #[cfg(feature = "fail-injection")]
+        maybe_fault(
+            CommitFaultPoint::BeforeSourceArchive,
+            "before source archive",
+        )?;
 
-            let archiving = state_machine::transition_transaction(
-                TransactionState::LibraryCommitted,
-                "archive",
-            )?;
-            ImportRepository::update_file_transaction_state(client, tx_id, &archiving, None)
-                .await?;
+        let archiving =
+            state_machine::transition_transaction(TransactionState::LibraryCommitted, "archive")?;
+        ImportRepository::update_file_transaction_state(client, tx_id, &archiving, None).await?;
 
-            if archive_dir.exists() {
-                return Err(AppError::Internal(format!(
-                    "archive target already exists: {}",
-                    archive_dir.display()
-                )));
-            }
-            tokio::fs::create_dir_all(archive_dir.parent().unwrap())
-                .await
-                .map_err(|e| AppError::IoError(format!("cannot create archive base dir: {e}")))?;
-
-            #[cfg(feature = "fail-injection")]
-            maybe_fault(
-                CommitFaultPoint::DuringSourceArchive,
-                "during source archive",
-            )?;
-
-            tokio::fs::rename(&source_album_dir, &archive_dir)
-                .await
-                .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
-            sync_parent_dir(&archive_dir).await?;
-
-            let archived = state_machine::transition_transaction(
-                TransactionState::SourceArchiving,
-                "archived",
-            )?;
-            ImportRepository::update_file_transaction_state(client, tx_id, &archived, None).await?;
+        if archive_dir.exists() {
+            return Err(AppError::Internal(format!(
+                "archive target already exists: {}",
+                archive_dir.display()
+            )));
         }
+        tokio::fs::create_dir_all(archive_dir.parent().unwrap())
+            .await
+            .map_err(|e| AppError::IoError(format!("cannot create archive base dir: {e}")))?;
+
+        #[cfg(feature = "fail-injection")]
+        maybe_fault(
+            CommitFaultPoint::DuringSourceArchive,
+            "during source archive",
+        )?;
+
+        tokio::fs::rename(&source_album_dir, &archive_dir)
+            .await
+            .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
+        sync_parent_dir(&archive_dir).await?;
+
+        let archived =
+            state_machine::transition_transaction(TransactionState::SourceArchiving, "archived")?;
+        ImportRepository::update_file_transaction_state(client, tx_id, &archived, None).await?;
     }
 
     // Best-effort staging cleanup. A failure here leaves cleanup_required but
@@ -1133,6 +1145,54 @@ pub(crate) async fn verify_staging_set(
                 staged.display(),
                 bytes_to_hex(&img.expected_blake3),
                 bytes_to_hex(&actual)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that every plan image whose source_path still exists on disk
+/// resolves to a location inside `source_album_dir`. The source_album_dir is
+/// the authoritative album root (read from `import_albums.source_path`) and
+/// must NOT be re-derived from an image's parent.
+///
+/// Canonicalization is used when paths exist to resolve symlinks and
+/// case-mismatched Windows paths; a source whose canonicalization fails is
+/// rejected because we cannot trust it, while a source that does not exist
+/// at all is tolerated (the archive-only branch does not need it).
+pub(crate) fn validate_plan_image_sources(
+    source_album_dir: &Path,
+    plan_images: &[PlanImageRow],
+) -> Result<(), AppError> {
+    let canonical_root = if source_album_dir.exists() {
+        source_album_dir.canonicalize().map_err(|e| {
+            AppError::IoError(format!(
+                "cannot canonicalize source album dir {}: {e}",
+                source_album_dir.display()
+            ))
+        })?
+    } else {
+        source_album_dir.to_path_buf()
+    };
+
+    for img in plan_images {
+        let src = Path::new(&img.source_path);
+        if !src.exists() {
+            continue;
+        }
+        let canonical_src = src.canonicalize().map_err(|e| {
+            AppError::IoError(format!(
+                "cannot canonicalize source path {}: {e}",
+                src.display()
+            ))
+        })?;
+        if !canonical_src.starts_with(&canonical_root) {
+            return Err(AppError::Internal(format!(
+                "plan image source '{}' escapes source album root '{}' (resolved '{}' not under '{}')",
+                img.source_path,
+                source_album_dir.display(),
+                canonical_src.display(),
+                canonical_root.display()
             )));
         }
     }
@@ -2168,5 +2228,135 @@ mod tests {
         assert!(verify_dir_against_plan(tmp.path(), "album", &imgs)
             .await
             .is_err());
+    }
+
+    /// Album root = tmp/AlbumA; plan images live in AlbumA/chapter-1 and
+    /// AlbumA/chapter-2. Because both paths canonicalize under the album
+    /// root, the distinct subdirectories must not conflict.
+    #[tokio::test]
+    async fn validate_plan_image_sources_subdirs_ok() {
+        let tmp = TempDir::new().unwrap();
+        let album_root = tmp.path().join("AlbumA");
+        std::fs::create_dir_all(album_root.join("chapter-1")).unwrap();
+        std::fs::create_dir_all(album_root.join("chapter-2")).unwrap();
+        std::fs::write(album_root.join("chapter-1/001.jpg"), b"a").unwrap();
+        std::fs::write(album_root.join("chapter-2/002.jpg"), b"b").unwrap();
+
+        let imgs = vec![
+            plan_image_full(
+                &album_root.join("chapter-1/001.jpg").display().to_string(),
+                "AlbumA/chapter-1/001.jpg",
+                1,
+                blake3::hash(b"a").as_bytes(),
+            ),
+            plan_image_full(
+                &album_root.join("chapter-2/002.jpg").display().to_string(),
+                "AlbumA/chapter-2/002.jpg",
+                1,
+                blake3::hash(b"b").as_bytes(),
+            ),
+        ];
+        assert!(validate_plan_image_sources(&album_root, &imgs).is_ok());
+    }
+
+    /// A source that resolves outside the album root is rejected even when
+    /// the file exists on disk — this is the security property that
+    /// prevents a forged plan image from pulling in an unrelated file.
+    #[tokio::test]
+    async fn validate_plan_image_sources_escapes_root_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let album_root = tmp.path().join("AlbumA");
+        let outside = tmp.path().join("Outside");
+        std::fs::create_dir_all(&album_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(album_root.join("ok.png"), b"x").unwrap();
+        std::fs::write(outside.join("evil.png"), b"y").unwrap();
+
+        let imgs = vec![
+            plan_image_full(
+                &album_root.join("ok.png").display().to_string(),
+                "AlbumA/ok.png",
+                1,
+                blake3::hash(b"x").as_bytes(),
+            ),
+            plan_image_full(
+                &outside.join("evil.png").display().to_string(),
+                "AlbumA/evil.png",
+                1,
+                blake3::hash(b"y").as_bytes(),
+            ),
+        ];
+        let err = validate_plan_image_sources(&album_root, &imgs)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("escapes"),
+            "expected escapes-root error, got: {err}"
+        );
+    }
+
+    /// Archive-only recovery: the source album root no longer exists, and
+    /// neither do any source files. validate_plan_image_sources must still
+    /// succeed because the archive branch computes its location without
+    /// canonicalizing the source.
+    #[tokio::test]
+    async fn validate_plan_image_sources_all_missing_ok() {
+        let tmp = TempDir::new().unwrap();
+        let album_root = tmp.path().join("gone");
+        let imgs = vec![
+            plan_image_full(
+                &album_root.join("chapter-1/001.jpg").display().to_string(),
+                "AlbumA/chapter-1/001.jpg",
+                1,
+                &[0u8; 32],
+            ),
+            plan_image_full(
+                &album_root.join("chapter-2/002.jpg").display().to_string(),
+                "AlbumA/chapter-2/002.jpg",
+                1,
+                &[0u8; 32],
+            ),
+        ];
+        assert!(validate_plan_image_sources(&album_root, &imgs).is_ok());
+    }
+
+    /// Album root is the parent of both subdirectories — verify that the
+    /// album root (not a subdirectory parent) is the accepted containment
+    /// boundary. Previously, derive_source_album_dir would have rejected
+    /// this because chapter-1 and chapter-2 are distinct parents.
+    #[tokio::test]
+    async fn validate_plan_image_sources_distinct_subdirs_share_root() {
+        let tmp = TempDir::new().unwrap();
+        let album_root = tmp.path().join("AlbumA");
+        std::fs::create_dir_all(album_root.join("chapter-1")).unwrap();
+        std::fs::create_dir_all(album_root.join("chapter-2")).unwrap();
+        std::fs::write(album_root.join("chapter-1/001.jpg"), b"a").unwrap();
+        std::fs::write(album_root.join("chapter-2/002.jpg"), b"b").unwrap();
+
+        let imgs = vec![
+            plan_image_full(
+                &album_root.join("chapter-1/001.jpg").display().to_string(),
+                "AlbumA/chapter-1/001.jpg",
+                1,
+                blake3::hash(b"a").as_bytes(),
+            ),
+            plan_image_full(
+                &album_root.join("chapter-2/002.jpg").display().to_string(),
+                "AlbumA/chapter-2/002.jpg",
+                1,
+                blake3::hash(b"b").as_bytes(),
+            ),
+        ];
+        // Using a chapter subdir as the root must reject, because the
+        // other image escapes that subdir — proving that the album root
+        // (AlbumA) is the single accepted authority.
+        let chapter1_root = album_root.join("chapter-1");
+        let err = validate_plan_image_sources(&chapter1_root, &imgs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "expected escape error, got: {err}");
+
+        // Using the album root must accept both.
+        assert!(validate_plan_image_sources(&album_root, &imgs).is_ok());
     }
 }

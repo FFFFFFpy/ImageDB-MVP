@@ -20,8 +20,9 @@ use crate::repositories::import_repository::{
 };
 use crate::services::commit_service::{
     build_manifest, commit_library_records_transaction, normalize_relative_path, read_manifest,
-    stream_copy_with_hash, sync_parent_dir, validate_and_hash_frozen_plan, verify_dir_against_plan,
-    verify_staging_set, write_synced_then_rename,
+    stream_copy_with_hash, sync_parent_dir, validate_and_hash_frozen_plan,
+    validate_plan_image_sources, verify_dir_against_plan, verify_staging_set,
+    write_synced_then_rename,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -948,24 +949,55 @@ async fn resume_source_archive(
         ));
     }
 
-    // Derive the source album dir from the plan images. We cannot infer a
-    // reliable source location when plan_images is empty or the images span
-    // multiple parents, so surface those as conflicts rather than guessing.
-    let source_album_dir = match derive_source_album_dir(plan_images)? {
-        Some(d) => d,
-        None => {
-            let msg = "cannot derive source album directory from frozen plan".to_string();
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx.id,
-                &TransactionState::Conflict,
-                Some(&msg),
-            )
-            .await?;
-            return Ok((TransactionState::Conflict.to_string(), false, msg));
-        }
-    };
+    // The source album root MUST come from the persisted import_albums row,
+    // never from plan image parents. Commit and recovery share this rule so
+    // the archive location is computed identically in both code paths.
+    let import_album = ImportRepository::get_import_album_by_id(client, tx.import_album_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "import_album {} missing during recovery; cannot determine source album directory",
+                tx.import_album_id
+            ))
+        })?;
+    if import_album.source_path.is_empty() {
+        let msg = format!(
+            "import_album {} has empty source_path; cannot archive",
+            tx.import_album_id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    let source_album_dir = PathBuf::from(&import_album.source_path);
 
+    // Validate that every plan image whose source still exists on disk
+    // resolves inside the canonicalized source_album_dir. Subdirectories
+    // within the album (e.g. AlbumA/chapter-1, AlbumA/chapter-2) are
+    // allowed; only sources that escape the album root are rejected.
+    if let Err(e) = validate_plan_image_sources(&source_album_dir, plan_images) {
+        let msg = format!(
+            "plan image source escapes source album root '{}': {e}",
+            source_album_dir.display()
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+
+    // Archive location is derived from the persisted source_album_dir, not
+    // from any image path, so it remains computable even when the source
+    // has already been moved (archive-only recovery).
     let archive_base = source_album_dir
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -1084,28 +1116,6 @@ async fn resume_source_archive(
     }
 }
 
-/// Derive the source album directory from the frozen plan images. Returns
-/// None if plan_images is empty or images span multiple parent directories.
-fn derive_source_album_dir(plan_images: &[PlanImageRow]) -> Result<Option<PathBuf>, AppError> {
-    let Some(first) = plan_images.first() else {
-        return Ok(None);
-    };
-    let Some(first_parent) = Path::new(&first.source_path).parent().map(PathBuf::from) else {
-        return Ok(None);
-    };
-    for img in &plan_images[1..] {
-        let parent = Path::new(&img.source_path).parent().map(PathBuf::from);
-        if parent.as_ref() != Some(&first_parent) {
-            return Err(AppError::Internal(format!(
-                "plan images span multiple source parents ({} and {:?}); refusing to archive",
-                first_parent.display(),
-                parent
-            )));
-        }
-    }
-    Ok(Some(first_parent))
-}
-
 /// cleanup_required: remove only this transaction's staging dir. Failures
 /// preserve the state + error.
 async fn resume_cleanup(
@@ -1148,13 +1158,13 @@ async fn resume_cleanup(
 mod tests {
     use super::*;
 
-    fn img(source_path: &str, target_rel: &str) -> PlanImageRow {
+    fn img(source_path: &str, source_rel: &str, target_rel: &str) -> PlanImageRow {
         PlanImageRow {
             id: Uuid::new_v4(),
             plan_album_id: Uuid::new_v4(),
             import_image_id: Uuid::new_v4(),
             source_path: source_path.to_string(),
-            source_relative_path: target_rel.to_string(),
+            source_relative_path: source_rel.to_string(),
             target_relative_path: target_rel.to_string(),
             expected_file_size: 1,
             expected_blake3: vec![0; 32],
@@ -1164,36 +1174,70 @@ mod tests {
         }
     }
 
+    /// Archive location is derived purely from the persisted
+    /// import_albums.source_path plus the tx id and album relative path —
+    /// never from plan image parents. This keeps commit and recovery in
+    /// lockstep and makes archive-only recovery (source already moved)
+    /// possible.
     #[test]
-    fn derive_source_album_dir_empty_returns_none() {
-        let out = derive_source_album_dir(&[]).unwrap();
-        assert!(out.is_none());
+    fn archive_dir_computed_from_persisted_root() {
+        let tx_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let root = PathBuf::from("/src/AlbumA");
+        let archive_base = root
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".imagedb-processed");
+        let archive_dir = archive_base.join(tx_id.to_string()).join("AlbumA");
+        assert_eq!(
+            archive_dir,
+            PathBuf::from("/src/.imagedb-processed/11111111-1111-1111-1111-111111111111/AlbumA")
+        );
     }
 
+    /// A DB-provided album root tolerates plan images in distinct
+    /// subdirectories (AlbumA/chapter-1/001.jpg vs AlbumA/chapter-2/002.jpg)
+    /// — previously this was rejected as "multiple parents". The validation
+    /// function skips non-existent sources, so a unit test without a
+    /// filesystem still proves subdirectory tolerance.
     #[test]
-    fn derive_source_album_dir_single_parent() {
-        let imgs = vec![img("/src/album/photo1.png", "photo1.png")];
-        let out = derive_source_album_dir(&imgs).unwrap();
-        assert_eq!(out.as_deref(), Some(Path::new("/src/album")));
-    }
-
-    #[test]
-    fn derive_source_album_dir_multiple_same_parent() {
+    fn validate_sources_tolerates_distinct_subdirs_when_missing() {
+        let root = PathBuf::from("/src/AlbumA");
         let imgs = vec![
-            img("/src/album/photo1.png", "photo1.png"),
-            img("/src/album/photo2.png", "photo2.png"),
+            img(
+                "/src/AlbumA/chapter-1/001.jpg",
+                "AlbumA/chapter-1/001.jpg",
+                "chapter-1/001.jpg",
+            ),
+            img(
+                "/src/AlbumA/chapter-2/002.jpg",
+                "AlbumA/chapter-2/002.jpg",
+                "chapter-2/002.jpg",
+            ),
         ];
-        let out = derive_source_album_dir(&imgs).unwrap();
-        assert_eq!(out.as_deref(), Some(Path::new("/src/album")));
+        // Neither source file exists on the unit-test filesystem, so
+        // validation is a no-op pass. The important property is that the
+        // function does NOT raise the old "multiple source parents" error.
+        assert!(validate_plan_image_sources(&root, &imgs).is_ok());
     }
 
+    /// path_eq is reused by recovery and must handle the Windows case
+    /// normalization plus the Unix byte-exact rule.
     #[test]
-    fn derive_source_album_dir_conflicting_parents_rejected() {
-        let imgs = vec![
-            img("/src/album_a/photo1.png", "photo1.png"),
-            img("/src/album_b/photo2.png", "photo2.png"),
-        ];
-        let err = derive_source_album_dir(&imgs).unwrap_err();
-        assert!(err.to_string().contains("multiple source parents"));
+    fn path_eq_rule() {
+        if cfg!(target_os = "windows") {
+            assert!(crate::services::commit_service::path_eq(
+                Path::new("C:\\AlbumA"),
+                Path::new("c:\\albuma")
+            ));
+        } else {
+            assert!(crate::services::commit_service::path_eq(
+                Path::new("/src/AlbumA"),
+                Path::new("/src/AlbumA")
+            ));
+            assert!(!crate::services::commit_service::path_eq(
+                Path::new("/src/AlbumA"),
+                Path::new("/src/albuma")
+            ));
+        }
     }
 }

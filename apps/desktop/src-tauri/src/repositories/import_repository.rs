@@ -172,6 +172,7 @@ pub struct ImportAlbumFullRow {
     pub id: Uuid,
     pub source_path: String,
     pub source_name: String,
+    pub state: String,
 }
 
 pub struct ImportImageFullRow {
@@ -1095,7 +1096,7 @@ impl ImportRepository {
     ) -> Result<Vec<ImportAlbumFullRow>, AppError> {
         let rows = client
             .query(
-                "SELECT id, source_path, source_name FROM import_albums WHERE import_run_id = $1",
+                "SELECT id, source_path, source_name, state FROM import_albums WHERE import_run_id = $1",
                 &[&import_run_id],
             )
             .await
@@ -1109,8 +1110,31 @@ impl ImportRepository {
                 id: r.get("id"),
                 source_path: r.get("source_path"),
                 source_name: r.get("source_name"),
+                state: r.get("state"),
             })
             .collect())
+    }
+
+    /// Fetch a single import album by its id, including the persisted source
+    /// path and state. Used by commit and recovery to read the authoritative
+    /// source album directory instead of deriving it from plan images.
+    pub async fn get_import_album_by_id(
+        client: &Client,
+        id: Uuid,
+    ) -> Result<Option<ImportAlbumFullRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, source_path, source_name, state FROM import_albums WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query import album by id: {e}")))?;
+        Ok(row.map(|r| ImportAlbumFullRow {
+            id: r.get("id"),
+            source_path: r.get("source_path"),
+            source_name: r.get("source_name"),
+            state: r.get("state"),
+        }))
     }
 
     pub async fn get_import_images_by_ids(
