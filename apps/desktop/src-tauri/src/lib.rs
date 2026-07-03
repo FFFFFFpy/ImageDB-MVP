@@ -6,6 +6,9 @@ mod repositories;
 mod services;
 mod state;
 
+#[cfg(feature = "fail-injection")]
+pub mod tests;
+
 use std::path::PathBuf;
 
 pub fn run() {

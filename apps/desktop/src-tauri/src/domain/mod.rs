@@ -1,4 +1,6 @@
+pub mod duplicate_group;
 pub mod import_state;
+pub mod state_machine;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -128,33 +130,39 @@ impl DatabaseState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransactionState {
-    Ready,
+    Planned,
     Staging,
     Verifying,
     Verified,
     Publishing,
     Published,
     DbCommitting,
-    Committed,
+    LibraryCommitted,
     SourceArchiving,
     SourceArchived,
+    CleanupRequired,
+    Conflict,
     Failed(String),
+    Cancelled,
 }
 
 impl fmt::Display for TransactionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ready => write!(f, "READY"),
-            Self::Staging => write!(f, "STAGING"),
-            Self::Verifying => write!(f, "VERIFYING"),
-            Self::Verified => write!(f, "VERIFIED"),
-            Self::Publishing => write!(f, "PUBLISHING"),
-            Self::Published => write!(f, "PUBLISHED"),
-            Self::DbCommitting => write!(f, "DB_COMMITTING"),
-            Self::Committed => write!(f, "COMMITTED"),
-            Self::SourceArchiving => write!(f, "SOURCE_ARCHIVING"),
-            Self::SourceArchived => write!(f, "SOURCE_ARCHIVED"),
-            Self::Failed(msg) => write!(f, "FAILED: {msg}"),
+            Self::Planned => write!(f, "planned"),
+            Self::Staging => write!(f, "staging"),
+            Self::Verifying => write!(f, "verifying"),
+            Self::Verified => write!(f, "verified"),
+            Self::Publishing => write!(f, "publishing"),
+            Self::Published => write!(f, "published"),
+            Self::DbCommitting => write!(f, "db_committing"),
+            Self::LibraryCommitted => write!(f, "library_committed"),
+            Self::SourceArchiving => write!(f, "source_archiving"),
+            Self::SourceArchived => write!(f, "source_archived"),
+            Self::CleanupRequired => write!(f, "cleanup_required"),
+            Self::Conflict => write!(f, "conflict"),
+            Self::Failed(msg) => write!(f, "failed: {msg}"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }

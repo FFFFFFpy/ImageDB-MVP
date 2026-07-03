@@ -3,12 +3,16 @@ use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ImportRunState {
+    Created,
     Scanning,
     Fingerprinting,
     DetectingDuplicates,
-    Completed,
+    Analyzing,
+    ReviewRequired,
+    ReadyToCommit,
     Committing,
-    Committed,
+    RecoveryRequired,
+    Completed,
     Cancelled,
     Failed,
 }
@@ -16,12 +20,16 @@ pub enum ImportRunState {
 impl fmt::Display for ImportRunState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Created => write!(f, "created"),
             Self::Scanning => write!(f, "scanning"),
             Self::Fingerprinting => write!(f, "fingerprinting"),
             Self::DetectingDuplicates => write!(f, "detecting_duplicates"),
-            Self::Completed => write!(f, "completed"),
+            Self::Analyzing => write!(f, "analyzing"),
+            Self::ReviewRequired => write!(f, "review_required"),
+            Self::ReadyToCommit => write!(f, "ready_to_commit"),
             Self::Committing => write!(f, "committing"),
-            Self::Committed => write!(f, "committed"),
+            Self::RecoveryRequired => write!(f, "recovery_required"),
+            Self::Completed => write!(f, "completed"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::Failed => write!(f, "failed"),
         }
@@ -32,12 +40,16 @@ impl ImportRunState {
     #[allow(dead_code)]
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
+            "created" => Some(Self::Created),
             "scanning" => Some(Self::Scanning),
             "fingerprinting" => Some(Self::Fingerprinting),
             "detecting_duplicates" => Some(Self::DetectingDuplicates),
-            "completed" => Some(Self::Completed),
+            "analyzing" => Some(Self::Analyzing),
+            "review_required" => Some(Self::ReviewRequired),
+            "ready_to_commit" => Some(Self::ReadyToCommit),
             "committing" => Some(Self::Committing),
-            "committed" => Some(Self::Committed),
+            "recovery_required" => Some(Self::RecoveryRequired),
+            "completed" => Some(Self::Completed),
             "cancelled" => Some(Self::Cancelled),
             "failed" => Some(Self::Failed),
             _ => None,
@@ -129,6 +141,7 @@ impl fmt::Display for DecodeState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DuplicateScope {
     IntraAlbum,
+    CrossAlbum,
     Library,
 }
 
@@ -136,6 +149,7 @@ impl fmt::Display for DuplicateScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::IntraAlbum => write!(f, "intra_album"),
+            Self::CrossAlbum => write!(f, "cross_album"),
             Self::Library => write!(f, "library"),
         }
     }
@@ -526,22 +540,25 @@ mod tests {
 
     #[test]
     fn import_run_state_round_trip() {
-        assert_eq!(
-            ImportRunState::from_str_opt(&ImportRunState::Scanning.to_string()),
-            Some(ImportRunState::Scanning)
-        );
-        assert_eq!(
-            ImportRunState::from_str_opt(&ImportRunState::Completed.to_string()),
-            Some(ImportRunState::Completed)
-        );
-        assert_eq!(
-            ImportRunState::from_str_opt(&ImportRunState::Committing.to_string()),
-            Some(ImportRunState::Committing)
-        );
-        assert_eq!(
-            ImportRunState::from_str_opt(&ImportRunState::Committed.to_string()),
-            Some(ImportRunState::Committed)
-        );
+        for state in [
+            ImportRunState::Created,
+            ImportRunState::Scanning,
+            ImportRunState::Fingerprinting,
+            ImportRunState::DetectingDuplicates,
+            ImportRunState::Analyzing,
+            ImportRunState::ReviewRequired,
+            ImportRunState::ReadyToCommit,
+            ImportRunState::Committing,
+            ImportRunState::RecoveryRequired,
+            ImportRunState::Completed,
+            ImportRunState::Cancelled,
+            ImportRunState::Failed,
+        ] {
+            assert_eq!(
+                ImportRunState::from_str_opt(&state.to_string()),
+                Some(state)
+            );
+        }
         assert_eq!(ImportRunState::from_str_opt("unknown"), None);
     }
 

@@ -4,7 +4,6 @@ use crate::domain::import_state::{
 };
 use crate::services::review_service;
 use crate::state::AppState;
-use std::path::PathBuf;
 use tauri::State;
 use uuid::Uuid;
 
@@ -143,11 +142,19 @@ pub struct ImagePreview {
 }
 
 #[tauri::command]
-pub async fn get_image_preview(path: String) -> Result<ImagePreview, String> {
-    let p = PathBuf::from(&path);
-    if !p.exists() {
-        return Err(format!("file not found: {path}"));
-    }
-    let data_url = review_service::load_image_preview(&p).map_err(|e| format!("{e}"))?;
+pub async fn get_image_preview(
+    state: State<'_, AppState>,
+    candidate_id: String,
+    image_side: String,
+) -> Result<ImagePreview, String> {
+    let cid = parse_uuid(&candidate_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let data_url = review_service::load_image_preview_by_candidate(&client, cid, &image_side)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    handle.abort();
     Ok(ImagePreview { data_url })
 }

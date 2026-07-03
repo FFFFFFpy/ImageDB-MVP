@@ -222,6 +222,31 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
             <div>Failed: {progress?.albums_failed ?? 0}</div>
           </div>
 
+          {/* Detailed staging pipeline progress */}
+          <div className="commit-pipeline">
+            <h3>Pipeline</h3>
+            <ul className="pipeline-steps">
+              <li className={progress?.current_stage === 'preparing' ? 'active' : 'done'}>
+                Prepare Transaction
+              </li>
+              <li className={progress?.current_stage === 'committing' || progress?.current_stage === 'processing_album' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
+                Copy to Staging
+              </li>
+              <li className={progress?.current_stage === 'verifying' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
+                Verify Files
+              </li>
+              <li className={progress?.current_stage === 'publishing' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
+                Publish
+              </li>
+              <li className={progress?.current_stage === 'db_committing' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
+                Database Commit
+              </li>
+              <li className={progress?.current_stage === 'archiving' ? 'active' : progress?.current_stage === 'done' ? 'done' : ''}>
+                Source Archive
+              </li>
+            </ul>
+          </div>
+
           {progress && progress.errors.length > 0 && (
             <div className="commit-errors">
               <h3>Errors</h3>

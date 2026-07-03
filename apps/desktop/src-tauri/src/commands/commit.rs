@@ -19,7 +19,12 @@ pub async fn start_import_commit(
         .map(|h| h.task.is_finished())
         .unwrap_or(false)
     {
-        commit_state.active = None;
+        // Await and resolve the finished task to ensure JoinHandle is joined.
+        if let Some(handle) = commit_state.active.take() {
+            let progress = resolve_commit_handle(handle).await;
+            let mut tracker = commit_state.progress_tracker.lock().await;
+            *tracker = progress;
+        }
     }
 
     if commit_state.active.is_some() {
@@ -85,6 +90,33 @@ pub async fn cancel_import_commit(state: State<'_, AppState>) -> Result<String, 
     }
 }
 
+/// Await a finished JoinHandle and handle JoinError (panic).
+/// Returns the inner value on success, or a failed CommitProgress on panic.
+async fn resolve_commit_handle(handle: crate::state::CommitHandle) -> CommitProgress {
+    match handle.task.await {
+        Ok(progress) => progress,
+        Err(join_err) => {
+            let msg = if join_err.is_panic() {
+                let panic_msg = join_err
+                    .into_panic()
+                    .downcast::<String>()
+                    .map(|s| *s)
+                    .unwrap_or_else(|_| "commit task panicked".to_string());
+                format!("panic: {panic_msg}")
+            } else {
+                "commit task cancelled".to_string()
+            };
+            CommitProgress {
+                state: "failed".to_string(),
+                import_run_id: String::new(),
+                current_stage: "failed".to_string(),
+                errors: vec![msg],
+                ..CommitProgress::idle("")
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn get_commit_progress(state: State<'_, AppState>) -> Result<CommitProgress, String> {
     let mut commit_state = state.commit_state.lock().await;
@@ -94,7 +126,12 @@ pub async fn get_commit_progress(state: State<'_, AppState>) -> Result<CommitPro
         .map(|h| h.task.is_finished())
         .unwrap_or(false)
     {
-        commit_state.active = None;
+        // Await and resolve the finished task to ensure JoinHandle is joined.
+        if let Some(handle) = commit_state.active.take() {
+            let progress = resolve_commit_handle(handle).await;
+            let mut tracker = commit_state.progress_tracker.lock().await;
+            *tracker = progress;
+        }
     }
     let tracker = commit_state.progress_tracker.lock().await;
     Ok(tracker.clone())

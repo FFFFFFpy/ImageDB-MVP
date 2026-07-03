@@ -25,7 +25,12 @@ pub async fn start_scan(
         .map(|handle| handle.task.is_finished())
         .unwrap_or(false)
     {
-        scan_state.active = None;
+        // Await and resolve the finished task to ensure JoinHandle is joined.
+        if let Some(handle) = scan_state.active.take() {
+            let progress = resolve_scan_handle(handle).await;
+            let mut tracker = scan_state.progress_tracker.lock().await;
+            *tracker = progress;
+        }
     }
 
     if scan_state.active.is_some() {
@@ -87,6 +92,32 @@ pub async fn cancel_scan(state: State<'_, AppState>) -> Result<String, String> {
     }
 }
 
+/// Await a finished JoinHandle and handle JoinError (panic).
+/// Returns the inner value on success, or a failed ScanProgress on panic.
+async fn resolve_scan_handle(handle: crate::state::ScanHandle) -> ScanProgress {
+    match handle.task.await {
+        Ok(progress) => progress,
+        Err(join_err) => {
+            let msg = if join_err.is_panic() {
+                let panic_msg = join_err
+                    .into_panic()
+                    .downcast::<String>()
+                    .map(|s| *s)
+                    .unwrap_or_else(|_| "scan task panicked".to_string());
+                format!("panic: {panic_msg}")
+            } else {
+                "scan task cancelled".to_string()
+            };
+            ScanProgress {
+                state: "failed".to_string(),
+                current_stage: "failed".to_string(),
+                errors: vec![msg],
+                ..ScanProgress::idle()
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn get_scan_progress(state: State<'_, AppState>) -> Result<ScanProgress, String> {
     let mut scan_state = state.scan_state.lock().await;
@@ -96,7 +127,12 @@ pub async fn get_scan_progress(state: State<'_, AppState>) -> Result<ScanProgres
         .map(|handle| handle.task.is_finished())
         .unwrap_or(false)
     {
-        scan_state.active = None;
+        // Await and resolve the finished task to ensure JoinHandle is joined.
+        if let Some(handle) = scan_state.active.take() {
+            let progress = resolve_scan_handle(handle).await;
+            let mut tracker = scan_state.progress_tracker.lock().await;
+            *tracker = progress;
+        }
     }
     let tracker = scan_state.progress_tracker.lock().await;
     Ok(tracker.clone())

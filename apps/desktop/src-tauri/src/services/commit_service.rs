@@ -8,6 +8,8 @@ use crate::repositories::import_repository::{
     ImportAlbumFullRow, ImportImageFullRow, ImportRepository,
 };
 use crate::services::review_service;
+#[cfg(feature = "fail-injection")]
+use crate::tests::fail_injection::{maybe_fault, CommitFaultPoint};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -282,7 +284,7 @@ async fn execute_commit_pipeline(
         ImportRepository::update_import_run_state(
             client,
             import_run_id,
-            &ImportRunState::Committed,
+            &ImportRunState::Completed,
         )
         .await?;
         "completed".to_string()
@@ -368,294 +370,236 @@ async fn get_or_freeze_plan(
     Ok(plan)
 }
 
+/// Commit a single album using the staged file transaction protocol.
 async fn commit_single_album(
     client: &mut Client,
     input: AlbumCommitInput<'_>,
 ) -> Result<CommitAlbumResult, AppError> {
-    let AlbumCommitInput {
-        library_root,
-        library_root_id,
-        import_run_id,
-        import_album_id,
-        source_path,
-        album_name,
-        images,
-    } = input;
+    let AlbumCommitInput { library_root, library_root_id, import_run_id, import_album_id,
+        source_path, album_name, images } = input;
     let album_relative_path = album_name;
 
-    if let Some(existing) =
-        ImportRepository::find_library_album_by_path(client, library_root_id, album_relative_path)
-            .await?
-    {
+    // Idempotent skip or conflict check.
+    if let Some(existing) = ImportRepository::find_library_album_by_path(client, library_root_id, album_relative_path).await? {
         if decide_idempotent_skip(Some(&existing), images.len() as u32).is_some() {
             return Ok(CommitAlbumResult {
-                album_name: album_name.to_string(),
-                status: "skipped".to_string(),
+                album_name: album_name.to_string(), status: "skipped".to_string(),
                 images_committed: images.len() as u32,
-                target_path: Some(
-                    library_root
-                        .join("Albums")
-                        .join(album_relative_path)
-                        .display()
-                        .to_string(),
-                ),
-                manifest_path: None,
-                error: None,
+                target_path: Some(library_root.join("Albums").join(album_relative_path).display().to_string()),
+                manifest_path: None, error: None,
             });
         }
-        return Err(AppError::Internal(format!(
-            "target conflict: library album already exists at {album_relative_path} with different state or count"
-        )));
+        return Err(AppError::Internal(format!("target conflict: library album already exists at {album_relative_path}")));
     }
 
     let publish_dir = library_root.join("Albums").join(album_relative_path);
-    check_target_conflict(library_root, album_relative_path, false)?;
+    if publish_dir.exists() {
+        return Err(AppError::Internal(format!("target directory already exists: {}", publish_dir.display())));
+    }
 
+    // Verify source files.
     for entry in images {
         let src = Path::new(&entry.import_image.source_path);
         if !src.exists() {
-            return Err(AppError::IoError(format!(
-                "source file missing: {}",
-                src.display()
-            )));
+            return Err(AppError::IoError(format!("source file missing: {}", src.display())));
         }
         if let Some(expected_blake3) = &entry.import_image.blake3 {
-            let data = std::fs::read(src).map_err(|e| {
-                AppError::IoError(format!("cannot read source file {}: {e}", src.display()))
-            })?;
+            let data = std::fs::read(src).map_err(|e| AppError::IoError(format!("cannot read source file {}: {e}", src.display())))?;
             let actual = blake3::hash(&data).as_bytes().to_vec();
             if actual != *expected_blake3 {
-                return Err(AppError::Internal(format!(
-                    "source snapshot mismatch for {}",
-                    src.display()
-                )));
+                return Err(AppError::Internal(format!("source snapshot mismatch for {}", src.display())));
             }
         }
     }
 
+    // Phase 1: Create transaction + all operations before any copy
     let tx_id = Uuid::new_v4();
-    let staging_dir = library_root
-        .join(".imagedb")
-        .join("staging")
-        .join(tx_id.to_string())
-        .join(album_name);
+    let staging_base = library_root.join(".imagedb").join("staging").join(tx_id.to_string());
+    let staging_dir = staging_base.join(album_relative_path);
 
-    tokio::fs::create_dir_all(&staging_dir)
-        .await
+    let tx_db_id = ImportRepository::insert_file_transaction(client, import_run_id, import_album_id,
+        "planned", Some(&staging_dir.display().to_string()), Some(&publish_dir.display().to_string()), None).await?;
+
+    let mut op_ids: Vec<(Uuid, PathBuf, Vec<u8>)> = Vec::new();
+    for entry in images {
+        let img = &entry.import_image;
+        let target_rel = &img.relative_path;
+        let staged_path = staging_dir.join(target_rel);
+        let target_path = publish_dir.join(target_rel);
+        let expected_blake3 = img.blake3.as_deref().unwrap_or(&[]);
+        let op_id = ImportRepository::insert_file_operation(client, tx_db_id,
+            &img.source_path, &staged_path.display().to_string(),
+            &target_path.display().to_string(), img.file_size, expected_blake3).await?;
+        op_ids.push((op_id, staged_path, expected_blake3.to_vec()));
+    }
+    ImportRepository::update_file_transaction_state(client, tx_db_id, "staging", None).await?;
+
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::AfterDbWrite, "after DB write")?;
+
+    // Phase 2: Stream copy to staging with .part files
+    tokio::fs::create_dir_all(&staging_dir).await
         .map_err(|e| AppError::IoError(format!("cannot create staging dir: {e}")))?;
 
-    let tx_db_id = ImportRepository::insert_file_transaction(
-        client,
-        import_run_id,
-        import_album_id,
-        "staging",
-        Some(&staging_dir.display().to_string()),
-        Some(&publish_dir.display().to_string()),
-        None,
-    )
-    .await?;
+    for (i, entry) in images.iter().enumerate() {
+        let img = &entry.import_image;
+        let src = Path::new(&img.source_path);
+        let target_rel = &img.relative_path;
+        let staged_path = staging_dir.join(target_rel);
+        let part_path = staging_dir.join(format!("{}.part", target_rel));
 
-    let mut staging_files: Vec<(PathBuf, Vec<u8>, usize)> = Vec::new();
-
-    for entry in images {
-        let src = Path::new(&entry.import_image.source_path);
-        let file_name = src.file_name().unwrap_or_default();
-        let staged_path = staging_dir.join(file_name);
-
-        tokio::fs::copy(src, &staged_path).await.map_err(|e| {
-            AppError::IoError(format!("staging copy failed for {}: {e}", src.display()))
-        })?;
-
-        let staged_data = tokio::fs::read(&staged_path)
-            .await
-            .map_err(|e| AppError::IoError(format!("cannot read staged file: {e}")))?;
-        let actual_blake3 = blake3::hash(&staged_data).as_bytes().to_vec();
-
-        let expected = entry
-            .import_image
-            .blake3
-            .as_ref()
-            .ok_or_else(|| AppError::Internal("missing blake3 in import image".to_string()))?;
-
-        if actual_blake3 != *expected {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx_db_id,
-                "failed",
-                Some("BLAKE3 verification failed"),
-            )
-            .await?;
-            return Err(AppError::Internal(format!(
-                "BLAKE3 mismatch for staged file {}",
-                staged_path.display()
-            )));
+        if let Some(parent) = staged_path.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| AppError::IoError(format!("cannot create staging subdir: {e}")))?;
         }
 
-        let op_id = ImportRepository::insert_file_operation(
-            client,
-            tx_db_id,
-            &entry.import_image.source_path,
-            &staged_path.display().to_string(),
-            &publish_dir.join(file_name).display().to_string(),
-            entry.import_image.file_size,
-            expected,
-        )
-        .await?;
+        let mut src_file = tokio::fs::File::open(src).await
+            .map_err(|e| AppError::IoError(format!("cannot open source for staging: {e}")))?;
+        let mut dst_file = tokio::fs::File::create(&part_path).await
+            .map_err(|e| AppError::IoError(format!("cannot create part file: {e}")))?;
 
-        ImportRepository::update_file_operation_state(
-            client,
-            op_id,
-            "verified",
-            Some(&actual_blake3),
-            None,
-        )
-        .await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; 65536];
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        loop {
+            let n = src_file.read(&mut buf).await
+                .map_err(|e| AppError::IoError(format!("read error during staging: {e}")))?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+            dst_file.write_all(&buf[..n]).await
+                .map_err(|e| AppError::IoError(format!("write error during staging: {e}")))?;
+        }
+        dst_file.flush().await.map_err(|e| AppError::IoError(format!("flush error: {e}")))?;
+        drop(dst_file);
 
-        staging_files.push((
-            staged_path,
-            actual_blake3,
-            entry.import_image.file_size as usize,
-        ));
+        let actual_blake3 = hasher.finalize().as_bytes().to_vec();
+        let expected_blake3 = img.blake3.as_deref().unwrap_or(&[]);
+
+        if !expected_blake3.is_empty() && actual_blake3 != expected_blake3 {
+            let _ = tokio::fs::remove_dir_all(&staging_base).await;
+            ImportRepository::update_file_transaction_state(client, tx_db_id, "failed",
+                Some("BLAKE3 mismatch during staging")).await?;
+            return Err(AppError::Internal(format!("BLAKE3 mismatch for staged file {}", staged_path.display())));
+        }
+
+        tokio::fs::rename(&part_path, &staged_path).await
+            .map_err(|e| AppError::IoError(format!("rename part file failed: {e}")))?;
+
+        ImportRepository::update_file_operation_state(client, op_ids[i].0, "verified",
+            Some(&actual_blake3), None).await?;
+
+        #[cfg(feature = "fail-injection")]
+        maybe_fault(CommitFaultPoint::AfterStagingCopy, "after staging copy")?;
     }
 
     ImportRepository::update_file_transaction_state(client, tx_db_id, "verified", None).await?;
 
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::AfterStagingVerify, "after staging verify")?;
+
+    // Phase 3: Write manifest (temp file + atomic rename)
     let manifest = AlbumManifest {
         album_name: album_name.to_string(),
         relative_path: album_relative_path.to_string(),
         image_count: images.len() as u32,
-        images: images
-            .iter()
-            .map(|e| AlbumManifestImage {
-                relative_path: Path::new(&e.import_image.source_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                file_size: e.import_image.file_size,
-                blake3: e
-                    .import_image
-                    .blake3
-                    .as_ref()
-                    .map(|b| bytes_to_hex(b))
-                    .unwrap_or_default(),
-                width: e.import_image.width,
-                height: e.import_image.height,
-                format: e.import_image.format.clone(),
-            })
-            .collect(),
+        images: images.iter().map(|e| AlbumManifestImage {
+            relative_path: e.import_image.relative_path.clone(),
+            file_size: e.import_image.file_size,
+            blake3: e.import_image.blake3.as_ref().map(|b| bytes_to_hex(b)).unwrap_or_default(),
+            width: e.import_image.width,
+            height: e.import_image.height,
+            format: e.import_image.format.clone(),
+        }).collect(),
     };
 
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| AppError::Internal(format!("manifest serialize failed: {e}")))?;
     let manifest_hash = blake3::hash(manifest_json.as_bytes()).as_bytes().to_vec();
 
-    let manifests_dir = library_root.join(".imagedb").join("manifests");
-    tokio::fs::create_dir_all(&manifests_dir)
-        .await
-        .map_err(|e| AppError::IoError(format!("cannot create manifests dir: {e}")))?;
-    let manifest_file = manifests_dir.join(format!("{album_name}.json"));
-    tokio::fs::write(&manifest_file, &manifest_json)
-        .await
-        .map_err(|e| AppError::IoError(format!("manifest write failed: {e}")))?;
+    let staging_manifest_dir = staging_dir.join(".imagedb");
+    tokio::fs::create_dir_all(&staging_manifest_dir).await
+        .map_err(|e| AppError::IoError(format!("cannot create staging manifest dir: {e}")))?;
+    let staging_manifest_tmp = staging_manifest_dir.join(".imagedb-manifest.json.tmp");
+    let staging_manifest_file = staging_manifest_dir.join(".imagedb-manifest.json");
+    tokio::fs::write(&staging_manifest_tmp, &manifest_json).await
+        .map_err(|e| AppError::IoError(format!("manifest tmp write failed: {e}")))?;
+    tokio::fs::rename(&staging_manifest_tmp, &staging_manifest_file).await
+        .map_err(|e| AppError::IoError(format!("manifest atomic rename failed: {e}")))?;
+
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::AfterManifestWrite, "after manifest write")?;
 
     ImportRepository::update_file_transaction_state(client, tx_db_id, "publishing", None).await?;
 
-    tokio::fs::create_dir_all(&publish_dir)
-        .await
-        .map_err(|e| AppError::IoError(format!("cannot create publish dir: {e}")))?;
+    // Phase 4: Atomic publish (rename staging dir -> publish dir)
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::BeforePublishRename, "before publish rename")?;
 
-    for (staged_path, _hash, _size) in &staging_files {
-        let file_name = staged_path.file_name().unwrap_or_default();
-        let dest = publish_dir.join(file_name);
-        tokio::fs::copy(staged_path, &dest).await.map_err(|e| {
-            AppError::IoError(format!(
-                "publish copy failed for {}: {e}",
-                staged_path.display()
-            ))
-        })?;
+    tokio::fs::rename(&staging_dir, &publish_dir).await
+        .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
 
-        let published_data = tokio::fs::read(&dest)
-            .await
-            .map_err(|e| AppError::IoError(format!("cannot read published file: {e}")))?;
-        let published_hash = blake3::hash(&published_data).as_bytes().to_vec();
-
-        let staged_data = tokio::fs::read(staged_path)
-            .await
-            .map_err(|e| AppError::IoError(format!("cannot re-read staged for verify: {e}")))?;
-        let staged_hash = blake3::hash(&staged_data).as_bytes().to_vec();
-
-        if published_hash != staged_hash {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            let _ = std::fs::remove_dir_all(&publish_dir);
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx_db_id,
-                "failed",
-                Some("post-publish BLAKE3 mismatch"),
-            )
-            .await?;
-            return Err(AppError::Internal(format!(
-                "post-publish BLAKE3 mismatch for {}",
-                dest.display()
-            )));
-        }
-    }
+    let manifests_dir = library_root.join(".imagedb").join("manifests");
+    tokio::fs::create_dir_all(&manifests_dir).await
+        .map_err(|e| AppError::IoError(format!("cannot create manifests dir: {e}")))?;
+    let manifest_file = manifests_dir.join(format!("{album_name}.json"));
+    let manifest_tmp = manifests_dir.join(format!("{album_name}.json.tmp"));
+    tokio::fs::write(&manifest_tmp, &manifest_json).await
+        .map_err(|e| AppError::IoError(format!("manifest write failed: {e}")))?;
+    tokio::fs::rename(&manifest_tmp, &manifest_file).await
+        .map_err(|e| AppError::IoError(format!("manifest atomic rename failed: {e}")))?;
 
     ImportRepository::update_file_transaction_state(client, tx_db_id, "published", None).await?;
 
-    ImportRepository::update_file_transaction_state(client, tx_db_id, "db_committing", None)
-        .await?;
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::AfterPublishRename, "after publish rename")?;
 
-    if let Err(e) = commit_library_records_transaction(
-        client,
-        library_root_id,
-        album_name,
-        album_relative_path,
-        &manifest_hash,
-        images,
-    )
-    .await
+    // Phase 5: DB commit (do NOT delete publish_dir on failure)
+    ImportRepository::update_file_transaction_state(client, tx_db_id, "db_committing", None).await?;
+
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::BeforeDbCommit, "before DB commit")?;
+
+    if let Err(e) = commit_library_records_transaction(client, library_root_id, album_name,
+        album_relative_path, &manifest_hash, images).await
     {
-        let _ = std::fs::remove_dir_all(&publish_dir);
-        let _ = ImportRepository::update_file_transaction_state(
-            client,
-            tx_db_id,
-            "failed",
-            Some(&e.to_string()),
-        )
-        .await;
+        let _ = ImportRepository::update_file_transaction_state(client, tx_db_id, "published",
+            Some(&e.to_string())).await;
         return Err(e);
     }
 
-    ImportRepository::update_file_transaction_state(client, tx_db_id, "committed", None).await?;
+    ImportRepository::update_file_transaction_state(client, tx_db_id, "library_committed", None).await?;
 
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::AfterDbCommit, "after DB commit")?;
+
+    // Phase 6: Source archive
     let source_dir = Path::new(source_path);
     if source_dir.exists() {
-        let archive_base = Path::new(source_path)
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(".imagedb-archive");
-        let archive_dir = archive_base.join(album_name);
-        tokio::fs::create_dir_all(&archive_dir)
-            .await
-            .map_err(|e| AppError::IoError(format!("cannot create archive dir: {e}")))?;
+        #[cfg(feature = "fail-injection")]
+        maybe_fault(CommitFaultPoint::BeforeSourceArchive, "before source archive")?;
+        let archive_base = source_dir.parent().unwrap_or(Path::new(".")).join(".imagedb-processed");
+        let archive_dir = archive_base.join(tx_id.to_string()).join(album_relative_path);
 
-        ImportRepository::update_file_transaction_state(client, tx_db_id, "source_archiving", None)
-            .await?;
+        ImportRepository::update_file_transaction_state(client, tx_db_id, "source_archiving", None).await?;
 
-        copy_dir_recursive(source_dir, &archive_dir)?;
+        if archive_dir.exists() {
+            return Err(AppError::Internal(format!("archive target already exists: {}", archive_dir.display())));
+        }
 
-        ImportRepository::update_file_transaction_state(client, tx_db_id, "source_archived", None)
-            .await?;
+        tokio::fs::create_dir_all(archive_dir.parent().unwrap()).await
+            .map_err(|e| AppError::IoError(format!("cannot create archive base dir: {e}")))?;
+
+        tokio::fs::rename(source_dir, &archive_dir).await
+            .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
+
+        ImportRepository::update_file_transaction_state(client, tx_db_id, "source_archived", None).await?;
     }
 
-    let _ = std::fs::remove_dir_all(staging_dir.parent().unwrap_or(&staging_dir));
+    let _ = tokio::fs::remove_dir_all(&staging_base).await;
 
     Ok(CommitAlbumResult {
-        album_name: album_name.to_string(),
-        status: "committed".to_string(),
+        album_name: album_name.to_string(), status: "committed".to_string(),
         images_committed: images.len() as u32,
         target_path: Some(publish_dir.display().to_string()),
         manifest_path: Some(manifest_file.display().to_string()),

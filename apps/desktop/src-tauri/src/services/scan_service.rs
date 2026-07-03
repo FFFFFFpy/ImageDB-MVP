@@ -10,7 +10,7 @@ use crate::infrastructure::image_fingerprint::{
 use crate::infrastructure::postgres::PostgresManager;
 use crate::infrastructure::settings::SettingsStore;
 use crate::repositories::import_repository::{
-    ImportRepository, NewDuplicateCandidate, NewImportImage,
+    ImportRepository, LibraryImageRow, NewDuplicateCandidate, NewImportImage,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -118,6 +118,24 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Compute perceptual band values from fingerprint data for bucketed similarity search.
+/// Each band is the first 4 bytes of a perceptual hash component.
+fn compute_perceptual_bands(fp: &FingerprintedData) -> Vec<Vec<u8>> {
+    let mut bands = Vec::new();
+    for hash_bytes in [
+        &fp.gradient_hash_bytes,
+        &fp.block_hash_bytes,
+        &fp.median_hash_bytes,
+    ] {
+        if hash_bytes.len() >= 4 {
+            bands.push(hash_bytes[..4].to_vec());
+        } else if !hash_bytes.is_empty() {
+            bands.push(hash_bytes.clone());
+        }
+    }
+    bands
 }
 
 fn scan_directory_for_albums(source_root: &Path) -> Result<Vec<AlbumEntry>, AppError> {
@@ -759,25 +777,52 @@ pub async fn run_scan(
         }
     }
 
-    let library_images = ImportRepository::get_library_images_for_comparison(&client)
-        .await
-        .unwrap_or_default();
+    // Phase 3: Indexed historical library matching (no N×M full scan).
+    //
+    // Instead of loading ALL library images and comparing each import image
+    // against each library image (N×M), we:
+    // 1. Batch query library images by BLAKE3 (indexed exact match).
+    // 2. Batch query library images by pixel_hash (indexed exact match).
+    // 3. For perceptual matching, query by perceptual band (bucketed recall).
 
-    if !library_images.is_empty() {
+    // Collect all BLAKE3 hashes from import images.
+    let all_blake3: Vec<Vec<u8>> = all_album_images
+        .iter()
+        .filter_map(|e| {
+            if e.fp.blake3_bytes.is_empty() {
+                None
+            } else {
+                Some(e.fp.blake3_bytes.clone())
+            }
+        })
+        .collect();
+
+    // 1. Batch BLAKE3 exact match against library.
+    if !all_blake3.is_empty() {
+        let matched_library =
+            ImportRepository::find_library_images_by_blake3(&client, &all_blake3).await?;
+
+        let mut blake3_to_lib: std::collections::HashMap<Vec<u8>, Vec<LibraryImageRow>> =
+            std::collections::HashMap::new();
+        for lib in &matched_library {
+            blake3_to_lib
+                .entry(lib.blake3.clone())
+                .or_default()
+                .push(lib.clone());
+        }
+
         for entry in &all_album_images {
             if cancelled.load(Ordering::Relaxed) {
                 break;
             }
-            for lib in &library_images {
-                let file_exact = (entry.fp.file_size as i64) == lib.file_size
-                    && entry.fp.blake3_bytes == lib.blake3;
-                let pixel_exact = lib
-                    .pixel_hash
-                    .as_ref()
-                    .map(|ph| *ph == entry.fp.pixel_hash_bytes)
-                    .unwrap_or(false);
+            if let Some(libs) = blake3_to_lib.get(&entry.fp.blake3_bytes) {
+                for lib in libs {
+                    let pixel_exact = lib
+                        .pixel_hash
+                        .as_ref()
+                        .map(|ph| *ph == entry.fp.pixel_hash_bytes)
+                        .unwrap_or(false);
 
-                if file_exact {
                     ImportRepository::insert_duplicate_candidate(
                         &client,
                         NewDuplicateCandidate {
@@ -802,68 +847,72 @@ pub async fn run_scan(
                     duplicate_count += 1;
                     progress.duplicate_count = duplicate_count;
                     emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
-                } else if pixel_exact {
-                    ImportRepository::insert_duplicate_candidate(
-                        &client,
-                        NewDuplicateCandidate {
-                            import_run_id,
-                            source_image_id: entry.image_db_id,
-                            candidate_source_image_id: None,
-                            candidate_library_image_id: Some(lib.id),
-                            scope: DuplicateScope::Library,
-                            match_type: MatchType::PixelExact,
-                            blake3_equal: false,
-                            pixel_hash_equal: true,
-                            gradient_distance: None,
-                            block_distance: None,
-                            median_distance: None,
-                            transform_type: None,
-                            confidence: Some(1.0),
-                            decision: Some(Decision::AutoDuplicate),
-                            decision_source: Some(DecisionSource::ExactRule),
-                        },
-                    )
-                    .await?;
-                    duplicate_count += 1;
-                    progress.duplicate_count = duplicate_count;
-                    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
-                } else {
-                    let lib_hex = PerceptualHex::from_bytes(
-                        &lib.gradient_hash,
-                        &lib.block_hash,
-                        &lib.median_hash,
-                    );
-                    if let Some(lib_hex) = lib_hex {
-                        if let Some(evidence) =
-                            compare_perceptual_library(&entry.fp, &lib_hex, thresholds)
-                        {
-                            let (match_type, decision, source) =
-                                classify_perceptual(&evidence, thresholds);
-                            ImportRepository::insert_duplicate_candidate(
-                                &client,
-                                NewDuplicateCandidate {
-                                    import_run_id,
-                                    source_image_id: entry.image_db_id,
-                                    candidate_source_image_id: None,
-                                    candidate_library_image_id: Some(lib.id),
-                                    scope: DuplicateScope::Library,
-                                    match_type,
-                                    blake3_equal: false,
-                                    pixel_hash_equal: false,
-                                    gradient_distance: Some(evidence.gradient_distance),
-                                    block_distance: Some(evidence.block_distance),
-                                    median_distance: Some(evidence.median_distance),
-                                    transform_type: Some(evidence.transform_type.to_string()),
-                                    confidence: Some(evidence.confidence),
-                                    decision,
-                                    decision_source: source,
-                                },
-                            )
-                            .await?;
-                            duplicate_count += 1;
-                            progress.duplicate_count = duplicate_count;
-                            emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
-                        }
+                }
+            }
+        }
+    }
+
+    // 2. Perceptual matching via band-based recall (bounded candidates).
+    let max_perceptual_candidates: usize = 50;
+    for entry in &all_album_images {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let bands = compute_perceptual_bands(&entry.fp);
+        let mut recalled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+        for (band_idx, band_val) in bands.iter().enumerate() {
+            if band_val.is_empty() {
+                continue;
+            }
+            let candidates = ImportRepository::find_library_images_by_perceptual_band(
+                &client,
+                band_idx as u8,
+                band_val,
+                max_perceptual_candidates,
+            )
+            .await?;
+            for lib in candidates {
+                if recalled.contains(&lib.id) {
+                    continue;
+                }
+                recalled.insert(lib.id);
+
+                let lib_hex = PerceptualHex::from_bytes(
+                    &lib.gradient_hash,
+                    &lib.block_hash,
+                    &lib.median_hash,
+                );
+                if let Some(lib_hex) = lib_hex {
+                    if let Some(evidence) =
+                        compare_perceptual_library(&entry.fp, &lib_hex, thresholds)
+                    {
+                        let (match_type, decision, source) =
+                            classify_perceptual(&evidence, thresholds);
+                        ImportRepository::insert_duplicate_candidate(
+                            &client,
+                            NewDuplicateCandidate {
+                                import_run_id,
+                                source_image_id: entry.image_db_id,
+                                candidate_source_image_id: None,
+                                candidate_library_image_id: Some(lib.id),
+                                scope: DuplicateScope::Library,
+                                match_type,
+                                blake3_equal: false,
+                                pixel_hash_equal: false,
+                                gradient_distance: Some(evidence.gradient_distance),
+                                block_distance: Some(evidence.block_distance),
+                                median_distance: Some(evidence.median_distance),
+                                transform_type: Some(evidence.transform_type.to_string()),
+                                confidence: Some(evidence.confidence),
+                                decision,
+                                decision_source: source,
+                            },
+                        )
+                        .await?;
+                        duplicate_count += 1;
+                        progress.duplicate_count = duplicate_count;
+                        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
                     }
                 }
             }

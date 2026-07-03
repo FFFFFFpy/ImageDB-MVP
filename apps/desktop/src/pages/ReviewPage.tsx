@@ -131,7 +131,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
     let cancelled = false;
 
     api
-      .getImagePreview(detail.source_image_path)
+      .getImagePreview(detail.candidate_id, 'source')
       .then((p) => {
         if (!cancelled) setLeftPreview(p.data_url);
       })
@@ -139,20 +139,14 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
         if (!cancelled) setLeftPreview(null);
       });
 
-    const rightPath =
-      detail.candidate_source_image_path ?? detail.candidate_library_image_path;
-    if (rightPath) {
-      api
-        .getImagePreview(rightPath)
-        .then((p) => {
-          if (!cancelled) setRightPreview(p.data_url);
-        })
-        .catch(() => {
-          if (!cancelled) setRightPreview(null);
-        });
-    } else {
-      setRightPreview(null);
-    }
+    api
+      .getImagePreview(detail.candidate_id, 'candidate')
+      .then((p) => {
+        if (!cancelled) setRightPreview(p.data_url);
+      })
+      .catch(() => {
+        if (!cancelled) setRightPreview(null);
+      });
 
     return () => {
       cancelled = true;
@@ -341,10 +335,15 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
         <h1>Review</h1>
         <div className="empty-state">
           <h1>No Review Candidates</h1>
-          <p>This import run has no uncertain duplicate candidates to review.</p>
-          <button className="btn-secondary" onClick={() => onNavigate('dashboard')}>
-            Back to Dashboard
-          </button>
+          <p>This import run has no uncertain duplicate candidates to review. You can proceed directly to the import plan.</p>
+          <div className="toolbar" style={{ justifyContent: 'center', marginTop: '1rem' }}>
+            <button className="btn-primary" onClick={handleGeneratePlan}>
+              Generate Import Plan
+            </button>
+            <button className="btn-secondary" onClick={() => onNavigate('dashboard')}>
+              Back to Dashboard
+            </button>
+          </div>
         </div>
       </div>
     );

@@ -29,7 +29,7 @@ struct TransactionRecord {
 pub fn run_probe(source_dir: &Path, library_root: &Path) -> FileTransactionProbeResult {
     let tx_id = Uuid::new_v4().to_string();
     let mut diagnostics = Vec::new();
-    let mut state = TransactionState::Ready;
+    let mut state = TransactionState::Planned;
     let mut published_files = Vec::new();
     let mut blake3_verified = false;
     let manifest_path: Option<String> = None;
@@ -494,7 +494,7 @@ mod tests {
         assert!(Path::new(&manifest_file).exists());
         let manifest_json = std::fs::read_to_string(&manifest_file).unwrap();
         let record: TransactionRecord = serde_json::from_str(&manifest_json).unwrap();
-        assert_eq!(record.state, "PUBLISHED");
+        assert_eq!(record.state, "published");
     }
 
     #[test]

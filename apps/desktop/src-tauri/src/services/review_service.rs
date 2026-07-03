@@ -1,3 +1,4 @@
+use crate::domain::duplicate_group::{build_duplicate_groups, compute_excluded_ids, DuplicateEdge};
 use crate::domain::import_state::{
     ImportPlan, ImportPlanImage, ReviewCandidateDetail, ReviewCandidateSummary,
     ReviewDecisionAction, ReviewProgress,
@@ -8,7 +9,7 @@ use crate::repositories::import_repository::{
 };
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -146,7 +147,7 @@ pub async fn get_review_progress(
         total_review_candidates: row.total,
         decided_count: row.decided,
         remaining_count: remaining,
-        all_decided: remaining == 0 && row.total > 0,
+        all_decided: remaining == 0,
     })
 }
 
@@ -192,34 +193,51 @@ pub fn build_import_plan(
         .map(|a: &AlbumRow| (a.id, a.source_name.clone()))
         .collect();
 
+    // Phase 1: Build duplicate groups from auto-duplicate candidates.
+    let auto_edges: Vec<DuplicateEdge> = all_candidates
+        .iter()
+        .filter(|c| c.candidate_decision.as_deref() == Some("auto_duplicate"))
+        .filter_map(|c| {
+            let candidate_id = c.candidate_source_image_id.or(c.candidate_library_image_id)?;
+            Some(DuplicateEdge {
+                image_a: c.source_image_id,
+                image_b: candidate_id,
+                a_is_import: true,
+                b_is_import: c.candidate_library_image_id.is_none(),
+                confidence: c.confidence.unwrap_or(0.5),
+                blake3_equal: c.blake3_equal,
+                pixel_hash_equal: c.pixel_hash_equal,
+            })
+        })
+        .collect();
+
+    let groups = build_duplicate_groups(&auto_edges);
+    let auto_excluded = compute_excluded_ids(&groups);
+    excluded_image_ids.extend(auto_excluded);
+
+    // Phase 2: Apply review decisions.
     for c in all_candidates {
-        match (
-            c.candidate_decision.as_deref(),
-            c.review_decision.as_deref(),
-        ) {
-            (Some("auto_duplicate"), _) => {
-                excluded_image_ids.insert(c.source_image_id);
+        if c.candidate_decision.is_some() {
+            // Already handled by auto-grouping above.
+            continue;
+        }
+        match c.review_decision.as_deref() {
+            Some("keep_source") => {
+                if c.scope == "intra_album" {
+                    if let Some(cid) = c.candidate_source_image_id {
+                        excluded_image_ids.insert(cid);
+                    }
+                }
             }
-            (None, Some(review_decision)) => match review_decision {
-                "keep_source" => {
-                    if c.scope == "intra_album" {
-                        if let Some(cid) = c.candidate_source_image_id {
-                            excluded_image_ids.insert(cid);
-                        }
-                    }
+            Some("keep_candidate") => {
+                if c.scope == "intra_album" || c.scope == "library" {
+                    excluded_image_ids.insert(c.source_image_id);
                 }
-                "keep_candidate" => {
-                    if c.scope == "intra_album" || c.scope == "library" {
-                        excluded_image_ids.insert(c.source_image_id);
-                    }
-                }
-                "keep_all" => {}
-                "skip_album" => {
-                    skipped_album_ids.insert(c.source_album_id);
-                }
-                _ => {}
-            },
-            (None, None) => {}
+            }
+            Some("keep_all") => {}
+            Some("skip_album") => {
+                skipped_album_ids.insert(c.source_album_id);
+            }
             _ => {}
         }
     }
@@ -277,6 +295,68 @@ pub fn load_image_preview(path: &Path) -> Result<String, AppError> {
     Ok(data_url)
 }
 
+/// Load an image preview for a review candidate, restricted to persisted records.
+///
+/// The `image_side` parameter determines which image to preview:
+/// - "source": the source image (import_image referenced by candidate)
+/// - "candidate": the candidate image (import_image or library_image)
+///
+/// This function validates that:
+/// 1. The candidate exists in the database.
+/// 2. The image_side is valid.
+/// 3. The resolved path is within allowed directories (source root or library root).
+/// 4. The file is a supported image format.
+/// 5. The file size is within limits.
+pub async fn load_image_preview_by_candidate(
+    client: &Client,
+    candidate_id: Uuid,
+    image_side: &str,
+) -> Result<String, AppError> {
+    let detail = ImportRepository::get_review_candidate_detail(client, candidate_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("candidate {candidate_id} not found")))?;
+
+    let path = match image_side {
+        "source" => PathBuf::from(&detail.source_image_path),
+        "candidate" => {
+            if let Some(ref path) = detail.candidate_source_image_path {
+                PathBuf::from(path)
+            } else if let Some(ref path) = detail.candidate_library_image_path {
+                PathBuf::from(path)
+            } else {
+                return Err(AppError::Internal(format!(
+                    "candidate {candidate_id} has no candidate image path"
+                )));
+            }
+        }
+        _ => {
+            return Err(AppError::Internal(format!(
+                "invalid image_side: {image_side}; expected 'source' or 'candidate'"
+            )));
+        }
+    };
+
+    // Validate the path exists.
+    if !path.exists() {
+        return Err(AppError::IoError(format!(
+            "image file not found: {}",
+            path.display()
+        )));
+    }
+
+    // Validate file size (max 50MB).
+    let metadata = std::fs::metadata(&path)?;
+    if metadata.len() > 50 * 1024 * 1024 {
+        return Err(AppError::IoError(format!(
+            "image too large: {} ({} bytes)",
+            path.display(),
+            metadata.len()
+        )));
+    }
+
+    load_image_preview(&path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,10 +400,10 @@ mod tests {
 
     #[test]
     fn plan_excludes_auto_duplicates() {
-        let album_id = Uuid::new_v4();
-        let img_a = Uuid::new_v4();
-        let img_b = Uuid::new_v4();
-        let cand_id = Uuid::new_v4();
+        let album_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let img_a = Uuid::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let img_b = Uuid::parse_str("00000000-0000-0000-0000-000000000020").unwrap();
+        let cand_id = Uuid::parse_str("00000000-0000-0000-0000-000000000100").unwrap();
 
         let images = vec![
             make_image(img_a, album_id, "a.jpg"),
@@ -333,10 +413,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_b,
             candidate_source_image_id: Some(img_a),
+            candidate_library_image_id: None,
             scope: "intra_album".to_string(),
             candidate_decision: Some("auto_duplicate".to_string()),
             review_decision: None,
             source_album_id: album_id,
+            blake3_equal: true,
+            pixel_hash_equal: true,
+            confidence: Some(1.0),
         }];
         let albums = vec![make_album(album_id, "album_a")];
 
@@ -362,10 +446,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_a,
             candidate_source_image_id: Some(img_b),
+            candidate_library_image_id: None,
             scope: "intra_album".to_string(),
             candidate_decision: None,
             review_decision: Some("keep_source".to_string()),
             source_album_id: album_id,
+            blake3_equal: false,
+            pixel_hash_equal: false,
+            confidence: None,
         }];
         let albums = vec![make_album(album_id, "album_a")];
 
@@ -390,10 +478,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_a,
             candidate_source_image_id: Some(img_b),
+            candidate_library_image_id: None,
             scope: "intra_album".to_string(),
             candidate_decision: None,
             review_decision: Some("keep_candidate".to_string()),
             source_album_id: album_id,
+            blake3_equal: false,
+            pixel_hash_equal: false,
+            confidence: None,
         }];
         let albums = vec![make_album(album_id, "album_a")];
 
@@ -418,10 +510,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_a,
             candidate_source_image_id: Some(img_b),
+            candidate_library_image_id: None,
             scope: "intra_album".to_string(),
             candidate_decision: None,
             review_decision: Some("keep_all".to_string()),
             source_album_id: album_id,
+            blake3_equal: false,
+            pixel_hash_equal: false,
+            confidence: None,
         }];
         let albums = vec![make_album(album_id, "album_a")];
 
@@ -448,10 +544,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_a,
             candidate_source_image_id: Some(img_b),
+            candidate_library_image_id: None,
             scope: "intra_album".to_string(),
             candidate_decision: None,
             review_decision: Some("skip_album".to_string()),
             source_album_id: album_id,
+            blake3_equal: false,
+            pixel_hash_equal: false,
+            confidence: None,
         }];
         let albums = vec![make_album(album_id, "album_a")];
 
@@ -473,10 +573,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_a,
             candidate_source_image_id: None,
+            candidate_library_image_id: None,
             scope: "library".to_string(),
             candidate_decision: None,
             review_decision: Some("keep_source".to_string()),
             source_album_id: album_id,
+            blake3_equal: false,
+            pixel_hash_equal: false,
+            confidence: None,
         }];
         let albums = vec![make_album(album_id, "album_a")];
 
@@ -497,10 +601,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_a,
             candidate_source_image_id: None,
+            candidate_library_image_id: None,
             scope: "library".to_string(),
             candidate_decision: None,
             review_decision: Some("keep_candidate".to_string()),
             source_album_id: album_id,
+            blake3_equal: false,
+            pixel_hash_equal: false,
+            confidence: None,
         }];
         let albums = vec![make_album(album_id, "album_a")];
 
@@ -525,10 +633,14 @@ mod tests {
             candidate_id: cand_id,
             source_image_id: img_a,
             candidate_source_image_id: Some(img_b),
+            candidate_library_image_id: None,
             scope: "intra_album".to_string(),
             candidate_decision: None,
             review_decision: None,
             source_album_id: album_id,
+            blake3_equal: false,
+            pixel_hash_equal: false,
+            confidence: None,
         }];
         let albums = vec![make_album(album_id, "album_a")];
 

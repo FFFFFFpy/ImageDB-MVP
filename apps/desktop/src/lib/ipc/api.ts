@@ -76,8 +76,8 @@ export const api = {
   getLatestCompletedImportRun: () =>
     invoke<string | null>('get_latest_completed_import_run'),
 
-  getImagePreview: (path: string) =>
-    invoke<ImagePreview>('get_image_preview', { path }),
+  getImagePreview: (candidateId: string, imageSide: string) =>
+    invoke<ImagePreview>('get_image_preview', { candidateId, imageSide }),
 
   startImportCommit: (importRunId: string) =>
     invoke<string>('start_import_commit', { importRunId }),

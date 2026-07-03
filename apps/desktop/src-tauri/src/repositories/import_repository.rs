@@ -42,6 +42,7 @@ pub struct ImportImageRecord {
     pub state: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct LibraryImageRow {
     pub id: Uuid,
     pub file_size: i64,
@@ -142,10 +143,14 @@ pub struct ImportPlanCandidateRow {
     pub candidate_id: Uuid,
     pub source_image_id: Uuid,
     pub candidate_source_image_id: Option<Uuid>,
+    pub candidate_library_image_id: Option<Uuid>,
     pub scope: String,
     pub candidate_decision: Option<String>,
     pub review_decision: Option<String>,
     pub source_album_id: Uuid,
+    pub blake3_equal: bool,
+    pub pixel_hash_equal: bool,
+    pub confidence: Option<f64>,
 }
 
 pub struct ImportPlanImageRow {
@@ -482,6 +487,116 @@ impl ImportRepository {
             .collect())
     }
 
+    /// Batch query library images by BLAKE3 hashes (indexed exact match).
+    pub async fn find_library_images_by_blake3(
+        client: &Client,
+        blake3_hashes: &[Vec<u8>],
+    ) -> Result<Vec<LibraryImageRow>, AppError> {
+        if blake3_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = client
+            .query(
+                "SELECT id, file_size, blake3, pixel_hash, gradient_hash, block_hash, median_hash
+                 FROM library_images
+                 WHERE blake3 = ANY($1)",
+                &[&blake3_hashes],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query library by blake3: {e}")))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| LibraryImageRow {
+                id: r.get("id"),
+                file_size: r.get("file_size"),
+                blake3: r.get("blake3"),
+                pixel_hash: r.get("pixel_hash"),
+                gradient_hash: r.get("gradient_hash"),
+                block_hash: r.get("block_hash"),
+                median_hash: r.get("median_hash"),
+            })
+            .collect())
+    }
+
+    /// Query library images by perceptual band (bucketed similarity recall).
+    /// Returns at most `max_candidates` results per band.
+    pub async fn find_library_images_by_perceptual_band(
+        client: &Client,
+        band_index: u8,
+        band_value: &[u8],
+        max_candidates: usize,
+    ) -> Result<Vec<LibraryImageRow>, AppError> {
+        let band_col = match band_index {
+            0 => "perceptual_band_0",
+            1 => "perceptual_band_1",
+            2 => "perceptual_band_2",
+            3 => "perceptual_band_3",
+            _ => return Ok(Vec::new()),
+        };
+
+        let query = format!(
+            "SELECT id, file_size, blake3, pixel_hash, gradient_hash, block_hash, median_hash
+             FROM library_images
+             WHERE {} = $1
+             LIMIT $2",
+            band_col
+        );
+
+        let rows = client
+            .query(&query, &[&band_value, &(max_candidates as i64)])
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query library by band: {e}")))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| LibraryImageRow {
+                id: r.get("id"),
+                file_size: r.get("file_size"),
+                blake3: r.get("blake3"),
+                pixel_hash: r.get("pixel_hash"),
+                gradient_hash: r.get("gradient_hash"),
+                block_hash: r.get("block_hash"),
+                median_hash: r.get("median_hash"),
+            })
+            .collect())
+    }
+
+    /// Find import images in the same run that share BLAKE3 hashes (cross-album exact match).
+    pub async fn find_sibling_images_by_blake3(
+        client: &Client,
+        import_run_id: Uuid,
+        blake3_hashes: &[Vec<u8>],
+    ) -> Result<Vec<(Uuid, Uuid, i64, Vec<u8>)>, AppError> {
+        if blake3_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = client
+            .query(
+                "SELECT ii.id, ii.import_album_id, ii.file_size, ii.blake3
+                 FROM import_images ii
+                 JOIN import_albums ia ON ii.import_album_id = ia.id
+                 WHERE ia.import_run_id = $1 AND ii.blake3 = ANY($2)",
+                &[&import_run_id, &blake3_hashes],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query sibling images by blake3: {e}"))
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get("id"),
+                    r.get("import_album_id"),
+                    r.get("file_size"),
+                    r.get("blake3"),
+                )
+            })
+            .collect())
+    }
+
     pub async fn count_duplicates_for_run(
         client: &Client,
         import_run_id: Uuid,
@@ -715,10 +830,14 @@ impl ImportRepository {
                 "SELECT dc.id AS candidate_id,
                         dc.source_image_id,
                         dc.candidate_source_image_id,
+                        dc.candidate_library_image_id,
                         dc.scope,
                         dc.decision AS candidate_decision,
                         rd.decision AS review_decision,
-                        si.import_album_id AS source_album_id
+                        si.import_album_id AS source_album_id,
+                        dc.blake3_equal,
+                        dc.pixel_hash_equal,
+                        dc.confidence
                  FROM duplicate_candidates dc
                  JOIN import_images si ON dc.source_image_id = si.id
                  LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
@@ -736,10 +855,14 @@ impl ImportRepository {
                 candidate_id: r.get("candidate_id"),
                 source_image_id: r.get("source_image_id"),
                 candidate_source_image_id: r.get("candidate_source_image_id"),
+                candidate_library_image_id: r.get("candidate_library_image_id"),
                 scope: r.get("scope"),
                 candidate_decision: r.get("candidate_decision"),
                 review_decision: r.get("review_decision"),
                 source_album_id: r.get("source_album_id"),
+                blake3_equal: r.get("blake3_equal"),
+                pixel_hash_equal: r.get("pixel_hash_equal"),
+                confidence: r.get("confidence"),
             })
             .collect())
     }
@@ -983,7 +1106,7 @@ impl ImportRepository {
         last_error: Option<&str>,
     ) -> Result<(), AppError> {
         let completed_at = match state {
-            "source_archived" | "committed" => Some(chrono::Utc::now()),
+            "source_archived" | "library_committed" => Some(chrono::Utc::now()),
             _ => None,
         };
         client
@@ -1064,5 +1187,140 @@ impl ImportRepository {
             .await
             .map_err(|e| AppError::Internal(format!("failed to update library root path: {e}")))?;
         Ok(())
+    }
+
+    // ── Import Plan CRUD ──────────────────────────────────────────
+
+    pub async fn insert_import_plan(
+        client: &Client,
+        import_run_id: Uuid,
+        version: i32,
+        state: &str,
+        policy_version: &str,
+        library_root_id: Uuid,
+        plan_hash: Option<&[u8]>,
+    ) -> Result<Uuid, AppError> {
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_plans (id, import_run_id, version, state, policy_version, library_root_id, plan_hash)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[&id, &import_run_id, &version, &state, &policy_version, &library_root_id, &plan_hash],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to insert import plan: {e}")))?;
+        Ok(id)
+    }
+
+    pub async fn update_import_plan_state(
+        client: &Client,
+        plan_id: Uuid,
+        state: &str,
+    ) -> Result<(), AppError> {
+        let frozen_at = match state {
+            "frozen" => Some(chrono::Utc::now()),
+            _ => None,
+        };
+        client
+            .execute(
+                "UPDATE import_plans SET state = $1, frozen_at = COALESCE($2, frozen_at) WHERE id = $3",
+                &[&state, &frozen_at, &plan_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to update import plan state: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn get_frozen_plan_for_run(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Option<(Uuid, Uuid, Vec<u8>)>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, library_root_id, plan_hash FROM import_plans
+                 WHERE import_run_id = $1 AND state = 'frozen'
+                 ORDER BY version DESC LIMIT 1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query frozen plan: {e}")))?;
+        Ok(row.map(|r| (r.get("id"), r.get("library_root_id"), r.get("plan_hash"))))
+    }
+
+    pub async fn insert_plan_album(
+        client: &Client,
+        plan_id: Uuid,
+        import_album_id: Uuid,
+        target_relative_path: &str,
+        expected_image_count: i32,
+    ) -> Result<Uuid, AppError> {
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_plan_albums (id, plan_id, import_album_id, target_relative_path, expected_image_count)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[&id, &plan_id, &import_album_id, &target_relative_path, &expected_image_count],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to insert plan album: {e}")))?;
+        Ok(id)
+    }
+
+    pub async fn insert_plan_image(
+        client: &Client,
+        plan_album_id: Uuid,
+        import_image_id: Uuid,
+        source_path: &str,
+        source_relative_path: &str,
+        target_relative_path: &str,
+        expected_file_size: i64,
+        expected_blake3: &[u8],
+        width: Option<i32>,
+        height: Option<i32>,
+        format: Option<&str>,
+    ) -> Result<Uuid, AppError> {
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_plan_images
+                 (id, plan_album_id, import_image_id, source_path, source_relative_path,
+                  target_relative_path, expected_file_size, expected_blake3, width, height, format)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                &[&id, &plan_album_id, &import_image_id, &source_path, &source_relative_path,
+                  &target_relative_path, &expected_file_size, &expected_blake3, &width, &height, &format],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to insert plan image: {e}")))?;
+        Ok(id)
+    }
+
+    pub async fn get_plan_images(
+        client: &Client,
+        plan_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, String, i64, Vec<u8>)>, AppError> {
+        let rows = client
+            .query(
+                "SELECT ipi.import_image_id, ipi.source_path, ipi.target_relative_path,
+                        ipi.expected_file_size, ipi.expected_blake3
+                 FROM import_plan_images ipi
+                 JOIN import_plan_albums ipa ON ipi.plan_album_id = ipa.id
+                 WHERE ipa.plan_id = $1
+                 ORDER BY ipi.target_relative_path",
+                &[&plan_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query plan images: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get("import_image_id"),
+                    r.get("source_path"),
+                    r.get("target_relative_path"),
+                    r.get("expected_file_size"),
+                    r.get("expected_blake3"),
+                )
+            })
+            .collect())
     }
 }

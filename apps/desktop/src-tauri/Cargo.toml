@@ -11,6 +11,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 real-db-tests = []
+fail-injection = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
