@@ -53,6 +53,14 @@ pub fn run() {
             commands::start_scan,
             commands::cancel_scan,
             commands::get_scan_progress,
+            commands::get_review_queue,
+            commands::get_review_candidate_detail,
+            commands::submit_review_decision,
+            commands::skip_review_album,
+            commands::get_review_progress,
+            commands::generate_import_plan,
+            commands::get_latest_completed_import_run,
+            commands::get_image_preview,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run ImageDB");

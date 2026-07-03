@@ -1,10 +1,12 @@
 mod database;
 mod probe;
+pub mod review;
 pub mod scan;
 mod settings_cmd;
 
 pub use database::*;
 pub use probe::*;
+pub use review::*;
 pub use scan::*;
 pub use settings_cmd::*;
 

@@ -107,3 +107,78 @@ export interface ScanSourceInfo {
   albums: string[];
   album_count: number;
 }
+
+export interface ReviewCandidateSummary {
+  candidate_id: string;
+  source_image_id: string;
+  candidate_source_image_id: string | null;
+  candidate_library_image_id: string | null;
+  scope: string;
+  match_type: string;
+  transform_type: string | null;
+  confidence: number | null;
+  album_name: string;
+  has_decision: boolean;
+}
+
+export interface ReviewCandidateDetail {
+  candidate_id: string;
+  source_image_id: string;
+  source_image_path: string;
+  source_image_file_size: number;
+  source_image_width: number | null;
+  source_image_height: number | null;
+  candidate_source_image_id: string | null;
+  candidate_source_image_path: string | null;
+  candidate_source_image_file_size: number | null;
+  candidate_source_image_width: number | null;
+  candidate_source_image_height: number | null;
+  candidate_library_image_id: string | null;
+  candidate_library_image_path: string | null;
+  candidate_library_image_file_size: number | null;
+  candidate_library_image_width: number | null;
+  candidate_library_image_height: number | null;
+  scope: string;
+  match_type: string;
+  blake3_equal: boolean;
+  pixel_hash_equal: boolean;
+  gradient_distance: number | null;
+  block_distance: number | null;
+  median_distance: number | null;
+  transform_type: string | null;
+  confidence: number | null;
+  album_name: string;
+  album_id: string;
+  existing_decision: string | null;
+}
+
+export interface ReviewProgress {
+  import_run_id: string;
+  total_review_candidates: number;
+  decided_count: number;
+  remaining_count: number;
+  all_decided: boolean;
+}
+
+export interface ImportPlanImage {
+  image_id: string;
+  source_path: string;
+  relative_path: string;
+  file_size: number;
+  album_name: string;
+}
+
+export interface ImportPlan {
+  import_run_id: string;
+  total_albums: number;
+  total_images: number;
+  kept_images: ImportPlanImage[];
+  excluded_count: number;
+  skipped_albums: string[];
+}
+
+export interface ImagePreview {
+  data_url: string;
+}
+
+export type ReviewDecision = 'keep_source' | 'keep_candidate' | 'keep_all' | 'skip_album';

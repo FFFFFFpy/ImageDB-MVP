@@ -255,6 +255,113 @@ impl fmt::Display for DecisionSource {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReviewDecisionAction {
+    KeepSource,
+    KeepCandidate,
+    KeepAll,
+    SkipAlbum,
+}
+
+impl fmt::Display for ReviewDecisionAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::KeepSource => write!(f, "keep_source"),
+            Self::KeepCandidate => write!(f, "keep_candidate"),
+            Self::KeepAll => write!(f, "keep_all"),
+            Self::SkipAlbum => write!(f, "skip_album"),
+        }
+    }
+}
+
+impl ReviewDecisionAction {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "keep_source" => Some(Self::KeepSource),
+            "keep_candidate" => Some(Self::KeepCandidate),
+            "keep_all" => Some(Self::KeepAll),
+            "skip_album" => Some(Self::SkipAlbum),
+            _ => None,
+        }
+    }
+}
+
+pub const REVIEW_DECISION_VALUES: &str = "keep_source, keep_candidate, keep_all, skip_album";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewCandidateSummary {
+    pub candidate_id: String,
+    pub source_image_id: String,
+    pub candidate_source_image_id: Option<String>,
+    pub candidate_library_image_id: Option<String>,
+    pub scope: String,
+    pub match_type: String,
+    pub transform_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub album_name: String,
+    pub has_decision: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewCandidateDetail {
+    pub candidate_id: String,
+    pub source_image_id: String,
+    pub source_image_path: String,
+    pub source_image_file_size: i64,
+    pub source_image_width: Option<i32>,
+    pub source_image_height: Option<i32>,
+    pub candidate_source_image_id: Option<String>,
+    pub candidate_source_image_path: Option<String>,
+    pub candidate_source_image_file_size: Option<i64>,
+    pub candidate_source_image_width: Option<i32>,
+    pub candidate_source_image_height: Option<i32>,
+    pub candidate_library_image_id: Option<String>,
+    pub candidate_library_image_path: Option<String>,
+    pub candidate_library_image_file_size: Option<i64>,
+    pub candidate_library_image_width: Option<i32>,
+    pub candidate_library_image_height: Option<i32>,
+    pub scope: String,
+    pub match_type: String,
+    pub blake3_equal: bool,
+    pub pixel_hash_equal: bool,
+    pub gradient_distance: Option<i32>,
+    pub block_distance: Option<i32>,
+    pub median_distance: Option<i32>,
+    pub transform_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub album_name: String,
+    pub album_id: String,
+    pub existing_decision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewProgress {
+    pub import_run_id: String,
+    pub total_review_candidates: u32,
+    pub decided_count: u32,
+    pub remaining_count: u32,
+    pub all_decided: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportPlanImage {
+    pub image_id: String,
+    pub source_path: String,
+    pub relative_path: String,
+    pub file_size: i64,
+    pub album_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportPlan {
+    pub import_run_id: String,
+    pub total_albums: u32,
+    pub total_images: u32,
+    pub kept_images: Vec<ImportPlanImage>,
+    pub excluded_count: u32,
+    pub skipped_albums: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MatchingStrategy {
     Strict,
     Balanced,
@@ -411,6 +518,22 @@ mod tests {
             DecisionSource::PerceptualRule.to_string(),
             "perceptual_rule"
         );
+    }
+
+    #[test]
+    fn review_decision_action_round_trip() {
+        for action in [
+            ReviewDecisionAction::KeepSource,
+            ReviewDecisionAction::KeepCandidate,
+            ReviewDecisionAction::KeepAll,
+            ReviewDecisionAction::SkipAlbum,
+        ] {
+            assert_eq!(
+                ReviewDecisionAction::from_str_opt(&action.to_string()),
+                Some(action)
+            );
+        }
+        assert_eq!(ReviewDecisionAction::from_str_opt("bogus"), None);
     }
 
     #[test]

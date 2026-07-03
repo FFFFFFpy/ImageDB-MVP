@@ -6,6 +6,7 @@ import { api } from '../lib/ipc/api';
 import { DashboardPage } from '../pages/DashboardPage';
 import { OnboardingPage } from '../pages/OnboardingPage';
 import { ProbesPage } from '../pages/ProbesPage';
+import { ReviewPage } from '../pages/ReviewPage';
 import { ScanPage } from '../pages/ScanPage';
 import { SettingsPage } from '../pages/SettingsPage';
 
@@ -39,6 +40,7 @@ export function App() {
             />
           )}
           {route === 'scan' && <ScanPage />}
+          {route === 'review' && <ReviewPage onNavigate={navigate} />}
           {route === 'settings' && <SettingsPage />}
           {route === 'probes' && <ProbesPage />}
         </Layout>

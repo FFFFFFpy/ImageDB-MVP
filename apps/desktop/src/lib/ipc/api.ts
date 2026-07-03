@@ -10,6 +10,12 @@ import type {
   FileTransactionProbeResult,
   ScanProgress,
   ScanSourceInfo,
+  ReviewCandidateSummary,
+  ReviewCandidateDetail,
+  ReviewProgress,
+  ImportPlan,
+  ImagePreview,
+  ReviewDecision,
 } from './types';
 
 export const api = {
@@ -47,4 +53,28 @@ export const api = {
   cancelScan: () => invoke<string>('cancel_scan'),
 
   getScanProgress: () => invoke<ScanProgress>('get_scan_progress'),
+
+  getReviewQueue: (importRunId: string) =>
+    invoke<ReviewCandidateSummary[]>('get_review_queue', { importRunId }),
+
+  getReviewCandidateDetail: (candidateId: string) =>
+    invoke<ReviewCandidateDetail>('get_review_candidate_detail', { candidateId }),
+
+  submitReviewDecision: (candidateId: string, decision: ReviewDecision) =>
+    invoke<void>('submit_review_decision', { candidateId, decision }),
+
+  skipReviewAlbum: (importRunId: string, albumId: string) =>
+    invoke<number>('skip_review_album', { importRunId, albumId }),
+
+  getReviewProgress: (importRunId: string) =>
+    invoke<ReviewProgress>('get_review_progress', { importRunId }),
+
+  generateImportPlan: (importRunId: string) =>
+    invoke<ImportPlan>('generate_import_plan', { importRunId }),
+
+  getLatestCompletedImportRun: () =>
+    invoke<string | null>('get_latest_completed_import_run'),
+
+  getImagePreview: (path: string) =>
+    invoke<ImagePreview>('get_image_preview', { path }),
 };

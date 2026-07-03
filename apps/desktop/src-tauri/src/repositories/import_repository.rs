@@ -89,6 +89,79 @@ pub struct NewDuplicateCandidate {
     pub decision_source: Option<DecisionSource>,
 }
 
+pub struct ReviewCandidateRow {
+    pub candidate_id: Uuid,
+    pub source_image_id: Uuid,
+    pub candidate_source_image_id: Option<Uuid>,
+    pub candidate_library_image_id: Option<Uuid>,
+    pub scope: String,
+    pub match_type: String,
+    pub transform_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub album_name: String,
+    pub has_decision: bool,
+}
+
+pub struct ReviewCandidateDetailRow {
+    pub candidate_id: Uuid,
+    pub source_image_id: Uuid,
+    pub source_image_path: String,
+    pub source_image_file_size: i64,
+    pub source_image_width: Option<i32>,
+    pub source_image_height: Option<i32>,
+    pub candidate_source_image_id: Option<Uuid>,
+    pub candidate_source_image_path: Option<String>,
+    pub candidate_source_image_file_size: Option<i64>,
+    pub candidate_source_image_width: Option<i32>,
+    pub candidate_source_image_height: Option<i32>,
+    pub candidate_library_image_id: Option<Uuid>,
+    pub candidate_library_image_path: Option<String>,
+    pub candidate_library_image_file_size: Option<i64>,
+    pub candidate_library_image_width: Option<i32>,
+    pub candidate_library_image_height: Option<i32>,
+    pub scope: String,
+    pub match_type: String,
+    pub blake3_equal: bool,
+    pub pixel_hash_equal: bool,
+    pub gradient_distance: Option<i32>,
+    pub block_distance: Option<i32>,
+    pub median_distance: Option<i32>,
+    pub transform_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub album_name: String,
+    pub album_id: Uuid,
+    pub existing_decision: Option<String>,
+}
+
+pub struct ReviewProgressRow {
+    pub total: u32,
+    pub decided: u32,
+}
+
+pub struct ImportPlanCandidateRow {
+    pub candidate_id: Uuid,
+    pub source_image_id: Uuid,
+    pub candidate_source_image_id: Option<Uuid>,
+    pub scope: String,
+    pub candidate_decision: Option<String>,
+    pub review_decision: Option<String>,
+    pub source_album_id: Uuid,
+}
+
+pub struct ImportPlanImageRow {
+    pub id: Uuid,
+    pub source_path: String,
+    pub relative_path: String,
+    pub file_size: i64,
+    pub album_id: Uuid,
+    pub album_name: String,
+}
+
+pub struct AlbumRow {
+    pub id: Uuid,
+    pub source_name: String,
+}
+
 impl ImportRepository {
     pub async fn upsert_default_library_root(client: &Client) -> Result<Uuid, AppError> {
         if let Some(row) = client
@@ -387,5 +460,324 @@ impl ImportRepository {
             .await
             .map_err(|e| AppError::Internal(format!("failed to count duplicates: {e}")))?;
         Ok(row.get(0))
+    }
+
+    pub async fn get_review_candidates(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<ReviewCandidateRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT dc.id AS candidate_id,
+                        dc.source_image_id,
+                        dc.candidate_source_image_id,
+                        dc.candidate_library_image_id,
+                        dc.scope,
+                        dc.match_type,
+                        dc.transform_type,
+                        dc.confidence,
+                        ia.id AS album_id,
+                        ia.source_name AS album_name,
+                        (rd.id IS NOT NULL) AS has_decision
+                 FROM duplicate_candidates dc
+                 JOIN import_images si ON dc.source_image_id = si.id
+                 JOIN import_albums ia ON si.import_album_id = ia.id
+                 LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                 WHERE dc.import_run_id = $1
+                   AND dc.decision IS NULL
+                 ORDER BY ia.source_name, dc.created_at",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query review candidates: {e}")))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ReviewCandidateRow {
+                candidate_id: r.get("candidate_id"),
+                source_image_id: r.get("source_image_id"),
+                candidate_source_image_id: r.get("candidate_source_image_id"),
+                candidate_library_image_id: r.get("candidate_library_image_id"),
+                scope: r.get("scope"),
+                match_type: r.get("match_type"),
+                transform_type: r.get("transform_type"),
+                confidence: r.get("confidence"),
+                album_name: r.get("album_name"),
+                has_decision: r.get("has_decision"),
+            })
+            .collect())
+    }
+
+    pub async fn get_review_candidate_detail(
+        client: &Client,
+        candidate_id: Uuid,
+    ) -> Result<Option<ReviewCandidateDetailRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT dc.id AS candidate_id,
+                        dc.source_image_id,
+                        si.source_path AS source_image_path,
+                        si.file_size AS source_image_file_size,
+                        si.width AS source_image_width,
+                        si.height AS source_image_height,
+                        dc.candidate_source_image_id,
+                        csi.source_path AS candidate_source_image_path,
+                        csi.file_size AS candidate_source_image_file_size,
+                        csi.width AS candidate_source_image_width,
+                        csi.height AS candidate_source_image_height,
+                        dc.candidate_library_image_id,
+                        concat_ws('\\', lr.path, NULLIF(la.relative_path, ''), cli.relative_path)
+                            AS candidate_library_image_path,
+                        cli.file_size AS candidate_library_image_file_size,
+                        cli.width AS candidate_library_image_width,
+                        cli.height AS candidate_library_image_height,
+                        dc.scope,
+                        dc.match_type,
+                        dc.blake3_equal,
+                        dc.pixel_hash_equal,
+                        dc.gradient_distance,
+                        dc.block_distance,
+                        dc.median_distance,
+                        dc.transform_type,
+                        dc.confidence,
+                        ia.source_name AS album_name,
+                        ia.id AS album_id,
+                        rd.decision AS existing_decision
+                 FROM duplicate_candidates dc
+                 JOIN import_images si ON dc.source_image_id = si.id
+                 JOIN import_albums ia ON si.import_album_id = ia.id
+                 LEFT JOIN import_images csi ON dc.candidate_source_image_id = csi.id
+                 LEFT JOIN library_images cli ON dc.candidate_library_image_id = cli.id
+                 LEFT JOIN library_albums la ON cli.album_id = la.id
+                 LEFT JOIN library_roots lr ON la.library_root_id = lr.id
+                 LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                 WHERE dc.id = $1",
+                &[&candidate_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query review candidate detail: {e}"))
+            })?;
+
+        Ok(row.map(|r| ReviewCandidateDetailRow {
+            candidate_id: r.get("candidate_id"),
+            source_image_id: r.get("source_image_id"),
+            source_image_path: r.get("source_image_path"),
+            source_image_file_size: r.get("source_image_file_size"),
+            source_image_width: r.get("source_image_width"),
+            source_image_height: r.get("source_image_height"),
+            candidate_source_image_id: r.get("candidate_source_image_id"),
+            candidate_source_image_path: r.get("candidate_source_image_path"),
+            candidate_source_image_file_size: r.get("candidate_source_image_file_size"),
+            candidate_source_image_width: r.get("candidate_source_image_width"),
+            candidate_source_image_height: r.get("candidate_source_image_height"),
+            candidate_library_image_id: r.get("candidate_library_image_id"),
+            candidate_library_image_path: r.get("candidate_library_image_path"),
+            candidate_library_image_file_size: r.get("candidate_library_image_file_size"),
+            candidate_library_image_width: r.get("candidate_library_image_width"),
+            candidate_library_image_height: r.get("candidate_library_image_height"),
+            scope: r.get("scope"),
+            match_type: r.get("match_type"),
+            blake3_equal: r.get("blake3_equal"),
+            pixel_hash_equal: r.get("pixel_hash_equal"),
+            gradient_distance: r.get("gradient_distance"),
+            block_distance: r.get("block_distance"),
+            median_distance: r.get("median_distance"),
+            transform_type: r.get("transform_type"),
+            confidence: r.get("confidence"),
+            album_name: r.get("album_name"),
+            album_id: r.get("album_id"),
+            existing_decision: r.get("existing_decision"),
+        }))
+    }
+
+    pub async fn get_review_decision(
+        client: &Client,
+        candidate_id: Uuid,
+    ) -> Result<Option<String>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT decision FROM review_decisions WHERE candidate_id = $1",
+                &[&candidate_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query review decision: {e}")))?;
+
+        Ok(row.map(|r| r.get("decision")))
+    }
+
+    pub async fn insert_review_decision_once(
+        client: &Client,
+        candidate_id: Uuid,
+        decision: &str,
+        selected_image_id: Option<Uuid>,
+        notes: Option<&str>,
+    ) -> Result<(), AppError> {
+        let id = Uuid::new_v4();
+        let row = client
+            .query_opt(
+                "INSERT INTO review_decisions (id, candidate_id, decision, selected_image_id, notes)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (candidate_id) DO UPDATE
+                 SET decision = review_decisions.decision
+                 WHERE review_decisions.decision = EXCLUDED.decision
+                   AND review_decisions.selected_image_id IS NOT DISTINCT FROM EXCLUDED.selected_image_id
+                 RETURNING id",
+                &[&id, &candidate_id, &decision, &selected_image_id, &notes],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to insert review decision: {e}"))
+            })?;
+
+        if row.is_none() {
+            return Err(AppError::Internal(format!(
+                "candidate {candidate_id} already has a conflicting review decision"
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_review_progress(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<ReviewProgressRow, AppError> {
+        let total_row = client
+            .query_one(
+                "SELECT COUNT(*) AS total
+                 FROM duplicate_candidates
+                 WHERE import_run_id = $1 AND decision IS NULL",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count review candidates: {e}")))?;
+        let total: i64 = total_row.get("total");
+
+        let decided_row = client
+            .query_one(
+                "SELECT COUNT(*) AS decided
+                 FROM review_decisions rd
+                 JOIN duplicate_candidates dc ON rd.candidate_id = dc.id
+                 WHERE dc.import_run_id = $1 AND dc.decision IS NULL",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count decided reviews: {e}")))?;
+        let decided: i64 = decided_row.get("decided");
+
+        Ok(ReviewProgressRow {
+            total: total as u32,
+            decided: decided as u32,
+        })
+    }
+
+    pub async fn get_all_candidates_for_import_plan(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<ImportPlanCandidateRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT dc.id AS candidate_id,
+                        dc.source_image_id,
+                        dc.candidate_source_image_id,
+                        dc.scope,
+                        dc.decision AS candidate_decision,
+                        rd.decision AS review_decision,
+                        si.import_album_id AS source_album_id
+                 FROM duplicate_candidates dc
+                 JOIN import_images si ON dc.source_image_id = si.id
+                 LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                 WHERE dc.import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query candidates for import plan: {e}"))
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ImportPlanCandidateRow {
+                candidate_id: r.get("candidate_id"),
+                source_image_id: r.get("source_image_id"),
+                candidate_source_image_id: r.get("candidate_source_image_id"),
+                scope: r.get("scope"),
+                candidate_decision: r.get("candidate_decision"),
+                review_decision: r.get("review_decision"),
+                source_album_id: r.get("source_album_id"),
+            })
+            .collect())
+    }
+
+    pub async fn get_all_import_images_with_album(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<ImportPlanImageRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT ii.id,
+                        ii.source_path,
+                        ii.relative_path,
+                        ii.file_size,
+                        ia.id AS album_id,
+                        ia.source_name AS album_name
+                 FROM import_images ii
+                 JOIN import_albums ia ON ii.import_album_id = ia.id
+                 WHERE ia.import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query import images for plan: {e}"))
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ImportPlanImageRow {
+                id: r.get("id"),
+                source_path: r.get("source_path"),
+                relative_path: r.get("relative_path"),
+                file_size: r.get("file_size"),
+                album_id: r.get("album_id"),
+                album_name: r.get("album_name"),
+            })
+            .collect())
+    }
+
+    pub async fn get_albums_for_run(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<AlbumRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, source_name FROM import_albums WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query albums for run: {e}")))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| AlbumRow {
+                id: r.get("id"),
+                source_name: r.get("source_name"),
+            })
+            .collect())
+    }
+
+    pub async fn get_latest_completed_run(client: &Client) -> Result<Option<Uuid>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id FROM import_runs
+                 WHERE state = 'completed'
+                 ORDER BY completed_at DESC
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query latest run: {e}")))?;
+
+        Ok(row.map(|r| r.get("id")))
     }
 }
