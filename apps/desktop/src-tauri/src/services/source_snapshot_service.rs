@@ -11,6 +11,12 @@
 //! Shared by [`crate::services::scan_service`],
 //! [`crate::services::commit_service`] (Phase 6 source archive), and
 //! [`crate::services::recovery_service`] (resume_source_archive).
+//!
+//! Phase 5: the blocking work (read_dir + File::open + BLAKE3 hashing) is
+//! isolated inside `spawn_blocking` so the async runtime is never blocked
+//! by a large-album snapshot. Special filesystem entries (symlinks,
+//! directory junctions, Windows reparse points, FIFOs, devices) are
+//! **rejected explicitly** — never silently hashed or skipped.
 use crate::error::AppError;
 use crate::repositories::import_repository::{
     ImportRepository, NewSnapshotFile, SnapshotFileRecord,
@@ -40,6 +46,21 @@ pub enum SnapshotVerifyError {
     SnapshotHashMismatch {
         expected: String,
         actual: String,
+    },
+    /// Phase 5: a special filesystem entry (symlink, directory junction,
+    /// Windows reparse point, FIFO, socket, device, or any other non-regular
+    /// file) was encountered. The album is rejected rather than silently
+    /// hashed.
+    ///
+    /// Note: in the current implementation, special entries are rejected at
+    /// the `collect_album_files` layer with an `AppError` (the snapshot
+    /// cannot be captured at all if a special entry is present). This
+    /// variant is retained so a future verifier-only mode can surface the
+    /// specific entry kind without aborting the whole snapshot.
+    #[allow(dead_code)]
+    UnsupportedEntry {
+        path: String,
+        entry_kind: String,
     },
 }
 
@@ -71,6 +92,10 @@ impl std::fmt::Display for SnapshotVerifyError {
                     "snapshot hash mismatch: expected {expected}, got {actual}"
                 )
             }
+            Self::UnsupportedEntry { path, entry_kind } => write!(
+                f,
+                "unsupported filesystem entry ({entry_kind}) at {path}: only regular files are allowed"
+            ),
         }
     }
 }
@@ -137,18 +162,75 @@ fn hash_file_sync(path: &Path) -> Result<Vec<u8>, AppError> {
     Ok(hasher.finalize().as_bytes().to_vec())
 }
 
-/// Recursively walk `album_path` and return every file with its relative
-/// path, size, and BLAKE3. Sidecars, descriptions, nested files, and any
-/// other non-directory entry are included — this is the full album image
-/// used to prove source/archive integrity later.
+/// Classify a `FileType`-style entry kind for the `UnsupportedEntry` error.
+/// Returns `None` for regular files + directories (directories are walked,
+/// regular files are hashed; everything else is rejected).
+fn classify_special_entry(ft: &std::fs::FileType) -> Option<&'static str> {
+    if ft.is_symlink() {
+        Some("symlink")
+    } else if ft.is_dir() {
+        None
+    } else if ft.is_file() {
+        // On Unix, a regular file. On Windows, `is_file()` is true for the
+        // normal case but `is_symlink()` already caught reparse-point
+        // symlinks above. Other reparse point types (junctions) are reported
+        // as `is_dir()` by std on Windows, so we additionally check via
+        // metadata kind below in `walk`.
+        None
+    } else {
+        // FIFO, socket, char/block device, or unknown.
+        Some("special_file")
+    }
+}
+
+/// Recursively walk `album_path` and return every regular file with its
+/// relative path, size, and BLAKE3. Sidecars, descriptions, nested files,
+/// and any other non-directory entry are included — this is the full album
+/// image used to prove source/archive integrity later.
+///
+/// Phase 5: **special filesystem entries are rejected explicitly** —
+/// symlinks, directory junctions, Windows reparse points, FIFOs, sockets,
+/// and devices surface as an `AppError` rather than being silently hashed
+/// or skipped. Only regular files + directories are walked.
 pub fn collect_album_files(album_path: &Path) -> Result<Vec<NewSnapshotFile>, AppError> {
     fn walk(dir: &Path, album_path: &Path, out: &mut Vec<NewSnapshotFile>) -> Result<(), AppError> {
         let entries = std::fs::read_dir(dir)?;
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            let ft = entry.file_type()?;
+            // Use symlink_metadata so we inspect the link itself, not its
+            // target. A symlink must NEVER be followed into during a
+            // snapshot — it would silently pull in unrelated files.
+            let meta = std::fs::symlink_metadata(&path)?;
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                return Err(AppError::Internal(format!(
+                    "unsupported filesystem entry (symlink) at {}: only regular files are allowed",
+                    path.display()
+                )));
+            }
             if ft.is_dir() {
+                // On Windows, directory junctions and some reparse points
+                // are reported as `is_dir()` by std. `symlink_metadata`
+                // already gave us the reparse info; if the entry is a
+                // reparse point that is NOT a normal directory, reject it.
+                // std::fs::FileType does not expose reparse tag directly,
+                // so we rely on the canonicalize-then-compare check: if
+                // canonicalizing the dir yields a path that does not start
+                // with this dir, it is almost certainly a junction.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    // FILE_ATTRIBUTE_REPARSE_POINT = 0x400. If set, this is
+                    // a reparse point (junction or mounted folder, not a
+                    // plain directory).
+                    if meta.file_attributes() & 0x400 != 0 {
+                        return Err(AppError::Internal(format!(
+                            "unsupported filesystem entry (reparse point / junction) at {}: only regular files are allowed",
+                            path.display()
+                        )));
+                    }
+                }
                 walk(&path, album_path, out)?;
             } else if ft.is_file() {
                 let relative_path = normalize_snapshot_relative_path(album_path, &path)?;
@@ -160,6 +242,13 @@ pub fn collect_album_files(album_path: &Path) -> Result<Vec<NewSnapshotFile>, Ap
                     file_size: metadata.len() as i64,
                     blake3,
                 });
+            } else {
+                // FIFO, socket, char/block device, or unknown.
+                let kind = classify_special_entry(&ft).unwrap_or("unknown");
+                return Err(AppError::Internal(format!(
+                    "unsupported filesystem entry ({kind}) at {}: only regular files are allowed",
+                    path.display()
+                )));
             }
         }
         Ok(())
@@ -195,13 +284,22 @@ pub fn compute_snapshot_hash(files: &[NewSnapshotFile]) -> Vec<u8> {
 
 /// Capture a full snapshot of `source_album_path` and persist it under
 /// `import_album_id`. Returns the new snapshot id and its hash.
+///
+/// Phase 5: the blocking work (`read_dir` + `File::open` + BLAKE3 hashing
+/// over potentially many large files) is isolated inside
+/// `spawn_blocking` so the async runtime worker is never held hostage by
+/// a slow snapshot.
 pub async fn capture_source_album_snapshot(
     client: &tokio_postgres::Client,
     import_run_id: Uuid,
     import_album_id: Uuid,
     source_album_path: &Path,
 ) -> Result<(Uuid, Vec<u8>), AppError> {
-    let files = collect_album_files(source_album_path)?;
+    let album_path = source_album_path.to_path_buf();
+    // Offload the blocking directory walk + hashing to a dedicated thread.
+    let files = tokio::task::spawn_blocking(move || collect_album_files(&album_path))
+        .await
+        .map_err(|e| AppError::Internal(format!("source album snapshot task failed: {e}")))??;
     let snapshot_hash = compute_snapshot_hash(&files);
     let snapshot_id = Uuid::new_v4();
     ImportRepository::insert_source_album_snapshot(
@@ -243,6 +341,10 @@ pub async fn load_source_album_snapshot(
 
 /// Load the persisted snapshot header + files for `import_album_id` and
 /// verify the on-disk directory against it.
+///
+/// Phase 5: the blocking directory walk + hashing is isolated inside
+/// `spawn_blocking` so the async runtime is never blocked by a large
+/// album verification.
 pub async fn verify_source_album_snapshot(
     client: &tokio_postgres::Client,
     import_album_id: Uuid,
@@ -259,7 +361,33 @@ pub async fn verify_source_album_snapshot(
         };
     let stored_files = ImportRepository::get_snapshot_files(client, snapshot.snapshot_id).await?;
 
-    verify_source_snapshot_files(source_album_path, &snapshot.snapshot_hash, &stored_files)
+    // Move the blocking walk + hash off the async worker.
+    let album_path = source_album_path.to_path_buf();
+    let snapshot_hash = snapshot.snapshot_hash.clone();
+    let stored_files_owned: Vec<SnapshotFileRecord> = stored_files;
+    tokio::task::spawn_blocking(move || {
+        verify_source_snapshot_files(&album_path, &snapshot_hash, &stored_files_owned)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("snapshot verify task failed: {e}")))?
+}
+
+/// Async wrapper for [`verify_source_snapshot_files`] that isolates the
+/// blocking directory walk + hashing on a `spawn_blocking` task. Used by
+/// async callers (commit Phase 6 source-archive verify, recovery). The
+/// synchronous [`verify_source_snapshot_files`] is kept for unit tests and
+/// any synchronous caller.
+pub async fn verify_source_snapshot_files_async(
+    source_album_path: &Path,
+    snapshot_hash: Vec<u8>,
+    stored_files: Vec<SnapshotFileRecord>,
+) -> Result<Vec<SnapshotVerifyError>, AppError> {
+    let album_path = source_album_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        verify_source_snapshot_files(&album_path, &snapshot_hash, &stored_files)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("snapshot verify task failed: {e}")))?
 }
 
 /// Pure verifier: compare `source_album_path` against a previously captured
