@@ -274,27 +274,95 @@ pub fn build_import_plan(
     }
 }
 
-pub fn load_image_preview(path: &Path) -> Result<String, AppError> {
+/// Decode an image from disk, cap its decoded pixel count, downscale to a
+/// size-limited thumbnail, and re-encode as JPEG. Returns a data URL. Never
+/// returns the full-resolution original.
+fn render_thumbnail(
+    path: &Path,
+    max_dim: u32,
+    max_pixels: u64,
+    max_source_bytes: u64,
+) -> Result<String, AppError> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > max_source_bytes {
+        return Err(AppError::IoError(format!(
+            "image too large to preview: {} ({} bytes > {})",
+            path.display(),
+            metadata.len(),
+            max_source_bytes
+        )));
+    }
+
+    // Validate the format by extension before reading, so a non-image file
+    // (e.g. a renamed executable) is rejected cheaply.
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        _ => "application/octet-stream",
+    let _mime = match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "webp" => ext.clone(),
+        _ => {
+            return Err(AppError::Internal(format!(
+                "unsupported image format for preview: {}",
+                path.display()
+            )));
+        }
     };
 
-    let data = std::fs::read(path)
+    let bytes = std::fs::read(path)
         .map_err(|e| AppError::IoError(format!("failed to read image {}: {e}", path.display())))?;
+    let reader = std::io::Cursor::new(bytes);
+    let img = image::ImageReader::new(reader)
+        .with_guessed_format()
+        .map_err(|e| AppError::ImageError(format!("cannot inspect image: {e}")))?
+        .decode()
+        .map_err(|e| AppError::ImageError(format!("corrupt or undecodable image: {e}")))?;
 
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-    let data_url = format!("data:{mime};base64,{b64}");
+    // Cap decoded pixels so a maliciously huge-but-valid image cannot exhaust
+    // memory during the resize.
+    let (w, h) = (img.width() as u64, img.height() as u64);
+    if w.saturating_mul(h) > max_pixels {
+        return Err(AppError::ImageError(format!(
+            "decoded image too large for preview: {w}x{h} (>{max_pixels} pixels)"
+        )));
+    }
 
-    Ok(data_url)
+    // Downscale so neither dimension exceeds max_dim.
+    let thumb = if img.width() > max_dim || img.height() > max_dim {
+        img.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    thumb
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .map_err(|e| AppError::ImageError(format!("thumbnail encode failed: {e}")))?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+    Ok(format!("data:image/jpeg;base64,{b64}"))
+}
+
+/// Allowed-roots check: a preview path must canonicalize to a location inside
+/// the candidate's source root or library root. This blocks path-escape
+/// attacks (e.g. a DB row pointing at /etc/passwd or ..\\..\\secrets).
+fn path_within_allowed_roots(resolved: &Path, allowed: &[PathBuf]) -> Result<(), AppError> {
+    let canon = resolved.canonicalize().map_err(|e| {
+        AppError::IoError(format!("cannot canonicalize {}: {e}", resolved.display()))
+    })?;
+    for root in allowed {
+        let root_canon = match root.canonicalize() {
+            Ok(c) => c,
+            Err(_) => continue, // a root that doesn't exist can't be matched
+        };
+        if canon.starts_with(&root_canon) {
+            return Ok(());
+        }
+    }
+    Err(AppError::Internal(format!(
+        "preview path {} is outside the candidate's allowed source/library roots",
+        resolved.display()
+    )))
 }
 
 /// Load an image preview for a review candidate, restricted to persisted records.
@@ -306,25 +374,30 @@ pub fn load_image_preview(path: &Path) -> Result<String, AppError> {
 /// This function validates that:
 /// 1. The candidate exists in the database.
 /// 2. The image_side is valid.
-/// 3. The resolved path is within allowed directories (source root or library root).
+/// 3. The resolved path canonicalizes inside the candidate's source root or
+///    library root (no path escape).
 /// 4. The file is a supported image format.
-/// 5. The file size is within limits.
+/// 5. The source file size is within limits.
+/// 6. The decoded pixel count is within limits.
+/// 7. A size-limited JPEG thumbnail is returned, never the full-resolution
+///    original.
 pub async fn load_image_preview_by_candidate(
     client: &Client,
     candidate_id: Uuid,
     image_side: &str,
 ) -> Result<String, AppError> {
+    use crate::repositories::import_repository::ImportRepository;
     let detail = ImportRepository::get_review_candidate_detail(client, candidate_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("candidate {candidate_id} not found")))?;
 
-    let path = match image_side {
-        "source" => PathBuf::from(&detail.source_image_path),
+    let (path, is_library_candidate) = match image_side {
+        "source" => (PathBuf::from(&detail.source_image_path), false),
         "candidate" => {
-            if let Some(ref path) = detail.candidate_source_image_path {
-                PathBuf::from(path)
-            } else if let Some(ref path) = detail.candidate_library_image_path {
-                PathBuf::from(path)
+            if let Some(ref p) = detail.candidate_source_image_path {
+                (PathBuf::from(p), false)
+            } else if let Some(ref p) = detail.candidate_library_image_path {
+                (PathBuf::from(p), true)
             } else {
                 return Err(AppError::Internal(format!(
                     "candidate {candidate_id} has no candidate image path"
@@ -338,6 +411,51 @@ pub async fn load_image_preview_by_candidate(
         }
     };
 
+    // Build the allowed roots: the import run's source_root (for import images)
+    // and the library root of the candidate library image (for library images).
+    let mut allowed: Vec<PathBuf> = Vec::new();
+    // Import run source root.
+    let run_row = client
+        .query_opt(
+            "SELECT ir.source_root FROM import_runs ir
+             JOIN import_albums ia ON ia.import_run_id = ir.id
+             JOIN import_images ii ON ii.import_album_id = ia.id
+             WHERE ii.id = $1",
+            &[&detail.source_image_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query import run root: {e}")))?;
+    if let Some(row) = run_row {
+        let source_root: String = row.get("source_root");
+        allowed.push(PathBuf::from(source_root));
+    }
+    if is_library_candidate {
+        // Library image path is already resolved as root/album_rel/img_rel in
+        // get_review_candidate_detail; its allowed root is the library root,
+        // which is the parent of the album-relative path. We add the path's
+        // own album directory and the broader library root by querying it.
+        if let Some(lib_img_id) = detail.candidate_library_image_id {
+            let lib_row = client
+                .query_opt(
+                    "SELECT lr.path AS root_path
+                     FROM library_images li
+                     JOIN library_albums la ON la.id = li.album_id
+                     JOIN library_roots lr ON lr.id = la.library_root_id
+                     WHERE li.id = $1",
+                    &[&lib_img_id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to query library root: {e}")))?;
+            if let Some(row) = lib_row {
+                let root_path: String = row.get("root_path");
+                allowed.push(PathBuf::from(root_path));
+            }
+        }
+    }
+
+    // Path escape check.
+    path_within_allowed_roots(&path, &allowed)?;
+
     // Validate the path exists.
     if !path.exists() {
         return Err(AppError::IoError(format!(
@@ -346,22 +464,113 @@ pub async fn load_image_preview_by_candidate(
         )));
     }
 
-    // Validate file size (max 50MB).
-    let metadata = std::fs::metadata(&path)?;
-    if metadata.len() > 50 * 1024 * 1024 {
-        return Err(AppError::IoError(format!(
-            "image too large: {} ({} bytes)",
-            path.display(),
-            metadata.len()
-        )));
-    }
-
-    load_image_preview(&path)
+    render_thumbnail(
+        &path,
+        PREVIEW_MAX_DIMENSION,
+        PREVIEW_MAX_PIXELS,
+        PREVIEW_MAX_SOURCE_BYTES,
+    )
 }
+
+/// Maximum dimension (px) of a generated preview thumbnail.
+const PREVIEW_MAX_DIMENSION: u32 = 800;
+/// Maximum decoded pixel count for a preview source.
+const PREVIEW_MAX_PIXELS: u64 = 50_000_000;
+/// Maximum source file size (bytes) for a preview.
+const PREVIEW_MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn path_within_allowed_roots_rejects_escape() {
+        let tmp = TempDir::new().unwrap();
+        let allowed_root = tmp.path().join("src");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        let inside = allowed_root.join("a.jpg");
+        std::fs::write(&inside, b"x").unwrap();
+        let outside = tmp.path().join("secret.txt");
+        std::fs::write(&outside, b"x").unwrap();
+
+        assert!(path_within_allowed_roots(&inside, std::slice::from_ref(&allowed_root)).is_ok());
+        assert!(
+            path_within_allowed_roots(&outside, &[allowed_root]).is_err(),
+            "path outside allowed root must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_within_allowed_roots_rejects_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let allowed_root = tmp.path().join("src");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        // A symlink-free traversal: ../secret relative to src.
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, b"x").unwrap();
+        let escaped = allowed_root.join("..").join("secret.txt");
+        assert!(
+            path_within_allowed_roots(&escaped, &[allowed_root]).is_err(),
+            "traversal escape must be rejected"
+        );
+    }
+
+    #[test]
+    fn render_thumbnail_rejects_non_image() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("not_image.jpg");
+        std::fs::write(&p, b"this is not a real jpeg").unwrap();
+        let result = render_thumbnail(&p, 800, 50_000_000, 100 * 1024 * 1024);
+        assert!(result.is_err(), "non-image file must be rejected");
+    }
+
+    #[test]
+    fn render_thumbnail_rejects_corrupt_image() {
+        let tmp = TempDir::new().unwrap();
+        // Valid extension, garbage content.
+        let p = tmp.path().join("corrupt.png");
+        std::fs::write(&p, b"\x89PNG\r\n\x1a\nGARBAGE").unwrap();
+        let result = render_thumbnail(&p, 800, 50_000_000, 100 * 1024 * 1024);
+        assert!(result.is_err(), "corrupt image must be rejected");
+    }
+
+    #[test]
+    fn render_thumbnail_returns_small_jpeg_data_url() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("ok.png");
+        image::RgbImage::new(2000, 2000).save(&p).unwrap();
+        let url = render_thumbnail(&p, 800, 50_000_000, 100 * 1024 * 1024).unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        // Decoded thumbnail bytes must be much smaller than the original.
+        let b64 = &url["data:image/jpeg;base64,".len()..];
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert!(
+            bytes.len() < 2000 * 2000 * 3,
+            "thumbnail must be downscaled"
+        );
+    }
+
+    #[test]
+    fn render_thumbnail_rejects_unsupported_format() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("doc.txt");
+        std::fs::write(&p, b"hello").unwrap();
+        let result = render_thumbnail(&p, 800, 50_000_000, 100 * 1024 * 1024);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn render_thumbnail_rejects_oversized_source() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("big.png");
+        std::fs::write(&p, b"x").unwrap();
+        // max_source_bytes = 0 → any non-empty file is too large.
+        let result = render_thumbnail(&p, 800, 50_000_000, 0);
+        assert!(result.is_err(), "oversized source must be rejected");
+    }
 
     #[test]
     fn review_decision_action_display_parse() {
