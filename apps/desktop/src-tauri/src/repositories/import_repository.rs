@@ -4,6 +4,7 @@ use crate::domain::import_state::{
     Decision, DecisionSource, DecodeState, DuplicateScope, ImportAlbumState, ImportImageState,
     ImportRunState, MatchType, SCAN_POLICY_VERSION,
 };
+use crate::domain::state_machine::{FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
 use tokio_postgres::Client;
 use uuid::Uuid;
@@ -198,6 +199,102 @@ pub struct LibraryAlbumRow {
 
 pub struct FileTransactionRow {
     pub id: Uuid,
+    pub state: String,
+}
+
+// ── Frozen plan row types (immutable commit source of truth) ──────────
+
+/// A frozen plan album with its persisted target path.
+#[derive(Debug, Clone)]
+pub struct PlanAlbumRow {
+    pub plan_album_id: Uuid,
+    pub import_album_id: Uuid,
+    pub target_relative_path: String,
+    pub expected_image_count: i32,
+    pub album_plan_hash: Option<Vec<u8>>,
+}
+
+/// A single persisted plan image entry.
+#[derive(Debug, Clone)]
+pub struct PlanImageRow {
+    pub id: Uuid,
+    pub plan_album_id: Uuid,
+    pub import_image_id: Uuid,
+    pub source_path: String,
+    pub source_relative_path: String,
+    pub target_relative_path: String,
+    pub expected_file_size: i64,
+    pub expected_blake3: Vec<u8>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub format: Option<String>,
+}
+
+/// Full frozen plan: header + albums (each with its images).
+#[derive(Debug, Clone)]
+pub struct FrozenPlanRow {
+    pub plan_id: Uuid,
+    pub import_run_id: Uuid,
+    pub library_root_id: Uuid,
+    pub plan_hash: Option<Vec<u8>>,
+    pub policy_version: String,
+    pub albums: Vec<(PlanAlbumRow, Vec<PlanImageRow>)>,
+}
+
+// ── File transaction recovery row types ───────────────────────────────
+
+/// Full persisted record of a file transaction.
+#[derive(Debug, Clone)]
+pub struct FileTransactionFullRow {
+    pub id: Uuid,
+    pub import_run_id: Uuid,
+    pub import_album_id: Uuid,
+    pub state: String,
+    pub staging_path: Option<String>,
+    pub target_path: Option<String>,
+    pub manifest_path: Option<String>,
+    pub plan_hash: Option<Vec<u8>>,
+    pub manifest_hash: Option<Vec<u8>>,
+    pub last_error: Option<String>,
+}
+
+/// A persisted file operation with all prewritten evidence.
+#[derive(Debug, Clone)]
+pub struct FileOperationRow {
+    pub id: Uuid,
+    pub transaction_id: Uuid,
+    pub source_path: String,
+    pub staging_path: String,
+    pub target_path: String,
+    pub expected_size: i64,
+    pub expected_blake3: Vec<u8>,
+    pub actual_blake3: Option<Vec<u8>>,
+    pub state: String,
+    pub last_error: Option<String>,
+}
+
+/// Full library album record (for idempotency verification).
+#[derive(Debug, Clone)]
+pub struct LibraryAlbumFullRow {
+    pub id: Uuid,
+    pub library_root_id: Uuid,
+    pub display_name: String,
+    pub relative_path: String,
+    pub manifest_version: String,
+    pub manifest_hash: Vec<u8>,
+    pub image_count: i32,
+    pub state: String,
+    pub plan_hash: Option<Vec<u8>>,
+    pub transaction_id: Option<Uuid>,
+}
+
+/// Full library image record (for idempotency verification).
+#[derive(Debug, Clone)]
+pub struct LibraryImageFullRow {
+    pub id: Uuid,
+    pub relative_path: String,
+    pub file_size: i64,
+    pub blake3: Vec<u8>,
     pub state: String,
 }
 
@@ -1067,26 +1164,28 @@ impl ImportRepository {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_file_transaction(
         client: &Client,
+        transaction_id: Uuid,
         import_run_id: Uuid,
         import_album_id: Uuid,
-        state: &str,
+        state: &TransactionState,
         staging_path: Option<&str>,
         target_path: Option<&str>,
         manifest_path: Option<&str>,
-    ) -> Result<Uuid, AppError> {
-        let id = Uuid::new_v4();
+    ) -> Result<(), AppError> {
+        let state_str = state.to_string();
         client
             .execute(
                 "INSERT INTO file_transactions
                  (id, import_run_id, import_album_id, state, staging_path, target_path, manifest_path)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &[
-                    &id,
+                    &transaction_id,
                     &import_run_id,
                     &import_album_id,
-                    &state,
+                    &state_str,
                     &staging_path,
                     &target_path,
                     &manifest_path,
@@ -1096,24 +1195,27 @@ impl ImportRepository {
             .map_err(|e| {
                 AppError::Internal(format!("failed to insert file transaction: {e}"))
             })?;
-        Ok(id)
+        Ok(())
     }
 
     pub async fn update_file_transaction_state(
         client: &Client,
         id: Uuid,
-        state: &str,
+        state: &TransactionState,
         last_error: Option<&str>,
     ) -> Result<(), AppError> {
-        let completed_at = match state {
-            "source_archived" | "library_committed" => Some(chrono::Utc::now()),
+        let state_str = state.to_string();
+        let completed_at = match *state {
+            TransactionState::SourceArchived | TransactionState::LibraryCommitted => {
+                Some(chrono::Utc::now())
+            }
             _ => None,
         };
         client
             .execute(
                 "UPDATE file_transactions SET state = $1, last_error = $2,
                  completed_at = COALESCE($3, completed_at) WHERE id = $4",
-                &[&state, &last_error, &completed_at, &id],
+                &[&state_str, &last_error, &completed_at, &id],
             )
             .await
             .map_err(|e| {
@@ -1132,12 +1234,13 @@ impl ImportRepository {
         expected_blake3: &[u8],
     ) -> Result<Uuid, AppError> {
         let id = Uuid::new_v4();
+        let state = FileOpState::Planned.to_string();
         client
             .execute(
                 "INSERT INTO file_operations
                  (id, transaction_id, source_path, staging_path, target_path,
                   expected_size, expected_blake3, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     &id,
                     &transaction_id,
@@ -1146,6 +1249,7 @@ impl ImportRepository {
                     &target_path,
                     &expected_size,
                     &expected_blake3,
+                    &state,
                 ],
             )
             .await
@@ -1156,16 +1260,17 @@ impl ImportRepository {
     pub async fn update_file_operation_state(
         client: &Client,
         id: Uuid,
-        state: &str,
+        state: &FileOpState,
         actual_blake3: Option<&[u8]>,
         last_error: Option<&str>,
     ) -> Result<(), AppError> {
+        let state_str = state.to_string();
         client
             .execute(
                 "UPDATE file_operations SET state = $1, actual_blake3 = COALESCE($2, actual_blake3),
                  last_error = $3, attempt_count = attempt_count + 1, updated_at = now()
                  WHERE id = $4",
-                &[&state, &actual_blake3, &last_error, &id],
+                &[&state_str, &actual_blake3, &last_error, &id],
             )
             .await
             .map_err(|e| {
@@ -1212,19 +1317,56 @@ impl ImportRepository {
         Ok(id)
     }
 
+    /// Insert a plan and return its id, taking the state as a typed PlanState.
+    pub async fn create_import_plan(
+        client: &Client,
+        import_run_id: Uuid,
+        version: i32,
+        policy_version: &str,
+        library_root_id: Uuid,
+    ) -> Result<Uuid, AppError> {
+        let id = Uuid::new_v4();
+        let state = PlanState::Draft.to_string();
+        client
+            .execute(
+                "INSERT INTO import_plans (id, import_run_id, version, state, policy_version, library_root_id)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[&id, &import_run_id, &version, &state, &policy_version, &library_root_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to insert import plan: {e}")))?;
+        Ok(id)
+    }
+
+    pub async fn set_plan_hash(
+        client: &Client,
+        plan_id: Uuid,
+        plan_hash: &[u8],
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "UPDATE import_plans SET plan_hash = $1 WHERE id = $2",
+                &[&plan_hash, &plan_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to set plan hash: {e}")))?;
+        Ok(())
+    }
+
     pub async fn update_import_plan_state(
         client: &Client,
         plan_id: Uuid,
-        state: &str,
+        state: &PlanState,
     ) -> Result<(), AppError> {
-        let frozen_at = match state {
-            "frozen" => Some(chrono::Utc::now()),
+        let state_str = state.to_string();
+        let frozen_at = match *state {
+            PlanState::Frozen => Some(chrono::Utc::now()),
             _ => None,
         };
         client
             .execute(
                 "UPDATE import_plans SET state = $1, frozen_at = COALESCE($2, frozen_at) WHERE id = $3",
-                &[&state, &frozen_at, &plan_id],
+                &[&state_str, &frozen_at, &plan_id],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to update import plan state: {e}")))?;
@@ -1266,6 +1408,7 @@ impl ImportRepository {
         Ok(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_plan_image(
         client: &Client,
         plan_album_id: Uuid,
@@ -1286,8 +1429,19 @@ impl ImportRepository {
                  (id, plan_album_id, import_image_id, source_path, source_relative_path,
                   target_relative_path, expected_file_size, expected_blake3, width, height, format)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                &[&id, &plan_album_id, &import_image_id, &source_path, &source_relative_path,
-                  &target_relative_path, &expected_file_size, &expected_blake3, &width, &height, &format],
+                &[
+                    &id,
+                    &plan_album_id,
+                    &import_image_id,
+                    &source_path,
+                    &source_relative_path,
+                    &target_relative_path,
+                    &expected_file_size,
+                    &expected_blake3,
+                    &width,
+                    &height,
+                    &format,
+                ],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to insert plan image: {e}")))?;
@@ -1320,6 +1474,383 @@ impl ImportRepository {
                     r.get("expected_file_size"),
                     r.get("expected_blake3"),
                 )
+            })
+            .collect())
+    }
+
+    // ── Frozen plan full load (immutable commit source of truth) ──────
+
+    /// Load the active committable plan for a run: the frozen plan if one
+    /// exists, otherwise the most recently consumed plan (so idempotent
+    /// reruns can verify already-committed albums). Returns None if the run
+    /// has neither a frozen nor a consumed plan.
+    pub async fn load_frozen_plan(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Option<FrozenPlanRow>, AppError> {
+        // Prefer a frozen plan; fall back to the latest consumed one for
+        // idempotent recovery of an already-completed commit.
+        if let Some(p) = Self::load_plan_in_state(client, import_run_id, "frozen").await? {
+            return Ok(Some(p));
+        }
+        Self::load_plan_in_state(client, import_run_id, "consumed").await
+    }
+
+    /// Load the latest draft plan for a run (used to compute its hash before
+    /// freezing). Returns None if there is no draft plan.
+    pub async fn load_draft_plan(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Option<FrozenPlanRow>, AppError> {
+        Self::load_plan_in_state(client, import_run_id, "draft").await
+    }
+
+    async fn load_plan_in_state(
+        client: &Client,
+        import_run_id: Uuid,
+        state: &str,
+    ) -> Result<Option<FrozenPlanRow>, AppError> {
+        let header = client
+            .query_opt(
+                "SELECT id, import_run_id, library_root_id, plan_hash, policy_version
+                 FROM import_plans
+                 WHERE import_run_id = $1 AND state = $2
+                 ORDER BY version DESC LIMIT 1",
+                &[&import_run_id, &state],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to load {state} plan: {e}")))?;
+        let Some(header) = header else {
+            return Ok(None);
+        };
+        let plan_id: Uuid = header.get("id");
+        let plan_hash: Option<Vec<u8>> = header.get("plan_hash");
+
+        let album_rows = client
+            .query(
+                "SELECT id, import_album_id, target_relative_path, expected_image_count, album_plan_hash
+                 FROM import_plan_albums WHERE plan_id = $1
+                 ORDER BY target_relative_path",
+                &[&plan_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to load plan albums: {e}")))?;
+
+        let mut albums: Vec<(PlanAlbumRow, Vec<PlanImageRow>)> = Vec::new();
+        for ar in &album_rows {
+            let plan_album_id: Uuid = ar.get("id");
+            let images = client
+                .query(
+                    "SELECT id, plan_album_id, import_image_id, source_path, source_relative_path,
+                            target_relative_path, expected_file_size, expected_blake3,
+                            width, height, format
+                     FROM import_plan_images WHERE plan_album_id = $1
+                     ORDER BY target_relative_path",
+                    &[&plan_album_id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to load plan images: {e}")))?;
+            let album = PlanAlbumRow {
+                plan_album_id,
+                import_album_id: ar.get("import_album_id"),
+                target_relative_path: ar.get("target_relative_path"),
+                expected_image_count: ar.get("expected_image_count"),
+                album_plan_hash: ar.get("album_plan_hash"),
+            };
+            let imgs: Vec<PlanImageRow> = images
+                .iter()
+                .map(|r| PlanImageRow {
+                    id: r.get("id"),
+                    plan_album_id: r.get("plan_album_id"),
+                    import_image_id: r.get("import_image_id"),
+                    source_path: r.get("source_path"),
+                    source_relative_path: r.get("source_relative_path"),
+                    target_relative_path: r.get("target_relative_path"),
+                    expected_file_size: r.get("expected_file_size"),
+                    expected_blake3: r.get("expected_blake3"),
+                    width: r.get("width"),
+                    height: r.get("height"),
+                    format: r.get("format"),
+                })
+                .collect();
+            albums.push((album, imgs));
+        }
+
+        Ok(Some(FrozenPlanRow {
+            plan_id,
+            import_run_id: header.get("import_run_id"),
+            library_root_id: header.get("library_root_id"),
+            plan_hash,
+            policy_version: header.get("policy_version"),
+            albums,
+        }))
+    }
+
+    // ── File transaction recovery queries ──────────────────────────────
+
+    pub async fn get_file_transaction(
+        client: &Client,
+        transaction_id: Uuid,
+    ) -> Result<Option<FileTransactionFullRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, import_run_id, import_album_id, state, staging_path, target_path,
+                        manifest_path, plan_hash, manifest_hash, last_error
+                 FROM file_transactions WHERE id = $1",
+                &[&transaction_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query file transaction: {e}")))?;
+        Ok(row.map(|r| FileTransactionFullRow {
+            id: r.get("id"),
+            import_run_id: r.get("import_run_id"),
+            import_album_id: r.get("import_album_id"),
+            state: r.get("state"),
+            staging_path: r.get("staging_path"),
+            target_path: r.get("target_path"),
+            manifest_path: r.get("manifest_path"),
+            plan_hash: r.get("plan_hash"),
+            manifest_hash: r.get("manifest_hash"),
+            last_error: r.get("last_error"),
+        }))
+    }
+
+    /// All non-terminal file transactions needing recovery at startup.
+    pub async fn get_recoverable_transactions(
+        client: &Client,
+    ) -> Result<Vec<FileTransactionFullRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, import_run_id, import_album_id, state, staging_path, target_path,
+                        manifest_path, plan_hash, manifest_hash, last_error
+                 FROM file_transactions
+                 WHERE state NOT IN ('source_archived', 'failed', 'cancelled')
+                 ORDER BY started_at",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query recoverable transactions: {e}"))
+            })?;
+        Ok(rows
+            .iter()
+            .map(|r| FileTransactionFullRow {
+                id: r.get("id"),
+                import_run_id: r.get("import_run_id"),
+                import_album_id: r.get("import_album_id"),
+                state: r.get("state"),
+                staging_path: r.get("staging_path"),
+                target_path: r.get("target_path"),
+                manifest_path: r.get("manifest_path"),
+                plan_hash: r.get("plan_hash"),
+                manifest_hash: r.get("manifest_hash"),
+                last_error: r.get("last_error"),
+            })
+            .collect())
+    }
+
+    /// A persisted file operation with all prewritten evidence.
+    pub async fn get_file_operations(
+        client: &Client,
+        transaction_id: Uuid,
+    ) -> Result<Vec<FileOperationRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, transaction_id, source_path, staging_path, target_path,
+                        expected_size, expected_blake3, actual_blake3, state, last_error
+                 FROM file_operations WHERE transaction_id = $1
+                 ORDER BY target_path",
+                &[&transaction_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query file operations: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| FileOperationRow {
+                id: r.get("id"),
+                transaction_id: r.get("transaction_id"),
+                source_path: r.get("source_path"),
+                staging_path: r.get("staging_path"),
+                target_path: r.get("target_path"),
+                expected_size: r.get("expected_size"),
+                expected_blake3: r.get("expected_blake3"),
+                actual_blake3: r.get("actual_blake3"),
+                state: r.get("state"),
+                last_error: r.get("last_error"),
+            })
+            .collect())
+    }
+
+    /// Persist the plan hash and manifest hash on the transaction.
+    pub async fn set_transaction_hashes(
+        client: &Client,
+        transaction_id: Uuid,
+        plan_hash: Option<&[u8]>,
+        manifest_hash: Option<&[u8]>,
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "UPDATE file_transactions
+                 SET plan_hash = COALESCE($1, plan_hash),
+                     manifest_hash = COALESCE($2, manifest_hash)
+                 WHERE id = $3",
+                &[&plan_hash, &manifest_hash, &transaction_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to set transaction hashes: {e}")))?;
+        Ok(())
+    }
+
+    /// Persist the manifest path on the transaction.
+    pub async fn set_transaction_manifest_path(
+        client: &Client,
+        transaction_id: Uuid,
+        manifest_path: &str,
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "UPDATE file_transactions SET manifest_path = $1 WHERE id = $2",
+                &[&manifest_path, &transaction_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to set manifest path: {e}")))?;
+        Ok(())
+    }
+
+    /// Fetch the latest file transaction for an album regardless of state
+    /// (used to detect idempotent already-committed albums).
+    pub async fn find_latest_file_transaction(
+        client: &Client,
+        import_album_id: Uuid,
+    ) -> Result<Option<FileTransactionFullRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, import_run_id, import_album_id, state, staging_path, target_path,
+                        manifest_path, plan_hash, manifest_hash, last_error
+                 FROM file_transactions
+                 WHERE import_album_id = $1
+                 ORDER BY started_at DESC LIMIT 1",
+                &[&import_album_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query latest file transaction: {e}"))
+            })?;
+        Ok(row.map(|r| FileTransactionFullRow {
+            id: r.get("id"),
+            import_run_id: r.get("import_run_id"),
+            import_album_id: r.get("import_album_id"),
+            state: r.get("state"),
+            staging_path: r.get("staging_path"),
+            target_path: r.get("target_path"),
+            manifest_path: r.get("manifest_path"),
+            plan_hash: r.get("plan_hash"),
+            manifest_hash: r.get("manifest_hash"),
+            last_error: r.get("last_error"),
+        }))
+    }
+
+    // ── Library root identity ───────────────────────────────────────────
+
+    pub async fn get_library_root_path(
+        client: &Client,
+        library_root_id: Uuid,
+    ) -> Result<String, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT path FROM library_roots WHERE id = $1",
+                &[&library_root_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query library root path: {e}")))?;
+        row.map(|r| r.get::<_, String>("path"))
+            .ok_or_else(|| AppError::Internal(format!("library_root {library_root_id} not found")))
+    }
+
+    pub async fn find_library_root_by_path(
+        client: &Client,
+        path: &str,
+    ) -> Result<Option<Uuid>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id FROM library_roots WHERE path = $1 ORDER BY created_at LIMIT 1",
+                &[&path],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query library root by path: {e}"))
+            })?;
+        Ok(row.map(|r| r.get("id")))
+    }
+
+    pub async fn create_library_root(
+        client: &Client,
+        path: &str,
+        display_name: &str,
+    ) -> Result<Uuid, AppError> {
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO library_roots (id, path, display_name, is_active)
+                 VALUES ($1, $2, $3, TRUE)",
+                &[&id, &path, &display_name],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to insert library root: {e}")))?;
+        Ok(id)
+    }
+
+    // ── Library commit records ─────────────────────────────────────────
+
+    pub async fn get_library_album(
+        client: &Client,
+        library_root_id: Uuid,
+        relative_path: &str,
+    ) -> Result<Option<LibraryAlbumFullRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, library_root_id, display_name, relative_path, manifest_version,
+                        manifest_hash, image_count, state, plan_hash, transaction_id
+                 FROM library_albums
+                 WHERE library_root_id = $1 AND relative_path = $2",
+                &[&library_root_id, &relative_path],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query library album: {e}")))?;
+        Ok(row.map(|r| LibraryAlbumFullRow {
+            id: r.get("id"),
+            library_root_id: r.get("library_root_id"),
+            display_name: r.get("display_name"),
+            relative_path: r.get("relative_path"),
+            manifest_version: r.get("manifest_version"),
+            manifest_hash: r.get("manifest_hash"),
+            image_count: r.get("image_count"),
+            state: r.get("state"),
+            plan_hash: r.get("plan_hash"),
+            transaction_id: r.get("transaction_id"),
+        }))
+    }
+
+    pub async fn get_library_images_for_album(
+        client: &Client,
+        album_id: Uuid,
+    ) -> Result<Vec<LibraryImageFullRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, relative_path, file_size, blake3, state
+                 FROM library_images WHERE album_id = $1 ORDER BY relative_path",
+                &[&album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query library images: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| LibraryImageFullRow {
+                id: r.get("id"),
+                relative_path: r.get("relative_path"),
+                file_size: r.get("file_size"),
+                blake3: r.get("blake3"),
+                state: r.get("state"),
             })
             .collect())
     }

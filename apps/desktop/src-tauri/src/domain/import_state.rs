@@ -469,8 +469,6 @@ pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 
 pub const SCAN_POLICY_VERSION: &str = "2.0";
 
-pub const FROZEN_PLAN_KEY: &str = "frozen_plan";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitProgress {
     pub state: String,
@@ -523,15 +521,6 @@ pub struct CommitResult {
     pub album_results: Vec<CommitAlbumResult>,
     pub errors: Vec<String>,
     pub state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrozenPlanEntry {
-    pub image_id: String,
-    pub source_path: String,
-    pub relative_path: String,
-    pub file_size: i64,
-    pub album_name: String,
 }
 
 #[cfg(test)]
@@ -659,21 +648,5 @@ mod tests {
         assert_eq!(p.images_committed, 0);
         assert!(p.errors.is_empty());
         assert!(p.current_album.is_none());
-    }
-
-    #[test]
-    fn frozen_plan_entry_round_trip() {
-        let entry = FrozenPlanEntry {
-            image_id: "abc".to_string(),
-            source_path: "/src/a.jpg".to_string(),
-            relative_path: "a.jpg".to_string(),
-            file_size: 1024,
-            album_name: "album_a".to_string(),
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        let back: FrozenPlanEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.image_id, "abc");
-        assert_eq!(back.file_size, 1024);
-        assert_eq!(back.album_name, "album_a");
     }
 }

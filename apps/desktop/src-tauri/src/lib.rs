@@ -6,7 +6,7 @@ mod repositories;
 mod services;
 mod state;
 
-#[cfg(feature = "fail-injection")]
+#[cfg(any(feature = "fail-injection", feature = "real-db-tests"))]
 pub mod tests;
 
 use std::path::PathBuf;

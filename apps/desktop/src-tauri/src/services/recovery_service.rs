@@ -1,3 +1,7 @@
+//! Recovery service: resumes interrupted import transactions from their
+//! persisted state. This module is rewritten in Phase 7; the placeholder
+//! functions below are replaced with real recovery actions then.
+#![allow(dead_code)]
 use crate::error::AppError;
 use tokio_postgres::Client;
 use uuid::Uuid;
@@ -33,7 +37,9 @@ pub async fn scan_recoverable_transactions(
             &[],
         )
         .await
-        .map_err(|e| AppError::Internal(format!("failed to query recoverable transactions: {e}")))?;
+        .map_err(|e| {
+            AppError::Internal(format!("failed to query recoverable transactions: {e}"))
+        })?;
 
     let mut diagnostics = Vec::new();
     for row in &rows {
@@ -69,7 +75,9 @@ pub async fn scan_recoverable_transactions(
                 } else if target_exists && manifest_exists {
                     diags.push("target exists with manifest; check consistency".to_string());
                 } else if staging_exists && target_exists {
-                    diags.push("both staging and target exist; needs conflict resolution".to_string());
+                    diags.push(
+                        "both staging and target exist; needs conflict resolution".to_string(),
+                    );
                 } else {
                     diags.push("unknown publish state".to_string());
                 }
@@ -132,21 +140,15 @@ pub async fn recover_transaction(
 
     let state: String = row.get("state");
     match state.as_str() {
-        "planned" | "staging" | "verifying" | "verified" => {
-            Ok("retry_staging".to_string())
-        }
-        "publishing" | "published" | "db_committing" => {
-            Ok("retry_publish_and_commit".to_string())
-        }
-        "library_committed" | "source_archiving" => {
-            Ok("retry_archive".to_string())
-        }
-        "cleanup_required" => {
-            Ok("cleanup".to_string())
-        }
-        "conflict" => {
-            Err(AppError::Internal("conflict requires manual resolution".to_string()))
-        }
-        _ => Err(AppError::Internal(format!("cannot recover from state: {state}"))),
+        "planned" | "staging" | "verifying" | "verified" => Ok("retry_staging".to_string()),
+        "publishing" | "published" | "db_committing" => Ok("retry_publish_and_commit".to_string()),
+        "library_committed" | "source_archiving" => Ok("retry_archive".to_string()),
+        "cleanup_required" => Ok("cleanup".to_string()),
+        "conflict" => Err(AppError::Internal(
+            "conflict requires manual resolution".to_string(),
+        )),
+        _ => Err(AppError::Internal(format!(
+            "cannot recover from state: {state}"
+        ))),
     }
 }

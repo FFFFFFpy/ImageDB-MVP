@@ -1,3 +1,11 @@
+//! Centralized state-machine definitions for import runs, file transactions,
+//! file operations, and import plans. Every state change in the commit and
+//! recovery pipelines must go through these transition functions; services
+//! never write unchecked state strings.
+//!
+//! Some enum variants and transition functions are defined for completeness
+//! and future pipeline stages; they are allowed to be unused until wired in.
+#![allow(dead_code)]
 use crate::error::AppError;
 use std::fmt;
 
@@ -65,6 +73,39 @@ impl fmt::Display for TransactionState {
     }
 }
 
+impl TransactionState {
+    /// Parse a transaction state string. `failed` may carry a `": message"`
+    /// suffix in some legacy rows; the base token is what we match on.
+    pub fn parse(s: &str) -> Result<Self, StateError> {
+        let base = s.split(':').next().unwrap_or("").trim();
+        match base {
+            "planned" => Ok(Self::Planned),
+            "staging" => Ok(Self::Staging),
+            "verifying" => Ok(Self::Verifying),
+            "verified" => Ok(Self::Verified),
+            "publishing" => Ok(Self::Publishing),
+            "published" => Ok(Self::Published),
+            "db_committing" => Ok(Self::DbCommitting),
+            "library_committed" => Ok(Self::LibraryCommitted),
+            "source_archiving" => Ok(Self::SourceArchiving),
+            "source_archived" => Ok(Self::SourceArchived),
+            "cleanup_required" => Ok(Self::CleanupRequired),
+            "conflict" => Ok(Self::Conflict),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(StateError {
+                current: s.to_string(),
+                action: "parse".to_string(),
+                message: format!("unknown transaction state '{other}'"),
+            }),
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::SourceArchived | Self::Failed | Self::Cancelled)
+    }
+}
+
 /// Plan state for import plans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanState {
@@ -81,6 +122,22 @@ impl fmt::Display for PlanState {
             Self::Frozen => write!(f, "frozen"),
             Self::Consumed => write!(f, "consumed"),
             Self::Invalidated => write!(f, "invalidated"),
+        }
+    }
+}
+
+impl PlanState {
+    pub fn parse(s: &str) -> Result<Self, StateError> {
+        match s.trim() {
+            "draft" => Ok(Self::Draft),
+            "frozen" => Ok(Self::Frozen),
+            "consumed" => Ok(Self::Consumed),
+            "invalidated" => Ok(Self::Invalidated),
+            other => Err(StateError {
+                current: s.to_string(),
+                action: "parse".to_string(),
+                message: format!("unknown plan state '{other}'"),
+            }),
         }
     }
 }
@@ -113,11 +170,53 @@ impl fmt::Display for FileOpState {
     }
 }
 
+impl FileOpState {
+    pub fn parse(s: &str) -> Result<Self, StateError> {
+        match s.trim() {
+            "planned" => Ok(Self::Planned),
+            "copying" => Ok(Self::Copying),
+            "copied" => Ok(Self::Copied),
+            "verifying" => Ok(Self::Verifying),
+            "verified" => Ok(Self::Verified),
+            "published" => Ok(Self::Published),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(StateError {
+                current: s.to_string(),
+                action: "parse".to_string(),
+                message: format!("unknown file operation state '{other}'"),
+            }),
+        }
+    }
+}
+
+/// Validated transitions for a single file operation.
+/// Legal path: planned → copying → copied → verifying → verified → published.
+pub fn next_file_op_state(current: &FileOpState, action: &str) -> Result<FileOpState, StateError> {
+    match (current, action) {
+        (FileOpState::Planned, "copy") => Ok(FileOpState::Copying),
+        (FileOpState::Copying, "copied") => Ok(FileOpState::Copied),
+        (FileOpState::Copied, "verify") => Ok(FileOpState::Verifying),
+        (FileOpState::Verifying, "verified") => Ok(FileOpState::Verified),
+        (FileOpState::Verified, "publish") => Ok(FileOpState::Published),
+        (FileOpState::Planned, "verified") => Ok(FileOpState::Verified),
+        (FileOpState::Verified, "retry") => Ok(FileOpState::Verified),
+        (FileOpState::Published, "retry") => Ok(FileOpState::Published),
+        (_, "fail") => Ok(FileOpState::Failed),
+        (FileOpState::Planned | FileOpState::Copying, "cancel") => Ok(FileOpState::Cancelled),
+        _ => Err(StateError {
+            current: current.to_string(),
+            action: action.to_string(),
+            message: format!(
+                "no file operation transition defined from '{}' via '{}'",
+                current, action
+            ),
+        }),
+    }
+}
+
 /// Validated state transitions for import runs.
-pub fn next_import_run_state(
-    current: &str,
-    action: &str,
-) -> Result<&'static str, StateError> {
+pub fn next_import_run_state(current: &str, action: &str) -> Result<&'static str, StateError> {
     match (current, action) {
         // Created → Scanning (start scan)
         ("created", "start_scan") => Ok("scanning"),
@@ -156,10 +255,7 @@ pub fn next_import_run_state(
 }
 
 /// Validated state transitions for file transactions.
-pub fn next_transaction_state(
-    current: &str,
-    action: &str,
-) -> Result<&'static str, StateError> {
+pub fn next_transaction_state(current: &str, action: &str) -> Result<&'static str, StateError> {
     match (current, action) {
         ("planned", "stage") => Ok("staging"),
         ("staging", "verify") => Ok("verifying"),
@@ -190,40 +286,103 @@ pub fn next_transaction_state(
     }
 }
 
+/// Typed variant of [`next_transaction_state`]: returns the enum directly so
+/// callers cannot accidentally write an unchecked state string. This is the
+/// function the commit pipeline and recovery service must use.
+pub fn transition_transaction(
+    current: TransactionState,
+    action: &str,
+) -> Result<TransactionState, StateError> {
+    let next_str = next_transaction_state(&current.to_string(), action)?;
+    TransactionState::parse(next_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn import_run_valid_transitions() {
-        assert_eq!(next_import_run_state("created", "start_scan").unwrap(), "scanning");
-        assert_eq!(next_import_run_state("scanning", "fingerprint").unwrap(), "fingerprinting");
-        assert_eq!(next_import_run_state("fingerprinting", "detect").unwrap(), "detecting_duplicates");
-        assert_eq!(next_import_run_state("detecting_duplicates", "analyze").unwrap(), "analyzing");
-        assert_eq!(next_import_run_state("analyzing", "ready").unwrap(), "ready_to_commit");
-        assert_eq!(next_import_run_state("analyzing", "require_review").unwrap(), "review_required");
-        assert_eq!(next_import_run_state("review_required", "finalize").unwrap(), "ready_to_commit");
-        assert_eq!(next_import_run_state("ready_to_commit", "commit").unwrap(), "committing");
-        assert_eq!(next_import_run_state("committing", "complete").unwrap(), "completed");
-        assert_eq!(next_import_run_state("committing", "recover").unwrap(), "recovery_required");
-        assert_eq!(next_import_run_state("recovery_required", "retry").unwrap(), "committing");
-        assert_eq!(next_import_run_state("recovery_required", "resolve").unwrap(), "completed");
+        assert_eq!(
+            next_import_run_state("created", "start_scan").unwrap(),
+            "scanning"
+        );
+        assert_eq!(
+            next_import_run_state("scanning", "fingerprint").unwrap(),
+            "fingerprinting"
+        );
+        assert_eq!(
+            next_import_run_state("fingerprinting", "detect").unwrap(),
+            "detecting_duplicates"
+        );
+        assert_eq!(
+            next_import_run_state("detecting_duplicates", "analyze").unwrap(),
+            "analyzing"
+        );
+        assert_eq!(
+            next_import_run_state("analyzing", "ready").unwrap(),
+            "ready_to_commit"
+        );
+        assert_eq!(
+            next_import_run_state("analyzing", "require_review").unwrap(),
+            "review_required"
+        );
+        assert_eq!(
+            next_import_run_state("review_required", "finalize").unwrap(),
+            "ready_to_commit"
+        );
+        assert_eq!(
+            next_import_run_state("ready_to_commit", "commit").unwrap(),
+            "committing"
+        );
+        assert_eq!(
+            next_import_run_state("committing", "complete").unwrap(),
+            "completed"
+        );
+        assert_eq!(
+            next_import_run_state("committing", "recover").unwrap(),
+            "recovery_required"
+        );
+        assert_eq!(
+            next_import_run_state("recovery_required", "retry").unwrap(),
+            "committing"
+        );
+        assert_eq!(
+            next_import_run_state("recovery_required", "resolve").unwrap(),
+            "completed"
+        );
     }
 
     #[test]
     fn import_run_cancel_from_any() {
-        for state in &["created", "scanning", "fingerprinting", "detecting_duplicates",
-                       "analyzing", "review_required", "ready_to_commit", "committing",
-                       "recovery_required"] {
+        for state in &[
+            "created",
+            "scanning",
+            "fingerprinting",
+            "detecting_duplicates",
+            "analyzing",
+            "review_required",
+            "ready_to_commit",
+            "committing",
+            "recovery_required",
+        ] {
             assert_eq!(next_import_run_state(state, "cancel").unwrap(), "cancelled");
         }
     }
 
     #[test]
     fn import_run_fail_from_any() {
-        for state in &["created", "scanning", "fingerprinting", "detecting_duplicates",
-                       "analyzing", "review_required", "ready_to_commit", "committing",
-                       "recovery_required"] {
+        for state in &[
+            "created",
+            "scanning",
+            "fingerprinting",
+            "detecting_duplicates",
+            "analyzing",
+            "review_required",
+            "ready_to_commit",
+            "committing",
+            "recovery_required",
+        ] {
             assert_eq!(next_import_run_state(state, "fail").unwrap(), "failed");
         }
     }
@@ -236,21 +395,57 @@ mod tests {
 
     #[test]
     fn transaction_valid_transitions() {
-        assert_eq!(next_transaction_state("planned", "stage").unwrap(), "staging");
-        assert_eq!(next_transaction_state("staging", "verify").unwrap(), "verifying");
-        assert_eq!(next_transaction_state("verifying", "verified").unwrap(), "verified");
-        assert_eq!(next_transaction_state("verified", "publish").unwrap(), "publishing");
-        assert_eq!(next_transaction_state("publishing", "published").unwrap(), "published");
-        assert_eq!(next_transaction_state("published", "db_commit").unwrap(), "db_committing");
-        assert_eq!(next_transaction_state("db_committing", "library_committed").unwrap(), "library_committed");
-        assert_eq!(next_transaction_state("library_committed", "archive").unwrap(), "source_archiving");
-        assert_eq!(next_transaction_state("source_archiving", "archived").unwrap(), "source_archived");
+        assert_eq!(
+            next_transaction_state("planned", "stage").unwrap(),
+            "staging"
+        );
+        assert_eq!(
+            next_transaction_state("staging", "verify").unwrap(),
+            "verifying"
+        );
+        assert_eq!(
+            next_transaction_state("verifying", "verified").unwrap(),
+            "verified"
+        );
+        assert_eq!(
+            next_transaction_state("verified", "publish").unwrap(),
+            "publishing"
+        );
+        assert_eq!(
+            next_transaction_state("publishing", "published").unwrap(),
+            "published"
+        );
+        assert_eq!(
+            next_transaction_state("published", "db_commit").unwrap(),
+            "db_committing"
+        );
+        assert_eq!(
+            next_transaction_state("db_committing", "library_committed").unwrap(),
+            "library_committed"
+        );
+        assert_eq!(
+            next_transaction_state("library_committed", "archive").unwrap(),
+            "source_archiving"
+        );
+        assert_eq!(
+            next_transaction_state("source_archiving", "archived").unwrap(),
+            "source_archived"
+        );
     }
 
     #[test]
     fn transaction_fail_from_any() {
-        for state in &["planned", "staging", "verifying", "verified", "publishing",
-                       "published", "db_committing", "library_committed", "source_archiving"] {
+        for state in &[
+            "planned",
+            "staging",
+            "verifying",
+            "verified",
+            "publishing",
+            "published",
+            "db_committing",
+            "library_committed",
+            "source_archiving",
+        ] {
             assert_eq!(next_transaction_state(state, "fail").unwrap(), "failed");
         }
     }

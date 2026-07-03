@@ -1,3 +1,10 @@
+//! Duplicate group construction and representative selection.
+//!
+//! Note: representative selection currently prefers import images over
+//! library images. Phase 8 of the core fix flips this so a historical
+//! library image is the representative (and the new import image is
+//! excluded). The dead-code fields below are retained for that rewrite.
+#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -87,8 +94,10 @@ pub fn build_duplicate_groups(edges: &[DuplicateEdge]) -> Vec<DuplicateGroup> {
     let mut idx_is_import: Vec<bool> = Vec::new();
 
     for edge in edges {
-        for (id, is_import) in &[(edge.image_a, edge.a_is_import), (edge.image_b, edge.b_is_import)]
-        {
+        for (id, is_import) in &[
+            (edge.image_a, edge.a_is_import),
+            (edge.image_b, edge.b_is_import),
+        ] {
             if !id_to_idx.contains_key(id) {
                 let idx = idx_to_id.len();
                 id_to_idx.insert(*id, idx);
@@ -122,7 +131,7 @@ pub fn build_duplicate_groups(edges: &[DuplicateEdge]) -> Vec<DuplicateGroup> {
         let image_ids: Vec<Uuid> = indices.iter().map(|&i| idx_to_id[i]).collect();
 
         // Select representative using deterministic rules.
-        let representative_idx = select_representative(indices, &idx_is_import, &edges, &id_to_idx);
+        let representative_idx = select_representative(indices, &idx_is_import, edges, &id_to_idx);
         let representative_id = idx_to_id[representative_idx];
         let representative_is_import = idx_is_import[representative_idx];
 
@@ -250,10 +259,7 @@ mod tests {
         let a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
         let c = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
-        let edges = vec![
-            make_edge(a, b, true, 1.0),
-            make_edge(b, c, true, 1.0),
-        ];
+        let edges = vec![make_edge(a, b, true, 1.0), make_edge(b, c, true, 1.0)];
 
         let groups = build_duplicate_groups(&edges);
         assert_eq!(groups.len(), 1);
@@ -267,10 +273,7 @@ mod tests {
         let b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
         let c = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
         // A ≈ B, B ≈ C (perceptual, not byte-identical)
-        let edges = vec![
-            make_edge(a, b, false, 0.9),
-            make_edge(b, c, false, 0.85),
-        ];
+        let edges = vec![make_edge(a, b, false, 0.9), make_edge(b, c, false, 0.85)];
 
         let groups = build_duplicate_groups(&edges);
         assert_eq!(groups.len(), 1);
@@ -283,10 +286,7 @@ mod tests {
         let b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
         let c = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
         let d = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
-        let edges = vec![
-            make_edge(a, b, true, 1.0),
-            make_edge(c, d, true, 1.0),
-        ];
+        let edges = vec![make_edge(a, b, true, 1.0), make_edge(c, d, true, 1.0)];
 
         let groups = build_duplicate_groups(&edges);
         assert_eq!(groups.len(), 2);

@@ -1,11 +1,16 @@
-/// Failure injection acceptance tests.
-///
-/// These tests verify that the system can recover from failures at every
-/// key point in the staged file transaction protocol. They require
-/// real PostgreSQL and filesystem access.
-///
-/// Invocation:
-///   cargo test --features fail-injection,real-db-tests -- --ignored --test-threads=1 fail_injection_
+//! Failure injection acceptance tests.
+//!
+//! These tests verify that the system can recover from failures at every
+//! key point in the staged file transaction protocol. They require
+//! real PostgreSQL and filesystem access.
+//!
+//! Invocation:
+//!   cargo test --features fail-injection,real-db-tests -- --ignored --test-threads=1 fail_injection_
+//!
+//! NOTE: this file is rewritten in Phase 11 to drive the real Recovery
+//! Service instead of just clearing the fault and re-running the commit.
+#![allow(unused_imports)]
+#![allow(dead_code)]
 #[cfg(test)]
 #[cfg(feature = "fail-injection")]
 mod tests {
@@ -22,7 +27,12 @@ mod tests {
     use uuid::Uuid;
 
     /// Set up a full test environment with PostgreSQL.
-    async fn setup_full_env() -> (TempDir, Arc<Mutex<PostgresManager>>, Uuid, std::path::PathBuf) {
+    async fn setup_full_env() -> (
+        TempDir,
+        Arc<Mutex<PostgresManager>>,
+        Uuid,
+        std::path::PathBuf,
+    ) {
         let tmp = TempDir::new().unwrap();
         let app_data = tmp.path().join("app_data");
         let source_root = tmp.path().join("source");
@@ -42,36 +52,91 @@ mod tests {
         let (mut client, db_handle) = manager.connect().await.unwrap();
         MigrationRunner::run_pending(&mut client).await.unwrap();
 
-        let library_root_id = ImportRepository::upsert_default_library_root(&client).await.unwrap();
-        ImportRepository::update_library_root_path(&client, library_root_id, &library_root.display().to_string()).await.unwrap();
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        ImportRepository::update_library_root_path(
+            &client,
+            library_root_id,
+            &library_root.display().to_string(),
+        )
+        .await
+        .unwrap();
 
-        let import_run_id = ImportRepository::create_import_run(&client, &source_root.display().to_string(), library_root_id).await.unwrap();
-        let album_id = ImportRepository::insert_import_album(&client, import_run_id, &album_path.display().to_string(), "album_a").await.unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            &source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &album_path.display().to_string(),
+            "album_a",
+        )
+        .await
+        .unwrap();
 
         let img1_blake3 = blake3::hash(b"photo one data").as_bytes().to_vec();
         let img2_blake3 = blake3::hash(b"photo two data").as_bytes().to_vec();
 
-        let _img1 = ImportRepository::insert_import_image(&client, NewImportImage {
-            album_id, source_path: album_path.join("photo1.png").display().to_string(),
-            relative_path: "album_a/photo1.png".to_string(), file_size: 14,
-            modified_at: None, width: Some(10), height: Some(10), format: Some("png".to_string()),
-            decode_state: DecodeState::Decoded, blake3: Some(img1_blake3.clone()),
-            pixel_hash: Some(vec![1; 8]), gradient_hash: Some(vec![1; 8]),
-            block_hash: Some(vec![1; 8]), median_hash: Some(vec![1; 8]),
-            fingerprint_version: Some("test".to_string()), state: ImportImageState::Fingerprinted,
-        }).await.unwrap();
+        let _img1 = ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id,
+                source_path: album_path.join("photo1.png").display().to_string(),
+                relative_path: "album_a/photo1.png".to_string(),
+                file_size: 14,
+                modified_at: None,
+                width: Some(10),
+                height: Some(10),
+                format: Some("png".to_string()),
+                decode_state: DecodeState::Decoded,
+                blake3: Some(img1_blake3.clone()),
+                pixel_hash: Some(vec![1; 8]),
+                gradient_hash: Some(vec![1; 8]),
+                block_hash: Some(vec![1; 8]),
+                median_hash: Some(vec![1; 8]),
+                fingerprint_version: Some("test".to_string()),
+                state: ImportImageState::Fingerprinted,
+            },
+        )
+        .await
+        .unwrap();
 
-        let _img2 = ImportRepository::insert_import_image(&client, NewImportImage {
-            album_id, source_path: album_path.join("photo2.png").display().to_string(),
-            relative_path: "album_a/photo2.png".to_string(), file_size: 14,
-            modified_at: None, width: Some(10), height: Some(10), format: Some("png".to_string()),
-            decode_state: DecodeState::Decoded, blake3: Some(img2_blake3.clone()),
-            pixel_hash: Some(vec![2; 8]), gradient_hash: Some(vec![2; 8]),
-            block_hash: Some(vec![2; 8]), median_hash: Some(vec![2; 8]),
-            fingerprint_version: Some("test".to_string()), state: ImportImageState::Fingerprinted,
-        }).await.unwrap();
+        let _img2 = ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id,
+                source_path: album_path.join("photo2.png").display().to_string(),
+                relative_path: "album_a/photo2.png".to_string(),
+                file_size: 14,
+                modified_at: None,
+                width: Some(10),
+                height: Some(10),
+                format: Some("png".to_string()),
+                decode_state: DecodeState::Decoded,
+                blake3: Some(img2_blake3.clone()),
+                pixel_hash: Some(vec![2; 8]),
+                gradient_hash: Some(vec![2; 8]),
+                block_hash: Some(vec![2; 8]),
+                median_hash: Some(vec![2; 8]),
+                fingerprint_version: Some("test".to_string()),
+                state: ImportImageState::Fingerprinted,
+            },
+        )
+        .await
+        .unwrap();
 
-        ImportRepository::update_import_run_state(&client, import_run_id, &ImportRunState::Completed).await.unwrap();
+        ImportRepository::update_import_run_state(
+            &client,
+            import_run_id,
+            &ImportRunState::Completed,
+        )
+        .await
+        .unwrap();
 
         drop(client);
         db_handle.abort();
@@ -89,7 +154,7 @@ mod tests {
     ) {
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(tokio::sync::Mutex::new(
-            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string())
+            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string()),
         ));
 
         let result = commit_service::run_import_commit(
@@ -116,12 +181,16 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(tokio::sync::Mutex::new(
-            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string())
+            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string()),
         ));
         let result = commit_service::run_import_commit(
-            pg_manager.clone(), library_root.display().to_string(),
-            import_run_id, cancelled, progress,
-        ).await;
+            pg_manager.clone(),
+            library_root.display().to_string(),
+            import_run_id,
+            cancelled,
+            progress,
+        )
+        .await;
         assert!(result.is_err(), "should fail after DB write");
 
         clear_fault_point();
@@ -136,12 +205,16 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(tokio::sync::Mutex::new(
-            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string())
+            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string()),
         ));
         let result = commit_service::run_import_commit(
-            pg_manager.clone(), library_root.display().to_string(),
-            import_run_id, cancelled, progress,
-        ).await;
+            pg_manager.clone(),
+            library_root.display().to_string(),
+            import_run_id,
+            cancelled,
+            progress,
+        )
+        .await;
         assert!(result.is_err(), "should fail before publish rename");
 
         clear_fault_point();
@@ -156,12 +229,16 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(tokio::sync::Mutex::new(
-            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string())
+            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string()),
         ));
         let result = commit_service::run_import_commit(
-            pg_manager.clone(), library_root.display().to_string(),
-            import_run_id, cancelled, progress,
-        ).await;
+            pg_manager.clone(),
+            library_root.display().to_string(),
+            import_run_id,
+            cancelled,
+            progress,
+        )
+        .await;
         assert!(result.is_err(), "should fail after publish rename");
 
         clear_fault_point();
@@ -176,12 +253,16 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(tokio::sync::Mutex::new(
-            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string())
+            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string()),
         ));
         let result = commit_service::run_import_commit(
-            pg_manager.clone(), library_root.display().to_string(),
-            import_run_id, cancelled, progress,
-        ).await;
+            pg_manager.clone(),
+            library_root.display().to_string(),
+            import_run_id,
+            cancelled,
+            progress,
+        )
+        .await;
         assert!(result.is_err(), "should fail before DB commit");
 
         clear_fault_point();
@@ -196,12 +277,16 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(tokio::sync::Mutex::new(
-            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string())
+            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string()),
         ));
         let result = commit_service::run_import_commit(
-            pg_manager.clone(), library_root.display().to_string(),
-            import_run_id, cancelled, progress,
-        ).await;
+            pg_manager.clone(),
+            library_root.display().to_string(),
+            import_run_id,
+            cancelled,
+            progress,
+        )
+        .await;
         assert!(result.is_err(), "should fail before source archive");
 
         clear_fault_point();
@@ -215,12 +300,16 @@ mod tests {
 
         let cancelled = Arc::new(AtomicBool::new(true));
         let progress = Arc::new(tokio::sync::Mutex::new(
-            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string())
+            crate::domain::import_state::CommitProgress::idle(&import_run_id.to_string()),
         ));
         let result = commit_service::run_import_commit(
-            pg_manager.clone(), library_root.display().to_string(),
-            import_run_id, cancelled, progress,
-        ).await;
+            pg_manager.clone(),
+            library_root.display().to_string(),
+            import_run_id,
+            cancelled,
+            progress,
+        )
+        .await;
         assert!(result.is_ok(), "cancel should not hard-fail");
 
         let publish_dir = library_root.join("Albums").join("album_a");
@@ -242,9 +331,14 @@ mod tests {
             let mgr = pg_manager.lock().await;
             mgr.connect().await.unwrap()
         };
-        let count: i64 = client.query_one(
-            "SELECT COUNT(*) FROM library_albums WHERE display_name = 'album_a'", &[]
-        ).await.unwrap().get(0);
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM library_albums WHERE display_name = 'album_a'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
         assert_eq!(count, 1, "should have exactly one library album record");
         drop(client);
         handle.abort();

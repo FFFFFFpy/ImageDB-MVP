@@ -1,9 +1,10 @@
-/// Failure injection infrastructure for the commit pipeline.
-///
-/// This module provides fault injection points that can be triggered
-/// during commit operations to test recovery paths. The actual test
-/// functions are in the `tests` submodule (only compiled in test mode).
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+//! Failure injection infrastructure for the commit pipeline.
+//!
+//! This module provides fault injection points that can be triggered
+//! during commit operations to test recovery paths. The actual test
+//! functions are in the `tests` submodule (only compiled in test mode).
+#![allow(dead_code)]
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// Fault injection points in the commit pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +53,10 @@ pub(crate) fn check_fault(point: CommitFaultPoint) -> bool {
 }
 
 /// Check fault and return an error if triggered.
-pub(crate) fn maybe_fault(point: CommitFaultPoint, msg: &str) -> Result<(), crate::error::AppError> {
+pub(crate) fn maybe_fault(
+    point: CommitFaultPoint,
+    msg: &str,
+) -> Result<(), crate::error::AppError> {
     if check_fault(point) {
         Err(crate::error::AppError::Internal(format!(
             "injected fault at {:?}: {msg}",

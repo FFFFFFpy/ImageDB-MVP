@@ -198,7 +198,9 @@ pub fn build_import_plan(
         .iter()
         .filter(|c| c.candidate_decision.as_deref() == Some("auto_duplicate"))
         .filter_map(|c| {
-            let candidate_id = c.candidate_source_image_id.or(c.candidate_library_image_id)?;
+            let candidate_id = c
+                .candidate_source_image_id
+                .or(c.candidate_library_image_id)?;
             Some(DuplicateEdge {
                 image_a: c.source_image_id,
                 image_b: candidate_id,
