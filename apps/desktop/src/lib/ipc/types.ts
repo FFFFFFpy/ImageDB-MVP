@@ -240,6 +240,10 @@ export interface RecoveryOutcome {
   transaction_id: string;
   final_state: string;
   recovered: boolean;
+  /** true when the transaction is in a genuine terminal state
+   * (source_archived / failed / cancelled). failed/cancelled are
+   * terminal-but-not-recovered. */
+  terminal: boolean;
   message: string;
 }
 

@@ -36,6 +36,11 @@ pub struct RecoveryOutcomeDto {
     pub transaction_id: String,
     pub final_state: String,
     pub recovered: bool,
+    /// `true` when the transaction is in a genuine terminal state
+    /// (`source_archived`, `failed`, `cancelled`). Failed/cancelled are
+    /// terminal-but-not-recovered: the GUI must show "terminal, not
+    /// recovered" instead of treating them as a success.
+    pub terminal: bool,
     pub message: String,
 }
 
@@ -96,6 +101,7 @@ pub async fn recover_transaction(
         transaction_id: outcome.transaction_id.to_string(),
         final_state: outcome.final_state,
         recovered: outcome.recovered,
+        terminal: outcome.terminal,
         message: outcome.message,
     })
 }

@@ -98,13 +98,18 @@ export function RecoveryPage({ onNavigate }: RecoveryPageProps) {
       {actionError && <div className="recovery-error">{actionError}</div>}
 
       {lastOutcome && (
-        <div className={`recovery-card ${lastOutcome.recovered ? 'success' : ''}`}>
+        <div
+          className={`recovery-card ${lastOutcome.recovered ? 'success' : lastOutcome.terminal ? 'failed' : ''}`}
+        >
           <h3>恢复结果</h3>
           <p>
             事务 {lastOutcome.transaction_id.slice(0, 8)}... →{' '}
             {formatState(lastOutcome.final_state)}
           </p>
           <p>{lastOutcome.message}</p>
+          {!lastOutcome.recovered && lastOutcome.terminal && (
+            <p className="recovery-error-detail">此事务处于终态但未恢复成功，需要手动解决。</p>
+          )}
         </div>
       )}
 

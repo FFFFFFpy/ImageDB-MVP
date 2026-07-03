@@ -17,12 +17,14 @@ function formatFileSize(bytes: number): string {
 }
 
 function isTerminalProgress(progress: CommitProgress): boolean {
+  // Phase 2: the persisted DB state is the single source of truth. The
+  // only terminal states are the reconciler's outputs — no
+  // `completed_with_errors` / `cancelled_pending_recovery` overlay.
   return (
     progress.state === 'completed' ||
-    progress.state === 'completed_with_errors' ||
     progress.state === 'failed' ||
     progress.state === 'recovery_required' ||
-    progress.state === 'cancelled_pending_recovery'
+    progress.state === 'cancelled'
   );
 }
 
@@ -370,10 +372,8 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   }
 
   const isSuccess = progress?.state === 'completed';
-  const needsRecovery =
-    progress?.state === 'completed_with_errors' ||
-    progress?.state === 'recovery_required' ||
-    progress?.state === 'cancelled_pending_recovery';
+  const isCancelled = progress?.state === 'cancelled';
+  const needsRecovery = progress?.state === 'recovery_required';
   const detectedIncomplete = progress?.state === 'recovery_required';
 
   return (
@@ -384,11 +384,13 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
         <div className="result-status">
           {isSuccess
             ? '导入已完成'
-            : detectedIncomplete
-              ? '检测到未完成事务'
-              : needsRecovery
-                ? '部分完成，等待恢复'
-                : '导入出现问题'}
+            : isCancelled
+              ? '导入已取消'
+              : detectedIncomplete
+                ? '检测到未完成事务'
+                : needsRecovery
+                  ? '部分完成，等待恢复'
+                  : '导入出现问题'}
         </div>
         <div className="commit-stats">
           <div className="stat-card">

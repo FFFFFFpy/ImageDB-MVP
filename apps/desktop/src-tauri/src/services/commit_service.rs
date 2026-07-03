@@ -24,7 +24,7 @@ use crate::repositories::import_repository::{
 };
 use crate::services::recovery_service::reconcile_import_run_state;
 use crate::services::source_snapshot_service::{
-    load_source_album_snapshot, verify_source_snapshot_files,
+    load_source_album_snapshot, verify_source_snapshot_files_async,
 };
 #[cfg(feature = "fail-injection")]
 use crate::tests::fail_injection::{maybe_fault, CommitFaultPoint};
@@ -259,13 +259,22 @@ async fn execute_commit_pipeline(
         )))?;
 
     if frozen.albums.is_empty() {
-        // Rule: empty plan completes the run directly.
-        ImportRepository::update_import_run_state(
-            client,
-            import_run_id,
-            &ImportRunState::Completed,
-        )
-        .await?;
+        // Phase 3: an empty plan must NOT bypass transaction checks. The
+        // reconciler is the single authoritative decider: it completes the
+        // run only if the full invariant set (plan state/hash, album/image
+        // counts, and the complete file-transaction set) passes. An empty
+        // plan with an active/conflict/failed/cancelled transaction routes
+        // to `recovery_required` instead.
+        let reconciled = reconcile_import_run_state(client, import_run_id).await?;
+        let final_state = match reconciled.state {
+            ImportRunState::Completed => "completed",
+            ImportRunState::RecoveryRequired => "recovery_required",
+            other => {
+                return Err(AppError::Internal(format!(
+                    "unexpected run state after empty-plan reconcile: {other}"
+                )))
+            }
+        };
         return Ok(CommitResult {
             import_run_id: import_run_id.to_string(),
             albums_total: 0,
@@ -275,7 +284,7 @@ async fn execute_commit_pipeline(
             images_committed: 0,
             album_results: Vec::new(),
             errors: Vec::new(),
-            state: "completed".to_string(),
+            state: final_state.to_string(),
         });
     }
 
@@ -389,82 +398,73 @@ async fn execute_commit_pipeline(
         reconcile_import_run_state(client, import_run_id).await?;
     }
 
-    // If the pipeline was cancelled, mark any still-active transactions as
-    // failed so the reconciler has a clean terminal set to reason about.
-    // Without this, a cancelled commit would leave transactions in
-    // `planned`/`staging`/etc and the reconciler would (correctly) refuse
-    // to promote the run to `completed`, but also wouldn't distinguish
-    // cancellation from a normal partial commit.
-    if cancelled.load(Ordering::Relaxed) {
-        let active = ImportRepository::get_all_transactions_for_run(client, import_run_id).await?;
-        for t in active {
-            if let Ok(s) = TransactionState::parse(&t.state) {
-                if !s.is_terminal() && s != TransactionState::Conflict {
-                    ImportRepository::update_file_transaction_state(
-                        client,
-                        t.id,
-                        &TransactionState::Failed,
-                        Some("commit cancelled by user"),
-                    )
-                    .await?;
-                }
-            }
-        }
-    }
+    // Phase 1: cancellation must NOT manufacture unrecoverable transactions.
+    // Previously this block flipped every non-terminal, non-conflict
+    // transaction to `failed`, which (a) made them un-recoverable (Recovery
+    // rejects `failed`), and (b) leaked the failed state into the run. The
+    // correct semantics: a recoverable transaction stays at its last
+    // recoverable state so Recovery can resume it; the run is then marked
+    // `recovery_required` by the reconciler (not `failed`). Only the run
+    // itself may receive a user-initiated terminal label, and even then we
+    // do not write it here — the reconciler owns run state.
+    //
+    // We intentionally do NOT mutate transaction states on cancel. The
+    // mid-flight transaction is left at e.g. `staging`/`verified`/`published`
+    // so `recover_transaction` can drive it forward on the next launch.
 
     // Final authoritative run-state decision. The reconciler inspects
     // every transaction against the frozen plan and writes the only state
     // the product allows: `completed` iff every frozen-plan album is
-    // source_archived, `recovery_required` otherwise. This replaces the
-    // previous counter-based heuristic so a completed run cannot mask a
-    // surviving recoverable transaction.
+    // source_archived (or the plan is empty + invariants pass),
+    // `recovery_required` otherwise. This replaces the previous
+    // counter-based heuristic so a completed run cannot mask a surviving
+    // recoverable transaction.
+    //
+    // Phase 2: the persisted DB state is the single source of truth. The
+    // API/progress/GUI render exactly this state — no
+    // `completed_with_errors` / `cancelled_pending_recovery` overlay. A
+    // cancelled commit surfaces as `recovery_required` (there is a
+    // mid-flight transaction to recover) unless the run had no
+    // transactions at all, in which case reconcile leaves it at the
+    // user-explicit state.
     let reconciled = reconcile_import_run_state(client, import_run_id).await?;
 
-    let final_state = if cancelled.load(Ordering::Relaxed) {
-        "cancelled_pending_recovery".to_string()
-    } else {
-        match reconciled.state {
-            ImportRunState::Completed => {
-                if albums_failed == 0 && all_errors.is_empty() {
-                    "completed".to_string()
-                } else {
-                    "completed_with_errors".to_string()
-                }
-            }
-            ImportRunState::RecoveryRequired => {
-                if albums_failed > 0 {
-                    // Surface album-level failure counts on the run row for
-                    // operator diagnostics. The state itself was already
-                    // set by reconcile; this only writes error metadata
-                    // (deliberately not using update_import_run_error,
-                    // which would overwrite state to `failed` and undo
-                    // the reconciler's decision).
-                    client
-                        .execute(
-                            "UPDATE import_runs SET error_code = $1, error_message = $2 WHERE id = $3",
-                            &[
-                                &"commit_partial",
-                                &format!(
-                                    "{albums_failed} album(s) failed, {} error(s)",
-                                    all_errors.len()
-                                ),
-                                &import_run_id,
-                            ],
-                        )
-                        .await
-                        .map_err(|e| {
-                            AppError::Internal(format!(
-                                "failed to update partial commit diagnostics: {e}"
-                            ))
-                        })?;
-                    "completed_with_errors".to_string()
-                } else {
-                    "recovery_required".to_string()
-                }
-            }
-            other => other.to_string(),
+    let final_state = match reconciled.state {
+        ImportRunState::Completed => "completed",
+        ImportRunState::RecoveryRequired => "recovery_required",
+        ImportRunState::Cancelled => "cancelled",
+        ImportRunState::Failed => "failed",
+        other => {
+            return Err(AppError::Internal(format!(
+                "unexpected run state after commit reconcile: {other}"
+            )))
         }
     };
+
+    // Surface non-blocking diagnostics (album failure counts) on the run
+    // row WITHOUT mutating the authoritative state. A run with failed
+    // albums is `recovery_required` per the reconciler; this only writes
+    // error_code/error_message metadata for operator diagnostics. It
+    // deliberately does not use update_import_run_error (which would
+    // overwrite state to `failed` and undo the reconciler's decision).
+    if !all_errors.is_empty() {
+        client
+            .execute(
+                "UPDATE import_runs SET error_code = $1, error_message = $2 WHERE id = $3",
+                &[
+                    &"commit_partial",
+                    &format!(
+                        "{albums_failed} album(s) failed, {} error(s)",
+                        all_errors.len()
+                    ),
+                    &import_run_id,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to update partial commit diagnostics: {e}"))
+            })?;
+    }
 
     Ok(CommitResult {
         import_run_id: import_run_id.to_string(),
@@ -475,7 +475,7 @@ async fn execute_commit_pipeline(
         images_committed: total_committed,
         album_results,
         errors: all_errors,
-        state: final_state,
+        state: final_state.to_string(),
     })
 }
 
@@ -1007,13 +1007,37 @@ async fn commit_single_album(
     // unrelated paths on disk.
     validate_plan_image_sources(&source_album_dir, &images)?;
 
-    let archive_base = source_album_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".imagedb-processed");
-    let archive_dir = archive_base
-        .join(tx_id.to_string())
-        .join(&album_relative_path);
+    // Phase 4: verify the persisted source snapshot's album path agrees
+    // with the import album's source_path. Mismatch → conflict (never an
+    // auto-fix), so a snapshot captured for a different album cannot vouch
+    // for this archive.
+    if let Err(e) =
+        validate_snapshot_album_path_identity(&snapshot.source_album_path, &source_album_dir)
+    {
+        let msg = e.to_string();
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx_id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Err(e);
+    }
+
+    // Phase 4: archive root is derived from the **persisted
+    // import_runs.source_root** — never from `source_album_dir.parent()`
+    // (which can be empty / `.` for root-level albums) and never from a
+    // plan image parent. The album relative path is computed against
+    // source_root so the archive always lives under the user's source tree.
+    let archive_dir = compute_archive_dir(
+        client,
+        import_run_id,
+        &source_album_dir,
+        &album_relative_path,
+        tx_id,
+    )
+    .await?;
 
     let source_exists = source_album_dir.exists();
     let archive_exists = archive_dir.exists();
@@ -1185,7 +1209,16 @@ pub(crate) async fn verify_source_snapshot_or_conflict(
     snapshot_files: &[SnapshotFileRecord],
     label: &str,
 ) -> Result<Option<String>, AppError> {
-    let errors = match verify_source_snapshot_files(dir, snapshot_hash, snapshot_files) {
+    // Phase 5: the blocking directory walk + BLAKE3 hashing is isolated on
+    // a spawn_blocking task so the async runtime is never blocked while
+    // verifying a large album against its captured snapshot.
+    let errors = match verify_source_snapshot_files_async(
+        dir,
+        snapshot_hash.to_vec(),
+        snapshot_files.to_vec(),
+    )
+    .await
+    {
         Ok(errors) => errors,
         Err(e) => {
             let msg = format!(
@@ -1468,6 +1501,178 @@ pub(crate) fn validate_plan_image_sources(
                 canonical_root.display()
             )));
         }
+    }
+    Ok(())
+}
+
+/// Compute the archive directory for a transaction from the **persisted
+/// `import_runs.source_root`** + the transaction id + album relative path.
+///
+/// Result: `<source_root>/.imagedb-processed/<tx_id>/<album_relative_path>`.
+///
+/// This is the Phase 4 fix: the archive root must always live under the
+/// persisted source root, never under `source_album_dir.parent()` (which
+/// can be `.` for root-level albums) and never under a plan image parent.
+/// Returns an `AppError` if the source root is missing, non-absolute, or
+/// the album path escapes it.
+///
+/// `source_album_dir` is the authoritative album directory read from
+/// `import_albums.source_path`; it is verified to live under `source_root`
+/// (after canonicalization when both exist) before the archive location is
+/// computed.
+pub(crate) async fn compute_archive_dir(
+    client: &Client,
+    import_run_id: Uuid,
+    source_album_dir: &Path,
+    album_relative_path: &str,
+    tx_id: Uuid,
+) -> Result<PathBuf, AppError> {
+    let run = ImportRepository::get_import_run_by_id(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    let source_root = PathBuf::from(&run.source_root);
+    if source_root.as_os_str().is_empty() {
+        return Err(AppError::Internal(format!(
+            "import run {import_run_id} has empty source_root"
+        )));
+    }
+    if !source_root.is_absolute() {
+        return Err(AppError::Internal(format!(
+            "import run {import_run_id} source_root is not absolute: {}",
+            source_root.display()
+        )));
+    }
+
+    // Verify the album directory is contained by the persisted source root.
+    validate_album_under_root(&source_root, source_album_dir)?;
+
+    let archive_dir = source_root
+        .join(".imagedb-processed")
+        .join(tx_id.to_string())
+        .join(normalize_relative_path(album_relative_path)?);
+    // The archive dir must end up under the source root (defense-in-depth
+    // against a malformed album_relative_path that somehow traversed up).
+    if !archive_dir.starts_with(&source_root) {
+        return Err(AppError::Internal(format!(
+            "archive dir {} escaped source_root {} (album_relative_path='{}')",
+            archive_dir.display(),
+            source_root.display(),
+            album_relative_path
+        )));
+    }
+    Ok(archive_dir)
+}
+
+/// Verify that `source_album_dir` is contained by the persisted
+/// `source_root`. Canonicalization is used when both paths exist (resolves
+/// symlinks + Windows case). If `source_root` does not exist on disk, fall
+/// back to lexical containment on the raw paths (after rejecting any `..`
+/// traversal), so an archive-only recovery that re-points at a remounted
+/// root still works. Reject relative paths, `..` traversal, and any escape.
+pub(crate) fn validate_album_under_root(
+    source_root: &Path,
+    source_album_dir: &Path,
+) -> Result<(), AppError> {
+    if !source_album_dir.is_absolute() {
+        return Err(AppError::Internal(format!(
+            "source album dir is not absolute: {}",
+            source_album_dir.display()
+        )));
+    }
+    // Reject `..` traversal lexically first, regardless of existence.
+    for comp in source_album_dir.components() {
+        if matches!(comp, Component::ParentDir) {
+            return Err(AppError::Internal(format!(
+                "source album dir contains '..': {}",
+                source_album_dir.display()
+            )));
+        }
+    }
+
+    if source_root.exists() && source_album_dir.exists() {
+        let canonical_root = source_root.canonicalize().map_err(|e| {
+            AppError::IoError(format!(
+                "cannot canonicalize source_root {}: {e}",
+                source_root.display()
+            ))
+        })?;
+        let canonical_album = source_album_dir.canonicalize().map_err(|e| {
+            AppError::IoError(format!(
+                "cannot canonicalize source album dir {}: {e}",
+                source_album_dir.display()
+            ))
+        })?;
+        if !canonical_album.starts_with(&canonical_root) {
+            return Err(AppError::Internal(format!(
+                "source album dir '{}' escapes persisted source_root '{}' (resolved '{}' not under '{}')",
+                source_album_dir.display(),
+                source_root.display(),
+                canonical_album.display(),
+                canonical_root.display()
+            )));
+        }
+        Ok(())
+    } else {
+        // Lexical containment fallback when paths don't exist on disk.
+        if !source_album_dir.starts_with(source_root) {
+            return Err(AppError::Internal(format!(
+                "source album dir '{}' is not under persisted source_root '{}' (lexical)",
+                source_album_dir.display(),
+                source_root.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Verify that the persisted `source_album_snapshots.source_album_path`
+/// agrees with `import_albums.source_path`. They must denote the same
+/// path (canonical equality when both exist; lexical equality otherwise).
+/// Mismatch → `AppError` (never an auto-fix), so a snapshot captured for a
+/// different album cannot be used to vouch for this archive.
+pub(crate) fn validate_snapshot_album_path_identity(
+    snapshot_album_path: &str,
+    source_album_dir: &Path,
+) -> Result<(), AppError> {
+    if snapshot_album_path.is_empty() {
+        return Err(AppError::Internal(
+            "source_album_snapshots.source_album_path is empty".to_string(),
+        ));
+    }
+    let snapshot_path = Path::new(snapshot_album_path);
+    if !snapshot_path.is_absolute() {
+        return Err(AppError::Internal(format!(
+            "source_album_snapshots.source_album_path is not absolute: {snapshot_album_path}"
+        )));
+    }
+    if snapshot_path.exists() && source_album_dir.exists() {
+        let canonical_snapshot = snapshot_path.canonicalize().map_err(|e| {
+            AppError::IoError(format!(
+                "cannot canonicalize snapshot album path {}: {e}",
+                snapshot_path.display()
+            ))
+        })?;
+        let canonical_album = source_album_dir.canonicalize().map_err(|e| {
+            AppError::IoError(format!(
+                "cannot canonicalize source album dir {}: {e}",
+                source_album_dir.display()
+            ))
+        })?;
+        if canonical_snapshot != canonical_album {
+            return Err(AppError::Internal(format!(
+                "source snapshot path '{}' does not match import album source_path '{}' (resolved '{}' vs '{}')",
+                snapshot_album_path,
+                source_album_dir.display(),
+                canonical_snapshot.display(),
+                canonical_album.display()
+            )));
+        }
+    } else if !path_eq(snapshot_path, source_album_dir) {
+        return Err(AppError::Internal(format!(
+            "source snapshot path '{}' does not match import album source_path '{}' (lexical)",
+            snapshot_album_path,
+            source_album_dir.display()
+        )));
     }
     Ok(())
 }

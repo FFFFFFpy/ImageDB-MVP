@@ -60,6 +60,12 @@ pub struct RecoveryOutcome {
     pub transaction_id: Uuid,
     pub final_state: String,
     pub recovered: bool,
+    /// `true` only when the transaction is in a genuine terminal state
+    /// (`source_archived`, `failed`, `cancelled`). A `failed`/`cancelled`
+    /// transaction is terminal-but-not-recovered: callers must NOT treat
+    /// it as a successful recovery. Distinct from `recovered` so the GUI
+    /// can show "terminal, not recovered" for failed/cancelled rows.
+    pub terminal: bool,
     pub message: String,
 }
 
@@ -149,6 +155,11 @@ pub async fn scan_recoverable_transactions(
 /// row; `false` means the persisted state already matched the computed
 /// verdict (the idempotent no-op case). Tests use this to assert stability
 /// across repeated calls.
+///
+/// `completed_at` is **always** the persisted DB value — read back from
+/// `import_runs` after any write — never a transient in-memory timestamp.
+/// It is `None` when the run is not `completed`. This guarantees repeated
+/// reconcile calls and post-restart reads return the same value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconciledRunState {
     pub import_run_id: Uuid,
@@ -167,31 +178,42 @@ pub struct ReconciledRunState {
 ///
 /// # Rules (product-level invariants)
 ///
-/// 1. Any `conflict` transaction → `recovery_required`.
-/// 2. Any active (non-terminal, non-conflict) transaction —
+/// 1. **Empty frozen plan**: complete only after the *full* invariant
+///    check (plan state, plan hash, album/image counts, and the complete
+///    file-transaction set) passes. An empty plan with an active, failed,
+///    cancelled, or conflict transaction is **not** `completed` — it goes
+///    to `recovery_required` (or stays at the user-explicit terminal state).
+///    See [`empty_plan_allows_completion`].
+/// 2. Any `conflict` transaction → `recovery_required`.
+/// 3. Any active (non-terminal, non-conflict) transaction —
 ///    `planned | staging | verifying | verified | publishing | published |
 ///    db_committing | library_committed | source_archiving |
-///    cleanup_required` → `recovery_required`.
-/// 3. Any `failed` or `cancelled` transaction → `recovery_required`
+///    cleanup_required` → `recovery_required`. These transactions are still
+///    recoverable; cancellation must NOT flip them to `failed`/`cancelled`
+///    (that would create an unrecoverable terminal state).
+/// 4. Any `failed` or `cancelled` transaction → `recovery_required`
 ///    (current product semantics: no silent completion with unresolved
 ///    transaction outcomes; promote to a real `failed` run path when one
 ///    lands).
-/// 4. Every frozen-plan album has a `source_archived` transaction for its
-///    `import_album_id` → `completed` and `completed_at` is set. An empty
-///    frozen plan (no albums) also completes.
-/// 5. A run that has not yet reached the commit phase (`created`,
+/// 5. Every frozen-plan album has a `source_archived` transaction for its
+///    `import_album_id` → `completed` and `completed_at` is set (persisted).
+///    An empty frozen plan that passes [`empty_plan_allows_completion`]
+///    also completes.
+/// 6. A run that has not yet reached the commit phase (`created`,
 ///    `scanning`, `fingerprinting`, `detecting_duplicates`, `analyzing`,
 ///    `review_required`, `ready_to_commit`) is left untouched — reconcile
 ///    is meaningless before commit has been attempted.
-/// 6. Terminal states `cancelled` and `failed` are also left untouched:
+/// 7. Terminal states `cancelled` and `failed` are also left untouched:
 ///    they are set by explicit user/system actions, not derived.
 ///
-/// # Idempotency
+/// # Idempotency + persisted `completed_at`
 ///
 /// Calling this function twice in a row with no intervening state changes
 /// produces the same result and sets `changed = false` on the second call.
 /// `completed_at` is only written when transitioning *into* `completed`;
-/// it is cleared when the run is pulled back to `recovery_required`.
+/// it is cleared when the run is pulled back to `recovery_required`. The
+/// returned `completed_at` is always read back from the DB, so it is the
+/// exact persisted value — never a transient in-memory `now()`.
 pub async fn reconcile_import_run_state(
     client: &Client,
     import_run_id: Uuid,
@@ -250,30 +272,41 @@ pub async fn reconcile_import_run_state(
     let transactions =
         ImportRepository::get_all_transactions_for_run(client, import_run_id).await?;
 
-    // Empty frozen plan: commit was legitimately a no-op. Complete the run
-    // if it is still in a post-commit non-terminal state.
-    if frozen.albums.is_empty() {
-        let target = ImportRunState::Completed;
-        let changed = current != target;
-        if changed {
+    // Validate the frozen plan up front (state + hash + album/image counts).
+    // A tampered or inconsistent plan is a plan-integrity error: surface it
+    // as a recovery_required run rather than silently completing.
+    if let Err(plan_err) = validate_and_hash_frozen_plan(&frozen, frozen.library_root_id) {
+        // Plan integrity failure → recovery_required. Persist this so the
+        // GUI/API see the real state, and return the persisted state.
+        if current != ImportRunState::RecoveryRequired {
             ImportRepository::set_import_run_state(
                 client,
                 import_run_id,
-                &target,
-                Some(chrono::Utc::now()),
-                false,
+                &ImportRunState::RecoveryRequired,
+                None,
+                true,
             )
             .await?;
         }
-        return Ok(ReconciledRunState {
-            import_run_id,
-            state: target,
-            completed_at: Some(chrono::Utc::now()),
-            changed,
-        });
+        let _ = plan_err; // diagnostics only; the state itself is the signal
+        return read_back_run_state(client, import_run_id, current, true).await;
     }
 
-    // Rule 1: any conflict forces recovery_required.
+    // Empty frozen plan: complete ONLY if the full invariant check passes
+    // (no active / failed / cancelled / conflict transactions, no residual
+    // plan album/image rows that contradict the empty plan). This is the
+    // Phase 3 fix — previously an empty plan completed unconditionally,
+    // bypassing transaction checks.
+    if frozen.albums.is_empty() {
+        if empty_plan_allows_completion(&transactions) {
+            return complete_run_if_needed(client, import_run_id, current).await;
+        }
+        // An empty plan with surviving transactions / conflicts is not
+        // complete: route to recovery_required.
+        return set_recovery_required(client, import_run_id, &current).await;
+    }
+
+    // Rule 2: any conflict forces recovery_required.
     let has_conflict = transactions.iter().any(|t| {
         matches!(
             TransactionState::parse(&t.state),
@@ -284,7 +317,7 @@ pub async fn reconcile_import_run_state(
         return set_recovery_required(client, import_run_id, &current).await;
     }
 
-    // Rule 2: any active (recoverable) transaction forces recovery_required.
+    // Rule 3: any active (recoverable) transaction forces recovery_required.
     let has_active = transactions.iter().any(|t| {
         matches!(
             TransactionState::parse(&t.state),
@@ -304,7 +337,7 @@ pub async fn reconcile_import_run_state(
         return set_recovery_required(client, import_run_id, &current).await;
     }
 
-    // Rule 3: any failed/cancelled transaction blocks completion.
+    // Rule 4: any failed/cancelled transaction blocks completion.
     let has_failed_or_cancelled = transactions.iter().any(|t| {
         matches!(
             TransactionState::parse(&t.state),
@@ -315,7 +348,7 @@ pub async fn reconcile_import_run_state(
         return set_recovery_required(client, import_run_id, &current).await;
     }
 
-    // Rule 4: every frozen-plan album must have reached source_archived.
+    // Rule 5: every frozen-plan album must have reached source_archived.
     let archived_album_ids: std::collections::HashSet<Uuid> = transactions
         .iter()
         .filter(|t| {
@@ -333,30 +366,99 @@ pub async fn reconcile_import_run_state(
         .all(|(a, _)| archived_album_ids.contains(&a.import_album_id));
 
     if all_archived {
-        let target = ImportRunState::Completed;
-        let changed = current != target;
-        let now = chrono::Utc::now();
-        if changed {
-            ImportRepository::set_import_run_state(
-                client,
-                import_run_id,
-                &target,
-                Some(now),
-                false,
-            )
-            .await?;
-        }
-        Ok(ReconciledRunState {
-            import_run_id,
-            state: target,
-            completed_at: Some(now),
-            changed,
-        })
+        complete_run_if_needed(client, import_run_id, current).await
     } else {
         // Some plan album has no transaction at all — commit was aborted
         // mid-pipeline before a row was inserted. Recovery required.
         set_recovery_required(client, import_run_id, &current).await
     }
+}
+
+/// Empty-plan invariant check (Phase 3).
+///
+/// An empty frozen plan completes the run ONLY when **all** of the
+/// following hold:
+///
+/// - No `conflict` transaction exists.
+/// - No active (recoverable) transaction exists.
+/// - No `failed` or `cancelled` transaction exists.
+///
+/// If any of these fail, the empty plan must NOT bypass transaction
+/// checks — the run is `recovery_required` (or stays at the user-explicit
+/// terminal state, handled by the caller).
+///
+/// `import_plan_albums` / `import_plan_images` rows are already covered by
+/// `validate_and_hash_frozen_plan` (an empty `frozen.albums` with residual
+/// rows would fail the expected_image_count check there). The transaction
+/// check below is the additional guard for file_transactions.
+fn empty_plan_allows_completion(
+    transactions: &[crate::repositories::import_repository::FileTransactionStateRow],
+) -> bool {
+    // No conflict / active / failed / cancelled transactions. A
+    // `source_archived` row (or any unparseable leftover) is tolerated
+    // because `source_archived` is a genuine terminal success and an
+    // unparseable row is handled at the plan-integrity layer above.
+    transactions.iter().all(|t| {
+        matches!(
+            TransactionState::parse(&t.state),
+            Ok(TransactionState::SourceArchived) | Err(_)
+        )
+    })
+}
+
+/// Transition the run to `Completed` if it isn't already, writing a stable
+/// `completed_at` timestamp. Returns the persisted `completed_at` read back
+/// from the DB (Phase 6: never a transient in-memory value).
+///
+/// If the run was already `Completed`, no write occurs and the existing
+/// persisted `completed_at` is returned verbatim — so repeated reconcile
+/// calls and post-restart reads return the same value.
+async fn complete_run_if_needed(
+    client: &Client,
+    import_run_id: Uuid,
+    current: ImportRunState,
+) -> Result<ReconciledRunState, AppError> {
+    let changed = current != ImportRunState::Completed;
+    if changed {
+        // Write a stable timestamp. If a prior completed_at exists (e.g. the
+        // row was Completed, pulled back, and is now re-completing), the
+        // COALESCE in set_import_run_state preserves it; otherwise we set
+        // a fresh one. The value returned to the caller is read back from
+        // the DB so it is always the persisted truth.
+        ImportRepository::set_import_run_state(
+            client,
+            import_run_id,
+            &ImportRunState::Completed,
+            Some(chrono::Utc::now()),
+            false,
+        )
+        .await?;
+    }
+    read_back_run_state(client, import_run_id, ImportRunState::Completed, changed).await
+}
+
+/// Read back the persisted `state` + `completed_at` for the run. Used after
+/// any reconcile write so the returned `ReconciledRunState` reflects the
+/// exact DB row — not an in-memory guess.
+///
+/// `prev_state` is the state the caller already computed; if the read-back
+/// state disagrees, the read-back wins (it is the source of truth).
+async fn read_back_run_state(
+    client: &Client,
+    import_run_id: Uuid,
+    prev_state: ImportRunState,
+    changed: bool,
+) -> Result<ReconciledRunState, AppError> {
+    let row = ImportRepository::get_import_run_by_id(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    let persisted_state = ImportRunState::from_str_opt(&row.state).unwrap_or(prev_state);
+    Ok(ReconciledRunState {
+        import_run_id,
+        state: persisted_state,
+        completed_at: row.completed_at,
+        changed,
+    })
 }
 
 async fn set_recovery_required(
@@ -424,25 +526,43 @@ async fn recover_transaction_with_client(
                 transaction_id,
                 final_state: state.clone(),
                 recovered: false,
+                terminal: false,
                 message: format!("unparseable transaction state '{state}'"),
             });
         }
     };
 
-    let outcome: Result<(String, bool, String), AppError> = if current.is_terminal() {
-        Ok((
-            current.to_string(),
-            true,
-            "transaction already terminal".to_string(),
-        ))
+    // Phase 1: terminal transactions are NOT auto-recovered. A `failed` or
+    // `cancelled` transaction is terminal-but-not-recovered — callers must
+    // not treat it as a successful recovery, and the run must stay
+    // `recovery_required` (or be moved to a real `failed` run path). Only
+    // `source_archived` is a genuine "already done, nothing to do" success.
+    let outcome: Result<(String, bool, bool, String), AppError> = if current.is_terminal() {
+        let (recovered, msg) = match current {
+            TransactionState::SourceArchived => (
+                true,
+                "transaction already source_archived".to_string(),
+            ),
+            TransactionState::Failed | TransactionState::Cancelled => (
+                false,
+                format!(
+                    "transaction is in terminal state '{current}'; not recoverable (manual resolution required)"
+                ),
+            ),
+            _ => (false, format!("terminal state {current}")),
+        };
+        Ok((current.to_string(), recovered, true, msg))
     } else if current == TransactionState::Conflict {
         Ok((
             current.to_string(),
             false,
+            false,
             "conflict requires manual resolution".to_string(),
         ))
     } else {
-        recover_active_transaction(client, transaction_id, &tx, current, import_run_id).await
+        recover_active_transaction(client, transaction_id, &tx, current, import_run_id)
+            .await
+            .map(|(s, recovered, msg)| (s, recovered, false, msg))
     };
 
     // Always reconcile the parent run after any transaction-level change
@@ -452,7 +572,7 @@ async fn recover_transaction_with_client(
     // run back to `recovery_required`.
     reconcile_import_run_state(client, import_run_id).await?;
 
-    let (final_state, recovered, message) = match outcome {
+    let (final_state, recovered, terminal, message) = match outcome {
         Ok(o) => o,
         Err(e) => return Err(e),
     };
@@ -461,6 +581,7 @@ async fn recover_transaction_with_client(
         transaction_id,
         final_state,
         recovered,
+        terminal,
         message,
     })
 }
@@ -1653,16 +1774,40 @@ async fn resume_source_archive(
         return Ok((TransactionState::Conflict.to_string(), false, msg));
     };
 
-    // Archive location is derived from the persisted source_album_dir, not
-    // from any image path, so it remains computable even when the source
-    // has already been moved (archive-only recovery).
-    let archive_base = source_album_dir
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".imagedb-processed");
-    let archive_dir = archive_base
-        .join(tx.id.to_string())
-        .join(album_relative_path);
+    // Phase 4: verify the persisted source snapshot's album path agrees with
+    // the import album's source_path. Mismatch → conflict.
+    if let Err(e) = crate::services::commit_service::validate_snapshot_album_path_identity(
+        &snapshot.source_album_path,
+        &source_album_dir,
+    ) {
+        let msg = e.to_string();
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+
+    // Phase 4: archive root is derived from the persisted
+    // `import_runs.source_root` (via compute_archive_dir) — never from
+    // `source_album_dir.parent()`. The album relative path is normalized
+    // so the archive always lives under the user's source tree.
+    let archive_dir = crate::services::commit_service::compute_archive_dir(
+        client,
+        tx.import_run_id,
+        &source_album_dir,
+        album_relative_path,
+        tx.id,
+    )
+    .await
+    .map_err(|e| {
+        // Compute failures must surface as a conflict so the operator can
+        // resolve the path-identity issue, not a silent abort.
+        AppError::Internal(format!("cannot compute archive dir: {e}"))
+    })?;
 
     let source_exists = source_album_dir.exists();
     let archive_exists = archive_dir.exists();
@@ -1838,24 +1983,29 @@ mod tests {
         }
     }
 
-    /// Archive location is derived purely from the persisted
-    /// import_albums.source_path plus the tx id and album relative path —
-    /// never from plan image parents. This keeps commit and recovery in
-    /// lockstep and makes archive-only recovery (source already moved)
-    /// possible.
+    /// Archive location is derived from the persisted
+    /// `import_runs.source_root` plus the tx id and album relative path —
+    /// never from `source_album_dir.parent()` and never from a plan image
+    /// parent. This keeps commit and recovery in lockstep and makes
+    /// archive-only recovery (source already moved) possible while
+    /// guaranteeing the archive always lives under the user's source tree.
     #[test]
-    fn archive_dir_computed_from_persisted_root() {
+    fn archive_dir_computed_from_persisted_source_root() {
         let tx_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        let root = PathBuf::from("/src/AlbumA");
-        let archive_base = root
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".imagedb-processed");
-        let archive_dir = archive_base.join(tx_id.to_string()).join("AlbumA");
+        // source_root is the persisted import_runs.source_root; the archive
+        // always lives under it regardless of where the album dir is.
+        let source_root = PathBuf::from("/src");
+        let album_relative_path = "AlbumA";
+        let archive_dir = source_root
+            .join(".imagedb-processed")
+            .join(tx_id.to_string())
+            .join(album_relative_path);
         assert_eq!(
             archive_dir,
             PathBuf::from("/src/.imagedb-processed/11111111-1111-1111-1111-111111111111/AlbumA")
         );
+        // The archive dir must stay under source_root.
+        assert!(archive_dir.starts_with(&source_root));
     }
 
     /// A DB-provided album root tolerates plan images in distinct

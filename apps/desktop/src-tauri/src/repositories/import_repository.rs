@@ -18,6 +18,7 @@ pub struct ImportRunRecord {
     pub state: String,
     pub policy_version: String,
     pub statistics: serde_json::Value,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub struct ImportAlbumRecord {
@@ -1126,7 +1127,7 @@ impl ImportRepository {
     ) -> Result<Option<ImportRunRecord>, AppError> {
         let row = client
             .query_opt(
-                "SELECT id, source_root, library_root_id, state, policy_version, statistics
+                "SELECT id, source_root, library_root_id, state, policy_version, statistics, completed_at
                  FROM import_runs WHERE id = $1",
                 &[&id],
             )
@@ -1140,6 +1141,7 @@ impl ImportRepository {
             state: r.get("state"),
             policy_version: r.get("policy_version"),
             statistics: r.get("statistics"),
+            completed_at: r.get("completed_at"),
         }))
     }
 
