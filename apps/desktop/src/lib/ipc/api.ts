@@ -16,6 +16,7 @@ import type {
   ImportPlan,
   ImagePreview,
   ReviewDecision,
+  CommitProgress,
 } from './types';
 
 export const api = {
@@ -77,4 +78,13 @@ export const api = {
 
   getImagePreview: (path: string) =>
     invoke<ImagePreview>('get_image_preview', { path }),
+
+  startImportCommit: (importRunId: string) =>
+    invoke<string>('start_import_commit', { importRunId }),
+
+  cancelImportCommit: () =>
+    invoke<string>('cancel_import_commit'),
+
+  getCommitProgress: () =>
+    invoke<CommitProgress>('get_commit_progress'),
 };

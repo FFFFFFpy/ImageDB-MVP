@@ -1,6 +1,6 @@
 # Current Task
 
-Executing: tasks/05-import-loop.md
+Executing: tasks/06-recovery.md
 
 Once this task passes all acceptance criteria, update this file to point to the next task.
 
@@ -11,3 +11,4 @@ Once this task passes all acceptance criteria, update this file to point to the 
 > Milestone 2 scan and exact duplicate detection is complete. Report: reports/milestone-2.md.
 > Milestone 3 perceptual similarity detection is complete. Report: reports/milestone-3.md.
 > Milestone 4 human review GUI is complete. Report: reports/milestone-4.md.
+> Milestone 5 formal import loop is complete. Report: reports/milestone-5.md.

@@ -162,6 +162,40 @@ pub struct AlbumRow {
     pub source_name: String,
 }
 
+pub struct ImportAlbumFullRow {
+    pub id: Uuid,
+    pub source_path: String,
+    pub source_name: String,
+}
+
+pub struct ImportImageFullRow {
+    pub id: Uuid,
+    pub source_path: String,
+    pub relative_path: String,
+    pub file_size: i64,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub format: Option<String>,
+    pub blake3: Option<Vec<u8>>,
+    pub pixel_hash: Option<Vec<u8>>,
+    pub gradient_hash: Option<Vec<u8>>,
+    pub block_hash: Option<Vec<u8>>,
+    pub median_hash: Option<Vec<u8>>,
+    pub fingerprint_version: Option<String>,
+    pub import_album_id: Uuid,
+}
+
+pub struct LibraryAlbumRow {
+    pub id: Uuid,
+    pub image_count: i32,
+    pub state: String,
+}
+
+pub struct FileTransactionRow {
+    pub id: Uuid,
+    pub state: String,
+}
+
 impl ImportRepository {
     pub async fn upsert_default_library_root(client: &Client) -> Result<Uuid, AppError> {
         if let Some(row) = client
@@ -779,5 +813,256 @@ impl ImportRepository {
             .map_err(|e| AppError::Internal(format!("failed to query latest run: {e}")))?;
 
         Ok(row.map(|r| r.get("id")))
+    }
+
+    pub async fn get_import_run_by_id(
+        client: &Client,
+        id: Uuid,
+    ) -> Result<Option<ImportRunRecord>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, source_root, library_root_id, state, policy_version, statistics
+                 FROM import_runs WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query import run: {e}")))?;
+
+        Ok(row.map(|r| ImportRunRecord {
+            id: r.get("id"),
+            source_root: r.get("source_root"),
+            library_root_id: r.get("library_root_id"),
+            state: r.get("state"),
+            policy_version: r.get("policy_version"),
+            statistics: r.get("statistics"),
+        }))
+    }
+
+    pub async fn get_import_albums_with_source_for_run(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<ImportAlbumFullRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, source_path, source_name FROM import_albums WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query import albums with source: {e}"))
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ImportAlbumFullRow {
+                id: r.get("id"),
+                source_path: r.get("source_path"),
+                source_name: r.get("source_name"),
+            })
+            .collect())
+    }
+
+    pub async fn get_import_images_by_ids(
+        client: &Client,
+        image_ids: &[Uuid],
+    ) -> Result<Vec<ImportImageFullRow>, AppError> {
+        if image_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = client
+            .query(
+                "SELECT id, source_path, relative_path, file_size, width, height, format,
+                        blake3, pixel_hash, gradient_hash, block_hash, median_hash,
+                        fingerprint_version, import_album_id
+                 FROM import_images WHERE id = ANY($1)",
+                &[&image_ids],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query import images by ids: {e}"))
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ImportImageFullRow {
+                id: r.get("id"),
+                source_path: r.get("source_path"),
+                relative_path: r.get("relative_path"),
+                file_size: r.get("file_size"),
+                width: r.get("width"),
+                height: r.get("height"),
+                format: r.get("format"),
+                blake3: r.get("blake3"),
+                pixel_hash: r.get("pixel_hash"),
+                gradient_hash: r.get("gradient_hash"),
+                block_hash: r.get("block_hash"),
+                median_hash: r.get("median_hash"),
+                fingerprint_version: r.get("fingerprint_version"),
+                import_album_id: r.get("import_album_id"),
+            })
+            .collect())
+    }
+
+    pub async fn find_library_album_by_path(
+        client: &Client,
+        library_root_id: Uuid,
+        relative_path: &str,
+    ) -> Result<Option<LibraryAlbumRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, image_count, state FROM library_albums
+                 WHERE library_root_id = $1 AND relative_path = $2",
+                &[&library_root_id, &relative_path],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query library album by path: {e}"))
+            })?;
+
+        Ok(row.map(|r| LibraryAlbumRow {
+            id: r.get("id"),
+            image_count: r.get("image_count"),
+            state: r.get("state"),
+        }))
+    }
+
+    pub async fn find_existing_file_transaction(
+        client: &Client,
+        import_album_id: Uuid,
+    ) -> Result<Option<FileTransactionRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, state FROM file_transactions WHERE import_album_id = $1",
+                &[&import_album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query file transaction: {e}")))?;
+
+        Ok(row.map(|r| FileTransactionRow {
+            id: r.get("id"),
+            state: r.get("state"),
+        }))
+    }
+
+    pub async fn insert_file_transaction(
+        client: &Client,
+        import_run_id: Uuid,
+        import_album_id: Uuid,
+        state: &str,
+        staging_path: Option<&str>,
+        target_path: Option<&str>,
+        manifest_path: Option<&str>,
+    ) -> Result<Uuid, AppError> {
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO file_transactions
+                 (id, import_run_id, import_album_id, state, staging_path, target_path, manifest_path)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    &id,
+                    &import_run_id,
+                    &import_album_id,
+                    &state,
+                    &staging_path,
+                    &target_path,
+                    &manifest_path,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to insert file transaction: {e}"))
+            })?;
+        Ok(id)
+    }
+
+    pub async fn update_file_transaction_state(
+        client: &Client,
+        id: Uuid,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), AppError> {
+        let completed_at = match state {
+            "source_archived" | "committed" => Some(chrono::Utc::now()),
+            _ => None,
+        };
+        client
+            .execute(
+                "UPDATE file_transactions SET state = $1, last_error = $2,
+                 completed_at = COALESCE($3, completed_at) WHERE id = $4",
+                &[&state, &last_error, &completed_at, &id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to update file transaction state: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub async fn insert_file_operation(
+        client: &Client,
+        transaction_id: Uuid,
+        source_path: &str,
+        staging_path: &str,
+        target_path: &str,
+        expected_size: i64,
+        expected_blake3: &[u8],
+    ) -> Result<Uuid, AppError> {
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO file_operations
+                 (id, transaction_id, source_path, staging_path, target_path,
+                  expected_size, expected_blake3, state)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')",
+                &[
+                    &id,
+                    &transaction_id,
+                    &source_path,
+                    &staging_path,
+                    &target_path,
+                    &expected_size,
+                    &expected_blake3,
+                ],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to insert file operation: {e}")))?;
+        Ok(id)
+    }
+
+    pub async fn update_file_operation_state(
+        client: &Client,
+        id: Uuid,
+        state: &str,
+        actual_blake3: Option<&[u8]>,
+        last_error: Option<&str>,
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "UPDATE file_operations SET state = $1, actual_blake3 = COALESCE($2, actual_blake3),
+                 last_error = $3, attempt_count = attempt_count + 1, updated_at = now()
+                 WHERE id = $4",
+                &[&state, &actual_blake3, &last_error, &id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to update file operation state: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub async fn update_library_root_path(
+        client: &Client,
+        id: Uuid,
+        path: &str,
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "UPDATE library_roots SET path = $1, updated_at = now() WHERE id = $2",
+                &[&path, &id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to update library root path: {e}")))?;
+        Ok(())
     }
 }

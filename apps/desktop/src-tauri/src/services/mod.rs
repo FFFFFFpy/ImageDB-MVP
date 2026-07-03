@@ -1,3 +1,4 @@
+pub mod commit_service;
 pub mod database_service;
 pub mod review_service;
 pub mod scan_service;

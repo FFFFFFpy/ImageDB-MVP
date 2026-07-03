@@ -182,3 +182,37 @@ export interface ImagePreview {
 }
 
 export type ReviewDecision = 'keep_source' | 'keep_candidate' | 'keep_all' | 'skip_album';
+
+export interface CommitProgress {
+  state: string;
+  import_run_id: string;
+  current_stage: string;
+  current_album: string | null;
+  albums_total: number;
+  albums_completed: number;
+  albums_skipped: number;
+  albums_failed: number;
+  images_committed: number;
+  errors: string[];
+}
+
+export interface CommitAlbumResult {
+  album_name: string;
+  status: string;
+  images_committed: number;
+  target_path: string | null;
+  manifest_path: string | null;
+  error: string | null;
+}
+
+export interface CommitResult {
+  import_run_id: string;
+  albums_total: number;
+  albums_committed: number;
+  albums_skipped: number;
+  albums_failed: number;
+  images_committed: number;
+  album_results: CommitAlbumResult[];
+  errors: string[];
+  state: string;
+}

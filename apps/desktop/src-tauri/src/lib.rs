@@ -61,6 +61,9 @@ pub fn run() {
             commands::generate_import_plan,
             commands::get_latest_completed_import_run,
             commands::get_image_preview,
+            commands::start_import_commit,
+            commands::cancel_import_commit,
+            commands::get_commit_progress,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run ImageDB");

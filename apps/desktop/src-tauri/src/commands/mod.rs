@@ -1,9 +1,11 @@
+mod commit;
 mod database;
 mod probe;
 pub mod review;
 pub mod scan;
 mod settings_cmd;
 
+pub use commit::*;
 pub use database::*;
 pub use probe::*;
 pub use review::*;

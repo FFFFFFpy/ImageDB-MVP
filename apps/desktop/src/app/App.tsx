@@ -3,6 +3,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 import { Layout } from '../components/Layout';
 import { useRouter } from '../hooks/use-router';
 import { api } from '../lib/ipc/api';
+import { CommitPage } from '../pages/CommitPage';
 import { DashboardPage } from '../pages/DashboardPage';
 import { OnboardingPage } from '../pages/OnboardingPage';
 import { ProbesPage } from '../pages/ProbesPage';
@@ -41,6 +42,7 @@ export function App() {
           )}
           {route === 'scan' && <ScanPage />}
           {route === 'review' && <ReviewPage onNavigate={navigate} />}
+          {route === 'commit' && <CommitPage onNavigate={navigate} />}
           {route === 'settings' && <SettingsPage />}
           {route === 'probes' && <ProbesPage />}
         </Layout>

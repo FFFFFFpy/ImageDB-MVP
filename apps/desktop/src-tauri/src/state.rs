@@ -1,4 +1,4 @@
-use crate::domain::import_state::ScanProgress;
+use crate::domain::import_state::{CommitProgress, ScanProgress};
 use crate::infrastructure::postgres::PostgresManager;
 use crate::infrastructure::settings::SettingsStore;
 use crate::services::DatabaseService;
@@ -26,12 +26,32 @@ impl Default for ScanState {
     }
 }
 
+pub struct CommitHandle {
+    pub cancelled: Arc<AtomicBool>,
+    pub task: tokio::task::JoinHandle<CommitProgress>,
+}
+
+pub struct CommitState {
+    pub active: Option<CommitHandle>,
+    pub progress_tracker: Arc<Mutex<CommitProgress>>,
+}
+
+impl Default for CommitState {
+    fn default() -> Self {
+        Self {
+            active: None,
+            progress_tracker: Arc::new(Mutex::new(CommitProgress::idle(""))),
+        }
+    }
+}
+
 pub struct AppState {
     pub postgres_manager: Arc<Mutex<PostgresManager>>,
     pub settings: Arc<Mutex<SettingsStore>>,
     pub database_service: DatabaseService,
     pub fixture_dir: PathBuf,
     pub scan_state: Arc<Mutex<ScanState>>,
+    pub commit_state: Arc<Mutex<CommitState>>,
 }
 
 impl AppState {
@@ -49,6 +69,7 @@ impl AppState {
             database_service,
             fixture_dir,
             scan_state: Arc::new(Mutex::new(ScanState::default())),
+            commit_state: Arc::new(Mutex::new(CommitState::default())),
         })
     }
 }

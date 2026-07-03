@@ -3,10 +3,12 @@ use tokio_postgres::Client;
 
 const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_0002: &str = include_str!("../../../migrations/0002_indexes.sql");
+const MIGRATION_0003: &str = include_str!("../../../migrations/0003_commit_indexes.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
     ("0002_indexes", MIGRATION_0002),
+    ("0003_commit_indexes", MIGRATION_0003),
 ];
 
 pub struct MigrationRunner;
@@ -101,14 +103,18 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 2);
+        assert_eq!(MIGRATIONS.len(), 3);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
+        assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
     }
 
     #[test]
     fn test_migration_versions_ordered() {
         let versions: Vec<&str> = MIGRATIONS.iter().map(|(v, _)| *v).collect();
-        assert_eq!(versions, vec!["0001_initial", "0002_indexes"]);
+        assert_eq!(
+            versions,
+            vec!["0001_initial", "0002_indexes", "0003_commit_indexes"]
+        );
     }
 }

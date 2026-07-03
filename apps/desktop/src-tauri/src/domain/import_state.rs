@@ -7,6 +7,8 @@ pub enum ImportRunState {
     Fingerprinting,
     DetectingDuplicates,
     Completed,
+    Committing,
+    Committed,
     Cancelled,
     Failed,
 }
@@ -18,6 +20,8 @@ impl fmt::Display for ImportRunState {
             Self::Fingerprinting => write!(f, "fingerprinting"),
             Self::DetectingDuplicates => write!(f, "detecting_duplicates"),
             Self::Completed => write!(f, "completed"),
+            Self::Committing => write!(f, "committing"),
+            Self::Committed => write!(f, "committed"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::Failed => write!(f, "failed"),
         }
@@ -32,6 +36,8 @@ impl ImportRunState {
             "fingerprinting" => Some(Self::Fingerprinting),
             "detecting_duplicates" => Some(Self::DetectingDuplicates),
             "completed" => Some(Self::Completed),
+            "committing" => Some(Self::Committing),
+            "committed" => Some(Self::Committed),
             "cancelled" => Some(Self::Cancelled),
             "failed" => Some(Self::Failed),
             _ => None,
@@ -449,6 +455,71 @@ pub const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 
 pub const SCAN_POLICY_VERSION: &str = "2.0";
 
+pub const FROZEN_PLAN_KEY: &str = "frozen_plan";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitProgress {
+    pub state: String,
+    pub import_run_id: String,
+    pub current_stage: String,
+    pub current_album: Option<String>,
+    pub albums_total: u32,
+    pub albums_completed: u32,
+    pub albums_skipped: u32,
+    pub albums_failed: u32,
+    pub images_committed: u32,
+    pub errors: Vec<String>,
+}
+
+impl CommitProgress {
+    pub fn idle(import_run_id: &str) -> Self {
+        Self {
+            state: "idle".to_string(),
+            import_run_id: import_run_id.to_string(),
+            current_stage: "idle".to_string(),
+            current_album: None,
+            albums_total: 0,
+            albums_completed: 0,
+            albums_skipped: 0,
+            albums_failed: 0,
+            images_committed: 0,
+            errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitAlbumResult {
+    pub album_name: String,
+    pub status: String,
+    pub images_committed: u32,
+    pub target_path: Option<String>,
+    pub manifest_path: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitResult {
+    pub import_run_id: String,
+    pub albums_total: u32,
+    pub albums_committed: u32,
+    pub albums_skipped: u32,
+    pub albums_failed: u32,
+    pub images_committed: u32,
+    pub album_results: Vec<CommitAlbumResult>,
+    pub errors: Vec<String>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrozenPlanEntry {
+    pub image_id: String,
+    pub source_path: String,
+    pub relative_path: String,
+    pub file_size: i64,
+    pub album_name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +533,14 @@ mod tests {
         assert_eq!(
             ImportRunState::from_str_opt(&ImportRunState::Completed.to_string()),
             Some(ImportRunState::Completed)
+        );
+        assert_eq!(
+            ImportRunState::from_str_opt(&ImportRunState::Committing.to_string()),
+            Some(ImportRunState::Committing)
+        );
+        assert_eq!(
+            ImportRunState::from_str_opt(&ImportRunState::Committed.to_string()),
+            Some(ImportRunState::Committed)
         );
         assert_eq!(ImportRunState::from_str_opt("unknown"), None);
     }
@@ -549,5 +628,35 @@ mod tests {
         assert!(strict.auto_decide);
         assert!(balanced.auto_decide);
         assert!(!loose.auto_decide);
+    }
+
+    #[test]
+    fn commit_progress_idle_defaults() {
+        let p = CommitProgress::idle("run-1");
+        assert_eq!(p.state, "idle");
+        assert_eq!(p.import_run_id, "run-1");
+        assert_eq!(p.albums_total, 0);
+        assert_eq!(p.albums_completed, 0);
+        assert_eq!(p.albums_skipped, 0);
+        assert_eq!(p.albums_failed, 0);
+        assert_eq!(p.images_committed, 0);
+        assert!(p.errors.is_empty());
+        assert!(p.current_album.is_none());
+    }
+
+    #[test]
+    fn frozen_plan_entry_round_trip() {
+        let entry = FrozenPlanEntry {
+            image_id: "abc".to_string(),
+            source_path: "/src/a.jpg".to_string(),
+            relative_path: "a.jpg".to_string(),
+            file_size: 1024,
+            album_name: "album_a".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: FrozenPlanEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.image_id, "abc");
+        assert_eq!(back.file_size, 1024);
+        assert_eq!(back.album_name, "album_a");
     }
 }
