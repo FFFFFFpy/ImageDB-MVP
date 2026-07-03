@@ -16,7 +16,7 @@
 use crate::domain::import_state::{
     CommitAlbumResult, CommitProgress, CommitResult, ImportRunState,
 };
-use crate::domain::state_machine::{self, FileOpState, TransactionState};
+use crate::domain::state_machine::{self, FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
 use crate::infrastructure::postgres::PostgresManager;
 use crate::repositories::import_repository::{
@@ -26,6 +26,7 @@ use crate::repositories::import_repository::{
 use crate::tests::fail_injection::{maybe_fault, CommitFaultPoint};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -197,11 +198,7 @@ pub async fn run_import_commit(
     let mut progress = progress_tracker.lock().await;
     match &result {
         Ok(r) => {
-            progress.state = if r.state == "completed" {
-                "completed".to_string()
-            } else {
-                "completed_with_errors".to_string()
-            };
+            progress.state = r.state.clone();
             progress.current_stage = "done".to_string();
         }
         Err(e) => {
@@ -250,10 +247,6 @@ async fn execute_commit_pipeline(
             "no frozen import plan for run {import_run_id}; generate and freeze a plan before committing"
         )))?;
 
-    // Rule 4: validate the plan integrity up front. Any corruption rejects the
-    // whole plan — no silent drops.
-    validate_frozen_plan(&frozen, library_root_id)?;
-
     if frozen.albums.is_empty() {
         // Rule: empty plan completes the run directly.
         ImportRepository::update_import_run_state(
@@ -275,24 +268,9 @@ async fn execute_commit_pipeline(
         });
     }
 
-    // Verify the plan hash is present and matches a recomputation over the
-    // canonical plan content. This catches tampering with the frozen rows.
-    let recomputed = compute_plan_hash(&frozen)?;
-    match &frozen.plan_hash {
-        Some(stored) if stored == &recomputed => { /* ok */ }
-        Some(stored) => {
-            return Err(AppError::Internal(format!(
-                "frozen plan hash mismatch: stored {} but recomputed {} — plan rows were modified after freezing",
-                bytes_to_hex(stored),
-                bytes_to_hex(&recomputed)
-            )));
-        }
-        None => {
-            return Err(AppError::Internal(
-                "frozen plan has no plan_hash; cannot commit".to_string(),
-            ));
-        }
-    }
+    // Rule 4: validate and hash the immutable plan up front. Commit and
+    // recovery both use this function so a tampered plan fails consistently.
+    let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
 
     {
         let mut p = progress_tracker.lock().await;
@@ -308,6 +286,8 @@ async fn execute_commit_pipeline(
     let mut albums_skipped = 0u32;
     let mut albums_failed = 0u32;
     let mut all_errors = Vec::new();
+    let mut recovery_required_detected = false;
+    let mut cleanup_required_detected = false;
 
     for (plan_album, images) in &frozen.albums {
         if cancelled.load(Ordering::Relaxed) {
@@ -332,7 +312,7 @@ async fn execute_commit_pipeline(
             library_root_id,
             import_run_id,
             frozen.plan_id,
-            &frozen.plan_hash.clone().unwrap_or_default(),
+            &validated_plan_hash,
             cancelled,
             commit,
         )
@@ -345,9 +325,31 @@ async fn execute_commit_pipeline(
                     albums_committed += 1;
                     total_committed += result.images_committed;
                 }
+                if result.status == "cleanup_required" {
+                    cleanup_required_detected = true;
+                    if let Some(error) = &result.error {
+                        all_errors.push(error.clone());
+                    }
+                }
                 album_results.push(result);
             }
             Err(e) => {
+                if let AppError::ResumeRequired(transaction_id) = e {
+                    recovery_required_detected = true;
+                    let msg = format!(
+                        "detected incomplete transaction {transaction_id}; route to recovery"
+                    );
+                    all_errors.push(msg.clone());
+                    album_results.push(CommitAlbumResult {
+                        album_name: plan_album.target_relative_path.clone(),
+                        status: "recovery_required".to_string(),
+                        images_committed: 0,
+                        target_path: None,
+                        manifest_path: None,
+                        error: Some(msg),
+                    });
+                    continue;
+                }
                 albums_failed += 1;
                 let err_msg = format!("album {}: {e}", plan_album.target_relative_path);
                 all_errors.push(err_msg.clone());
@@ -372,7 +374,15 @@ async fn execute_commit_pipeline(
         }
     }
 
-    let final_state = if albums_failed == 0 && !cancelled.load(Ordering::Relaxed) {
+    let final_state = if recovery_required_detected || cleanup_required_detected {
+        ImportRepository::update_import_run_state(
+            client,
+            import_run_id,
+            &ImportRunState::RecoveryRequired,
+        )
+        .await?;
+        "recovery_required".to_string()
+    } else if albums_failed == 0 && !cancelled.load(Ordering::Relaxed) {
         ImportRepository::update_import_run_state(
             client,
             import_run_id,
@@ -421,12 +431,28 @@ async fn execute_commit_pipeline(
     })
 }
 
-/// Rule 4: validate the frozen plan integrity. Any inconsistency rejects the
-/// whole plan — never silently drop entries.
-fn validate_frozen_plan(
+/// Rule 4: validate the frozen/consumed immutable plan and return its verified
+/// hash. Any inconsistency rejects the whole plan — never silently drop entries
+/// or substitute an empty hash.
+pub(crate) fn validate_and_hash_frozen_plan(
     frozen: &FrozenPlanRow,
     expected_library_root_id: Uuid,
-) -> Result<(), AppError> {
+) -> Result<Vec<u8>, AppError> {
+    match PlanState::parse(&frozen.plan_state)? {
+        PlanState::Frozen | PlanState::Consumed => {}
+        other => {
+            return Err(AppError::Internal(format!(
+                "plan {} is in state {other}; expected frozen or consumed",
+                frozen.plan_id
+            )));
+        }
+    }
+    if frozen.plan_hash.is_none() {
+        return Err(AppError::Internal(format!(
+            "plan {} has no plan_hash; cannot commit or recover",
+            frozen.plan_id
+        )));
+    }
     if frozen.library_root_id != expected_library_root_id {
         return Err(AppError::Internal(format!(
             "frozen plan library_root_id {} != import run library_root_id {expected_library_root_id}",
@@ -462,7 +488,16 @@ fn validate_frozen_plan(
             }
         }
     }
-    Ok(())
+    let recomputed = compute_plan_hash(frozen)?;
+    let stored = frozen.plan_hash.as_ref().expect("checked above");
+    if stored != &recomputed {
+        return Err(AppError::Internal(format!(
+            "frozen plan hash mismatch: stored {} but recomputed {} - plan rows were modified after freezing",
+            bytes_to_hex(stored),
+            bytes_to_hex(&recomputed)
+        )));
+    }
+    Ok(recomputed)
 }
 
 /// Compute a deterministic BLAKE3 hash over the canonical serialized plan
@@ -572,7 +607,12 @@ async fn commit_single_album(
                     "target conflict for album '{album_relative_path}': {msg}"
                 )));
             }
-            IdempotencyVerdict::Resume => { /* fall through to staging */ }
+            IdempotencyVerdict::Resume { transaction_id } => {
+                // Do NOT fall through to create a second active transaction
+                // for the same album. Surface a distinct error so the caller
+                // (command / GUI) can route to recovery with this id.
+                return Err(AppError::ResumeRequired(transaction_id));
+            }
         }
     }
 
@@ -770,12 +810,12 @@ async fn commit_single_album(
         .map_err(|e| AppError::IoError(format!("cannot create staging manifest dir: {e}")))?;
     let staging_manifest_tmp = staging_manifest_dir.join(".imagedb-manifest.json.tmp");
     let staging_manifest_file = staging_manifest_dir.join(".imagedb-manifest.json");
-    tokio::fs::write(&staging_manifest_tmp, &manifest_json)
-        .await
-        .map_err(|e| AppError::IoError(format!("manifest tmp write failed: {e}")))?;
-    tokio::fs::rename(&staging_manifest_tmp, &staging_manifest_file)
-        .await
-        .map_err(|e| AppError::IoError(format!("manifest atomic rename failed: {e}")))?;
+    write_synced_then_rename(
+        &staging_manifest_tmp,
+        &staging_manifest_file,
+        manifest_json.as_bytes(),
+    )
+    .await?;
 
     ImportRepository::set_transaction_hashes(client, tx_id, None, Some(&manifest_hash)).await?;
 
@@ -802,6 +842,24 @@ async fn commit_single_album(
     tokio::fs::rename(&staging_dir, &publish_dir)
         .await
         .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
+    sync_parent_dir(&publish_dir).await?;
+
+    // The manifest moved with the rename: record the published path on the
+    // transaction and expose it via CommitAlbumResult. The staging path no
+    // longer exists and must never be returned as the manifest location.
+    let published_manifest_path = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
+    if !published_manifest_path.exists() {
+        return Err(AppError::Internal(format!(
+            "published manifest missing after rename: {}",
+            published_manifest_path.display()
+        )));
+    }
+    ImportRepository::set_transaction_manifest_path(
+        client,
+        tx_id,
+        &published_manifest_path.display().to_string(),
+    )
+    .await?;
 
     let published =
         state_machine::transition_transaction(TransactionState::Publishing, "published")?;
@@ -833,13 +891,13 @@ async fn commit_single_album(
     .await
     {
         // DB failed: keep the published dir, stay PUBLISHED, hand to recovery.
-        let _ = ImportRepository::update_file_transaction_state(
+        ImportRepository::update_file_transaction_state(
             client,
             tx_id,
             &TransactionState::Published,
             Some(&e.to_string()),
         )
-        .await;
+        .await?;
         return Err(e);
     }
 
@@ -897,6 +955,7 @@ async fn commit_single_album(
             tokio::fs::rename(&source_album_dir, &archive_dir)
                 .await
                 .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
+            sync_parent_dir(&archive_dir).await?;
 
             let archived = state_machine::transition_transaction(
                 TransactionState::SourceArchiving,
@@ -910,13 +969,22 @@ async fn commit_single_album(
     // does not invalidate the commit.
     if let Err(e) = tokio::fs::remove_dir_all(&staging_base).await {
         if staging_base.exists() {
-            let _ = ImportRepository::update_file_transaction_state(
+            let msg = format!("staging cleanup failed: {e}");
+            ImportRepository::update_file_transaction_state(
                 client,
                 tx_id,
                 &TransactionState::CleanupRequired,
-                Some(&format!("staging cleanup failed: {e}")),
+                Some(&msg),
             )
-            .await;
+            .await?;
+            return Ok(CommitAlbumResult {
+                album_name: album_relative_path,
+                status: "cleanup_required".to_string(),
+                images_committed: image_count,
+                target_path: Some(publish_dir.display().to_string()),
+                manifest_path: Some(published_manifest_path.display().to_string()),
+                error: Some(msg),
+            });
         }
     }
 
@@ -925,7 +993,7 @@ async fn commit_single_album(
         status: "committed".to_string(),
         images_committed: image_count,
         target_path: Some(publish_dir.display().to_string()),
-        manifest_path: Some(staging_manifest_file.display().to_string()),
+        manifest_path: Some(published_manifest_path.display().to_string()),
         error: None,
     })
 }
@@ -958,7 +1026,68 @@ pub(crate) async fn stream_copy_with_hash(src: &Path, dst: &Path) -> Result<Vec<
         .flush()
         .await
         .map_err(|e| AppError::IoError(format!("flush error: {e}")))?;
+    dst_file
+        .sync_all()
+        .await
+        .map_err(|e| AppError::IoError(format!("sync error: {e}")))?;
     Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+pub(crate) async fn write_synced_then_rename(
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let mut file = tokio::fs::File::create(tmp_path).await.map_err(|e| {
+        AppError::IoError(format!(
+            "cannot create temp file {}: {e}",
+            tmp_path.display()
+        ))
+    })?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| AppError::IoError(format!("temp file write failed: {e}")))?;
+    file.flush()
+        .await
+        .map_err(|e| AppError::IoError(format!("temp file flush failed: {e}")))?;
+    file.sync_all()
+        .await
+        .map_err(|e| AppError::IoError(format!("temp file sync failed: {e}")))?;
+    drop(file);
+
+    tokio::fs::rename(tmp_path, final_path)
+        .await
+        .map_err(|e| AppError::IoError(format!("atomic rename failed: {e}")))?;
+    sync_parent_dir(final_path).await?;
+    Ok(())
+}
+
+pub(crate) async fn sync_parent_dir(path: &Path) -> Result<(), AppError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    match tokio::fs::File::open(parent).await {
+        Ok(dir) => match dir.sync_all().await {
+            Ok(()) => Ok(()),
+            Err(e) if is_unsupported_dir_sync(&e) => Ok(()),
+            Err(e) => Err(AppError::IoError(format!(
+                "parent directory sync failed for {}: {e}",
+                parent.display()
+            ))),
+        },
+        Err(e) if is_unsupported_dir_sync(&e) => Ok(()),
+        Err(e) => Err(AppError::IoError(format!(
+            "cannot open parent directory for sync {}: {e}",
+            parent.display()
+        ))),
+    }
+}
+
+fn is_unsupported_dir_sync(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::Unsupported | ErrorKind::PermissionDenied | ErrorKind::Other
+    )
 }
 
 /// Re-verify the staging file set: every expected file exists, has the right
@@ -1008,6 +1137,137 @@ pub(crate) async fn verify_staging_set(
         }
     }
     Ok(())
+}
+
+/// Verify that a directory contains *exactly* the file set prescribed by the
+/// frozen plan: same relative paths, same sizes, same BLAKE3 hashes, and no
+/// extra or missing entries. Subdirectories not referenced by any plan image
+/// are treated as unexpected entries.
+///
+/// Used by the source-archive recovery path to validate the source album dir
+/// before renaming it, and to validate the archive dir before trusting it in
+/// lieu of the source.
+pub(crate) async fn verify_dir_against_plan(
+    dir: &Path,
+    album_relative_path: &str,
+    plan_images: &[PlanImageRow],
+) -> Result<(), AppError> {
+    use std::collections::HashMap;
+
+    if !dir.exists() {
+        return Err(AppError::Internal(format!(
+            "directory does not exist: {}",
+            dir.display()
+        )));
+    }
+
+    let mut expected: HashMap<String, &PlanImageRow> = HashMap::new();
+    let album_rel = normalize_relative_path(album_relative_path)?;
+    for img in plan_images {
+        let source_rel = normalize_relative_path(&img.source_relative_path)?;
+        let rel = source_rel
+            .strip_prefix(&(album_rel.clone() + "/"))
+            .unwrap_or(&source_rel)
+            .to_string();
+        expected.insert(rel, img);
+    }
+
+    // Walk the directory recursively and match every file against the plan.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    walk_and_verify(dir, dir, &expected, &mut seen).await?;
+
+    // Any plan entry not observed on disk is a missing file.
+    for rel in expected.keys() {
+        if !seen.contains(rel) {
+            return Err(AppError::Internal(format!(
+                "plan file missing from directory: {rel}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn walk_and_verify(
+    root: &Path,
+    current: &Path,
+    expected: &std::collections::HashMap<String, &PlanImageRow>,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<(), AppError> {
+    let mut entries = tokio::fs::read_dir(current)
+        .await
+        .map_err(|e| AppError::IoError(format!("cannot read_dir {}: {e}", current.display())))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| AppError::IoError(format!("read_dir next failed: {e}")))?
+    {
+        let ft = entry
+            .file_type()
+            .await
+            .map_err(|e| AppError::IoError(format!("file_type failed: {e}")))?;
+        let path = entry.path();
+        if ft.is_dir() {
+            Box::pin(walk_and_verify(root, &path, expected, seen)).await?;
+            continue;
+        }
+        if !ft.is_file() {
+            return Err(AppError::Internal(format!(
+                "unexpected non-regular file: {}",
+                path.display()
+            )));
+        }
+        let rel_os = path
+            .strip_prefix(root)
+            .map_err(|e| AppError::Internal(format!("strip_prefix failed: {e}")))?;
+        let rel = rel_os.to_string_lossy().replace('\\', "/");
+        if seen.contains(&rel) {
+            return Err(AppError::Internal(format!(
+                "duplicate file encountered: {rel}"
+            )));
+        }
+        seen.insert(rel.clone());
+        let img = expected.get(&rel).ok_or_else(|| {
+            AppError::Internal(format!("extra file on disk not in frozen plan: {rel}"))
+        })?;
+        let meta = tokio::fs::metadata(&path).await.map_err(|e| {
+            AppError::IoError(format!("metadata failed for {}: {e}", path.display()))
+        })?;
+        if meta.len() != img.expected_file_size as u64 {
+            return Err(AppError::Internal(format!(
+                "file size mismatch for {rel}: expected {} got {}",
+                img.expected_file_size,
+                meta.len()
+            )));
+        }
+        let actual = hash_existing_file(&path).await?;
+        if actual != img.expected_blake3 {
+            return Err(AppError::Internal(format!(
+                "BLAKE3 mismatch for {rel}: expected {} got {}",
+                bytes_to_hex(&img.expected_blake3),
+                bytes_to_hex(&actual)
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn hash_existing_file(path: &Path) -> Result<Vec<u8>, AppError> {
+    let mut f = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| AppError::IoError(format!("cannot open {}: {e}", path.display())))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .await
+            .map_err(|e| AppError::IoError(format!("read error: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1172,8 +1432,10 @@ pub enum IdempotencyVerdict {
     /// The on-disk state conflicts with the persisted transaction. Do not
     /// overwrite; surface the conflict.
     Conflict(String),
-    /// The transaction is mid-flight; resume from its persisted state.
-    Resume,
+    /// The transaction is mid-flight (any non-terminal state); the caller
+    /// must route to recovery for this transaction_id rather than creating a
+    /// second active transaction for the same album.
+    Resume { transaction_id: Uuid },
 }
 
 /// Rule 12: complete idempotency verification. Returns `AlreadyCommitted`
@@ -1191,8 +1453,6 @@ pub async fn verify_complete_evidence(
     album_relative_path: &str,
     images: &[PlanImageRow],
 ) -> Result<IdempotencyVerdict, AppError> {
-    // Only a transaction that reached at least `published` can be idempotently
-    // complete; anything earlier is mid-flight and must resume.
     let tx_state = match TransactionState::parse(&existing_tx.state) {
         Ok(s) => s,
         Err(_) => {
@@ -1202,15 +1462,16 @@ pub async fn verify_complete_evidence(
             )));
         }
     };
-    if !matches!(
-        tx_state,
-        TransactionState::Published
-            | TransactionState::DbCommitting
-            | TransactionState::LibraryCommitted
-            | TransactionState::SourceArchiving
-            | TransactionState::SourceArchived
-    ) {
-        return Ok(IdempotencyVerdict::Resume);
+
+    // Any non-terminal state other than SourceArchived is mid-flight: the
+    // caller must resume the existing transaction through recovery rather
+    // than creating a second active file_transaction for the same album.
+    // Only SourceArchived can possibly be AlreadyCommitted (full evidence
+    // check below).
+    if !matches!(tx_state, TransactionState::SourceArchived) {
+        return Ok(IdempotencyVerdict::Resume {
+            transaction_id: existing_tx.id,
+        });
     }
 
     // Plan hash must match.
@@ -1227,9 +1488,13 @@ pub async fn verify_complete_evidence(
 
     let publish_dir = library_root.join("Albums").join(album_relative_path);
     if !publish_dir.exists() {
-        // Published state but no dir → mid-flight, resume (recovery will
-        // re-stage + re-publish).
-        return Ok(IdempotencyVerdict::Resume);
+        // SourceArchived without the published dir is evidence tampering:
+        // surface as conflict rather than auto-resuming.
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "transaction {} is source_archived but published dir {} is missing",
+            existing_tx.id,
+            publish_dir.display()
+        )));
     }
 
     // Manifest must parse and match.
@@ -1534,6 +1799,7 @@ mod tests {
             plan_id: Uuid::new_v4(),
             import_run_id: run_id,
             library_root_id: root_id,
+            plan_state: "frozen".to_string(),
             plan_hash: None,
             policy_version: "2.0".to_string(),
             albums: vec![(album, vec![img])],
@@ -1783,5 +2049,124 @@ mod tests {
         ImportRepository::set_plan_hash(client, plan_id, &hash).await?;
         ImportRepository::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
         Ok(())
+    }
+
+    fn plan_image_full(
+        source_path: &str,
+        target_rel: &str,
+        size: i64,
+        blake3: &[u8],
+    ) -> PlanImageRow {
+        PlanImageRow {
+            id: Uuid::new_v4(),
+            plan_album_id: Uuid::new_v4(),
+            import_image_id: Uuid::new_v4(),
+            source_path: source_path.to_string(),
+            source_relative_path: target_rel.to_string(),
+            target_relative_path: target_rel.to_string(),
+            expected_file_size: size,
+            expected_blake3: blake3.to_vec(),
+            width: Some(10),
+            height: Some(10),
+            format: Some("png".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_dir_against_plan_valid() {
+        let tmp = TempDir::new().unwrap();
+        let data_a = b"alpha";
+        let data_b = b"beta";
+        std::fs::write(tmp.path().join("a.png"), data_a).unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/b.png"), data_b).unwrap();
+        let imgs = vec![
+            plan_image_full("/s/a.png", "a.png", 5, blake3::hash(data_a).as_bytes()),
+            plan_image_full(
+                "/s/sub/b.png",
+                "sub/b.png",
+                4,
+                blake3::hash(data_b).as_bytes(),
+            ),
+        ];
+        assert!(verify_dir_against_plan(tmp.path(), "album", &imgs)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_dir_against_plan_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.png"), b"alpha").unwrap();
+        let imgs = vec![
+            plan_image_full("/s/a.png", "a.png", 5, blake3::hash(b"alpha").as_bytes()),
+            plan_image_full("/s/b.png", "b.png", 4, blake3::hash(b"beta").as_bytes()),
+        ];
+        let err = verify_dir_against_plan(tmp.path(), "album", &imgs)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing"),
+            "expected missing-file error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_dir_against_plan_extra_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.png"), b"alpha").unwrap();
+        std::fs::write(tmp.path().join("extra.png"), b"x").unwrap();
+        let imgs = vec![plan_image_full(
+            "/s/a.png",
+            "a.png",
+            5,
+            blake3::hash(b"alpha").as_bytes(),
+        )];
+        let err = verify_dir_against_plan(tmp.path(), "album", &imgs)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("extra"));
+    }
+
+    #[tokio::test]
+    async fn verify_dir_against_plan_size_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.png"), b"alpha").unwrap();
+        let imgs = vec![plan_image_full(
+            "/s/a.png",
+            "a.png",
+            999,
+            blake3::hash(b"alpha").as_bytes(),
+        )];
+        let err = verify_dir_against_plan(tmp.path(), "album", &imgs)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("size mismatch"));
+    }
+
+    #[tokio::test]
+    async fn verify_dir_against_plan_blake3_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.png"), b"alpha").unwrap();
+        let imgs = vec![plan_image_full("/s/a.png", "a.png", 5, &[0u8; 32])];
+        let err = verify_dir_against_plan(tmp.path(), "album", &imgs)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("BLAKE3"));
+    }
+
+    #[tokio::test]
+    async fn verify_dir_against_plan_empty_dir_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let imgs = vec![plan_image_full(
+            "/s/a.png",
+            "a.png",
+            5,
+            blake3::hash(b"alpha").as_bytes(),
+        )];
+        assert!(verify_dir_against_plan(tmp.path(), "album", &imgs)
+            .await
+            .is_err());
     }
 }

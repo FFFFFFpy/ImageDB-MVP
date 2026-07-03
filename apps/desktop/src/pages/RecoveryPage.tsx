@@ -217,7 +217,6 @@ function RecoveryCard({ tx, recovering, reverifying, onRecover, onReverify }: Re
         >
           {reverifying ? '验证中...' : '重新验证'}
         </button>
-        {tx.target_path && <button className="btn-secondary">打开目标目录</button>}
         {/* No "overwrite" button — conflicts require manual resolution. */}
       </div>
     </div>

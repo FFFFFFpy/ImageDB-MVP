@@ -20,7 +20,8 @@ use crate::repositories::import_repository::{
 };
 use crate::services::commit_service::{
     build_manifest, commit_library_records_transaction, normalize_relative_path, read_manifest,
-    stream_copy_with_hash, verify_staging_set,
+    stream_copy_with_hash, sync_parent_dir, validate_and_hash_frozen_plan, verify_dir_against_plan,
+    verify_staging_set, write_synced_then_rename,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -230,6 +231,7 @@ async fn recover_transaction_with_client(
     let library_root_path =
         ImportRepository::get_library_root_path(client, library_root_id).await?;
     let library_root = PathBuf::from(&library_root_path);
+    let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
 
     // Dispatch by state.
     let outcome = match current {
@@ -238,7 +240,7 @@ async fn recover_transaction_with_client(
                 client,
                 &tx,
                 &frozen.plan_id,
-                &frozen.plan_hash,
+                &validated_plan_hash,
                 &plan_images,
             )
             .await?
@@ -248,7 +250,7 @@ async fn recover_transaction_with_client(
                 client,
                 &tx,
                 &frozen.plan_id,
-                frozen.plan_hash.as_deref().unwrap_or_default(),
+                &validated_plan_hash,
                 &library_root,
                 library_root_id,
                 tx.import_run_id,
@@ -263,7 +265,7 @@ async fn recover_transaction_with_client(
                 client,
                 &tx,
                 &frozen.plan_id,
-                frozen.plan_hash.as_deref().unwrap_or_default(),
+                &validated_plan_hash,
                 &library_root,
                 library_root_id,
                 tx.import_run_id,
@@ -278,7 +280,7 @@ async fn recover_transaction_with_client(
                 client,
                 &tx,
                 &frozen.plan_id,
-                frozen.plan_hash.as_deref().unwrap_or_default(),
+                &validated_plan_hash,
                 &library_root,
                 library_root_id,
                 tx.import_run_id,
@@ -323,7 +325,7 @@ async fn resume_staging(
     client: &mut Client,
     tx: &FileTransactionFullRow,
     _plan_id: &Uuid,
-    _plan_hash: &Option<Vec<u8>>,
+    _plan_hash: &[u8],
     plan_images: &[PlanImageRow],
 ) -> Result<(String, bool, String), AppError> {
     let staging_dir = tx
@@ -467,7 +469,7 @@ async fn resume_staging(
     ))
 }
 
-async fn hash_file(path: &Path) -> Result<Vec<u8>, AppError> {
+pub(crate) async fn hash_file(path: &Path) -> Result<Vec<u8>, AppError> {
     let mut f = tokio::fs::File::open(path)
         .await
         .map_err(|e| AppError::IoError(format!("cannot open {}: {e}", path.display())))?;
@@ -558,6 +560,21 @@ async fn resume_publishing(
             tokio::fs::rename(staging, &publish_dir)
                 .await
                 .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
+            sync_parent_dir(&publish_dir).await?;
+            // Manifest moved with the rename: record the published path.
+            let published_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
+            if !published_manifest.exists() {
+                return Err(AppError::Internal(format!(
+                    "published manifest missing after rename: {}",
+                    published_manifest.display()
+                )));
+            }
+            ImportRepository::set_transaction_manifest_path(
+                client,
+                tx.id,
+                &published_manifest.display().to_string(),
+            )
+            .await?;
             ImportRepository::update_file_transaction_state(
                 client,
                 tx.id,
@@ -677,12 +694,7 @@ async fn publish_from_staging(
         .map_err(|e| AppError::IoError(format!("cannot create manifest dir: {e}")))?;
     let tmp = manifest_dir.join(".imagedb-manifest.json.tmp");
     let final_m = manifest_dir.join(".imagedb-manifest.json");
-    tokio::fs::write(&tmp, &manifest_json)
-        .await
-        .map_err(|e| AppError::IoError(format!("manifest tmp write failed: {e}")))?;
-    tokio::fs::rename(&tmp, &final_m)
-        .await
-        .map_err(|e| AppError::IoError(format!("manifest rename failed: {e}")))?;
+    write_synced_then_rename(&tmp, &final_m, manifest_json.as_bytes()).await?;
     ImportRepository::set_transaction_hashes(client, tx.id, None, Some(&manifest_hash)).await?;
 
     // Atomic publish.
@@ -712,6 +724,21 @@ async fn publish_from_staging(
     tokio::fs::rename(&staging_dir, &publish_dir)
         .await
         .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
+    sync_parent_dir(&publish_dir).await?;
+    // Manifest moved with the rename: record the published path.
+    let published_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
+    if !published_manifest.exists() {
+        return Err(AppError::Internal(format!(
+            "published manifest missing after rename: {}",
+            published_manifest.display()
+        )));
+    }
+    ImportRepository::set_transaction_manifest_path(
+        client,
+        tx.id,
+        &published_manifest.display().to_string(),
+    )
+    .await?;
     let published =
         state_machine::transition_transaction(TransactionState::Publishing, "published")?;
     ImportRepository::update_file_transaction_state(client, tx.id, &published, None).await?;
@@ -773,6 +800,27 @@ async fn resume_db_commit(
             return Ok((TransactionState::Conflict.to_string(), false, msg));
         }
     };
+    let published_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
+    if !published_manifest.exists() {
+        let msg = format!(
+            "published manifest missing: {}",
+            published_manifest.display()
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    ImportRepository::set_transaction_manifest_path(
+        client,
+        tx.id,
+        &published_manifest.display().to_string(),
+    )
+    .await?;
     let manifest_hash = blake3::hash(
         serde_json::to_string_pretty(&manifest)
             .unwrap_or_default()
@@ -852,7 +900,16 @@ async fn resume_db_commit(
     resume_source_archive(client, tx, library_root, album_relative_path, plan_images).await
 }
 
-/// library_committed/source_archiving: verify dir + DB, resume archive only.
+/// library_committed/source_archiving: validate source and archive against
+/// the frozen plan, then safely rename source → archive. Never auto-delete
+/// the source album directory.
+///
+/// | source | archive | outcome                                                  |
+/// |--------|---------|----------------------------------------------------------|
+/// | ✓      | ✗       | verify source vs plan → rename → source_archived         |
+/// | ✗      | ✓       | verify archive vs plan → source_archived if match        |
+/// | ✗      | ✗       | conflict                                                 |
+/// | ✓      | ✓       | conflict (no delete, no overwrite)                       |
 async fn resume_source_archive(
     client: &mut Client,
     tx: &FileTransactionFullRow,
@@ -879,7 +936,7 @@ async fn resume_source_archive(
         return Ok((TransactionState::Conflict.to_string(), false, msg));
     }
 
-    // If already archived (idempotent), verify and finish.
+    // Idempotent: already archived.
     if matches!(
         TransactionState::parse(&tx.state),
         Ok(TransactionState::SourceArchived)
@@ -891,72 +948,162 @@ async fn resume_source_archive(
         ));
     }
 
-    let archiving =
-        state_machine::transition_transaction(TransactionState::LibraryCommitted, "archive")?;
-    ImportRepository::update_file_transaction_state(client, tx.id, &archiving, None).await?;
-
-    // Source album dir is the parent of the first image's source_path.
-    let source_album_dir = plan_images
-        .first()
-        .and_then(|img| Path::new(&img.source_path).parent().map(PathBuf::from));
-    let Some(source_dir) = source_album_dir else {
-        // No source to archive — mark done.
-        let archived =
-            state_machine::transition_transaction(TransactionState::SourceArchiving, "archived")?;
-        ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
-        return Ok((
-            TransactionState::SourceArchived.to_string(),
-            true,
-            "no source dir to archive".to_string(),
-        ));
+    // Derive the source album dir from the plan images. We cannot infer a
+    // reliable source location when plan_images is empty or the images span
+    // multiple parents, so surface those as conflicts rather than guessing.
+    let source_album_dir = match derive_source_album_dir(plan_images)? {
+        Some(d) => d,
+        None => {
+            let msg = "cannot derive source album directory from frozen plan".to_string();
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
     };
 
-    if !source_dir.exists() {
-        // Already moved (idempotent). Mark archived.
-        let archived =
-            state_machine::transition_transaction(TransactionState::SourceArchiving, "archived")?;
-        ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
-        return Ok((
-            TransactionState::SourceArchived.to_string(),
-            true,
-            "source already archived".to_string(),
-        ));
-    }
-
-    let archive_base = source_dir
+    let archive_base = source_album_dir
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".imagedb-processed");
     let archive_dir = archive_base
         .join(tx.id.to_string())
         .join(album_relative_path);
-    if archive_dir.exists() {
-        // Idempotent: archive already present; remove the source and finish.
-        let _ = tokio::fs::remove_dir_all(&source_dir).await;
-        let archived =
-            state_machine::transition_transaction(TransactionState::SourceArchiving, "archived")?;
-        ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
-        return Ok((
-            TransactionState::SourceArchived.to_string(),
-            true,
-            "archive dir already present".to_string(),
-        ));
-    }
-    tokio::fs::create_dir_all(archive_dir.parent().unwrap())
-        .await
-        .map_err(|e| AppError::IoError(format!("cannot create archive base: {e}")))?;
-    tokio::fs::rename(&source_dir, &archive_dir)
-        .await
-        .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
 
-    let archived =
-        state_machine::transition_transaction(TransactionState::SourceArchiving, "archived")?;
-    ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
-    Ok((
-        TransactionState::SourceArchived.to_string(),
-        true,
-        "source archived".to_string(),
-    ))
+    let source_exists = source_album_dir.exists();
+    let archive_exists = archive_dir.exists();
+
+    let archiving =
+        state_machine::transition_transaction(TransactionState::LibraryCommitted, "archive")?;
+    ImportRepository::update_file_transaction_state(client, tx.id, &archiving, None).await?;
+
+    match (source_exists, archive_exists) {
+        (true, false) => {
+            // Source present, archive missing: verify source contents against
+            // the frozen plan, then same-filesystem rename to archive.
+            if let Err(e) =
+                verify_dir_against_plan(&source_album_dir, album_relative_path, plan_images).await
+            {
+                let msg = format!(
+                    "source album {} does not match frozen plan: {e}",
+                    source_album_dir.display()
+                );
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx.id,
+                    &TransactionState::Conflict,
+                    Some(&msg),
+                )
+                .await?;
+                return Ok((TransactionState::Conflict.to_string(), false, msg));
+            }
+            tokio::fs::create_dir_all(archive_dir.parent().unwrap())
+                .await
+                .map_err(|e| AppError::IoError(format!("cannot create archive base: {e}")))?;
+            tokio::fs::rename(&source_album_dir, &archive_dir)
+                .await
+                .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
+            sync_parent_dir(&archive_dir).await?;
+            let archived = state_machine::transition_transaction(
+                TransactionState::SourceArchiving,
+                "archived",
+            )?;
+            ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
+            Ok((
+                TransactionState::SourceArchived.to_string(),
+                true,
+                "source archived".to_string(),
+            ))
+        }
+        (false, true) => {
+            // Source missing, archive present: only trust the archive if its
+            // contents exactly match the frozen plan; otherwise conflict.
+            if let Err(e) =
+                verify_dir_against_plan(&archive_dir, album_relative_path, plan_images).await
+            {
+                let msg = format!(
+                    "archive {} does not match frozen plan: {e}",
+                    archive_dir.display()
+                );
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx.id,
+                    &TransactionState::Conflict,
+                    Some(&msg),
+                )
+                .await?;
+                return Ok((TransactionState::Conflict.to_string(), false, msg));
+            }
+            let archived = state_machine::transition_transaction(
+                TransactionState::SourceArchiving,
+                "archived",
+            )?;
+            ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
+            Ok((
+                TransactionState::SourceArchived.to_string(),
+                true,
+                "archive verified against plan; source already archived".to_string(),
+            ))
+        }
+        (false, false) => {
+            // Neither exists: cannot confirm the source was preserved. Conflict.
+            let msg = format!(
+                "source {} and archive {} both missing; cannot confirm archive integrity",
+                source_album_dir.display(),
+                archive_dir.display()
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            Ok((TransactionState::Conflict.to_string(), false, msg))
+        }
+        (true, true) => {
+            // Both exist: ambiguous state — do NOT delete or overwrite either.
+            let msg = format!(
+                "source {} and archive {} both present; refusing to overwrite or delete",
+                source_album_dir.display(),
+                archive_dir.display()
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            Ok((TransactionState::Conflict.to_string(), false, msg))
+        }
+    }
+}
+
+/// Derive the source album directory from the frozen plan images. Returns
+/// None if plan_images is empty or images span multiple parent directories.
+fn derive_source_album_dir(plan_images: &[PlanImageRow]) -> Result<Option<PathBuf>, AppError> {
+    let Some(first) = plan_images.first() else {
+        return Ok(None);
+    };
+    let Some(first_parent) = Path::new(&first.source_path).parent().map(PathBuf::from) else {
+        return Ok(None);
+    };
+    for img in &plan_images[1..] {
+        let parent = Path::new(&img.source_path).parent().map(PathBuf::from);
+        if parent.as_ref() != Some(&first_parent) {
+            return Err(AppError::Internal(format!(
+                "plan images span multiple source parents ({} and {:?}); refusing to archive",
+                first_parent.display(),
+                parent
+            )));
+        }
+    }
+    Ok(Some(first_parent))
 }
 
 /// cleanup_required: remove only this transaction's staging dir. Failures
@@ -988,12 +1135,65 @@ async fn resume_cleanup(
         }
     }
     let archived =
-        state_machine::transition_transaction(TransactionState::SourceArchiving, "archived")
-            .unwrap_or(TransactionState::SourceArchived);
+        state_machine::transition_transaction(TransactionState::CleanupRequired, "cleaned")?;
     ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
     Ok((
         TransactionState::SourceArchived.to_string(),
         true,
         "cleanup complete".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(source_path: &str, target_rel: &str) -> PlanImageRow {
+        PlanImageRow {
+            id: Uuid::new_v4(),
+            plan_album_id: Uuid::new_v4(),
+            import_image_id: Uuid::new_v4(),
+            source_path: source_path.to_string(),
+            source_relative_path: target_rel.to_string(),
+            target_relative_path: target_rel.to_string(),
+            expected_file_size: 1,
+            expected_blake3: vec![0; 32],
+            width: None,
+            height: None,
+            format: None,
+        }
+    }
+
+    #[test]
+    fn derive_source_album_dir_empty_returns_none() {
+        let out = derive_source_album_dir(&[]).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn derive_source_album_dir_single_parent() {
+        let imgs = vec![img("/src/album/photo1.png", "photo1.png")];
+        let out = derive_source_album_dir(&imgs).unwrap();
+        assert_eq!(out.as_deref(), Some(Path::new("/src/album")));
+    }
+
+    #[test]
+    fn derive_source_album_dir_multiple_same_parent() {
+        let imgs = vec![
+            img("/src/album/photo1.png", "photo1.png"),
+            img("/src/album/photo2.png", "photo2.png"),
+        ];
+        let out = derive_source_album_dir(&imgs).unwrap();
+        assert_eq!(out.as_deref(), Some(Path::new("/src/album")));
+    }
+
+    #[test]
+    fn derive_source_album_dir_conflicting_parents_rejected() {
+        let imgs = vec![
+            img("/src/album_a/photo1.png", "photo1.png"),
+            img("/src/album_b/photo2.png", "photo2.png"),
+        ];
+        let err = derive_source_album_dir(&imgs).unwrap_err();
+        assert!(err.to_string().contains("multiple source parents"));
+    }
 }

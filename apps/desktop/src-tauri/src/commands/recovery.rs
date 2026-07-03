@@ -4,7 +4,9 @@
 //! transactions, execute recovery for one, and re-verify a transaction's
 //! on-disk evidence.
 use crate::repositories::import_repository::ImportRepository;
-use crate::services::commit_service::{verify_complete_evidence, IdempotencyVerdict};
+use crate::services::commit_service::{
+    validate_and_hash_frozen_plan, verify_complete_evidence, IdempotencyVerdict,
+};
 use crate::services::recovery_service;
 use crate::state::AppState;
 use serde::Serialize;
@@ -141,6 +143,7 @@ async fn reverify_with_client(
     let library_root_path =
         ImportRepository::get_library_root_path(client, frozen.library_root_id).await?;
     let library_root = PathBuf::from(&library_root_path);
+    let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, frozen.library_root_id)?;
     let album_rel =
         crate::services::commit_service::normalize_relative_path(&plan_album.target_relative_path)?;
     let verdict = verify_complete_evidence(
@@ -149,7 +152,7 @@ async fn reverify_with_client(
         frozen.library_root_id,
         &tx,
         frozen.plan_id,
-        frozen.plan_hash.as_deref().unwrap_or_default(),
+        &validated_plan_hash,
         &album_rel,
         &plan_images,
     )
@@ -160,9 +163,9 @@ async fn reverify_with_client(
             "all evidence matches".to_string(),
         ),
         IdempotencyVerdict::Conflict(m) => ("conflict".to_string(), m),
-        IdempotencyVerdict::Resume => (
+        IdempotencyVerdict::Resume { transaction_id } => (
             "resume".to_string(),
-            "mid-flight, resume recovery".to_string(),
+            format!("mid-flight transaction {transaction_id} detected; route to recovery"),
         ),
     };
     Ok((verdict_str, msg))

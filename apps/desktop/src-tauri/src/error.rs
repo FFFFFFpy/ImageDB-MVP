@@ -1,4 +1,5 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 #[allow(dead_code)]
@@ -14,6 +15,11 @@ pub enum AppError {
 
     #[error("io error: {0}")]
     IoError(String),
+
+    #[error(
+        "incomplete transaction {0} detected; route to recovery instead of starting a new commit"
+    )]
+    ResumeRequired(Uuid),
 }
 
 impl From<std::io::Error> for AppError {

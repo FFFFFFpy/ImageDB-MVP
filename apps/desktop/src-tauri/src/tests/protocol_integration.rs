@@ -610,3 +610,190 @@ fn new_img(
         state: ImportImageState::Fingerprinted,
     }
 }
+
+/// M5-C: after a successful commit, the transaction's persisted manifest_path
+/// must be the canonical published path (`<publish_dir>/.imagedb/
+/// .imagedb-manifest.json`), never the pre-rename staging location.
+#[tokio::test]
+#[ignore]
+async fn real_protocol_manifest_path_is_published() {
+    use crate::domain::import_state::{DecodeState, ImportImageState};
+    use crate::domain::state_machine::PlanState;
+    use crate::repositories::import_repository::NewImportImage;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    if std::env::var("IMAGEDB_POSTGRES_BIN")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping manifest path test");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let source_root = tmp.path().join("source");
+    let library_root = tmp.path().join("library");
+    let album_path = source_root.join("album_a");
+    std::fs::create_dir_all(&album_path).unwrap();
+    std::fs::write(album_path.join("p.png"), b"payload").unwrap();
+    let b3 = blake3::hash(b"payload").as_bytes().to_vec();
+
+    let mut manager = PostgresManager::new(&app_data);
+    assert!(manager.binaries_available());
+    let probe = manager.initialize().await.unwrap();
+    assert!(probe.connection_ok);
+    let (mut client, db_handle) = manager.connect().await.unwrap();
+    MigrationRunner::run_pending(&mut client).await.unwrap();
+    let library_root_id = ImportRepository::upsert_default_library_root(&client)
+        .await
+        .unwrap();
+    ImportRepository::update_library_root_path(
+        &client,
+        library_root_id,
+        &library_root.display().to_string(),
+    )
+    .await
+    .unwrap();
+    let run_id = ImportRepository::create_import_run(
+        &client,
+        &source_root.display().to_string(),
+        library_root_id,
+    )
+    .await
+    .unwrap();
+    let album_id = ImportRepository::insert_import_album(
+        &client,
+        run_id,
+        &album_path.display().to_string(),
+        "album_a",
+    )
+    .await
+    .unwrap();
+    ImportRepository::insert_import_image(
+        &client,
+        NewImportImage {
+            album_id,
+            source_path: album_path.join("p.png").display().to_string(),
+            relative_path: "album_a/p.png".to_string(),
+            file_size: 7,
+            modified_at: None,
+            width: Some(1),
+            height: Some(1),
+            format: Some("png".to_string()),
+            decode_state: DecodeState::Decoded,
+            blake3: Some(b3.clone()),
+            pixel_hash: Some(vec![1; 8]),
+            gradient_hash: Some(vec![1; 8]),
+            block_hash: Some(vec![1; 8]),
+            median_hash: Some(vec![1; 8]),
+            fingerprint_version: Some("test".to_string()),
+            state: ImportImageState::Fingerprinted,
+        },
+    )
+    .await
+    .unwrap();
+
+    let plan_id = ImportRepository::create_import_plan(&client, run_id, 1, "2.0", library_root_id)
+        .await
+        .unwrap();
+    let plan_album_id =
+        ImportRepository::insert_plan_album(&client, plan_id, album_id, "album_a", 1)
+            .await
+            .unwrap();
+    let img_id: uuid::Uuid = client
+        .query_one(
+            "SELECT id FROM import_images WHERE relative_path = 'album_a/p.png'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    ImportRepository::insert_plan_image(
+        &client,
+        plan_album_id,
+        img_id,
+        &album_path.join("p.png").display().to_string(),
+        "album_a/p.png",
+        "p.png",
+        7,
+        &b3,
+        Some(1),
+        Some(1),
+        Some("png"),
+    )
+    .await
+    .unwrap();
+    let frozen = ImportRepository::load_draft_plan(&client, run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let hash = crate::services::commit_service::compute_plan_hash(&frozen).unwrap();
+    ImportRepository::set_plan_hash(&client, plan_id, &hash)
+        .await
+        .unwrap();
+    ImportRepository::update_import_plan_state(&client, plan_id, &PlanState::Frozen)
+        .await
+        .unwrap();
+    drop(client);
+    db_handle.abort();
+
+    let pg = Arc::new(tokio::sync::Mutex::new(manager));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress = Arc::new(tokio::sync::Mutex::new(
+        crate::domain::import_state::CommitProgress::idle(&run_id.to_string()),
+    ));
+    let ok = crate::services::commit_service::run_import_commit(
+        pg.clone(),
+        library_root.display().to_string(),
+        run_id,
+        cancelled,
+        progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok.state, "completed");
+    let returned_path = ok.album_results[0]
+        .manifest_path
+        .as_deref()
+        .expect("manifest_path must be set");
+
+    let publish_dir = library_root.join("Albums").join("album_a");
+    let published_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
+    assert!(
+        published_manifest.exists(),
+        "published manifest file missing at {}",
+        published_manifest.display()
+    );
+    let returned_pathbuf = std::path::PathBuf::from(returned_path);
+    assert_eq!(
+        returned_pathbuf, published_manifest,
+        "CommitAlbumResult.manifest_path must be the published path, got {returned_path}"
+    );
+    // The file_transactions row must also point at the published path.
+    let (client, db_handle) = pg.lock().await.connect().await.unwrap();
+    let db_manifest_path: Option<String> = client
+        .query_one(
+            "SELECT manifest_path FROM file_transactions WHERE import_album_id = $1",
+            &[&album_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    db_handle.abort();
+    let db_manifest_path = db_manifest_path.expect("manifest_path must be persisted");
+    assert_eq!(
+        std::path::PathBuf::from(&db_manifest_path),
+        published_manifest,
+        "file_transactions.manifest_path must be the published path, got {db_manifest_path}"
+    );
+    // The path must NOT contain the staging marker after rename.
+    assert!(
+        !db_manifest_path.contains(".imagedb\\staging")
+            && !db_manifest_path.contains(".imagedb/staging"),
+        "manifest_path must not reference the staging directory: {db_manifest_path}"
+    );
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}

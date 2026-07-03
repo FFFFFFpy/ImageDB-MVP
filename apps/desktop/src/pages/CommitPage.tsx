@@ -21,6 +21,7 @@ function isTerminalProgress(progress: CommitProgress): boolean {
     progress.state === 'completed' ||
     progress.state === 'completed_with_errors' ||
     progress.state === 'failed' ||
+    progress.state === 'recovery_required' ||
     progress.state === 'cancelled_pending_recovery'
   );
 }
@@ -370,7 +371,10 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
   const isSuccess = progress?.state === 'completed';
   const needsRecovery =
-    progress?.state === 'completed_with_errors' || progress?.state === 'cancelled_pending_recovery';
+    progress?.state === 'completed_with_errors' ||
+    progress?.state === 'recovery_required' ||
+    progress?.state === 'cancelled_pending_recovery';
+  const detectedIncomplete = progress?.state === 'recovery_required';
 
   return (
     <div className="commit-page">
@@ -378,7 +382,13 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
       <div className={`commit-result ${isSuccess ? 'success' : 'partial'}`}>
         <div className="result-status">
-          {isSuccess ? '导入已完成' : needsRecovery ? '部分完成，等待恢复' : '导入出现问题'}
+          {isSuccess
+            ? '导入已完成'
+            : detectedIncomplete
+              ? '检测到未完成事务'
+              : needsRecovery
+                ? '部分完成，等待恢复'
+                : '导入出现问题'}
         </div>
         <div className="commit-stats">
           <div className="stat-card">

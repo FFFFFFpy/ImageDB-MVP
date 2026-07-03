@@ -236,6 +236,7 @@ pub struct FrozenPlanRow {
     pub plan_id: Uuid,
     pub import_run_id: Uuid,
     pub library_root_id: Uuid,
+    pub plan_state: String,
     pub plan_hash: Option<Vec<u8>>,
     pub policy_version: String,
     pub albums: Vec<(PlanAlbumRow, Vec<PlanImageRow>)>,
@@ -1512,7 +1513,7 @@ impl ImportRepository {
     ) -> Result<Option<FrozenPlanRow>, AppError> {
         let header = client
             .query_opt(
-                "SELECT id, import_run_id, library_root_id, plan_hash, policy_version
+                "SELECT id, import_run_id, library_root_id, state, plan_hash, policy_version
                  FROM import_plans
                  WHERE import_run_id = $1 AND state = $2
                  ORDER BY version DESC LIMIT 1",
@@ -1580,6 +1581,7 @@ impl ImportRepository {
             plan_id,
             import_run_id: header.get("import_run_id"),
             library_root_id: header.get("library_root_id"),
+            plan_state: header.get("state"),
             plan_hash,
             policy_version: header.get("policy_version"),
             albums,

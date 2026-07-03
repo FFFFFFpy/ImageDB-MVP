@@ -22,21 +22,21 @@ PostgreSQL 18.4 + pgvector and the real filesystem, and committed locally.
 
 ## 2. Completed phases
 
-| Phase | What | Commit |
-|------|------|--------|
-| 1 | file_operations state + DB constraints + state machine wiring | 4f37a23 |
-| 2 | immutable import_plans as the sole commit source of truth | 4f37a23 |
-| 3 | library root identity + relative path preservation | 4f37a23 |
-| 4 | recoverable file transaction protocol (prewrite, stream copy, manifest, atomic publish) | 4f37a23 |
-| 5 | DB commit + complete idempotency verification | 4f37a23 |
-| 6 | separate source-archive recovery stage | 71bad5a |
-| 7 | real Recovery Service that executes actions | 71bad5a |
-| 8 | prefer historical library images as representatives | 7241e09 |
-| 9 | secure candidate image previews | d1d4a6a |
-| 10 | re-verify old blockers (library fail-stop, zero-review, cross-album, post-scan state, cancel) | 7241e09 |
-| 11 | fault-injection tests driving the Recovery Service | 71bad5a |
-| 12 | wire recovery + conflict states to the desktop GUI | 1d55f55 |
-| 13 | final verification + build + real test execution | 7a62291 |
+| Phase | What                                                                                          | Commit  |
+| ----- | --------------------------------------------------------------------------------------------- | ------- |
+| 1     | file_operations state + DB constraints + state machine wiring                                 | 4f37a23 |
+| 2     | immutable import_plans as the sole commit source of truth                                     | 4f37a23 |
+| 3     | library root identity + relative path preservation                                            | 4f37a23 |
+| 4     | recoverable file transaction protocol (prewrite, stream copy, manifest, atomic publish)       | 4f37a23 |
+| 5     | DB commit + complete idempotency verification                                                 | 4f37a23 |
+| 6     | separate source-archive recovery stage                                                        | 71bad5a |
+| 7     | real Recovery Service that executes actions                                                   | 71bad5a |
+| 8     | prefer historical library images as representatives                                           | 7241e09 |
+| 9     | secure candidate image previews                                                               | d1d4a6a |
+| 10    | re-verify old blockers (library fail-stop, zero-review, cross-album, post-scan state, cancel) | 7241e09 |
+| 11    | fault-injection tests driving the Recovery Service                                            | 71bad5a |
+| 12    | wire recovery + conflict states to the desktop GUI                                            | 1d55f55 |
+| 13    | final verification + build + real test execution                                              | 7a62291 |
 
 ## 3. Core transaction protocol
 

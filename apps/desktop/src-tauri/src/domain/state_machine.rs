@@ -278,6 +278,7 @@ pub fn next_transaction_state(current: &str, action: &str) -> Result<&'static st
         ("library_committed", "retry") => Ok("library_committed"),
         ("source_archiving", "retry") => Ok("source_archiving"),
         ("cleanup_required", "clean") => Ok("cleanup_required"),
+        ("cleanup_required", "cleaned") => Ok("source_archived"),
         _ => Err(StateError {
             current: current.to_string(),
             action: action.to_string(),

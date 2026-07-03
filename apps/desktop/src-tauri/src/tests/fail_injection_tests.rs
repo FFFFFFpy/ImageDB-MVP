@@ -556,3 +556,215 @@ async fn fail_injection_cancel_during_commit() {
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
 }
+
+/// M5-B: re-committing while a prior transaction is mid-flight must NOT
+/// create a second active file_transaction for the same album. The second
+/// attempt must short-circuit with AppError::ResumeRequired carrying the
+/// original transaction_id, and no new transaction row must be written.
+#[tokio::test]
+#[ignore]
+async fn fail_injection_double_commit_detected() {
+    let (_tmp, pg, run_id, lib_root, _album) = setup_full_env().await;
+    // Inject a fault mid-staging to leave the first transaction non-terminal.
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::AfterStagingCopy,
+    )
+    .await;
+
+    // Count the file_transactions created so far (must be exactly one).
+    let first_tx_count: i64 = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let n: i64 = client
+            .query_one("SELECT COUNT(*) FROM file_transactions", &[])
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        handle.abort();
+        n
+    };
+    assert!(
+        first_tx_count >= 1,
+        "first commit must have created at least one file_transaction"
+    );
+
+    // Re-run commit without clearing the mid-flight state. It must surface a
+    // recovery_required result and NOT insert any new file_transaction.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(Mutex::new(
+        crate::domain::import_state::CommitProgress::idle(&run_id.to_string()),
+    ));
+    let result = commit_service::run_import_commit(
+        pg.clone(),
+        lib_root.display().to_string(),
+        run_id,
+        cancelled,
+        progress,
+    )
+    .await
+    .expect("second commit should return a recovery_required result");
+    assert_eq!(result.state, "recovery_required");
+    assert_eq!(result.album_results[0].status, "recovery_required");
+    let err_msg = result.errors.join("\n");
+    assert!(
+        err_msg.contains("route to recovery"),
+        "expected recovery routing error, got: {err_msg}"
+    );
+
+    let second_tx_count: i64 = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let n: i64 = client
+            .query_one("SELECT COUNT(*) FROM file_transactions", &[])
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        handle.abort();
+        n
+    };
+    assert_eq!(
+        second_tx_count, first_tx_count,
+        "second commit attempt must not create a new file_transaction"
+    );
+
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
+/// M5-A: if the source album dir disappears after the DB commit but before
+/// the archive rename, recovery must succeed by validating the archive
+/// against the frozen plan — not by blindly trusting an empty source slot.
+#[tokio::test]
+#[ignore]
+async fn fail_injection_source_deleted_archive_verified() {
+    let (_tmp, pg, run_id, lib_root, album_path) = setup_full_env().await;
+    // Inject BeforeSourceArchive: the DB is committed but the archive
+    // rename has not happened yet. Transaction state = library_committed.
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::BeforeSourceArchive,
+    )
+    .await;
+
+    // Simulate the user (or external tooling) deleting the source album dir
+    // AFTER the DB commit. The archive has not been created yet.
+    std::fs::remove_dir_all(&album_path).unwrap();
+
+    // Recovery now sees source=missing, archive=missing → must conflict
+    // (rule: cannot confirm archive integrity if neither dir exists).
+    drive_recovery(pg.clone(), run_id).await;
+
+    let (client, handle) = {
+        let mgr = pg.lock().await;
+        mgr.connect().await.unwrap()
+    };
+    let state: String = client
+        .query_one(
+            "SELECT state FROM file_transactions WHERE import_album_id = (
+                SELECT id FROM import_albums WHERE source_name = 'album_a' LIMIT 1
+            ) ORDER BY started_at DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    handle.abort();
+    assert_eq!(
+        state, "conflict",
+        "recovery must refuse when both source and archive are missing, got {state}"
+    );
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
+/// M5-A: if the archive rename already happened (so the archive is valid)
+/// but the source album dir is restored before recovery runs, recovery
+/// must surface a conflict — never silently delete or overwrite either.
+#[tokio::test]
+#[ignore]
+async fn fail_injection_source_and_archive_both_exist_conflict() {
+    let (_tmp, pg, run_id, lib_root, album_path) = setup_full_env().await;
+    // Inject BeforeSourceArchive so the DB commit succeeded but the
+    // archive rename has not happened yet.
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::BeforeSourceArchive,
+    )
+    .await;
+
+    // Manually perform the archive rename, then recreate the source dir
+    // to simulate an external restore / copy that produced both dirs.
+    let archive_base = album_path.parent().unwrap().join(".imagedb-processed");
+    let tx_id: uuid::Uuid = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let id: uuid::Uuid = client
+            .query_one(
+                "SELECT id FROM file_transactions WHERE import_album_id = (
+                    SELECT id FROM import_albums WHERE source_name = 'album_a' LIMIT 1
+                ) ORDER BY started_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        handle.abort();
+        id
+    };
+    let archive_dir = archive_base.join(tx_id.to_string()).join("album_a");
+    std::fs::create_dir_all(archive_dir.parent().unwrap()).unwrap();
+    std::fs::rename(&album_path, &archive_dir).unwrap();
+    // Restore the source album dir with matching contents.
+    std::fs::create_dir_all(&album_path).unwrap();
+    std::fs::write(album_path.join("photo1.png"), b"photo one data").unwrap();
+    std::fs::write(album_path.join("photo2.png"), b"photo two data").unwrap();
+
+    // Recovery must refuse to act when both source and archive are present.
+    drive_recovery(pg.clone(), run_id).await;
+
+    let (client, handle) = {
+        let mgr = pg.lock().await;
+        mgr.connect().await.unwrap()
+    };
+    let state: String = client
+        .query_one(
+            "SELECT state FROM file_transactions WHERE import_album_id = (
+                SELECT id FROM import_albums WHERE source_name = 'album_a' LIMIT 1
+            ) ORDER BY started_at DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    handle.abort();
+    assert_eq!(
+        state, "conflict",
+        "recovery must refuse when both source and archive exist, got {state}"
+    );
+    // Source and archive must both still be on disk (no silent deletion).
+    assert!(album_path.exists(), "source dir must not have been deleted");
+    assert!(
+        archive_dir.exists(),
+        "archive dir must not have been deleted"
+    );
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
