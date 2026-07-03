@@ -16,6 +16,7 @@ use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 use crate::repositories::import_repository::{ImportRepository, NewImportImage};
 use crate::services::commit_service;
 use crate::services::recovery_service;
+use crate::services::source_snapshot_service::capture_source_album_snapshot;
 use crate::tests::fail_injection::{clear_fault_point, set_fault_point, CommitFaultPoint};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -41,6 +42,13 @@ async fn setup_full_env() -> (
     std::fs::create_dir_all(&album_path).unwrap();
     std::fs::write(album_path.join("photo1.png"), b"photo one data").unwrap();
     std::fs::write(album_path.join("photo2.png"), b"photo two data").unwrap();
+    // Batch 3: exercise the snapshot-driven archive path with non-image
+    // content so the full source snapshot captures description + nested
+    // sidecar files, not just the imported plan images.
+    std::fs::write(album_path.join("description.txt"), b"album notes").unwrap();
+    let nested = album_path.join("sub");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("meta.xmp"), b"<xmp>data</xmp>").unwrap();
 
     let mut manager = PostgresManager::new(&app_data);
     assert!(
@@ -111,6 +119,12 @@ async fn setup_full_env() -> (
         .await
         .unwrap();
     }
+
+    // Persist the full source album snapshot (scan does this in production;
+    // commit Phase 6 requires it to verify source/archive integrity).
+    capture_source_album_snapshot(&client, import_run_id, album_id, &album_path)
+        .await
+        .unwrap();
 
     // Freeze a plan mirroring review_service::freeze_plan.
     freeze_test_plan(
@@ -689,6 +703,83 @@ async fn fail_injection_source_deleted_archive_verified() {
     m.shutdown().await.unwrap();
 }
 
+/// Batch 3: source-missing + archive-present must succeed when the archive
+/// matches the FULL source snapshot (not just the plan images). The rename
+/// is simulated by hand to emulate an external move; recovery verifies the
+/// archive contents against the persisted snapshot and promotes the
+/// transaction to source_archived.
+#[tokio::test]
+#[ignore]
+async fn fail_injection_source_missing_archive_verified_snapshot() {
+    let (_tmp, pg, run_id, lib_root, album_path) = setup_full_env().await;
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::BeforeSourceArchive,
+    )
+    .await;
+
+    // Look up the transaction id so we can compute the expected archive path
+    // (identical to the formula used by commit_service and recovery_service).
+    let tx_id: uuid::Uuid = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let id: uuid::Uuid = client
+            .query_one(
+                "SELECT id FROM file_transactions WHERE import_album_id = (
+                    SELECT id FROM import_albums WHERE source_name = 'album_a' LIMIT 1
+                ) ORDER BY started_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        handle.abort();
+        id
+    };
+    let archive_base = album_path.parent().unwrap().join(".imagedb-processed");
+    let archive_dir = archive_base.join(tx_id.to_string()).join("album_a");
+    std::fs::create_dir_all(archive_dir.parent().unwrap()).unwrap();
+    // Move the FULL source dir (images + description + nested sidecar) to
+    // the archive location so the snapshot verifier sees the same content
+    // captured at scan time.
+    std::fs::rename(&album_path, &archive_dir).unwrap();
+    assert!(
+        !album_path.exists(),
+        "source must be absent after the rename"
+    );
+    assert!(archive_dir.exists(), "archive must be present");
+
+    drive_recovery(pg.clone(), run_id).await;
+
+    let (client, handle) = {
+        let mgr = pg.lock().await;
+        mgr.connect().await.unwrap()
+    };
+    let state: String = client
+        .query_one(
+            "SELECT state FROM file_transactions WHERE import_album_id = (
+                SELECT id FROM import_albums WHERE source_name = 'album_a' LIMIT 1
+            ) ORDER BY started_at DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    handle.abort();
+    assert_eq!(
+        state, "source_archived",
+        "recovery must archive when source missing + archive matches snapshot, got {state}"
+    );
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
 /// M5-A: if the archive rename already happened (so the archive is valid)
 /// but the source album dir is restored before recovery runs, recovery
 /// must surface a conflict — never silently delete or overwrite either.
@@ -731,10 +822,17 @@ async fn fail_injection_source_and_archive_both_exist_conflict() {
     let archive_dir = archive_base.join(tx_id.to_string()).join("album_a");
     std::fs::create_dir_all(archive_dir.parent().unwrap()).unwrap();
     std::fs::rename(&album_path, &archive_dir).unwrap();
-    // Restore the source album dir with matching contents.
+    // Restore the source album dir with the FULL content the snapshot
+    // captured (images + description + nested sidecar). A partial restore
+    // would fail the snapshot verifier before the both-present branch
+    // could fire, defeating the purpose of this test.
     std::fs::create_dir_all(&album_path).unwrap();
     std::fs::write(album_path.join("photo1.png"), b"photo one data").unwrap();
     std::fs::write(album_path.join("photo2.png"), b"photo two data").unwrap();
+    std::fs::write(album_path.join("description.txt"), b"album notes").unwrap();
+    let restored_nested = album_path.join("sub");
+    std::fs::create_dir_all(&restored_nested).unwrap();
+    std::fs::write(restored_nested.join("meta.xmp"), b"<xmp>data</xmp>").unwrap();
 
     // Recovery must refuse to act when both source and archive are present.
     drive_recovery(pg.clone(), run_id).await;

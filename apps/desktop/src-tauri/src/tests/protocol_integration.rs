@@ -361,6 +361,17 @@ async fn real_protocol_tampered_plan_hash_rejected() {
     .await
     .unwrap();
 
+    // Persist the full source album snapshot (scan does this in production;
+    // commit Phase 6 requires it to verify source/archive integrity).
+    crate::services::source_snapshot_service::capture_source_album_snapshot(
+        &client,
+        run_id,
+        album_id,
+        &album_path,
+    )
+    .await
+    .unwrap();
+
     let plan_id = ImportRepository::create_import_plan(&client, run_id, 1, "2.0", library_root_id)
         .await
         .unwrap();
@@ -690,6 +701,17 @@ async fn real_protocol_manifest_path_is_published() {
             fingerprint_version: Some("test".to_string()),
             state: ImportImageState::Fingerprinted,
         },
+    )
+    .await
+    .unwrap();
+
+    // Persist the full source album snapshot (scan does this in production;
+    // commit Phase 6 requires it to verify source/archive integrity).
+    crate::services::source_snapshot_service::capture_source_album_snapshot(
+        &client,
+        run_id,
+        album_id,
+        &album_path,
     )
     .await
     .unwrap();

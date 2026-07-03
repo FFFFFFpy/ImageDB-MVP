@@ -20,7 +20,10 @@ use crate::domain::state_machine::{self, FileOpState, PlanState, TransactionStat
 use crate::error::AppError;
 use crate::infrastructure::postgres::PostgresManager;
 use crate::repositories::import_repository::{
-    FrozenPlanRow, ImportRepository, PlanAlbumRow, PlanImageRow,
+    FrozenPlanRow, ImportRepository, PlanAlbumRow, PlanImageRow, SnapshotFileRecord,
+};
+use crate::services::source_snapshot_service::{
+    load_source_album_snapshot, verify_source_snapshot_files,
 };
 #[cfg(feature = "fail-injection")]
 use crate::tests::fail_injection::{maybe_fault, CommitFaultPoint};
@@ -910,10 +913,14 @@ async fn commit_single_album(
     maybe_fault(CommitFaultPoint::AfterDbCommit, "after DB commit")?;
 
     // ── Phase 6: source archive (separate recoverable stage). ──
-    // The source album root MUST come from the persisted import_albums row,
-    // never from images[0].source_path.parent(). This keeps commit and
-    // recovery aligned on one authoritative path and correctly handles
-    // albums whose plan images span multiple subdirectories.
+    //
+    // Source album root comes from import_albums.source_path (never from
+    // plan image parents) so commit and recovery stay in lockstep.
+    //
+    // Archive integrity is proved with the FULL source snapshot captured
+    // at scan time — the frozen import plan is NOT used here because it
+    // only lists images selected for import, not the whole album (sidecars,
+    // descriptions, nested files, excluded images).
     let import_album = ImportRepository::get_import_album_by_id(client, plan_album.import_album_id)
         .await?
         .ok_or_else(|| {
@@ -930,6 +937,29 @@ async fn commit_single_album(
     }
     let source_album_dir = PathBuf::from(&import_album.source_path);
 
+    // Load the full source snapshot persisted during scan. A missing
+    // snapshot means we cannot prove archive integrity, so the archive
+    // stage is rejected rather than silently trusted.
+    let snapshot_pair = load_source_album_snapshot(client, plan_album.import_album_id).await?;
+    let Some((snapshot, snapshot_files)) = snapshot_pair else {
+        let msg = format!(
+            "no source snapshot for album {}; cannot archive safely",
+            plan_album.import_album_id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx_id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Err(AppError::Internal(msg));
+    };
+
+    // Defense-in-depth: every plan image whose source still exists must
+    // resolve inside the source album root. This does NOT substitute for
+    // the snapshot check — it catches forged plan entries that reference
+    // unrelated paths on disk.
     validate_plan_image_sources(&source_album_dir, &images)?;
 
     let archive_base = source_album_dir
@@ -940,41 +970,133 @@ async fn commit_single_album(
         .join(tx_id.to_string())
         .join(&album_relative_path);
 
-    if source_album_dir.exists() {
-        #[cfg(feature = "fail-injection")]
-        maybe_fault(
-            CommitFaultPoint::BeforeSourceArchive,
-            "before source archive",
-        )?;
+    let source_exists = source_album_dir.exists();
+    let archive_exists = archive_dir.exists();
 
-        let archiving =
-            state_machine::transition_transaction(TransactionState::LibraryCommitted, "archive")?;
-        ImportRepository::update_file_transaction_state(client, tx_id, &archiving, None).await?;
+    // Transition to source_archiving only when we actually have work to do.
+    // Both-missing / both-present are conflicts surfaced before any rename.
+    match (source_exists, archive_exists) {
+        (true, false) => {
+            #[cfg(feature = "fail-injection")]
+            maybe_fault(
+                CommitFaultPoint::BeforeSourceArchive,
+                "before source archive",
+            )?;
 
-        if archive_dir.exists() {
-            return Err(AppError::Internal(format!(
-                "archive target already exists: {}",
-                archive_dir.display()
-            )));
+            let archiving = state_machine::transition_transaction(
+                TransactionState::LibraryCommitted,
+                "archive",
+            )?;
+            ImportRepository::update_file_transaction_state(client, tx_id, &archiving, None)
+                .await?;
+
+            // Verify source directory against the full snapshot BEFORE rename.
+            if let Some(msg) = verify_source_snapshot_or_conflict(
+                client,
+                tx_id,
+                &source_album_dir,
+                &snapshot.snapshot_hash,
+                &snapshot_files,
+                "source album",
+            )
+            .await?
+            {
+                return Err(AppError::Internal(msg));
+            }
+
+            tokio::fs::create_dir_all(archive_dir.parent().unwrap())
+                .await
+                .map_err(|e| AppError::IoError(format!("cannot create archive base dir: {e}")))?;
+
+            #[cfg(feature = "fail-injection")]
+            maybe_fault(
+                CommitFaultPoint::DuringSourceArchive,
+                "during source archive",
+            )?;
+
+            tokio::fs::rename(&source_album_dir, &archive_dir)
+                .await
+                .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
+            sync_parent_dir(&archive_dir).await?;
+
+            // Re-verify AFTER rename: archive content must still match.
+            if let Some(msg) = verify_source_snapshot_or_conflict(
+                client,
+                tx_id,
+                &archive_dir,
+                &snapshot.snapshot_hash,
+                &snapshot_files,
+                "archive after rename",
+            )
+            .await?
+            {
+                return Err(AppError::Internal(msg));
+            }
+
+            let archived = state_machine::transition_transaction(
+                TransactionState::SourceArchiving,
+                "archived",
+            )?;
+            ImportRepository::update_file_transaction_state(client, tx_id, &archived, None).await?;
         }
-        tokio::fs::create_dir_all(archive_dir.parent().unwrap())
-            .await
-            .map_err(|e| AppError::IoError(format!("cannot create archive base dir: {e}")))?;
-
-        #[cfg(feature = "fail-injection")]
-        maybe_fault(
-            CommitFaultPoint::DuringSourceArchive,
-            "during source archive",
-        )?;
-
-        tokio::fs::rename(&source_album_dir, &archive_dir)
-            .await
-            .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
-        sync_parent_dir(&archive_dir).await?;
-
-        let archived =
-            state_machine::transition_transaction(TransactionState::SourceArchiving, "archived")?;
-        ImportRepository::update_file_transaction_state(client, tx_id, &archived, None).await?;
+        (false, true) => {
+            // Archive already exists (e.g. from an interrupted prior run).
+            // Trust it only if it exactly matches the captured snapshot.
+            if let Some(msg) = verify_source_snapshot_or_conflict(
+                client,
+                tx_id,
+                &archive_dir,
+                &snapshot.snapshot_hash,
+                &snapshot_files,
+                "existing archive",
+            )
+            .await?
+            {
+                return Err(AppError::Internal(msg));
+            }
+            let archiving = state_machine::transition_transaction(
+                TransactionState::LibraryCommitted,
+                "archive",
+            )?;
+            ImportRepository::update_file_transaction_state(client, tx_id, &archiving, None)
+                .await?;
+            let archived = state_machine::transition_transaction(
+                TransactionState::SourceArchiving,
+                "archived",
+            )?;
+            ImportRepository::update_file_transaction_state(client, tx_id, &archived, None).await?;
+        }
+        (false, false) => {
+            let msg = format!(
+                "source {} and archive {} both missing; cannot confirm archive integrity",
+                source_album_dir.display(),
+                archive_dir.display()
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Err(AppError::Internal(msg));
+        }
+        (true, true) => {
+            // Ambiguous state: do NOT delete or overwrite either directory.
+            let msg = format!(
+                "source {} and archive {} both present; refusing to overwrite or delete",
+                source_album_dir.display(),
+                archive_dir.display()
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Err(AppError::Internal(msg));
+        }
     }
 
     // Best-effort staging cleanup. A failure here leaves cleanup_required but
@@ -1008,6 +1130,57 @@ async fn commit_single_album(
         manifest_path: Some(published_manifest_path.display().to_string()),
         error: None,
     })
+}
+
+pub(crate) async fn verify_source_snapshot_or_conflict(
+    client: &Client,
+    tx_id: Uuid,
+    dir: &Path,
+    snapshot_hash: &[u8],
+    snapshot_files: &[SnapshotFileRecord],
+    label: &str,
+) -> Result<Option<String>, AppError> {
+    let errors = match verify_source_snapshot_files(dir, snapshot_hash, snapshot_files) {
+        Ok(errors) => errors,
+        Err(e) => {
+            let msg = format!(
+                "{} {} could not be verified against captured snapshot: {e}",
+                label,
+                dir.display()
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok(Some(msg));
+        }
+    };
+
+    if errors.is_empty() {
+        return Ok(None);
+    }
+
+    let msg = format!(
+        "{} {} does not match captured snapshot: {}",
+        label,
+        dir.display(),
+        errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    ImportRepository::update_file_transaction_state(
+        client,
+        tx_id,
+        &TransactionState::Conflict,
+        Some(&msg),
+    )
+    .await?;
+    Ok(Some(msg))
 }
 
 /// Stream-copy a file while incrementally computing BLAKE3. Returns the hash.
@@ -1207,6 +1380,7 @@ pub(crate) fn validate_plan_image_sources(
 /// Used by the source-archive recovery path to validate the source album dir
 /// before renaming it, and to validate the archive dir before trusting it in
 /// lieu of the source.
+#[cfg(test)]
 pub(crate) async fn verify_dir_against_plan(
     dir: &Path,
     album_relative_path: &str,
@@ -1247,6 +1421,7 @@ pub(crate) async fn verify_dir_against_plan(
     Ok(())
 }
 
+#[cfg(test)]
 async fn walk_and_verify(
     root: &Path,
     current: &Path,
@@ -1311,6 +1486,7 @@ async fn walk_and_verify(
     Ok(())
 }
 
+#[cfg(test)]
 async fn hash_existing_file(path: &Path) -> Result<Vec<u8>, AppError> {
     let mut f = tokio::fs::File::open(path)
         .await
@@ -1969,6 +2145,18 @@ mod tests {
             .await
             .unwrap();
         }
+
+        // Persist the full source album snapshot (run_scan does this in
+        // production; commit Phase 6 requires it to verify source/archive
+        // integrity).
+        crate::services::source_snapshot_service::capture_source_album_snapshot(
+            &client,
+            import_run_id,
+            album_id,
+            &album_path,
+        )
+        .await
+        .unwrap();
 
         // Freeze a plan directly (mirrors what review_service::freeze_plan does).
         freeze_test_plan(

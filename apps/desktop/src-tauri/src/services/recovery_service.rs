@@ -21,9 +21,9 @@ use crate::repositories::import_repository::{
 use crate::services::commit_service::{
     build_manifest, commit_library_records_transaction, normalize_relative_path, read_manifest,
     stream_copy_with_hash, sync_parent_dir, validate_and_hash_frozen_plan,
-    validate_plan_image_sources, verify_dir_against_plan, verify_staging_set,
-    write_synced_then_rename,
+    verify_source_snapshot_or_conflict, verify_staging_set, write_synced_then_rename,
 };
+use crate::services::source_snapshot_service::load_source_album_snapshot;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -292,14 +292,7 @@ async fn recover_transaction_with_client(
             .await?
         }
         TransactionState::LibraryCommitted | TransactionState::SourceArchiving => {
-            resume_source_archive(
-                client,
-                &tx,
-                &library_root,
-                &album_relative_path,
-                &plan_images,
-            )
-            .await?
+            resume_source_archive(client, &tx, &library_root, &album_relative_path).await?
         }
         TransactionState::CleanupRequired => resume_cleanup(client, &tx, &library_root).await?,
         _ => {
@@ -898,25 +891,25 @@ async fn resume_db_commit(
         .await?;
 
     // Continue to source archive.
-    resume_source_archive(client, tx, library_root, album_relative_path, plan_images).await
+    resume_source_archive(client, tx, library_root, album_relative_path).await
 }
 
 /// library_committed/source_archiving: validate source and archive against
-/// the frozen plan, then safely rename source → archive. Never auto-delete
-/// the source album directory.
+/// the **persisted source snapshot** (not the frozen import plan, which
+/// only lists images selected for import), then safely rename source →
+/// archive. Never auto-delete the source album directory.
 ///
-/// | source | archive | outcome                                                  |
-/// |--------|---------|----------------------------------------------------------|
-/// | ✓      | ✗       | verify source vs plan → rename → source_archived         |
-/// | ✗      | ✓       | verify archive vs plan → source_archived if match        |
-/// | ✗      | ✗       | conflict                                                 |
-/// | ✓      | ✓       | conflict (no delete, no overwrite)                       |
+/// | source | archive | outcome                                                    |
+/// |--------|---------|------------------------------------------------------------|
+/// | ✓      | ✗       | verify snapshot → rename → verify snapshot → source_archived |
+/// | ✗      | ✓       | verify snapshot → source_archived if match                 |
+/// | ✗      | ✗       | conflict                                                   |
+/// | ✓      | ✓       | conflict (no delete, no overwrite)                         |
 async fn resume_source_archive(
     client: &mut Client,
     tx: &FileTransactionFullRow,
     library_root: &Path,
     album_relative_path: &str,
-    plan_images: &[PlanImageRow],
 ) -> Result<(String, bool, String), AppError> {
     // The library commit is already successful. Do NOT re-copy or re-publish.
     let publish_dir = library_root.join("Albums").join(album_relative_path);
@@ -976,14 +969,14 @@ async fn resume_source_archive(
     }
     let source_album_dir = PathBuf::from(&import_album.source_path);
 
-    // Validate that every plan image whose source still exists on disk
-    // resolves inside the canonicalized source_album_dir. Subdirectories
-    // within the album (e.g. AlbumA/chapter-1, AlbumA/chapter-2) are
-    // allowed; only sources that escape the album root are rejected.
-    if let Err(e) = validate_plan_image_sources(&source_album_dir, plan_images) {
+    // The FULL source snapshot is the only accepted evidence for archive
+    // integrity. A missing snapshot means we cannot prove the archive is
+    // complete, so we refuse to mark it source_archived.
+    let snapshot_pair = load_source_album_snapshot(client, tx.import_album_id).await?;
+    let Some((snapshot, snapshot_files)) = snapshot_pair else {
         let msg = format!(
-            "plan image source escapes source album root '{}': {e}",
-            source_album_dir.display()
+            "no source snapshot for album {}; cannot archive safely",
+            tx.import_album_id
         );
         ImportRepository::update_file_transaction_state(
             client,
@@ -993,7 +986,7 @@ async fn resume_source_archive(
         )
         .await?;
         return Ok((TransactionState::Conflict.to_string(), false, msg));
-    }
+    };
 
     // Archive location is derived from the persisted source_album_dir, not
     // from any image path, so it remains computable even when the source
@@ -1016,21 +1009,18 @@ async fn resume_source_archive(
     match (source_exists, archive_exists) {
         (true, false) => {
             // Source present, archive missing: verify source contents against
-            // the frozen plan, then same-filesystem rename to archive.
-            if let Err(e) =
-                verify_dir_against_plan(&source_album_dir, album_relative_path, plan_images).await
+            // the persisted snapshot, then same-filesystem rename to archive,
+            // then verify the archive still matches.
+            if let Some(msg) = verify_source_snapshot_or_conflict(
+                client,
+                tx.id,
+                &source_album_dir,
+                &snapshot.snapshot_hash,
+                &snapshot_files,
+                "source album",
+            )
+            .await?
             {
-                let msg = format!(
-                    "source album {} does not match frozen plan: {e}",
-                    source_album_dir.display()
-                );
-                ImportRepository::update_file_transaction_state(
-                    client,
-                    tx.id,
-                    &TransactionState::Conflict,
-                    Some(&msg),
-                )
-                .await?;
                 return Ok((TransactionState::Conflict.to_string(), false, msg));
             }
             tokio::fs::create_dir_all(archive_dir.parent().unwrap())
@@ -1040,6 +1030,20 @@ async fn resume_source_archive(
                 .await
                 .map_err(|e| AppError::IoError(format!("source archive rename failed: {e}")))?;
             sync_parent_dir(&archive_dir).await?;
+
+            if let Some(msg) = verify_source_snapshot_or_conflict(
+                client,
+                tx.id,
+                &archive_dir,
+                &snapshot.snapshot_hash,
+                &snapshot_files,
+                "archive after rename",
+            )
+            .await?
+            {
+                return Ok((TransactionState::Conflict.to_string(), false, msg));
+            }
+
             let archived = state_machine::transition_transaction(
                 TransactionState::SourceArchiving,
                 "archived",
@@ -1053,21 +1057,17 @@ async fn resume_source_archive(
         }
         (false, true) => {
             // Source missing, archive present: only trust the archive if its
-            // contents exactly match the frozen plan; otherwise conflict.
-            if let Err(e) =
-                verify_dir_against_plan(&archive_dir, album_relative_path, plan_images).await
+            // contents exactly match the persisted snapshot; otherwise conflict.
+            if let Some(msg) = verify_source_snapshot_or_conflict(
+                client,
+                tx.id,
+                &archive_dir,
+                &snapshot.snapshot_hash,
+                &snapshot_files,
+                "archive",
+            )
+            .await?
             {
-                let msg = format!(
-                    "archive {} does not match frozen plan: {e}",
-                    archive_dir.display()
-                );
-                ImportRepository::update_file_transaction_state(
-                    client,
-                    tx.id,
-                    &TransactionState::Conflict,
-                    Some(&msg),
-                )
-                .await?;
                 return Ok((TransactionState::Conflict.to_string(), false, msg));
             }
             let archived = state_machine::transition_transaction(
@@ -1078,7 +1078,7 @@ async fn resume_source_archive(
             Ok((
                 TransactionState::SourceArchived.to_string(),
                 true,
-                "archive verified against plan; source already archived".to_string(),
+                "archive verified against snapshot; source already archived".to_string(),
             ))
         }
         (false, false) => {
@@ -1157,6 +1157,7 @@ async fn resume_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::commit_service::validate_plan_image_sources;
 
     fn img(source_path: &str, source_rel: &str, target_rel: &str) -> PlanImageRow {
         PlanImageRow {
