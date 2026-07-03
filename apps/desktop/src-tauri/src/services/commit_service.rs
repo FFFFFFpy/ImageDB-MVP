@@ -1477,9 +1477,8 @@ pub(crate) fn validate_plan_image_sources(
 /// extra or missing entries. Subdirectories not referenced by any plan image
 /// are treated as unexpected entries.
 ///
-/// Used by the source-archive recovery path to validate the source album dir
-/// before renaming it, and to validate the archive dir before trusting it in
-/// lieu of the source.
+/// Test helper retained to exercise exact directory validation semantics used
+/// by the source snapshot verifier.
 #[cfg(test)]
 pub(crate) async fn verify_dir_against_plan(
     dir: &Path,
@@ -2837,10 +2836,9 @@ mod tests {
         assert!(validate_plan_image_sources(&album_root, &imgs).is_ok());
     }
 
-    /// Album root is the parent of both subdirectories — verify that the
+    /// Album root is the parent of both subdirectories; verify that the
     /// album root (not a subdirectory parent) is the accepted containment
-    /// boundary. Previously, derive_source_album_dir would have rejected
-    /// this because chapter-1 and chapter-2 are distinct parents.
+    /// boundary even when chapter-1 and chapter-2 are distinct parents.
     #[tokio::test]
     async fn validate_plan_image_sources_distinct_subdirs_share_root() {
         let tmp = TempDir::new().unwrap();
