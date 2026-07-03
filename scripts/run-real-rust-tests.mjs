@@ -25,11 +25,17 @@ const suites = [
     filter: 'fail_injection_',
     features: 'real-db-tests,fail-injection',
   },
+  {
+    name: 'cancellation + final recovery invariants',
+    filter: 'cancellation_recovery_',
+    features: 'real-db-tests,fail-injection',
+  },
 ];
 
-if (env.IMAGEDB_REAL_TEST_PGVECTOR_LIFECYCLE === '1') {
-  suites.unshift({ name: 'managed PostgreSQL lifecycle', filter: 'real_pgvector_full_lifecycle' });
-}
+// The pgvector lifecycle test was previously gated behind an env var because
+// its migration-version assertion was stale (asserted 0007 after migration
+// 0008 landed). That assertion is now fixed, so it runs by default.
+suites.unshift({ name: 'managed PostgreSQL lifecycle', filter: 'real_pgvector_full_lifecycle' });
 
 for (const suite of suites) {
   const features = suite.features ?? 'real-db-tests';

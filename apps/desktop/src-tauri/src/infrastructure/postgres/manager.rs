@@ -984,7 +984,9 @@ mod tests {
             let version = MigrationRunner::current_version(&client)
                 .await
                 .expect("current_version #1");
-            assert_eq!(version.as_deref(), Some("0007_transaction_links"));
+            // Migration 0008 (source_album_snapshots) is the current head
+            // of the migration chain as of the M5/M6 core-fix round.
+            assert_eq!(version.as_deref(), Some("0008_source_album_snapshots"));
 
             drop(client);
             handle.abort();
@@ -1008,7 +1010,9 @@ mod tests {
             let version2 = MigrationRunner::current_version(&client2)
                 .await
                 .expect("current_version #2");
-            assert_eq!(version2.as_deref(), Some("0007_transaction_links"));
+            // Migration 0008 (source_album_snapshots) is the current head
+            // of the migration chain as of the M5/M6 core-fix round.
+            assert_eq!(version2.as_deref(), Some("0008_source_album_snapshots"));
 
             drop(client2);
             handle2.abort();

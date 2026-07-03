@@ -1,0 +1,12 @@
+# Generated Tauri capability/ACL/JSON schemas — not hand-edited.
+apps/desktop/src-tauri/gen/schemas/
+
+# Rust build artifacts.
+apps/desktop/src-tauri/target/
+apps/desktop/target/
+
+# Node modules.
+node_modules/
+
+# pnpm / build cache.
+apps/desktop/tsconfig.tsbuildinfo
