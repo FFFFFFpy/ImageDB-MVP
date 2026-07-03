@@ -1305,7 +1305,7 @@ pub(crate) async fn sync_parent_dir(path: &Path) -> Result<(), AppError> {
                 parent.display()
             ))),
         },
-        Err(e) if is_known_unsupported_dir_sync_error(&e) => Ok(()),
+        Err(e) if is_known_unsupported_dir_open_error(&e, parent) => Ok(()),
         Err(e) => Err(AppError::IoError(format!(
             "cannot open parent directory for sync {}: {e}",
             parent.display()
@@ -1313,9 +1313,30 @@ pub(crate) async fn sync_parent_dir(path: &Path) -> Result<(), AppError> {
     }
 }
 
-/// Decide whether an I/O error from opening or `sync_all()`-ing a directory
-/// represents a *known, deterministic* "directory fsync is not supported by
-/// this platform/filesystem" signal that we may safely downgrade to success.
+fn is_known_unsupported_dir_open_error(e: &std::io::Error, parent: &Path) -> bool {
+    if is_known_unsupported_dir_sync_error(e) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Tokio/std File::open can report ERROR_ACCESS_DENIED when the path is
+        // an existing directory because directory handles require different
+        // Windows flags. Treat only this directory-open case as unsupported;
+        // permission errors from sync_all() or missing/non-directory paths
+        // still propagate.
+        if e.kind() == ErrorKind::PermissionDenied && e.raw_os_error() == Some(5) && parent.is_dir()
+        {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = parent;
+    false
+}
+
+/// Decide whether an I/O error from `sync_all()`-ing a directory represents a
+/// *known, deterministic* "directory fsync is not supported by this
+/// platform/filesystem" signal that we may safely downgrade to success.
 ///
 /// Only `ErrorKind::Unsupported` is accepted unconditionally. Otherwise we
 /// require a `raw_os_error` that is on the platform-specific whitelist of
@@ -2880,6 +2901,18 @@ mod tests {
         // Same when the OS attached a raw code (e.g. Windows ERROR_ACCESS_DENIED=5).
         let err_with_raw = std::io::Error::from_raw_os_error(5);
         assert!(!is_known_unsupported_dir_sync_error(&err_with_raw));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_directory_access_denied_open_is_downgraded() {
+        let tmp = TempDir::new().unwrap();
+        let err = std::io::Error::from_raw_os_error(5);
+        assert!(is_known_unsupported_dir_open_error(&err, tmp.path()));
+        assert!(!is_known_unsupported_dir_open_error(
+            &err,
+            &tmp.path().join("missing")
+        ));
     }
 
     #[test]
