@@ -274,6 +274,36 @@ pub struct FileOperationRow {
     pub last_error: Option<String>,
 }
 
+/// A persisted source album snapshot header.
+#[derive(Debug, Clone)]
+pub struct SourceAlbumSnapshotRecord {
+    pub snapshot_id: Uuid,
+    pub import_run_id: Uuid,
+    pub import_album_id: Uuid,
+    pub source_album_path: String,
+    pub snapshot_hash: Vec<u8>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A persisted snapshot file entry.
+#[derive(Debug, Clone)]
+pub struct SnapshotFileRecord {
+    pub id: Uuid,
+    pub snapshot_id: Uuid,
+    pub relative_path: String,
+    pub file_type: String,
+    pub file_size: i64,
+    pub blake3: Vec<u8>,
+}
+
+/// Input struct for inserting a snapshot file.
+pub struct NewSnapshotFile {
+    pub relative_path: String,
+    pub file_type: String,
+    pub file_size: i64,
+    pub blake3: Vec<u8>,
+}
+
 /// Full library album record (for idempotency verification).
 #[derive(Debug, Clone)]
 pub struct LibraryAlbumFullRow {
@@ -1855,5 +1885,151 @@ impl ImportRepository {
                 state: r.get("state"),
             })
             .collect())
+    }
+
+    pub async fn insert_source_album_snapshot(
+        client: &Client,
+        snapshot_id: Uuid,
+        import_run_id: Uuid,
+        import_album_id: Uuid,
+        source_album_path: &str,
+        snapshot_hash: &[u8],
+        files: &[NewSnapshotFile],
+    ) -> Result<(), AppError> {
+        client.batch_execute("BEGIN").await.map_err(|e| {
+            AppError::Internal(format!("failed to begin source snapshot transaction: {e}"))
+        })?;
+
+        let result = async {
+            client
+                .execute(
+                    "INSERT INTO source_album_snapshots
+                        (id, import_run_id, import_album_id, source_album_path, snapshot_hash)
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[
+                        &snapshot_id,
+                        &import_run_id,
+                        &import_album_id,
+                        &source_album_path,
+                        &snapshot_hash,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to insert source_album_snapshot: {e}"))
+                })?;
+
+            for f in files {
+                client
+                    .execute(
+                        "INSERT INTO source_album_snapshot_files
+                            (id, snapshot_id, relative_path, file_type, file_size, blake3)
+                         VALUES ($1, $2, $3, $4, $5, $6)",
+                        &[
+                            &Uuid::new_v4(),
+                            &snapshot_id,
+                            &f.relative_path,
+                            &f.file_type,
+                            &f.file_size,
+                            &f.blake3,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!(
+                            "failed to insert snapshot file '{}': {e}",
+                            f.relative_path
+                        ))
+                    })?;
+            }
+
+            client
+                .execute(
+                    "UPDATE import_albums SET source_snapshot_hash = $1 WHERE id = $2",
+                    &[&snapshot_hash, &import_album_id],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "failed to update import_albums.source_snapshot_hash: {e}"
+                    ))
+                })?;
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(e);
+        }
+
+        client.batch_execute("COMMIT").await.map_err(|e| {
+            AppError::Internal(format!("failed to commit source snapshot transaction: {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    pub async fn get_source_album_snapshot(
+        client: &Client,
+        import_album_id: Uuid,
+    ) -> Result<Option<SourceAlbumSnapshotRecord>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, import_run_id, import_album_id, source_album_path, snapshot_hash, created_at
+                 FROM source_album_snapshots WHERE import_album_id = $1",
+                &[&import_album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query snapshot: {e}")))?;
+        Ok(row.map(|r| SourceAlbumSnapshotRecord {
+            snapshot_id: r.get("id"),
+            import_run_id: r.get("import_run_id"),
+            import_album_id: r.get("import_album_id"),
+            source_album_path: r.get("source_album_path"),
+            snapshot_hash: r.get("snapshot_hash"),
+            created_at: r.get("created_at"),
+        }))
+    }
+
+    pub async fn get_snapshot_files(
+        client: &Client,
+        snapshot_id: Uuid,
+    ) -> Result<Vec<SnapshotFileRecord>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, snapshot_id, relative_path, file_type, file_size, blake3
+                 FROM source_album_snapshot_files
+                 WHERE snapshot_id = $1 ORDER BY relative_path",
+                &[&snapshot_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query snapshot files: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| SnapshotFileRecord {
+                id: r.get("id"),
+                snapshot_id: r.get("snapshot_id"),
+                relative_path: r.get("relative_path"),
+                file_type: r.get("file_type"),
+                file_size: r.get("file_size"),
+                blake3: r.get("blake3"),
+            })
+            .collect())
+    }
+
+    pub async fn get_source_snapshot_hash_for_album(
+        client: &Client,
+        import_album_id: Uuid,
+    ) -> Result<Option<Vec<u8>>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT source_snapshot_hash FROM import_albums WHERE id = $1",
+                &[&import_album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query album snapshot hash: {e}")))?;
+        Ok(row.and_then(|r| r.get("source_snapshot_hash")))
     }
 }

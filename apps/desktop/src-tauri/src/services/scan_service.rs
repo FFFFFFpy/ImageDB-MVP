@@ -10,10 +10,12 @@ use crate::infrastructure::image_fingerprint::{
 use crate::infrastructure::postgres::PostgresManager;
 use crate::infrastructure::settings::SettingsStore;
 use crate::repositories::import_repository::{
-    ImportRepository, LibraryImageRow, NewDuplicateCandidate, NewImportImage,
+    ImportRepository, LibraryImageRow, NewDuplicateCandidate, NewImportImage, NewSnapshotFile,
+    SnapshotFileRecord,
 };
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::io::Read as _;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -195,6 +197,292 @@ fn scan_album_for_images(
     }
     images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(images)
+}
+
+fn hash_file_sync(path: &Path) -> Result<Vec<u8>, AppError> {
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| AppError::IoError(format!("cannot open {}: {e}", path.display())))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| AppError::IoError(format!("read error on {}: {e}", path.display())))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+fn normalize_snapshot_relative_path(
+    album_path: &Path,
+    file_path: &Path,
+) -> Result<String, AppError> {
+    let rel = file_path.strip_prefix(album_path).map_err(|_| {
+        AppError::Internal(format!(
+            "file {} is not under album {}",
+            file_path.display(),
+            album_path.display()
+        ))
+    })?;
+    if rel.as_os_str().is_empty() {
+        return Err(AppError::Internal(
+            "empty snapshot relative path".to_string(),
+        ));
+    }
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(AppError::Internal(format!(
+                    "invalid snapshot relative path component: {}",
+                    rel.display()
+                )));
+            }
+        }
+    }
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.starts_with('/') {
+        return Err(AppError::Internal(format!("invalid relative path: {s}")));
+    }
+    Ok(s)
+}
+
+fn file_type_from_path(path: &Path) -> String {
+    if path.is_file() {
+        "regular_file".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn collect_album_files(album_path: &Path) -> Result<Vec<NewSnapshotFile>, AppError> {
+    fn walk(dir: &Path, album_path: &Path, out: &mut Vec<NewSnapshotFile>) -> Result<(), AppError> {
+        let entries = std::fs::read_dir(dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                walk(&path, album_path, out)?;
+            } else if ft.is_file() {
+                let relative_path = normalize_snapshot_relative_path(album_path, &path)?;
+                let metadata = std::fs::metadata(&path)?;
+                let blake3 = hash_file_sync(&path)?;
+                out.push(NewSnapshotFile {
+                    relative_path,
+                    file_type: file_type_from_path(&path),
+                    file_size: metadata.len() as i64,
+                    blake3,
+                });
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(album_path, album_path, &mut files)?;
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(files)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn compute_snapshot_hash(files: &[NewSnapshotFile]) -> Vec<u8> {
+    let mut sorted: Vec<&NewSnapshotFile> = files.iter().collect();
+    sorted.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    let mut hasher = blake3::Hasher::new();
+    for f in sorted {
+        for field in [f.relative_path.as_bytes(), f.file_type.as_bytes()] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        hasher.update(&f.file_size.to_le_bytes());
+        hasher.update(&(f.blake3.len() as u64).to_le_bytes());
+        hasher.update(&f.blake3);
+    }
+    hasher.finalize().as_bytes().to_vec()
+}
+
+pub async fn capture_source_album_snapshot(
+    client: &tokio_postgres::Client,
+    import_run_id: Uuid,
+    import_album_id: Uuid,
+    source_album_path: &Path,
+) -> Result<(Uuid, Vec<u8>), AppError> {
+    let files = collect_album_files(source_album_path)?;
+    let snapshot_hash = compute_snapshot_hash(&files);
+    let snapshot_id = Uuid::new_v4();
+    ImportRepository::insert_source_album_snapshot(
+        client,
+        snapshot_id,
+        import_run_id,
+        import_album_id,
+        &source_album_path.display().to_string(),
+        &snapshot_hash,
+        &files,
+    )
+    .await?;
+    Ok((snapshot_id, snapshot_hash))
+}
+
+#[derive(Debug, Clone)]
+pub enum SnapshotVerifyError {
+    MissingFile(String),
+    ExtraFile(String),
+    SizeMismatch {
+        path: String,
+        expected: i64,
+        actual: i64,
+    },
+    HashMismatch {
+        path: String,
+    },
+    FileTypeMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    SnapshotHashMismatch {
+        expected: String,
+        actual: String,
+    },
+}
+
+impl std::fmt::Display for SnapshotVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFile(p) => write!(f, "missing file: {p}"),
+            Self::ExtraFile(p) => write!(f, "extra file: {p}"),
+            Self::SizeMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "size mismatch for {path}: expected {expected}, got {actual}"
+            ),
+            Self::HashMismatch { path } => write!(f, "blake3 mismatch for {path}"),
+            Self::FileTypeMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "file type mismatch for {path}: expected {expected}, got {actual}"
+            ),
+            Self::SnapshotHashMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "snapshot hash mismatch: expected {expected}, got {actual}"
+                )
+            }
+        }
+    }
+}
+
+pub async fn verify_source_album_snapshot(
+    client: &tokio_postgres::Client,
+    import_album_id: Uuid,
+    source_album_path: &Path,
+) -> Result<Vec<SnapshotVerifyError>, AppError> {
+    let snapshot =
+        match ImportRepository::get_source_album_snapshot(client, import_album_id).await? {
+            Some(s) => s,
+            None => {
+                return Err(AppError::Internal(format!(
+                    "no snapshot found for album {import_album_id}"
+                )));
+            }
+        };
+    let stored_files = ImportRepository::get_snapshot_files(client, snapshot.snapshot_id).await?;
+
+    verify_source_snapshot_files(source_album_path, &snapshot.snapshot_hash, &stored_files)
+}
+
+pub(crate) fn verify_source_snapshot_files(
+    source_album_path: &Path,
+    snapshot_hash: &[u8],
+    stored_files: &[SnapshotFileRecord],
+) -> Result<Vec<SnapshotVerifyError>, AppError> {
+    let actual_files = collect_album_files(source_album_path)?;
+
+    let mut errors = Vec::new();
+
+    let stored_map: std::collections::HashMap<&str, &SnapshotFileRecord> = stored_files
+        .iter()
+        .map(|f| (f.relative_path.as_str(), f))
+        .collect();
+    let actual_map: std::collections::HashMap<&str, &NewSnapshotFile> = actual_files
+        .iter()
+        .map(|f| (f.relative_path.as_str(), f))
+        .collect();
+
+    for (path, stored) in &stored_map {
+        match actual_map.get(path) {
+            None => errors.push(SnapshotVerifyError::MissingFile(path.to_string())),
+            Some(actual) => {
+                if stored.file_size != actual.file_size {
+                    errors.push(SnapshotVerifyError::SizeMismatch {
+                        path: path.to_string(),
+                        expected: stored.file_size,
+                        actual: actual.file_size,
+                    });
+                }
+                if stored.blake3 != actual.blake3 {
+                    errors.push(SnapshotVerifyError::HashMismatch {
+                        path: path.to_string(),
+                    });
+                }
+                if stored.file_type != actual.file_type {
+                    errors.push(SnapshotVerifyError::FileTypeMismatch {
+                        path: path.to_string(),
+                        expected: stored.file_type.clone(),
+                        actual: actual.file_type.clone(),
+                    });
+                }
+            }
+        }
+    }
+    for path in actual_map.keys() {
+        if !stored_map.contains_key(path) {
+            errors.push(SnapshotVerifyError::ExtraFile(path.to_string()));
+        }
+    }
+
+    let stored_hash = compute_snapshot_hash(
+        &stored_files
+            .iter()
+            .map(|f| NewSnapshotFile {
+                relative_path: f.relative_path.clone(),
+                file_type: f.file_type.clone(),
+                file_size: f.file_size,
+                blake3: f.blake3.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    if stored_hash != snapshot_hash {
+        errors.push(SnapshotVerifyError::SnapshotHashMismatch {
+            expected: hex_encode(snapshot_hash),
+            actual: hex_encode(&stored_hash),
+        });
+    }
+
+    let actual_hash = compute_snapshot_hash(&actual_files);
+    if actual_hash != snapshot_hash {
+        errors.push(SnapshotVerifyError::SnapshotHashMismatch {
+            expected: hex_encode(snapshot_hash),
+            actual: hex_encode(&actual_hash),
+        });
+    }
+
+    Ok(errors)
 }
 
 struct PerceptualEvidence {
@@ -484,6 +772,36 @@ pub async fn run_scan(
             &album.name,
         )
         .await?;
+    }
+
+    let snapshot_rows = client
+        .query(
+            "SELECT id, source_path FROM import_albums WHERE import_run_id = $1",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query albums for snapshot: {e}")))?;
+    for row in &snapshot_rows {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let album_id: Uuid = row.get("id");
+        let source_path: String = row.get("source_path");
+        capture_source_album_snapshot(&client, import_run_id, album_id, Path::new(&source_path))
+            .await?;
+        let snapshot_errors =
+            verify_source_album_snapshot(&client, album_id, Path::new(&source_path)).await?;
+        if !snapshot_errors.is_empty() {
+            return Err(AppError::Internal(format!(
+                "source snapshot verification failed for {}: {}",
+                source_path,
+                snapshot_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
     }
 
     ImportRepository::update_import_run_state(
@@ -1684,5 +2002,443 @@ mod tests {
             std::fs::read(&metadata_variant).unwrap(),
             metadata_bytes_before
         );
+    }
+
+    fn make_snapshot_file(path: &str, ft: &str, size: i64, hash: u8) -> NewSnapshotFile {
+        NewSnapshotFile {
+            relative_path: path.to_string(),
+            file_type: ft.to_string(),
+            file_size: size,
+            blake3: vec![hash; 32],
+        }
+    }
+
+    #[test]
+    fn test_snapshot_hash_stable() {
+        let files = vec![
+            make_snapshot_file("a.jpg", "jpg", 100, 1),
+            make_snapshot_file("b.png", "png", 200, 2),
+        ];
+        let h1 = compute_snapshot_hash(&files);
+        let h2 = compute_snapshot_hash(&files);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32);
+    }
+
+    #[test]
+    fn test_snapshot_hash_changes_on_content_diff() {
+        let files_a = vec![make_snapshot_file("a.jpg", "jpg", 100, 1)];
+        let files_b = vec![make_snapshot_file("a.jpg", "jpg", 101, 1)];
+        assert_ne!(
+            compute_snapshot_hash(&files_a),
+            compute_snapshot_hash(&files_b)
+        );
+    }
+
+    #[test]
+    fn test_snapshot_hash_changes_on_path_diff() {
+        let files_a = vec![make_snapshot_file("a.jpg", "jpg", 100, 1)];
+        let files_b = vec![make_snapshot_file("b.jpg", "jpg", 100, 1)];
+        assert_ne!(
+            compute_snapshot_hash(&files_a),
+            compute_snapshot_hash(&files_b)
+        );
+    }
+
+    #[test]
+    fn test_snapshot_hash_order_independent_of_input_order() {
+        let files_a = vec![
+            make_snapshot_file("a.jpg", "jpg", 100, 1),
+            make_snapshot_file("b.png", "png", 200, 2),
+        ];
+        let files_b = vec![
+            make_snapshot_file("b.png", "png", 200, 2),
+            make_snapshot_file("a.jpg", "jpg", 100, 1),
+        ];
+        assert_eq!(
+            compute_snapshot_hash(&files_a),
+            compute_snapshot_hash(&files_b)
+        );
+    }
+
+    #[test]
+    fn test_collect_album_files_covers_all_file_types() {
+        let tmp = TempDir::new().unwrap();
+        let album = tmp.path().join("my_album");
+        std::fs::create_dir_all(&album).unwrap();
+
+        create_test_image(&album, "img1.jpg");
+        create_test_image(&album, "img2.png");
+        std::fs::write(album.join("img3.webp"), b"fake webp content for test").unwrap();
+        std::fs::write(album.join("description.txt"), b"some description").unwrap();
+        let nested = album.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("sidecar.xmp"), b"<xmp/>").unwrap();
+
+        let files = collect_album_files(&album).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(paths.contains(&"description.txt"));
+        assert!(paths.contains(&"sub/sidecar.xmp"));
+        assert_eq!(files.len(), 5);
+
+        for f in &files {
+            assert!(!f.relative_path.starts_with('/'));
+            assert!(!f.relative_path.contains(".."));
+            assert!(!f.relative_path.contains('\\'));
+            assert!(!f.blake3.is_empty());
+            assert!(f.file_size > 0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_scan_persists_source_album_snapshot() {
+        use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping");
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let app_data = tmp.path().join("app_data");
+        let source_root = tmp.path().join("source");
+        let album = create_test_album(&source_root, "snap_album");
+
+        let img1 = create_test_image(&album, "img1.jpg");
+        let img2 = create_test_image(&album, "img2.png");
+        let img3 = album.join("img3.webp");
+        std::fs::write(&img3, b"fake webp content for snapshot test").unwrap();
+        std::fs::write(album.join("description.txt"), b"album notes").unwrap();
+        let nested = album.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("meta.xmp"), b"<xmp>data</xmp>").unwrap();
+
+        let img1_bytes = std::fs::read(&img1).unwrap();
+        let img2_bytes = std::fs::read(&img2).unwrap();
+        let img3_bytes = std::fs::read(&img3).unwrap();
+
+        std::fs::create_dir_all(&app_data).unwrap();
+        let mut manager = PostgresManager::new(&app_data);
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok);
+
+        let (mut client, db_handle) = manager.connect().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            &source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &album.display().to_string(),
+            "snap_album",
+        )
+        .await
+        .unwrap();
+
+        let (snapshot_id, snapshot_hash) =
+            capture_source_album_snapshot(&client, import_run_id, album_id, &album)
+                .await
+                .unwrap();
+
+        assert_eq!(snapshot_hash.len(), 32);
+
+        let stored_hash = ImportRepository::get_source_snapshot_hash_for_album(&client, album_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_hash, snapshot_hash);
+
+        let snapshot = ImportRepository::get_source_album_snapshot(&client, album_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.snapshot_id, snapshot_id);
+        assert_eq!(snapshot.import_run_id, import_run_id);
+        assert_eq!(snapshot.import_album_id, album_id);
+        assert_eq!(snapshot.snapshot_hash, snapshot_hash);
+
+        let files = ImportRepository::get_snapshot_files(&client, snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 5);
+
+        let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert!(
+            paths.contains(&"description.txt"),
+            "missing description.txt in {paths:?}"
+        );
+        assert!(
+            paths.contains(&"nested/meta.xmp"),
+            "missing nested/meta.xmp in {paths:?}"
+        );
+        let image_paths: Vec<&&str> = paths
+            .iter()
+            .filter(|p| p.ends_with(".jpg") || p.ends_with(".png") || p.ends_with(".webp"))
+            .collect();
+        assert_eq!(
+            image_paths.len(),
+            3,
+            "expected 3 images in snapshot, got {image_paths:?}"
+        );
+
+        for f in &files {
+            assert!(!f.relative_path.starts_with('/'));
+            assert!(!f.relative_path.contains(".."));
+            assert!(!f.relative_path.contains('\\'));
+            assert_eq!(f.blake3.len(), 32);
+        }
+
+        let recomputed = compute_snapshot_hash(
+            &files
+                .iter()
+                .map(|f| NewSnapshotFile {
+                    relative_path: f.relative_path.clone(),
+                    file_type: f.file_type.clone(),
+                    file_size: f.file_size,
+                    blake3: f.blake3.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(recomputed, snapshot_hash, "snapshot_hash must be stable");
+
+        let verify_errors = verify_source_album_snapshot(&client, album_id, &album)
+            .await
+            .unwrap();
+        assert!(
+            verify_errors.is_empty(),
+            "expected no errors, got: {verify_errors:?}"
+        );
+
+        drop(client);
+        db_handle.abort();
+        manager.shutdown().await.unwrap();
+
+        assert_eq!(std::fs::read(&img1).unwrap(), img1_bytes);
+        assert_eq!(std::fs::read(&img2).unwrap(), img2_bytes);
+        assert_eq!(std::fs::read(&img3).unwrap(), img3_bytes);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_snapshot_verify_detects_missing_file() {
+        use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let app_data = tmp.path().join("app_data");
+        let source_root = tmp.path().join("source");
+        let album = create_test_album(&source_root, "verify_album");
+        create_test_image(&album, "img1.jpg");
+        create_test_image(&album, "img2.png");
+        std::fs::write(album.join("description.txt"), b"notes").unwrap();
+
+        std::fs::create_dir_all(&app_data).unwrap();
+        let mut manager = PostgresManager::new(&app_data);
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok);
+
+        let (mut client, db_handle) = manager.connect().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            &source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &album.display().to_string(),
+            "verify_album",
+        )
+        .await
+        .unwrap();
+
+        capture_source_album_snapshot(&client, import_run_id, album_id, &album)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(album.join("description.txt")).unwrap();
+
+        let errors = verify_source_album_snapshot(&client, album_id, &album)
+            .await
+            .unwrap();
+        assert!(!errors.is_empty(), "should detect missing file");
+        let has_missing = errors
+            .iter()
+            .any(|e| matches!(e, SnapshotVerifyError::MissingFile(p) if p == "description.txt"));
+        assert!(has_missing, "expected MissingFile error, got: {errors:?}");
+
+        drop(client);
+        db_handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_snapshot_verify_detects_extra_file() {
+        use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let app_data = tmp.path().join("app_data");
+        let source_root = tmp.path().join("source");
+        let album = create_test_album(&source_root, "extra_album");
+        create_test_image(&album, "img1.jpg");
+
+        std::fs::create_dir_all(&app_data).unwrap();
+        let mut manager = PostgresManager::new(&app_data);
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok);
+
+        let (mut client, db_handle) = manager.connect().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            &source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &album.display().to_string(),
+            "extra_album",
+        )
+        .await
+        .unwrap();
+
+        capture_source_album_snapshot(&client, import_run_id, album_id, &album)
+            .await
+            .unwrap();
+
+        std::fs::write(album.join("extra.txt"), b"sneaked in").unwrap();
+
+        let errors = verify_source_album_snapshot(&client, album_id, &album)
+            .await
+            .unwrap();
+        assert!(!errors.is_empty(), "should detect extra file");
+        let has_extra = errors
+            .iter()
+            .any(|e| matches!(e, SnapshotVerifyError::ExtraFile(p) if p == "extra.txt"));
+        assert!(has_extra, "expected ExtraFile error, got: {errors:?}");
+
+        drop(client);
+        db_handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_snapshot_verify_detects_hash_mismatch() {
+        use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let app_data = tmp.path().join("app_data");
+        let source_root = tmp.path().join("source");
+        let album = create_test_album(&source_root, "hash_album");
+        create_test_image(&album, "img1.jpg");
+        std::fs::write(album.join("description.txt"), b"original").unwrap();
+
+        std::fs::create_dir_all(&app_data).unwrap();
+        let mut manager = PostgresManager::new(&app_data);
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok);
+
+        let (mut client, db_handle) = manager.connect().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            &source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &album.display().to_string(),
+            "hash_album",
+        )
+        .await
+        .unwrap();
+
+        capture_source_album_snapshot(&client, import_run_id, album_id, &album)
+            .await
+            .unwrap();
+
+        std::fs::write(album.join("description.txt"), b"tampered content").unwrap();
+
+        let errors = verify_source_album_snapshot(&client, album_id, &album)
+            .await
+            .unwrap();
+        assert!(!errors.is_empty(), "should detect hash mismatch");
+        let has_hash = errors.iter().any(|e| matches!(e, SnapshotVerifyError::HashMismatch { path } if path == "description.txt"));
+        assert!(has_hash, "expected HashMismatch error, got: {errors:?}");
+        let has_snapshot_mismatch = errors
+            .iter()
+            .any(|e| matches!(e, SnapshotVerifyError::SnapshotHashMismatch { .. }));
+        assert!(
+            has_snapshot_mismatch,
+            "expected SnapshotHashMismatch, got: {errors:?}"
+        );
+
+        drop(client);
+        db_handle.abort();
+        manager.shutdown().await.unwrap();
     }
 }
