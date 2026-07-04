@@ -382,3 +382,36 @@
 
 - 该测试使用 fail-injection 模拟只读/不可写，不是实际修改 Windows ACL 或真实 NAS 只读权限。
 - 超时和真实挂载共享存储门禁仍需要单独证据。
+
+## 2026-07-04: Recovery storage-timeout gate
+
+### 实现内容
+
+- 新增仅 `fail-injection` 测试构建可用的存储探测超时注入点，正式构建不改变实际探测路径。
+- 新增真实 PostgreSQL + 真实文件系统故障注入测试，覆盖 Recovery 在存储探测超时时的暂停行为。
+- commit 在 `AfterDbWrite` 中断后，测试强制 Recovery 看到 storage probe timeout。
+- Recovery 必须暂停，保持 transaction 为 `staging`，父 import run 保持 `recovery_required`，并写入可诊断的 `last_error`。
+- 清除超时故障后，同一 transaction 可继续恢复并最终收敛到 `source_archived`。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/services/recovery_service.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib fail_injection_recovery_storage_timeout_pauses_then_recovers -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- 存储探测超时时 Recovery 返回 `final_state=staging`、`recovered=false`，消息包含 `timed out`。
+- 数据库中 transaction 保持 `staging`，import run 保持 `recovery_required`，未产生完成状态。
+- 清除超时故障后，Recovery 成功完成后续提交闭环。
+
+### 已知限制
+
+- 该测试使用 fail-injection 模拟超时，不是真实 NAS/SMB 超时。
+- 真实挂载共享存储门禁仍需要单独证据。

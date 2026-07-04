@@ -887,6 +887,13 @@ fn recovery_storage_preflight(
             library_root.display()
         ));
     }
+    #[cfg(feature = "fail-injection")]
+    if crate::tests::fail_injection::force_storage_timeout() {
+        return Some(format!(
+            "recovery paused: storage probe timed out for library root '{}' after storage reprobe",
+            library_root.display()
+        ));
+    }
 
     let capabilities = probe_storage_capabilities(library_root);
     let required_bytes = estimated_recovery_write_bytes(current, plan_images);

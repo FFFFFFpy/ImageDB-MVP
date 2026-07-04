@@ -29,6 +29,7 @@ static FAULT_POINT: AtomicU8 = AtomicU8::new(255);
 static FAULT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static FORCE_CONSERVATIVE_PUBLISH: AtomicU8 = AtomicU8::new(0);
 static FORCE_STORAGE_UNWRITABLE: AtomicU8 = AtomicU8::new(0);
+static FORCE_STORAGE_TIMEOUT: AtomicU8 = AtomicU8::new(0);
 static FORCED_AVAILABLE_SPACE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Set the active fault point for the next commit operation.
@@ -56,6 +57,14 @@ pub(crate) fn set_force_storage_unwritable(enabled: bool) {
 
 pub(crate) fn force_storage_unwritable() -> bool {
     FORCE_STORAGE_UNWRITABLE.load(Ordering::SeqCst) == 1
+}
+
+pub(crate) fn set_force_storage_timeout(enabled: bool) {
+    FORCE_STORAGE_TIMEOUT.store(u8::from(enabled), Ordering::SeqCst);
+}
+
+pub(crate) fn force_storage_timeout() -> bool {
+    FORCE_STORAGE_TIMEOUT.load(Ordering::SeqCst) == 1
 }
 
 pub(crate) fn set_forced_available_space(bytes: Option<u64>) {
