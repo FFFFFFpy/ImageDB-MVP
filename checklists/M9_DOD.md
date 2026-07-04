@@ -7,5 +7,5 @@
 - [x] Installation, upgrade, reinstall, uninstall, and data retention gates verified.
 - [x] Performance and stability thresholds recorded.
 - [x] Windows release build passes and produces expected installer artifacts.
-- [ ] Final release gate command passes.
-- [ ] Final M6.5-M9 completion report written.
+- [x] Final release gate command passes.
+- [x] Final M6.5-M9 completion report written.

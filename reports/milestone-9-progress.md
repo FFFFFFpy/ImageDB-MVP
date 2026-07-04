@@ -1,5 +1,54 @@
 # M9 Progress Report
 
+## 2026-07-04: Final release gate and completion report
+
+### Implemented
+
+- Fixed `scripts/run-m9-release-gate.mjs` so the ordinary `pnpm rust:test` step does not inherit the release gate PostgreSQL runtime override. The managed-runtime diagnostic unit test now runs in the same environment shape as a normal developer/test run.
+- Kept PostgreSQL runtime injection scoped to the release steps that require it: the mounted storage gate and other explicit real/runtime gates.
+- Ran the full `pnpm release:gate` command successfully.
+- Wrote the final M6.5-M9 completion report to `reports/M6.5-M9-final.md`.
+- Marked all remaining M9 DoD items complete.
+
+### Modified Files
+
+- `scripts/run-m9-release-gate.mjs`
+- `reports/m9-performance-thresholds.json`
+- `reports/milestone-9-progress.md`
+- `reports/M6.5-M9-final.md`
+- `checklists/M9_DOD.md`
+
+### Commands And Results
+
+- `pnpm release:gate -- --only=rust`: passed, `pnpm rust:test` reported 188 passed, 1 ignored.
+- `pnpm release:gate`: passed.
+
+Full release gate step results:
+
+- `pnpm install`: passed in 0.3s.
+- `pnpm format:check`: passed in 2.2s.
+- `pnpm typecheck`: passed in 1.7s.
+- `pnpm test:unit`: passed in 2.2s.
+- `pnpm rust:test`: passed in 3.1s.
+- `pnpm rust:clippy`: passed in 0.8s.
+- `pnpm rust:test:real`: passed in 524.7s.
+- `pnpm release:performance`: passed in 9.5s.
+- `mounted SMB storage gate`: passed in 8.3s.
+- `pnpm build`: passed in 95.6s.
+
+### Actual Runtime Result
+
+- The full release gate completed in 648.6s.
+- The real Rust suite covered managed PostgreSQL lifecycle, scan persistence, source snapshot verification, review persistence, external PostgreSQL checks/migration, file transaction protocol, formal commit, M9 public command main chain, M9 diagnostics export, M9 public recovery command path, strict manifest validation, run-state reconciliation, fault-injection recovery, mounted storage recovery, and cancellation/final recovery invariants.
+- The performance gate generated the current 120-image threshold report: managed startup 4096 ms, scan 2289 ms, scan throughput 52.42 images/sec, plan 61 ms, commit 1008 ms, commit throughput 119.05 images/sec, empty recovery scan 17 ms, total 7491 ms.
+- The mounted storage gate mapped Windows loopback SMB and passed `mounted_storage_gate_library_root_disconnect_pauses_then_recovers`.
+- The Windows release build produced `apps/desktop/src-tauri/target/release/imagedb-desktop.exe` and `apps/desktop/src-tauri/target/release/bundle/nsis/ImageDB_0.1.0_x64-setup.exe`.
+
+### Known Limits
+
+- The final gate uses the existing public command-facing M9 main-chain test evidence plus frontend unit coverage; this environment still does not provide a working live Tauri WebView IPC test harness.
+- The performance gate records an MVP 120-image automated baseline. Full 1k/10k/100k benchmark campaigns and peak memory instrumentation remain release-hardening follow-ups.
+
 ## 2026-07-04: Performance and stability thresholds
 
 ### Implemented
@@ -28,7 +77,7 @@
 ### Actual Runtime Result
 
 - The gate generated 120 deterministic PNG images, initialized managed PostgreSQL, scanned through the command path, generated an import plan, committed through the command path, and scanned recovery state.
-- Measured values from `reports/m9-performance-thresholds.json`: managed startup 3144 ms, scan 2704 ms, scan throughput 44.38 images/sec, plan 82 ms, commit 809 ms, commit throughput 148.33 images/sec, empty recovery scan 18 ms, total 6777 ms.
+- Measured values from `reports/m9-performance-thresholds.json`: managed startup 4096 ms, scan 2289 ms, scan throughput 52.42 images/sec, plan 61 ms, commit 1008 ms, commit throughput 119.05 images/sec, empty recovery scan 17 ms, total 7491 ms.
 - Thresholds enforced by the gate: startup <= 15000 ms, scan <= 60000 ms, scan throughput >= 5 images/sec, plan <= 15000 ms, commit <= 60000 ms, commit throughput >= 5 images/sec, empty recovery scan <= 5000 ms, total <= 120000 ms.
 
 ### Known Limits

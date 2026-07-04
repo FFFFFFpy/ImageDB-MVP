@@ -4,11 +4,9 @@ import { spawnSync } from 'node:child_process';
 
 const repoRoot = process.cwd();
 const defaultPgBin = join(repoRoot, '.local', 'db-tools', 'postgresql-18.4', 'pgsql', 'bin');
-const env = { ...process.env };
-
-if (!env.IMAGEDB_POSTGRES_BIN && existsSync(defaultPgBin)) {
-  env.IMAGEDB_POSTGRES_BIN = defaultPgBin;
-}
+const baseEnv = { ...process.env };
+const postgresBin =
+  baseEnv.IMAGEDB_POSTGRES_BIN || (existsSync(defaultPgBin) ? defaultPgBin : null);
 
 const args = process.argv.slice(2);
 const onlyArg = args.find((arg) => arg.startsWith('--only='));
@@ -29,7 +27,13 @@ const steps = [
   },
   { id: 'typecheck', label: 'pnpm typecheck', command: 'pnpm', args: ['typecheck'] },
   { id: 'unit', label: 'pnpm test:unit', command: 'pnpm', args: ['test:unit'] },
-  { id: 'rust', label: 'pnpm rust:test', command: 'pnpm', args: ['rust:test'] },
+  {
+    id: 'rust',
+    label: 'pnpm rust:test',
+    command: 'pnpm',
+    args: ['rust:test'],
+    cleanPostgresEnv: true,
+  },
   { id: 'clippy', label: 'pnpm rust:clippy', command: 'pnpm', args: ['rust:clippy'] },
   {
     id: 'real',
@@ -58,7 +62,7 @@ function runStep(step) {
   const { command, args } = resolveCommand(step.command, step.args);
   const result = spawnSync(command, args, {
     cwd: repoRoot,
-    env,
+    env: envForStep(step),
     stdio: 'inherit',
   });
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
@@ -74,6 +78,18 @@ function runStep(step) {
   console.log(`[m9-release-gate] ${step.label} passed in ${seconds}s`);
 }
 
+function envForStep(step) {
+  const stepEnv = { ...baseEnv };
+  if (step.cleanPostgresEnv) {
+    delete stepEnv.IMAGEDB_POSTGRES_BIN;
+    delete stepEnv.IMAGEDB_POSTGRES_RUNTIME_DIR;
+  }
+  if (step.needsPostgresBin && postgresBin) {
+    stepEnv.IMAGEDB_POSTGRES_BIN = postgresBin;
+  }
+  return stepEnv;
+}
+
 function resolveCommand(command, args) {
   if (process.platform === 'win32' && command === 'pnpm') {
     return {
@@ -85,12 +101,12 @@ function resolveCommand(command, args) {
 }
 
 function runMountedGate() {
-  if (!env.IMAGEDB_POSTGRES_BIN) {
+  if (!postgresBin) {
     console.error('IMAGEDB_POSTGRES_BIN is required for the mounted storage gate');
     process.exit(1);
   }
 
-  if (env.IMAGEDB_MOUNTED_LIBRARY_ROOT) {
+  if (baseEnv.IMAGEDB_MOUNTED_LIBRARY_ROOT) {
     runStep({
       label: 'mounted storage gate from environment',
       command: 'cargo',
@@ -106,6 +122,7 @@ function runMountedGate() {
         '--ignored',
         '--test-threads=1',
       ],
+      needsPostgresBin: true,
     });
     return;
   }
@@ -160,6 +177,7 @@ finally {
     label: 'mounted storage gate using Windows loopback SMB',
     command: 'powershell',
     args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    needsPostgresBin: true,
   });
 }
 
