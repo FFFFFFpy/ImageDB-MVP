@@ -569,11 +569,20 @@ impl DatabaseService {
             ));
         }
 
-        if config.client_cert_path.is_some() || config.client_key_path.is_some() {
-            checks.push(ExternalPreflightCheck::warn(
-                "tls.client_certificate",
-                "Client certificate paths are recorded for profile review; this build does not yet load client key pairs",
-            ));
+        match (&config.client_cert_path, &config.client_key_path) {
+            (Some(_), Some(_)) => {
+                checks.push(ExternalPreflightCheck::pass(
+                    "tls.client_certificate",
+                    "Client certificate and private key paths are configured for mutual TLS",
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                checks.push(ExternalPreflightCheck::fail(
+                    "tls.client_certificate",
+                    "Client certificate and private key must be configured together",
+                ));
+            }
+            (None, None) => {}
         }
 
         let (client, handle) = match connect_external(&config).await {
