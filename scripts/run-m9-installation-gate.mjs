@@ -149,6 +149,12 @@ function hasInstalledMainExe() {
 }
 
 async function main() {
+  if (process.platform !== 'win32') {
+    throw new Error(
+      'install-gate requires Windows and the NSIS installer; run it on a clean Windows machine.',
+    );
+  }
+
   assertFile(installer, 'NSIS installer');
   rmSync(baseDir, { recursive: true, force: true });
   mkdirSync(baseDir, { recursive: true });

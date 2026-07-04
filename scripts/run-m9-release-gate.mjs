@@ -15,7 +15,14 @@ const skipInstall = args.includes('--skip-install');
 const skipBuild = args.includes('--skip-build');
 const skipReal = args.includes('--skip-real');
 const skipMounted = args.includes('--skip-mounted');
+const skipInstallGate = args.includes('--skip-install-gate');
 const noLoopbackSmb = args.includes('--no-loopback-smb');
+
+if (skipInstallGate) {
+  console.warn(
+    '[m9-release-gate] --skip-install-gate requested; release sign-off incomplete until pnpm release:install-gate passes on clean Windows.',
+  );
+}
 
 const steps = [
   { id: 'install', label: 'pnpm install', command: 'pnpm', args: ['install'], skip: skipInstall },
@@ -58,6 +65,14 @@ const steps = [
     args: ['release:verify-artifacts'],
     skip: skipBuild,
   },
+  {
+    id: 'install-gate',
+    label: 'pnpm release:install-gate',
+    command: 'pnpm',
+    args: ['release:install-gate'],
+    installGate: true,
+    skip: skipInstallGate,
+  },
 ];
 
 function shouldRun(step) {
@@ -66,6 +81,12 @@ function shouldRun(step) {
 
 function runStep(step) {
   console.log(`\n[m9-release-gate] ${step.label}`);
+  if (step.installGate && process.platform !== 'win32') {
+    console.error(
+      '[m9-release-gate] install-gate requires the Windows NSIS installer. Run this step on a clean Windows machine, or pass --skip-install-gate to mark release sign-off incomplete explicitly.',
+    );
+    process.exit(1);
+  }
   const started = Date.now();
   const { command, args } = resolveCommand(step.command, step.args);
   const result = spawnSync(command, args, {

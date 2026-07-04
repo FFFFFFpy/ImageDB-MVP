@@ -11,6 +11,12 @@ does NOT add new features. Each item was verified against real PostgreSQL
 18.4 + pgvector 0.8.3 and the real filesystem — claims are backed by tests
 that fail (not skip) when the runtime is missing.
 
+Manual acceptance note (2026-07-05): the local MVP main chain has also been
+run by hand from a fresh start through managed local PostgreSQL initialization,
+source selection, import / analysis, review, import-plan generation / freeze,
+commit, and final library directory admission. This is local main-chain
+acceptance, not final release publication.
+
 - M6.5 managed PostgreSQL runtime: the Windows release bundles its own
   PostgreSQL + pgvector runtime via Tauri resources; `lib.rs` exposes it to
   the `PostgresManager` locator via `IMAGEDB_POSTGRES_RUNTIME_DIR`. Missing
@@ -39,9 +45,17 @@ that fail (not skip) when the runtime is missing.
   persisted view. The commit page reads the frozen summary; the review page
   calls freeze (idempotent). Re-freeze returns the same summary; post-freeze
   candidate/review edits cannot change the commit set.
+- Scan completion entry: both `review_required` and `ready_to_commit` route
+  into Review / import review. Commit remains reserved for runs with an
+  already frozen plan.
 - Latest committable run: the query now prefers `ready_to_commit`, then
   resubmittable `cancelled` (no active transaction); `completed` no longer
   enters the default commit page; `recovery_required` routes to recovery.
+- Release gate status: `verify-artifacts` checks only release artifact and
+  packaged runtime presence. `install-gate` verifies NSIS install,
+  overwrite install, launch smoke, uninstall, and data retention. A clean
+  Windows release gate / install gate run is still required for release
+  sign-off.
 
 See `reports/m6_5_m9_closure.md` for the final closure report and the
 acceptance checklist in `.codex-plans/M6.5-M9-closure/checklists/`.
@@ -50,7 +64,8 @@ acceptance checklist in `.codex-plans/M6.5-M9-closure/checklists/`.
 
 - No new algorithms, no SMB protocol, no cross-platform runtime.
 - No rewrite of the transaction system.
-- No push, no remote branch, no PR, no release publication.
+- Remote branch exists for this task branch; no PR, release publication, or
+  artifact upload is recorded here.
 
 ## Prior milestones
 

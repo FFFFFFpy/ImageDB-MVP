@@ -57,11 +57,10 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   const [importRunId, setImportRunId] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Use the committable query (P0): picks up `completed`, `ready_to_commit`,
-  // and `cancelled` runs with a frozen plan, so a run cancelled before any
-  // transaction was prewritten can be re-committed from the same frozen plan
-  // instead of getting stuck at `recovery_required` with no transaction to
-  // recover.
+  // Keep this aligned with ImportRepository::get_latest_committable_run:
+  // only `ready_to_commit` and resubmittable `cancelled` runs with a frozen
+  // or consumed plan and non-empty plan_hash enter the default Commit page.
+  // `completed`, `failed`, and `recovery_required` do not.
   const latestRun = useQuery({
     queryKey: ['latestCommittableImportRun'],
     queryFn: api.getLatestCommittableImportRun,
@@ -138,8 +137,11 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
         {latestRun.isLoading && <p>正在加载可提交的导入任务…</p>}
         {!latestRun.data && !latestRun.isLoading && (
           <div className="commit-empty">
-            <p>当前没有可提交的导入任务。</p>
-            <button className="btn-primary" onClick={() => onNavigate('scan')}>
+            <p>当前没有已冻结计划的可提交任务。</p>
+            <button className="btn-primary" onClick={() => onNavigate('review')}>
+              前往审核 / 生成导入计划
+            </button>
+            <button className="btn-secondary" onClick={() => onNavigate('scan')}>
               前往扫描
             </button>
           </div>

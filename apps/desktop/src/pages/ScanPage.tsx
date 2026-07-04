@@ -84,7 +84,13 @@ export function isTerminalScanState(state: string | null | undefined): boolean {
 
 export function nextRouteForScanState(state: string | null | undefined): Route | null {
   if (state === 'review_required') return 'review';
-  if (state === 'ready_to_commit') return 'commit';
+  if (state === 'ready_to_commit') return 'review';
+  return null;
+}
+
+export function nextActionLabelForScanState(state: string | null | undefined): string | null {
+  const route = nextRouteForScanState(state);
+  if (route === 'review') return '前往入库审核';
   return null;
 }
 
@@ -205,6 +211,7 @@ export function ScanPage({ onNavigate }: ScanPageProps) {
   const displayProgress = scanEvent ?? progress;
   const isFinished = isTerminalScanState(displayProgress?.state);
   const nextRoute = nextRouteForScanState(displayProgress?.state);
+  const nextActionLabel = nextActionLabelForScanState(displayProgress?.state);
 
   return (
     <div className="scan-page">
@@ -321,9 +328,9 @@ export function ScanPage({ onNavigate }: ScanPageProps) {
 
           {isFinished && (
             <div className="scan-action-section">
-              {nextRoute && (
+              {nextRoute && nextActionLabel && (
                 <button className="btn-primary" onClick={() => onNavigate(nextRoute)}>
-                  {nextRoute === 'review' ? '前往审核' : '前往提交'}
+                  {nextActionLabel}
                 </button>
               )}
               <button

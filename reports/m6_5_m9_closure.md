@@ -34,7 +34,12 @@ Those defects are fixed and verified against real PostgreSQL 18.4 + pgvector
   "安装包不完整：缺少内置 PostgreSQL 运行文件，请重新安装 ImageDB." — it
   no longer tells the user to install PostgreSQL.
 - Release gate: `run-m9-release-gate.mjs` now runs
-  `pnpm release:verify-artifacts` after the build.
+  `pnpm release:verify-artifacts` after the build, followed by the explicit
+  `install-gate` step. `verify-artifacts` checks artifact and runtime file
+  presence only; `install-gate` is the step that validates NSIS install,
+  same-version overwrite install, launch smoke, uninstall, and data
+  retention. Non-Windows runs must fail unless `--skip-install-gate` is
+  passed explicitly, and that skip marks release sign-off incomplete.
 
 ### Real Test Fail-Fast
 
@@ -95,31 +100,48 @@ Those defects are fixed and verified against real PostgreSQL 18.4 + pgvector
   resubmittable `cancelled` (no active file transaction), ordered
   ready_to_commit-first then `started_at DESC`. `completed` no longer
   enters the default commit page; `recovery_required` routes to recovery.
+- Scan completion entry: `review_required` and `ready_to_commit` both enter
+  Review / import review. A scan result no longer jumps straight to Commit
+  before the frozen plan is created.
 - New real tests: `m9_freeze_plan_idempotent_and_summary_matches_commit_set`
   (idempotent re-freeze + summary matches commit set) and
   `m9_committable_run_prefers_ready_over_old_completed` (old completed run
   does not preempt a newer ready_to_commit run).
 
+## Manual Main-Chain Acceptance
+
+On 2026-07-05 the local MVP main chain was manually run from a fresh start
+through managed local PostgreSQL initialization, source directory selection,
+import / analysis, review, import-plan generation / freeze, commit, and
+formal admission into the local library directory.
+
+Current status: MVP main-chain local manual acceptance is complete at the
+code level. Release-grade acceptance still requires a clean Windows
+`pnpm release:gate` run, including `pnpm release:install-gate`, before
+release sign-off.
+
 ## Verification Commands
 
-| Command                         | Result | Notes                                                                                         |
-| ------------------------------- | ------ | --------------------------------------------------------------------------------------------- |
-| `pnpm install`                  | pass   |                                                                                               |
-| `pnpm format:check`             | pass   | prettier + cargo fmt clean                                                                    |
-| `pnpm typecheck`                | pass   | `tsc --noEmit`                                                                                |
-| `pnpm test:unit`                | pass   | 11 frontend tests across 3 files                                                              |
-| `pnpm rust:test`                | pass   | 191 lib tests pass (2 ignored real-db)                                                        |
-| `pnpm rust:clippy`              | pass   | `-D warnings` clean, all targets/features                                                     |
-| `pnpm rust:test:real`           | pass   | 82 real-DB tests across 16 suites (incl. 5 M9 + 24 fail-injection + 15 cancellation/recovery) |
-| `pnpm build`                    | pass   | release exe + NSIS installer built                                                            |
-| `pnpm release:verify-artifacts` | pass   | release exe, NSIS installer, and packaged runtime verified                                    |
+| Command                                    | Result | Notes                                                                                              |
+| ------------------------------------------ | ------ | -------------------------------------------------------------------------------------------------- |
+| `pnpm install`                             | pass   |                                                                                                    |
+| `pnpm format:check`                        | pass   | prettier + cargo fmt clean                                                                         |
+| `pnpm typecheck`                           | pass   | `tsc --noEmit`                                                                                     |
+| `pnpm test:unit`                           | pass   | 12 frontend tests across 3 files                                                                   |
+| `pnpm rust:test`                           | pass   | 196 lib tests pass (2 ignored real-db)                                                             |
+| `pnpm rust:clippy`                         | pass   | `-D warnings` clean, all targets/features                                                          |
+| `pnpm rust:test:real`                      | pass   | real-DB suite passed (incl. M9 main chain, diagnostics, recovery, fault injection, reconciliation) |
+| `pnpm build`                               | pass   | release exe + NSIS installer built                                                                 |
+| `pnpm release:verify-artifacts`            | pass   | release exe, NSIS installer, and packaged runtime presence verified                                |
+| `pnpm release:install-gate`                | pass   | local installer gate: install / overwrite install / launch smoke / uninstall / data retention      |
+| `pnpm release:gate -- --only=install-gate` | pass   | wrapper wiring confirmed for the new `install-gate` step                                           |
 
 `pnpm release:gate` was not run end-to-end in this session because it
 re-runs the full real suite + build (already verified individually above)
 and the Windows loopback SMB gate requires PowerShell admin elevation in
-this environment. The individual steps it composes all pass; the
-`verify-artifacts` step (newly added) passes. To run the full gate on a
-clean Windows machine: `pnpm release:gate`.
+this environment. The local install gate passed and is now part of the
+release gate; a full clean Windows `pnpm release:gate` run remains the
+release sign-off step.
 
 ## Release Artifact Check
 
@@ -137,8 +159,8 @@ clean Windows machine: `pnpm release:gate`.
   round guarantees Windows x64 only.
 - The `pnpm release:gate` end-to-end run (including the loopback SMB gate)
   was not executed in this session for the reasons noted above; the
-  composed steps pass individually. A clean-Windows full gate run remains
-  the final sign-off step.
+  clean-Windows full gate, including install-gate, remains the release
+  sign-off step.
 - The 24-hour stability run and the 1k/10k/100k performance campaigns
   from `tasks/09-release-closure.md` remain future hardening work; the
   MVP 120-image performance baseline is recorded in
@@ -157,5 +179,5 @@ d9b3e5c fix: fail real tests when postgres runtime is missing
 
 ## Push Status
 
-No push performed. No remote branch, PR, release, or artifact upload was
-created.
+Remote branch `origin/core_fix_m5_m6_refactor` exists. This report does not
+record a created PR, release, or artifact upload.

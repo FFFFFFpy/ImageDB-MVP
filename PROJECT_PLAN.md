@@ -230,9 +230,9 @@ READY
 
 ### 当前状态
 
-截至 2026-07-05，M6.5–M9 收口完成（见 `.codex-plans/M6.5-M9-closure/` 与 `reports/m6_5_m9_closure.md`）。托管 PostgreSQL runtime 打包为 Windows release 资源；真实测试缺 runtime 时 fail-fast；外部 PostgreSQL 使用统一 TLS connector；冻结计划主链（Review → freeze → Commit 读取 frozen summary）一致；可提交 run 查询优先 `ready_to_commit`；挂载目录能力门禁覆盖读写/rename/大小写/Unicode/长路径，断连不误报成功。
+截至 2026-07-05，M6.5–M9 主链本地人工验收通过（见 `.codex-plans/M6.5-M9-closure/` 与 `reports/m6_5_m9_closure.md`）：全新开始 → 初始化托管本地 PostgreSQL → 导入 / 分析 → 审核 → 生成 / 冻结导入计划 → 提交入库 → 本地目录正式入库。托管 PostgreSQL runtime 打包为 Windows release 资源；真实测试缺 runtime 时 fail-fast；外部 PostgreSQL 使用统一 TLS connector；冻结计划主链（Review → freeze → Commit 读取 frozen summary）一致；Scan 的 `ready_to_commit` 入口回到 Review 生成 / 冻结计划；可提交 run 查询优先 `ready_to_commit`；挂载目录能力门禁覆盖读写/rename/大小写/Unicode/长路径，断连不误报成功。
 
-M6.5 的干净 Windows 安装包、无预装数据库、非 ASCII 安装路径、升级、卸载和恢复行为在 M9 发布门禁中由真实测试覆盖。当前任务为 `tasks/09-release-closure.md`。
+当前状态不是最终发布完成。发布级签字仍需 clean Windows `pnpm release:gate`，其中 `verify-artifacts` 只检查构建产物和 runtime 文件存在，`install-gate` 才验证安装、覆盖安装、启动 smoke、卸载和数据保留。当前任务为 `tasks/09-release-closure.md`。
 
 ## 8. MVP 完成标准
 
