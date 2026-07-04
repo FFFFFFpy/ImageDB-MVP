@@ -1876,16 +1876,14 @@ mod tests {
 
         assert_eq!(snapshot_hash.len(), 32);
 
-        let stored_hash = ImportRepository::get_source_snapshot_hash_for_album(&client, album_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stored_hash, snapshot_hash);
-
+        // The snapshot hash lives on source_album_snapshots.snapshot_hash
+        // (single source of truth after migration 0009 dropped the
+        // redundant import_albums.source_snapshot_hash column).
         let snapshot = ImportRepository::get_source_album_snapshot(&client, album_id)
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(snapshot.snapshot_hash, snapshot_hash);
         assert_eq!(snapshot.snapshot_id, snapshot_id);
         assert_eq!(snapshot.import_run_id, import_run_id);
         assert_eq!(snapshot.import_album_id, album_id);

@@ -23,7 +23,17 @@ use crate::repositories::import_repository::{
 };
 use std::io::Read as _;
 use std::path::{Component, Path};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// P2: a global semaphore bounding the number of concurrent snapshot
+/// `spawn_blocking` tasks. Each snapshot capture + verify acquires a permit
+/// before offloading the blocking directory walk + BLAKE3 hashing, so a
+/// burst of concurrent snapshots (multi-album scan, parallel recovery) does
+/// not exhaust the blocking thread pool or saturate disk I/O. The bound is
+/// small (2) because snapshot work is I/O-heavy, not CPU-bound.
+static SNAPSHOT_CONCURRENCY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// A verification failure for a single snapshot check.
 #[derive(Debug, Clone)]
@@ -193,9 +203,35 @@ fn classify_special_entry(ft: &std::fs::FileType) -> Option<&'static str> {
 /// and devices surface as an `AppError` rather than being silently hashed
 /// or skipped. Only regular files + directories are walked.
 pub fn collect_album_files(album_path: &Path) -> Result<Vec<NewSnapshotFile>, AppError> {
-    fn walk(dir: &Path, album_path: &Path, out: &mut Vec<NewSnapshotFile>) -> Result<(), AppError> {
+    collect_album_files_with_cancel(album_path, None)
+}
+
+/// Variant that accepts an optional cancel flag (P2). The walk checks the
+/// flag before each directory entry so a snapshot of a very large album
+/// can be aborted promptly rather than walking the whole tree. The flag is
+/// `Option<&AtomicBool>` (sync) so it can be threaded through from a
+/// `spawn_blocking` task.
+pub fn collect_album_files_with_cancel(
+    album_path: &Path,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<NewSnapshotFile>, AppError> {
+    use std::sync::atomic::Ordering;
+    fn walk(
+        dir: &Path,
+        album_path: &Path,
+        out: &mut Vec<NewSnapshotFile>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), AppError> {
+        use std::sync::atomic::Ordering;
         let entries = std::fs::read_dir(dir)?;
         for entry in entries {
+            // Check cancellation before each entry so a large-album walk
+            // aborts promptly.
+            if let Some(flag) = cancelled {
+                if flag.load(Ordering::Relaxed) {
+                    return Err(AppError::Internal("snapshot walk cancelled".to_string()));
+                }
+            }
             let entry = entry?;
             let path = entry.path();
             // Use symlink_metadata so we inspect the link itself, not its
@@ -231,7 +267,7 @@ pub fn collect_album_files(album_path: &Path) -> Result<Vec<NewSnapshotFile>, Ap
                         )));
                     }
                 }
-                walk(&path, album_path, out)?;
+                walk(&path, album_path, out, cancelled)?;
             } else if ft.is_file() {
                 let relative_path = normalize_snapshot_relative_path(album_path, &path)?;
                 let metadata = std::fs::metadata(&path)?;
@@ -254,8 +290,9 @@ pub fn collect_album_files(album_path: &Path) -> Result<Vec<NewSnapshotFile>, Ap
         Ok(())
     }
     let mut files = Vec::new();
-    walk(album_path, album_path, &mut files)?;
+    walk(album_path, album_path, &mut files, cancelled)?;
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    let _ = Ordering::Relaxed;
     Ok(files)
 }
 
@@ -289,17 +326,51 @@ pub fn compute_snapshot_hash(files: &[NewSnapshotFile]) -> Vec<u8> {
 /// over potentially many large files) is isolated inside
 /// `spawn_blocking` so the async runtime worker is never held hostage by
 /// a slow snapshot.
+///
+/// P2: a global semaphore (`SNAPSHOT_CONCURRENCY`) bounds the number of
+/// concurrent snapshot tasks so a burst of albums cannot exhaust the
+/// blocking thread pool or saturate disk I/O.
 pub async fn capture_source_album_snapshot(
     client: &tokio_postgres::Client,
     import_run_id: Uuid,
     import_album_id: Uuid,
     source_album_path: &Path,
 ) -> Result<(Uuid, Vec<u8>), AppError> {
+    capture_source_album_snapshot_with_cancel(
+        client,
+        import_run_id,
+        import_album_id,
+        source_album_path,
+        None,
+    )
+    .await
+}
+
+/// Variant that accepts an optional cancel flag (P2). The flag is threaded
+/// into the blocking walk so a snapshot of a very large album can be
+/// aborted promptly.
+pub async fn capture_source_album_snapshot_with_cancel(
+    client: &tokio_postgres::Client,
+    import_run_id: Uuid,
+    import_album_id: Uuid,
+    source_album_path: &Path,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<(Uuid, Vec<u8>), AppError> {
     let album_path = source_album_path.to_path_buf();
-    // Offload the blocking directory walk + hashing to a dedicated thread.
-    let files = tokio::task::spawn_blocking(move || collect_album_files(&album_path))
+    // Acquire a concurrency permit before offloading. This bounds the
+    // number of simultaneous snapshot walks so the blocking thread pool
+    // is not exhausted by a multi-album scan or parallel recovery.
+    let _permit = SNAPSHOT_CONCURRENCY
+        .acquire()
         .await
-        .map_err(|e| AppError::Internal(format!("source album snapshot task failed: {e}")))??;
+        .map_err(|e| AppError::Internal(format!("snapshot semaphore closed: {e}")))?;
+    // Offload the blocking directory walk + hashing to a dedicated thread.
+    let cancel_for_task = cancelled.clone();
+    let files = tokio::task::spawn_blocking(move || {
+        collect_album_files_with_cancel(&album_path, cancel_for_task.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("source album snapshot task failed: {e}")))??;
     let snapshot_hash = compute_snapshot_hash(&files);
     let snapshot_id = Uuid::new_v4();
     ImportRepository::insert_source_album_snapshot(
@@ -345,6 +416,9 @@ pub async fn load_source_album_snapshot(
 /// Phase 5: the blocking directory walk + hashing is isolated inside
 /// `spawn_blocking` so the async runtime is never blocked by a large
 /// album verification.
+///
+/// P2: acquires the same `SNAPSHOT_CONCURRENCY` permit as capture so the
+/// combined snapshot load is bounded.
 pub async fn verify_source_album_snapshot(
     client: &tokio_postgres::Client,
     import_album_id: Uuid,
@@ -361,6 +435,11 @@ pub async fn verify_source_album_snapshot(
         };
     let stored_files = ImportRepository::get_snapshot_files(client, snapshot.snapshot_id).await?;
 
+    // Acquire a concurrency permit before offloading the blocking walk.
+    let _permit = SNAPSHOT_CONCURRENCY
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("snapshot semaphore closed: {e}")))?;
     // Move the blocking walk + hash off the async worker.
     let album_path = source_album_path.to_path_buf();
     let snapshot_hash = snapshot.snapshot_hash.clone();
@@ -383,6 +462,12 @@ pub async fn verify_source_snapshot_files_async(
     stored_files: Vec<SnapshotFileRecord>,
 ) -> Result<Vec<SnapshotVerifyError>, AppError> {
     let album_path = source_album_path.to_path_buf();
+    // Acquire a concurrency permit so the combined snapshot load (capture +
+    // verify across many albums) is bounded.
+    let _permit = SNAPSHOT_CONCURRENCY
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("snapshot semaphore closed: {e}")))?;
     tokio::task::spawn_blocking(move || {
         verify_source_snapshot_files(&album_path, &snapshot_hash, &stored_files)
     })

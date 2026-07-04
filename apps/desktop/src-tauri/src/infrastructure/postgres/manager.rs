@@ -986,7 +986,10 @@ mod tests {
                 .expect("current_version #1");
             // Migration 0008 (source_album_snapshots) is the current head
             // of the migration chain as of the M5/M6 core-fix round.
-            assert_eq!(version.as_deref(), Some("0008_source_album_snapshots"));
+            assert_eq!(
+                version.as_deref(),
+                Some("0009_drop_redundant_snapshot_hash")
+            );
 
             drop(client);
             handle.abort();
@@ -1012,7 +1015,10 @@ mod tests {
                 .expect("current_version #2");
             // Migration 0008 (source_album_snapshots) is the current head
             // of the migration chain as of the M5/M6 core-fix round.
-            assert_eq!(version2.as_deref(), Some("0008_source_album_snapshots"));
+            assert_eq!(
+                version2.as_deref(),
+                Some("0009_drop_redundant_snapshot_hash")
+            );
 
             drop(client2);
             handle2.abort();

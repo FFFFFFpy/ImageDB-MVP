@@ -376,34 +376,27 @@ pub async fn reconcile_import_run_state(
 
 /// Empty-plan invariant check (Phase 3).
 ///
-/// An empty frozen plan completes the run ONLY when **all** of the
-/// following hold:
+/// An empty frozen plan completes the run ONLY when there are **no**
+/// `file_transactions` rows for the run at all (commit was a genuine
+/// no-op). A run with any transaction — active, conflict, failed,
+/// cancelled, or even `source_archived` (leftover from a prior commit
+/// of a now-empty plan), or any **unparseable** state — is NOT
+/// auto-completed by an empty plan. Instead:
+/// - active/conflict/failed/cancelled → `recovery_required` (handled by
+///   the caller's `set_recovery_required` branch).
+/// - `source_archived` → falls through to the all-archived check (which
+///   is vacuously false for an empty plan, so `recovery_required`).
+/// - unparseable state → `recovery_required` (integrity error: the
+///   database cannot vouch for the transaction, so it must not be
+///   silently treated as safe).
 ///
-/// - No `conflict` transaction exists.
-/// - No active (recoverable) transaction exists.
-/// - No `failed` or `cancelled` transaction exists.
-///
-/// If any of these fail, the empty plan must NOT bypass transaction
-/// checks — the run is `recovery_required` (or stays at the user-explicit
-/// terminal state, handled by the caller).
-///
-/// `import_plan_albums` / `import_plan_images` rows are already covered by
-/// `validate_and_hash_frozen_plan` (an empty `frozen.albums` with residual
-/// rows would fail the expected_image_count check there). The transaction
-/// check below is the additional guard for file_transactions.
+/// P1 fix: previously `Err(_)` was tolerated as "safe", which let a
+/// corrupted/unknown transaction state slip through an empty plan to
+/// `completed`. Now only the empty set (no transactions) completes.
 fn empty_plan_allows_completion(
     transactions: &[crate::repositories::import_repository::FileTransactionStateRow],
 ) -> bool {
-    // No conflict / active / failed / cancelled transactions. A
-    // `source_archived` row (or any unparseable leftover) is tolerated
-    // because `source_archived` is a genuine terminal success and an
-    // unparseable row is handled at the plan-integrity layer above.
-    transactions.iter().all(|t| {
-        matches!(
-            TransactionState::parse(&t.state),
-            Ok(TransactionState::SourceArchived) | Err(_)
-        )
-    })
+    transactions.is_empty()
 }
 
 /// Transition the run to `Completed` if it isn't already, writing a stable
@@ -795,7 +788,9 @@ async fn resume_staging(
             )
             .await?;
         }
-        let actual = stream_copy_with_hash(src, &part).await?;
+        // Recovery runs to completion — no cancel token. The caller
+        // (recover_transaction) is invoked interactively by the operator.
+        let actual = stream_copy_with_hash(src, &part, None).await?;
         if actual != img.expected_blake3 {
             let _ = tokio::fs::remove_file(&part).await;
             let msg = format!("BLAKE3 mismatch recovering {}", src.display());

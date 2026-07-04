@@ -9,6 +9,8 @@ const MIGRATION_0005: &str = include_str!("../../../migrations/0005_import_plans
 const MIGRATION_0006: &str = include_str!("../../../migrations/0006_idempotency.sql");
 const MIGRATION_0007: &str = include_str!("../../../migrations/0007_transaction_links.sql");
 const MIGRATION_0008: &str = include_str!("../../../migrations/0008_source_album_snapshots.sql");
+const MIGRATION_0009: &str =
+    include_str!("../../../migrations/0009_drop_redundant_snapshot_hash.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
@@ -19,6 +21,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0006_idempotency", MIGRATION_0006),
     ("0007_transaction_links", MIGRATION_0007),
     ("0008_source_album_snapshots", MIGRATION_0008),
+    ("0009_drop_redundant_snapshot_hash", MIGRATION_0009),
 ];
 
 pub struct MigrationRunner;
@@ -113,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 8);
+        assert_eq!(MIGRATIONS.len(), 9);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
         assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
@@ -122,6 +125,7 @@ mod tests {
         assert!(MIGRATION_0006.contains("chk_import_run_state"));
         assert!(MIGRATION_0007.contains("plan_hash"));
         assert!(MIGRATION_0008.contains("source_album_snapshots"));
+        assert!(MIGRATION_0009.contains("source_snapshot_hash"));
     }
 
     #[test]
@@ -137,7 +141,8 @@ mod tests {
                 "0005_import_plans",
                 "0006_idempotency",
                 "0007_transaction_links",
-                "0008_source_album_snapshots"
+                "0008_source_album_snapshots",
+                "0009_drop_redundant_snapshot_hash"
             ]
         );
     }
