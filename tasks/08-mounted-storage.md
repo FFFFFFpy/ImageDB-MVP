@@ -1,5 +1,7 @@
 # M8：已挂载共享存储兼容
 
+> 收口复验（2026-07-05）：`probe_storage_capabilities` 覆盖读写、同目录/跨目录/目录/覆盖 rename、文件与目录 fsync、大小写、Unicode 归一化、长路径与最大文件名组件、文件锁、时间戳精度、可用空间；`classify_publish_strategy` 对任何必需能力为 `Unsupported` 的存储返回 `Unsupported`，断连/权限错误不会误报成功。真实测试 `mounted_storage_gate_library_root_disconnect_pauses_then_recovers` 与 Windows loopback SMB 门禁覆盖断连-恢复路径。详见 `reports/m6_5_m9_closure.md`。
+
 ## 1. 目标
 
 支持操作系统已经挂载的共享路径作为图库目录。应用把它视为文件系统路径，不内置 SMB 协议客户端。

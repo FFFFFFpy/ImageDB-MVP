@@ -1,5 +1,7 @@
 # M9：端到端发布收口
 
+> 收口状态（2026-07-05）：M6.5–M9 主链接通并经真实 PostgreSQL + 真实文件系统验证。冻结计划主链（Review → `freeze_import_plan` → Commit 读取 frozen summary）一致；可提交 run 查询优先 `ready_to_commit`；真实测试缺 runtime 时 fail-fast。最终验证命令与结果见 `reports/m6_5_m9_closure.md`。
+
 ## 1. 目标
 
 把已完成的数据库、扫描、审核、入库、恢复和共享存储能力收口为可安装、可升级、可诊断的 Windows MVP。
@@ -154,7 +156,12 @@ pnpm rust:test
 pnpm rust:clippy
 pnpm rust:test:real
 pnpm build
+pnpm release:gate
 ```
+
+`pnpm rust:test:real` 缺 PostgreSQL runtime 时必须失败（不得 skip）；
+`pnpm release:gate` 在构建后运行 `release:verify-artifacts` 校验打包的
+runtime 完整性。
 
 另需：
 

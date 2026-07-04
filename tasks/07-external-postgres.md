@@ -1,5 +1,7 @@
 # M7：外部 PostgreSQL 模式与迁移
 
+> 收口复验（2026-07-05）：外部连接通过 `infrastructure::postgres::external::connect_external` 路由，支持 `disable`/`require`/`verify-ca`/`verify-full` 四种 TLS 模式；预检覆盖 PG 版本（≥14）、pgvector 可用性、CREATE EXTENSION / 建表 / 建模式 / 只读 / 编码 / 时区 / 迁移版本；托管本地模式走 `NoTls` 回环、不受影响。详见 `reports/m6_5_m9_closure.md`。
+
 ## 1. 目标
 
 允许高级用户安全连接外部 PostgreSQL，并支持从托管本地数据库迁移过去。外部模式不得破坏托管数据库；迁移完成并验证前不得切换事实源。
