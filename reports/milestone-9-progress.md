@@ -1,5 +1,34 @@
 # M9 Progress Report
 
+## 2026-07-04: Public cancellation and crash recovery matrix
+
+### Implemented
+
+- Expanded the M9 public recovery integration coverage so setup, scan, plan generation, commit start, commit cancel, recovery scan, reverify, and recover all go through command-facing paths.
+- Added `m9_public_recovery_command_matrix_recovers_crash_points`, covering public recovery after injected crashes at `AfterDbWrite`, `AfterStagingCopy`, `AfterManifestWrite`, `AfterPublishRename`, and `BeforeSourceArchive`.
+- Added `m9_public_recovery_cancel_before_prewrite_leaves_committable_cancelled_run`, covering the public cancel command path before any transaction is prewritten: the run reaches `cancelled`, no recovery work is listed, and the run remains committable from the frozen plan.
+- Kept the existing `m9_public_recovery_command_path_recovers_after_staging_crash` regression, now backed by command-facing setup instead of direct scan/review service calls.
+- Marked the M9 cancellation and crash recovery public-path DoD item complete.
+
+### Modified Files
+
+- `apps/desktop/src-tauri/src/tests/m9_public_recovery_integration.rs`
+- `checklists/M9_DOD.md`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests,fail-injection --lib m9_public_recovery_ -- --ignored --test-threads=1 --nocapture`: passed, 3 tests.
+
+### Actual Runtime Result
+
+- Public cancel-before-prewrite path returned `commit cancellation requested`, reached persisted `cancelled`, listed no recoverable transactions, and kept the run discoverable through `get_latest_committable_import_run`.
+- Each public crash-point case started commit through the command path, reached `recovery_required`, listed exactly one recoverable transaction, reverified through the command path, recovered through repeated public recovery calls, ended at `source_archived`, cleared the recovery list, and left the import run `completed` with one `library_images` row.
+
+### Known Limits
+
+- The matrix uses command-facing Rust paths rather than a live WebView click harness, consistent with the main-chain gate limitation documented below.
+
 ## 2026-07-04: Public command main chain from first run to completed import
 
 ### Implemented
@@ -75,7 +104,7 @@
 
 ### Known Limits
 
-- The cancellation and crash-recovery DoD item remains open because the complete matrix is still service-level plus one public command recovery path; it has not yet been fully lifted to public command paths.
+- The cancellation/recovery matrix is now covered through public command-facing tests in addition to the broader service-level real suite.
 
 ## 2026-07-04: Installation, reinstall, uninstall, and data retention gate
 
