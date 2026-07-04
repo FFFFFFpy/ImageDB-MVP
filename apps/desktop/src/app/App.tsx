@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { Layout } from '../components/Layout';
 import { useRouter } from '../hooks/use-router';
@@ -14,6 +14,7 @@ import { SettingsPage } from '../pages/SettingsPage';
 
 export function App() {
   const { route, navigate } = useRouter();
+  const queryClient = useQueryClient();
 
   const settings = useQuery({
     queryKey: ['settings'],
@@ -24,8 +25,13 @@ export function App() {
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
   const handleOnboardingComplete = () => {
+    // Invalidate settings + database status so first_run_completed and the
+    // connected DB state are re-fetched fresh, then navigate without a full
+    // page reload (a reload would drop all in-memory React state and force
+    // the user to re-wait while the DB status poll repopulates).
+    queryClient.invalidateQueries({ queryKey: ['settings'] });
+    queryClient.invalidateQueries({ queryKey: ['database-status'] });
     navigate('dashboard');
-    window.location.reload();
   };
 
   return (

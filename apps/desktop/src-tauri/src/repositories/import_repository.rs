@@ -1274,6 +1274,29 @@ impl ImportRepository {
         Ok(row.map(|r| r.get("id")))
     }
 
+    /// Find the most recent run that the review page should load: a run in
+    /// `review_required` (undecided candidates) or `ready_to_commit` (all
+    /// decided, plan not yet committed). A freshly-finished scan leaves the
+    /// run in one of these states — never `completed` — so the review page
+    /// cannot use `get_latest_completed_run`. Picks the newest by
+    /// `started_at` so a re-scan supersedes an older review run.
+    pub async fn get_latest_reviewable_run(client: &Client) -> Result<Option<Uuid>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id FROM import_runs
+                 WHERE state IN ('review_required', 'ready_to_commit')
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query latest reviewable run: {e}"))
+            })?;
+
+        Ok(row.map(|r| r.get("id")))
+    }
+
     /// Find the most recent run that should be (re-)entered from the commit
     /// page. The default commit page must prefer a freshly-frozen
     /// `ready_to_commit` run over an older `completed` run; an old completed

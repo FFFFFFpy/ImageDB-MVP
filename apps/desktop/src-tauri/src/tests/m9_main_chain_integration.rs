@@ -203,6 +203,91 @@ async fn m9_managed_cluster_restarts_on_app_relaunch() {
     mgr.shutdown().await.unwrap();
 }
 
+/// The review page must load the run that a fresh scan leaves behind. A
+/// scan ends in `review_required` or `ready_to_commit` — never `completed` —
+/// so `get_latest_reviewable_run` is the query the review page needs.
+/// `get_latest_completed_run` would return None here and the review page
+/// would show "No Completed Import".
+#[tokio::test]
+#[ignore]
+async fn m9_review_page_finds_scan_run_via_latest_reviewable() {
+    ensure_postgres_bin();
+
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let fixture_dir = tmp.path().join("fixtures");
+    let source_root = tmp.path().join("source");
+    let album_dir = source_root.join("album_a");
+    let library_root = tmp.path().join("library");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    std::fs::create_dir_all(&library_root).unwrap();
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    write_test_png(&album_dir.join("a.png"));
+
+    let app_state = AppState::new(&app_data, fixture_dir).unwrap();
+    crate::commands::initialize_managed_database_for_state(&app_state)
+        .await
+        .unwrap();
+    crate::commands::update_settings_for_state(
+        &app_state,
+        crate::commands::SettingsDto {
+            database_mode: Some("managed".to_string()),
+            library_root: Some(library_root.display().to_string()),
+            external_host: None,
+            external_port: None,
+            external_database: None,
+            external_username: None,
+            external_tls_mode: None,
+            external_ca_cert_path: None,
+            external_client_cert_path: None,
+            external_client_key_path: None,
+            external_connect_timeout_secs: None,
+            external_query_timeout_secs: None,
+            external_profile_name: None,
+            first_run_completed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan = wait_for_scan_terminal(&app_state).await;
+    let import_run_id = uuid::Uuid::parse_str(scan.import_run_id.as_deref().unwrap()).unwrap();
+    // A fresh scan ends in ready_to_commit (no review candidates) — the
+    // reviewable-run query must find it.
+    assert!(
+        scan.state == "ready_to_commit" || scan.state == "review_required",
+        "{scan:?}"
+    );
+
+    let reviewable = crate::commands::get_latest_reviewable_import_run_for_state(&app_state)
+        .await
+        .unwrap();
+    assert_eq!(reviewable, Some(import_run_id.to_string()));
+
+    // The completed-run query must NOT find it (it's not completed yet) —
+    // that's the bug the review page used to hit.
+    let (client, handle) = {
+        let mgr = app_state.postgres_manager.lock().await;
+        mgr.connect().await.unwrap()
+    };
+    let completed: Option<uuid::Uuid> =
+        crate::repositories::import_repository::ImportRepository::get_latest_completed_run(&client)
+            .await
+            .unwrap();
+    assert!(
+        completed.is_none(),
+        "completed-run query should not find a non-completed run"
+    );
+    drop(client);
+    handle.abort();
+
+    let mut mgr = app_state.postgres_manager.lock().await;
+    mgr.shutdown().await.unwrap();
+}
+
 async fn wait_for_scan_terminal(app_state: &AppState) -> ScanProgress {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

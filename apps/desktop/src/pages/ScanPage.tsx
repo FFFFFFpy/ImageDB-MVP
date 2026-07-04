@@ -251,7 +251,7 @@ export function ScanPage({ onNavigate }: ScanPageProps) {
             <div className="scan-action-section">
               {nextRoute && (
                 <button className="btn-primary" onClick={() => onNavigate(nextRoute)}>
-                  {nextRoute === 'review' ? '鍓嶅線瀹℃牳' : '鍓嶅線鎻愪氦'}
+                  {nextRoute === 'review' ? '前往审核' : '前往提交'}
                 </button>
               )}
               <button

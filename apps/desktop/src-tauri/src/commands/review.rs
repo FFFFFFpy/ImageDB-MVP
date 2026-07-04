@@ -213,6 +213,35 @@ pub(crate) async fn get_latest_completed_import_run_for_state(
     result
 }
 
+/// Find the most recent run that the review page should load — a run in
+/// `review_required` or `ready_to_commit` (a freshly-finished scan leaves
+/// the run here, never `completed`). Returns `null` when no reviewable run
+/// exists, which the review page surfaces as "complete a scan first".
+#[tauri::command]
+pub async fn get_latest_reviewable_import_run(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    get_latest_reviewable_import_run_for_state(&state).await
+}
+
+pub(crate) async fn get_latest_reviewable_import_run_for_state(
+    state: &AppState,
+) -> Result<Option<String>, String> {
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result =
+        crate::repositories::import_repository::ImportRepository::get_latest_reviewable_run(
+            &client,
+        )
+        .await
+        .map(|opt| opt.map(|id| id.to_string()))
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
 /// Find the most recent run that can be (re-)entered from the commit page:
 /// `completed`, `ready_to_commit`, or `cancelled`. Used by the CommitPage so
 /// a run cancelled before any transaction was prewritten (P0 fix) is

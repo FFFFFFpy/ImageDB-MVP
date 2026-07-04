@@ -87,6 +87,7 @@ pub fn run() {
             commands::freeze_import_plan,
             commands::get_frozen_import_plan_summary,
             commands::get_latest_completed_import_run,
+            commands::get_latest_reviewable_import_run,
             commands::get_latest_committable_import_run,
             commands::get_image_preview,
             commands::start_import_commit,

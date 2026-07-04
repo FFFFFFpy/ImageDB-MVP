@@ -80,8 +80,8 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const runQuery = useQuery({
-    queryKey: ['latestImportRun'],
-    queryFn: () => api.getLatestCompletedImportRun(),
+    queryKey: ['latestReviewableImportRun'],
+    queryFn: () => api.getLatestReviewableImportRun(),
     enabled: !importRunId,
   });
 
