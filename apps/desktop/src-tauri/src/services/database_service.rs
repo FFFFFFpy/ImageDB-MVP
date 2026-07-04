@@ -38,9 +38,13 @@ const MIGRATION_TABLES: &[&str] = &[
     "file_operations",
     "audit_events",
     "import_plans",
+    "import_plan_albums",
     "import_plan_images",
     "source_album_snapshots",
+    "source_album_snapshot_files",
 ];
+
+const MIGRATION_SCHEMA_KINDS: &[&str] = &["constraints", "indexes"];
 
 impl DatabaseService {
     pub fn new(
@@ -212,6 +216,170 @@ impl DatabaseService {
             });
         }
         Ok(row_counts)
+    }
+
+    fn quote_ident(ident: &str) -> String {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
+
+    fn pg_verify_error(context: &str, error: tokio_postgres::Error) -> AppError {
+        AppError::Internal(format!("{context}: {error}"))
+    }
+
+    async fn table_content_fingerprint(
+        client: &tokio_postgres::Client,
+        table: &str,
+    ) -> Result<String, AppError> {
+        let columns = client
+            .query(
+                "SELECT column_name
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = $1
+                 ORDER BY ordinal_position",
+                &[&table],
+            )
+            .await
+            .map_err(|e| Self::pg_verify_error("migration content column lookup failed", e))?;
+        if columns.is_empty() {
+            return Ok("missing".to_string());
+        }
+
+        let select_cols = columns
+            .iter()
+            .map(|row| Self::quote_ident(row.get::<_, &str>("column_name")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let quoted_table = Self::quote_ident(table);
+        let sql = format!(
+            "SELECT COALESCE(md5(string_agg(row_hash, E'\\n' ORDER BY row_hash)), md5('')) AS fingerprint
+             FROM (
+                 SELECT md5(row_to_json(t)::text) AS row_hash
+                 FROM (SELECT {select_cols} FROM {quoted_table}) AS t
+             ) AS rows"
+        );
+        client
+            .query_one(&sql, &[])
+            .await
+            .map(|row| row.get::<_, String>("fingerprint"))
+            .map_err(|e| Self::pg_verify_error("migration content fingerprint query failed", e))
+    }
+
+    async fn compare_migration_content_fingerprints(
+        managed: &tokio_postgres::Client,
+        external: &tokio_postgres::Client,
+    ) -> Result<(), AppError> {
+        let mut mismatches = Vec::new();
+        for table in MIGRATION_TABLES {
+            let managed_fingerprint = Self::table_content_fingerprint(managed, table).await?;
+            let external_fingerprint = Self::table_content_fingerprint(external, table).await?;
+            if managed_fingerprint != external_fingerprint {
+                mismatches.push(format!(
+                    "{table}: managed={managed_fingerprint} external={external_fingerprint}"
+                ));
+            }
+        }
+
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Internal(format!(
+                "External migration content fingerprint verification failed: {}",
+                mismatches.join("; ")
+            )))
+        }
+    }
+
+    async fn schema_fingerprint(
+        client: &tokio_postgres::Client,
+        kind: &str,
+    ) -> Result<String, AppError> {
+        match kind {
+            "constraints" => client
+                .query_one(
+                    "SELECT COALESCE(md5(string_agg(conname || ':' || pg_get_constraintdef(c.oid), E'\n' ORDER BY conrelid::regclass::text, conname)), md5('')) AS fingerprint
+                     FROM pg_constraint c
+                     WHERE connamespace = 'public'::regnamespace
+                       AND conrelid::regclass::text = ANY($1)",
+                    &[&MIGRATION_TABLES],
+                )
+                .await
+                .map(|row| row.get::<_, String>("fingerprint"))
+                .map_err(|e| {
+                    Self::pg_verify_error("migration constraint fingerprint query failed", e)
+                }),
+            "indexes" => client
+                .query_one(
+                    "SELECT COALESCE(md5(string_agg(indexname || ':' || indexdef, E'\n' ORDER BY tablename, indexname)), md5('')) AS fingerprint
+                     FROM pg_indexes
+                     WHERE schemaname = 'public'
+                       AND tablename = ANY($1)",
+                    &[&MIGRATION_TABLES],
+                )
+                .await
+                .map(|row| row.get::<_, String>("fingerprint"))
+                .map_err(|e| Self::pg_verify_error("migration index fingerprint query failed", e)),
+            other => Err(AppError::Internal(format!(
+                "unknown schema fingerprint kind: {other}"
+            ))),
+        }
+    }
+
+    async fn compare_migration_schema_fingerprints(
+        managed: &tokio_postgres::Client,
+        external: &tokio_postgres::Client,
+    ) -> Result<(), AppError> {
+        let mut mismatches = Vec::new();
+        for kind in MIGRATION_SCHEMA_KINDS {
+            let managed_fingerprint = Self::schema_fingerprint(managed, kind).await?;
+            let external_fingerprint = Self::schema_fingerprint(external, kind).await?;
+            if managed_fingerprint != external_fingerprint {
+                mismatches.push(format!(
+                    "{kind}: managed={managed_fingerprint} external={external_fingerprint}"
+                ));
+            }
+        }
+
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Internal(format!(
+                "External migration schema fingerprint verification failed: {}",
+                mismatches.join("; ")
+            )))
+        }
+    }
+
+    async fn external_migration_read_write_smoke(
+        client: &tokio_postgres::Client,
+    ) -> Result<(), AppError> {
+        let smoke_key = "__imagedb_external_migration_smoke__";
+        client
+            .execute(
+                "INSERT INTO app_meta (key, value)
+             VALUES ($1, '{\"ok\": true}'::jsonb)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                &[&smoke_key],
+            )
+            .await
+            .map_err(|e| Self::pg_verify_error("external migration smoke write failed", e))?;
+        let ok = client
+            .query_one(
+                "SELECT value->>'ok' = 'true' FROM app_meta WHERE key = $1",
+                &[&smoke_key],
+            )
+            .await
+            .map_err(|e| Self::pg_verify_error("external migration smoke read failed", e))?
+            .get::<_, bool>(0);
+        if !ok {
+            return Err(AppError::Internal(
+                "external migration read/write smoke query returned unexpected value".to_string(),
+            ));
+        }
+        client
+            .execute("DELETE FROM app_meta WHERE key = $1", &[&smoke_key])
+            .await
+            .map_err(|e| Self::pg_verify_error("external migration smoke cleanup failed", e))?;
+        Ok(())
     }
 
     fn apply_psql_tls_env(command: &mut Command, config: &ConnectionConfig) {
@@ -1310,6 +1478,11 @@ impl DatabaseService {
         let row_counts =
             Self::compare_migration_row_counts(&managed_client, &external_client).await?;
         let all_counts_match = row_counts.iter().all(|count| count.matches);
+        let content_fingerprints_match =
+            Self::compare_migration_content_fingerprints(&managed_client, &external_client).await;
+        let schema_fingerprints_match =
+            Self::compare_migration_schema_fingerprints(&managed_client, &external_client).await;
+        let read_write_smoke = Self::external_migration_read_write_smoke(&external_client).await;
         let migration_version = MigrationRunner::current_version(&external_client).await?;
         external_handle.abort();
         managed_handle.abort();
@@ -1329,6 +1502,47 @@ impl DatabaseService {
             Self::finish_external_migration_progress(&progress_tracker, &result).await;
             return Ok(result);
         }
+        if let Err(e) = content_fingerprints_match {
+            diagnostics.push(e.to_string());
+            let result = ExternalMigrationResult {
+                switched: false,
+                backup_path: Some(backup_path.display().to_string()),
+                migration_version,
+                row_counts,
+                diagnostics,
+            };
+            Self::finish_external_migration_progress(&progress_tracker, &result).await;
+            return Ok(result);
+        }
+        diagnostics.push("External migration table content fingerprints verified".to_string());
+
+        if let Err(e) = schema_fingerprints_match {
+            diagnostics.push(e.to_string());
+            let result = ExternalMigrationResult {
+                switched: false,
+                backup_path: Some(backup_path.display().to_string()),
+                migration_version,
+                row_counts,
+                diagnostics,
+            };
+            Self::finish_external_migration_progress(&progress_tracker, &result).await;
+            return Ok(result);
+        }
+        diagnostics.push("External migration constraints and indexes verified".to_string());
+
+        if let Err(e) = read_write_smoke {
+            diagnostics.push(e.to_string());
+            let result = ExternalMigrationResult {
+                switched: false,
+                backup_path: Some(backup_path.display().to_string()),
+                migration_version,
+                row_counts,
+                diagnostics,
+            };
+            Self::finish_external_migration_progress(&progress_tracker, &result).await;
+            return Ok(result);
+        }
+        diagnostics.push("External migration read/write smoke verified".to_string());
 
         Self::set_external_migration_stage(&progress_tracker, "switch", &diagnostics).await;
         Self::check_external_migration_cancelled(
@@ -2084,6 +2298,32 @@ mod tests {
             .row_counts
             .iter()
             .any(|count| count.table == "app_meta" && count.external_rows >= 1));
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("table content fingerprints verified")),
+            "missing content verification diagnostic: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("constraints and indexes verified")),
+            "missing schema verification diagnostic: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("read/write smoke verified")),
+            "missing read/write smoke diagnostic: {:?}",
+            result.diagnostics
+        );
+        let backup_sql = std::fs::read_to_string(backup_path).expect("read backup sql");
+        assert!(backup_sql.contains("m7_migration_probe"));
 
         let (target_client, target_handle) =
             target_manager.connect().await.expect("target connect");

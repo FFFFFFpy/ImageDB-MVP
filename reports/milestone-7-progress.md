@@ -49,6 +49,12 @@ Date: 2026-07-04
   - explicitly switches back to the managed database and verifies managed pgvector connectivity;
   - restarts the external target and confirms the external probe row was not modified by fallback.
 - Hardened managed PostgreSQL startup after an external profile was active by treating `pg_ctl start` warnings with a ready/already-running log as a usable running server before continuing health checks.
+- Strengthened managed-to-external migration verification before profile switch:
+  - includes `import_plan_albums` and `source_album_snapshot_files` in migration table checks;
+  - verifies row counts and table content fingerprints across managed/external databases;
+  - verifies migrated public constraints and indexes;
+  - performs an external read/write smoke check before activation;
+  - keeps the active profile unswitched if any verification step fails.
 
 ## Commits
 
@@ -64,6 +70,7 @@ Date: 2026-07-04
 - External-unreachable managed fallback diagnostics implemented in the current M7 update.
 - Empty external PostgreSQL preflight and initialization coverage implemented in the current M7 update.
 - External-unreachable controlled managed fallback real coverage implemented in the current M7 update.
+- Managed-to-external backup and verification hardening implemented in the current M7 update.
 
 ## Commands run
 
@@ -83,6 +90,14 @@ Date: 2026-07-04
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml external_unreachable_diagnostics_points_to_controlled_managed_fallback`
 - `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_external_empty_database_ -- --ignored --nocapture --test-threads=1`
 - `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_external_unreachable_fallback_switches_to_managed_without_touching_external -- --ignored --nocapture --test-threads=1`
+- `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_migrate_managed_to_external_ -- --ignored --nocapture --test-threads=1`
+- `pnpm typecheck`
+- `pnpm test:unit`
+- `pnpm rust:test`
+- `pnpm rust:clippy`
+- `pnpm build`
+- `pnpm rust:test:real`
+- `Start-Process apps/desktop/src-tauri/target/release/imagedb-desktop.exe`
 
 ## Test result summary
 
@@ -99,6 +114,9 @@ Date: 2026-07-04
 - External-unreachable fallback diagnostics unit test passed.
 - Empty external PostgreSQL preflight/initialization test passed.
 - External-unreachable controlled managed fallback real test passed.
+- Managed-to-external migration real test passed with backup SQL inspection, row count checks, content fingerprint diagnostics, constraints/index diagnostics, and read/write smoke diagnostics.
+- Tauri release build passed and produced `apps/desktop/src-tauri/target/release/imagedb-desktop.exe`.
+- Release executable launch smoke passed: the process started and stayed running for 10 seconds before being stopped.
 
 ## Actual runtime result
 
@@ -113,11 +131,12 @@ Date: 2026-07-04
 - When an active external profile is unreachable, `get_state` now reports a diagnostic instructing the user to use the controlled switch-to-managed action without modifying external data.
 - A real empty external PostgreSQL target preflighted with all required capability checks passing, then `initialize_external` created pgvector, applied migrations through `0009_drop_redundant_snapshot_hash`, created `app_meta`, switched the active mode to external, and persisted only non-secret external profile metadata.
 - A real external target was activated, shut down, reported as unreachable with controlled fallback diagnostics, explicitly switched back to the managed database, then restarted with its external `app_meta` probe row intact.
+- The real managed-to-external migration wrote a SQL backup containing the seeded `m7_migration_probe`, imported it into a real external target, verified row counts, table content fingerprints, constraints/indexes, and external read/write access, then switched the active profile only after those checks passed.
+- The release executable at `apps/desktop/src-tauri/target/release/imagedb-desktop.exe` launched successfully and remained alive for the smoke window.
 
 ## Known remaining M7 gaps
 
 - Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, row-count mismatch, preflight cancellation, and running child-process cancellation.
-- Managed-to-external migration creates a backup and verifies key table row counts before switching, but the broader task wording still calls for final audit of constraints, indexes, key hashes, and settings/library transaction records before the migration verification DoD is closed.
 - GUI migration/profile controls exist for connection testing, migration progress, cancellation, diagnostics, row-count reports, active profile display, and controlled switch back to managed; a final GUI audit is still needed before the GUI DoD item is closed.
 
 M7 is not closed yet. `CURRENT_TASK.md` should remain on `tasks/07-external-postgres.md` until these gaps are resolved.
