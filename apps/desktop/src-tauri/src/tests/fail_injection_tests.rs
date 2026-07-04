@@ -9,10 +9,19 @@
 //!   IMAGEDB_POSTGRES_BIN=/path/to/pgsql/bin cargo test --manifest-path \
 //!       apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests \
 //!       --lib fail_injection_ -- --ignored --test-threads=1
+//!
+//! Mounted storage gate:
+//!   IMAGEDB_POSTGRES_BIN=/path/to/pgsql/bin \
+//!   IMAGEDB_MOUNTED_LIBRARY_ROOT=/already-mounted/share \
+//!   cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml \
+//!       --features fail-injection,real-db-tests --lib \
+//!       mounted_storage_gate_library_root_disconnect_pauses_then_recovers \
+//!       -- --ignored --test-threads=1
 #![cfg(test)]
 #![cfg(feature = "fail-injection")]
 use crate::domain::import_state::{DecodeState, ImportImageState};
 use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+use crate::infrastructure::storage_capabilities::{probe_storage_capabilities, PublishStrategy};
 use crate::repositories::import_repository::{ImportRepository, NewImportImage};
 use crate::services::commit_service::{self, COMMIT_MARKER_FILE_NAME};
 use crate::services::recovery_service;
@@ -37,10 +46,23 @@ async fn setup_full_env() -> (
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
+    setup_full_env_with_roots(None, None).await
+}
+
+async fn setup_full_env_with_roots(
+    source_root_override: Option<std::path::PathBuf>,
+    library_root_override: Option<std::path::PathBuf>,
+) -> (
+    TempDir,
+    Arc<Mutex<PostgresManager>>,
+    Uuid,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let tmp = TempDir::new().unwrap();
     let app_data = tmp.path().join("app_data");
-    let source_root = tmp.path().join("source");
-    let library_root = tmp.path().join("library");
+    let source_root = source_root_override.unwrap_or_else(|| tmp.path().join("source"));
+    let library_root = library_root_override.unwrap_or_else(|| tmp.path().join("library"));
     let album_path = source_root.join("album_a");
     std::fs::create_dir_all(&library_root).unwrap();
     std::fs::create_dir_all(&album_path).unwrap();
@@ -416,6 +438,94 @@ async fn fail_injection_library_root_disconnect_pauses_then_recovers() {
     assert_recovered(pg.clone(), &lib_root).await;
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn mounted_storage_gate_library_root_disconnect_pauses_then_recovers() {
+    let mounted_base = std::env::var_os("IMAGEDB_MOUNTED_LIBRARY_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("IMAGEDB_MOUNTED_LIBRARY_ROOT must point to an already-mounted SMB/NAS/shared storage directory");
+    assert!(
+        mounted_base.is_dir(),
+        "IMAGEDB_MOUNTED_LIBRARY_ROOT must be an existing directory, got {}",
+        mounted_base.display()
+    );
+
+    let run_suffix = Uuid::new_v4();
+    let lib_root = mounted_base.join(format!(".imagedb-m8-library-{run_suffix}"));
+    let source_root = std::env::var_os("IMAGEDB_MOUNTED_SOURCE_ROOT")
+        .map(std::path::PathBuf::from)
+        .map(|base| {
+            assert!(
+                base.is_dir(),
+                "IMAGEDB_MOUNTED_SOURCE_ROOT must be an existing directory, got {}",
+                base.display()
+            );
+            base.join(format!(".imagedb-m8-source-{run_suffix}"))
+        });
+
+    std::fs::create_dir_all(&lib_root).unwrap();
+    let capabilities = probe_storage_capabilities(&lib_root);
+    assert_ne!(
+        capabilities.publish_strategy,
+        PublishStrategy::Unsupported,
+        "mounted library root must be writable and recoverable; reasons: {:?}",
+        capabilities.strategy_reasons
+    );
+
+    let (_tmp, pg, run_id, lib_root, _album) =
+        setup_full_env_with_roots(source_root.clone(), Some(lib_root.clone())).await;
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::AfterDbWrite,
+    )
+    .await;
+
+    let tx_id: Uuid = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let id: Uuid = client
+            .query_one(
+                "SELECT id FROM file_transactions ORDER BY started_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        handle.abort();
+        id
+    };
+
+    let disconnected_root = lib_root.with_extension("offline");
+    std::fs::rename(&lib_root, &disconnected_root).unwrap();
+
+    let paused = recovery_service::recover_transaction(pg.clone(), tx_id)
+        .await
+        .expect("recovery should pause cleanly while the mounted library root is disconnected");
+    assert_eq!(paused.final_state, "staging");
+    assert!(!paused.recovered);
+    assert!(
+        paused.message.contains("recovery paused"),
+        "expected mounted-root pause message, got {}",
+        paused.message
+    );
+
+    std::fs::rename(&disconnected_root, &lib_root).unwrap();
+    drive_recovery(pg.clone(), run_id).await;
+    assert_recovered(pg.clone(), &lib_root).await;
+
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+    if let Some(source_root) = source_root {
+        let _ = std::fs::remove_dir_all(source_root);
+    }
+    let _ = std::fs::remove_dir_all(lib_root);
 }
 
 #[tokio::test]

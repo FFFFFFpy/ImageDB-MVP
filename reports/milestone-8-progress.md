@@ -445,3 +445,32 @@
 ### 已知限制
 
 - 真实 SMB/NAS 挂载路径测试仍需一个实际挂载共享目录。
+
+## 2026-07-04: Mounted shared-storage gate harness
+
+### 实现内容
+
+- 新增真实挂载共享存储门槛测试 `mounted_storage_gate_library_root_disconnect_pauses_then_recovers`。
+- 该测试必须显式提供 `IMAGEDB_MOUNTED_LIBRARY_ROOT`，并在该已挂载目录下创建唯一 library root；可选提供 `IMAGEDB_MOUNTED_SOURCE_ROOT` 让 source root 也落在挂载目录下。
+- 测试会先对挂载 library root 执行 `StorageCapabilities` 探测，若发布策略为 `Unsupported` 则失败。
+- 测试流程覆盖：真实 PostgreSQL + 挂载路径 library root → commit 在 `AfterDbWrite` 中断 → 将 library root 重命名为 offline 模拟挂载点不可见 → Recovery 必须暂停且保持 `staging/recovery_required` → 恢复路径 → Recovery 收敛到 `source_archived` 并校验 DB/文件一致。
+- 该测试被标记为 `#[ignore]`，避免没有真实挂载环境时误报通过。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib --no-run mounted_storage_gate_library_root_disconnect_pauses_then_recovers`
+
+### 实际运行结果
+
+- 当前工作机仍无可用 SMB/NAS 挂载路径：`Get-SmbMapping` 未返回映射，`Get-PSDrive -PSProvider FileSystem` 仅显示本地 `C:` 和 `D:`。
+- 因此真实挂载共享存储故障门槛尚未运行通过，`checklists/M8_DOD.md` 中“真实挂载共享存储故障测试通过”保持未勾选。
+
+### 已知限制
+
+- 该 harness 依赖操作者提供真实已挂载共享目录。未提供 `IMAGEDB_MOUNTED_LIBRARY_ROOT` 时测试会失败并说明所需环境。
+- 当前故障动作以重命名测试专用 library root 模拟挂载路径不可见；物理断网/重新挂载仍需要在真实 SMB/NAS 环境中人工配合执行。
