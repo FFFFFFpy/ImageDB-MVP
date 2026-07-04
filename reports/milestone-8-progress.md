@@ -165,3 +165,33 @@
 
 - 当前路径长度阈值为应用级保守限制，不等同于每个文件系统的精确最大路径能力。
 - 断连/只读/空间不足恢复、保守发布故障注入门禁和真实挂载共享存储故障测试仍未完成。
+
+## 2026-07-04: Recovery storage reprobe guard
+
+### 实现内容
+
+- Recovery 在执行 active transaction 动作前重新探测当前图库根 `StorageCapabilities`。
+- 若重探测结果为 `Unsupported`，Recovery 暂停并保持原 transaction 中间态，只写入 `last_error` 诊断；不把断连、只读或挂载不可写误写成完成。
+- 对需要继续写入 staging / publish 的恢复状态估算本次写入字节数，并在可用空间不足或空间无法验证时暂停恢复。
+- Recovery staging 分支遇到 source file 当前不可见时，保持 `staging` 状态并提示 reconnect 后重试，不再直接落为 `failed` 终态。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/services/recovery_service.rs`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml recovery_service::tests::`：9 passed。
+
+### 实际运行结果
+
+- 单元测试验证 Unsupported 的库根重探测会暂停恢复并保留 volume identity 诊断。
+- 单元测试验证可用空间小于预计恢复写入量时会暂停恢复。
+- 恢复分支现在把“source 当前不可见”视为可重试断连/挂载不可见状态，不会生成虚假完成，也不会把 transaction 变成不可恢复终态。
+
+### 已知限制
+
+- 当前实现会重新探测并记录 volume identity，但尚未把初始 volume identity 持久化到事务行，因此还不能严格证明“同一路径重新挂载到不同设备”。
+- 真实 SMB/NAS 人工断连、重新挂载、Recovery 收敛门禁尚未执行。

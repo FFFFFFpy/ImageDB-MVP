@@ -16,6 +16,9 @@ use crate::domain::import_state::ImportRunState;
 use crate::domain::state_machine::{self, FileOpState, TransactionState};
 use crate::error::AppError;
 use crate::infrastructure::postgres::PostgresManager;
+use crate::infrastructure::storage_capabilities::{
+    probe_storage_capabilities, CapabilityProbe, PublishStrategy as StoragePublishStrategy,
+};
 use crate::repositories::import_repository::{
     FileTransactionFullRow, ImportRepository, PlanImageRow,
 };
@@ -622,6 +625,13 @@ async fn recover_active_transaction(
         ImportRepository::get_library_root_path(client, library_root_id).await?;
     let library_root = PathBuf::from(&library_root_path);
     let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
+
+    if let Some(msg) = recovery_storage_preflight(&library_root, current, &plan_images) {
+        ImportRepository::update_file_transaction_state(client, tx.id, &current, Some(&msg))
+            .await?;
+        return Ok((current.to_string(), false, msg));
+    }
+
     let lease_owner = format!("imagedb-recovery-{}", Uuid::new_v4());
     let lease_token = Uuid::new_v4();
     ImportRepository::acquire_library_root_lease(
@@ -783,15 +793,18 @@ async fn resume_staging(
 
         let src = Path::new(&img.source_path);
         if !src.exists() {
-            let msg = format!("source file missing during recovery: {}", src.display());
+            let msg = format!(
+                "source file unavailable during recovery: {}; keeping transaction in staging so recovery can retry after reconnect",
+                src.display()
+            );
             ImportRepository::update_file_transaction_state(
                 client,
                 tx.id,
-                &TransactionState::Failed,
+                &TransactionState::Staging,
                 Some(&msg),
             )
             .await?;
-            return Ok((TransactionState::Failed.to_string(), false, msg));
+            return Ok((TransactionState::Staging.to_string(), false, msg));
         }
 
         let op_id = ops
@@ -860,6 +873,88 @@ async fn resume_staging(
         true,
         "staging resumed and verified; call recovery again to publish".to_string(),
     ))
+}
+
+fn recovery_storage_preflight(
+    library_root: &Path,
+    current: TransactionState,
+    plan_images: &[PlanImageRow],
+) -> Option<String> {
+    let capabilities = probe_storage_capabilities(library_root);
+    let required_bytes = estimated_recovery_write_bytes(current, plan_images);
+    let available_space = fs2::available_space(library_root);
+    recovery_storage_preflight_message(
+        library_root,
+        capabilities.publish_strategy,
+        &capabilities.strategy_reasons,
+        &capabilities.volume_identity,
+        required_bytes,
+        available_space,
+    )
+}
+
+fn estimated_recovery_write_bytes(current: TransactionState, plan_images: &[PlanImageRow]) -> u64 {
+    let image_bytes = plan_images
+        .iter()
+        .map(|img| img.expected_file_size.max(0) as u64)
+        .fold(0u64, u64::saturating_add);
+
+    match current {
+        TransactionState::Planned
+        | TransactionState::Staging
+        | TransactionState::Verifying
+        | TransactionState::Verified
+        | TransactionState::Publishing => image_bytes.saturating_add(1024 * 1024),
+        _ => 0,
+    }
+}
+
+fn recovery_storage_preflight_message(
+    library_root: &Path,
+    publish_strategy: StoragePublishStrategy,
+    strategy_reasons: &[String],
+    volume_identity: &CapabilityProbe,
+    required_bytes: u64,
+    available_space: std::io::Result<u64>,
+) -> Option<String> {
+    let volume = format!(
+        "volume_identity={:?}: {}",
+        volume_identity.status, volume_identity.detail
+    );
+
+    if publish_strategy == StoragePublishStrategy::Unsupported {
+        return Some(format!(
+            "recovery paused: library root '{}' is not currently usable after storage reprobe ({}; {})",
+            library_root.display(),
+            strategy_reasons.join("; "),
+            volume
+        ));
+    }
+
+    if required_bytes > 0 {
+        match available_space {
+            Ok(free) if free < required_bytes => {
+                return Some(format!(
+                    "recovery paused: insufficient free space at '{}' after storage reprobe (required at least {} bytes, available {} bytes; {})",
+                    library_root.display(),
+                    required_bytes,
+                    free,
+                    volume
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Some(format!(
+                    "recovery paused: free space could not be verified at '{}' after storage reprobe: {} ({})",
+                    library_root.display(),
+                    e,
+                    volume
+                ));
+            }
+        }
+    }
+
+    None
 }
 
 pub(crate) async fn hash_file(path: &Path) -> Result<Vec<u8>, AppError> {
@@ -2017,6 +2112,7 @@ async fn resume_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::storage_capabilities::{CapabilityProbe, CapabilityStatus};
     use crate::services::commit_service::validate_plan_image_sources;
 
     fn img(source_path: &str, source_rel: &str, target_rel: &str) -> PlanImageRow {
@@ -2105,6 +2201,52 @@ mod tests {
                 Path::new("/src/albuma")
             ));
         }
+    }
+
+    #[test]
+    fn recovery_storage_preflight_pauses_unsupported_root() {
+        let identity = CapabilityProbe {
+            status: CapabilityStatus::Unknown,
+            detail: "volume unavailable".to_string(),
+        };
+        let reasons = vec!["writable is Unsupported".to_string()];
+        let msg = recovery_storage_preflight_message(
+            Path::new("Z:/library"),
+            StoragePublishStrategy::Unsupported,
+            &reasons,
+            &identity,
+            0,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "mount missing",
+            )),
+        )
+        .expect("unsupported root must pause recovery");
+
+        assert!(msg.contains("recovery paused"));
+        assert!(msg.contains("writable is Unsupported"));
+        assert!(msg.contains("volume_identity=Unknown"));
+    }
+
+    #[test]
+    fn recovery_storage_preflight_pauses_when_space_is_short() {
+        let identity = CapabilityProbe {
+            status: CapabilityStatus::Supported,
+            detail: "dev=1; ino=2".to_string(),
+        };
+        let msg = recovery_storage_preflight_message(
+            Path::new("/library"),
+            StoragePublishStrategy::ConservativeMounted,
+            &[],
+            &identity,
+            4096,
+            Ok(128),
+        )
+        .expect("insufficient space must pause recovery");
+
+        assert!(msg.contains("insufficient free space"));
+        assert!(msg.contains("required at least 4096 bytes"));
+        assert!(msg.contains("available 128 bytes"));
     }
 
     #[test]
