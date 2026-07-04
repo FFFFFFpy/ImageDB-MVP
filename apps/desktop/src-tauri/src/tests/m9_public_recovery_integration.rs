@@ -9,10 +9,7 @@ const COMMAND_TIMEOUT_SECS: u64 = 90;
 #[tokio::test]
 #[ignore]
 async fn m9_public_recovery_command_path_recovers_after_staging_crash() {
-    if !ensure_postgres_bin() {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
-        return;
-    }
+    ensure_postgres_bin();
 
     let fixture = PublicRecoveryFixture::new().await;
     let app_state = &fixture.app_state;
@@ -108,10 +105,7 @@ async fn m9_public_recovery_command_path_recovers_after_staging_crash() {
 #[tokio::test]
 #[ignore]
 async fn m9_public_recovery_command_matrix_recovers_crash_points() {
-    if !ensure_postgres_bin() {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
-        return;
-    }
+    ensure_postgres_bin();
 
     for fault in [
         crate::tests::fail_injection::CommitFaultPoint::AfterDbWrite,
@@ -149,10 +143,7 @@ async fn m9_public_recovery_command_matrix_recovers_crash_points() {
 #[tokio::test]
 #[ignore]
 async fn m9_public_recovery_cancel_before_prewrite_leaves_committable_cancelled_run() {
-    if !ensure_postgres_bin() {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
-        return;
-    }
+    ensure_postgres_bin();
 
     let fixture = PublicRecoveryFixture::new().await;
     let app_state = &fixture.app_state;
@@ -403,5 +394,15 @@ fn ensure_postgres_bin() -> bool {
         std::env::set_var("IMAGEDB_POSTGRES_BIN", candidate);
         return true;
     }
-    false
+    panic!(
+        "IMAGEDB_POSTGRES_BIN is not set and no bundled test PostgreSQL was found.\n\
+         Expected one of:\n  \
+           - IMAGEDB_POSTGRES_BIN env var pointing at a pgsql/bin directory\n  \
+           - {} containing postgres.exe\n\
+         Run `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime, or\n\
+         set IMAGEDB_POSTGRES_BIN to a local PostgreSQL 18.x bin directory.\n\
+         (candidate checked: {})",
+        candidate.display(),
+        candidate.display()
+    );
 }

@@ -3368,8 +3368,15 @@ mod tests {
             .unwrap_or_default()
             .is_empty()
         {
-            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real commit integration test");
-            return;
+            // Fail-fast: a real-DB test that skips when the runtime is missing
+            // reports green without exercising the real commit pipeline.
+            // See the M6.5-M9 closure plan: real tests must fail, not skip.
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real commit integration test. \
+                 Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run \
+                 `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime \
+                 at .local/db-tools/postgresql-18.4/pgsql/bin."
+            );
         }
 
         let tmp = TempDir::new().unwrap();

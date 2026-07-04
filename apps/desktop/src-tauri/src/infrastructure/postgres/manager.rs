@@ -1127,8 +1127,12 @@ mod tests {
         let _bin_dir = match std::env::var("IMAGEDB_POSTGRES_BIN") {
             Ok(v) if !v.is_empty() => v,
             _ => {
-                eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real PostgreSQL lifecycle test");
-                return;
+                panic!(
+                    "IMAGEDB_POSTGRES_BIN is not set; cannot run the real PostgreSQL lifecycle test. \
+                     Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run \
+                     `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime \
+                     at .local/db-tools/postgresql-18.4/pgsql/bin."
+                );
             }
         };
 
@@ -1220,11 +1224,12 @@ mod tests {
             .join("windows-x86_64")
             .join("postgres-runtime");
         if !packaged_runtime.join("bin").join("postgres.exe").is_file() {
-            eprintln!(
-                "packaged postgres-runtime not found at {}; run `pnpm release:runtime` first; skipping",
+            panic!(
+                "Packaged postgres-runtime not found at {} (missing bin/postgres.exe). \
+                 Run `node scripts/package-postgres-runtime.mjs` to build it before running the \
+                 clean-bootstrap test.",
                 packaged_runtime.display()
             );
-            return;
         }
 
         // SAFETY: this is an #[ignore] real-db test run with

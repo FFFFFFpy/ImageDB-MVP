@@ -352,8 +352,9 @@ async fn real_protocol_tampered_plan_hash_rejected() {
         .unwrap_or_default()
         .is_empty()
     {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping tampered plan test");
-        return;
+        panic!(
+            "IMAGEDB_POSTGRES_BIN is not set; cannot run the real protocol integration test.              Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run              `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime              at .local/db-tools/postgresql-18.4/pgsql/bin."
+        );
     }
     let tmp = TempDir::new().unwrap();
     let app_data = tmp.path().join("app_data");
@@ -542,8 +543,9 @@ async fn real_protocol_cross_album_and_history_duplicates() {
         .unwrap_or_default()
         .is_empty()
     {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping cross-album test");
-        return;
+        panic!(
+            "IMAGEDB_POSTGRES_BIN is not set; cannot run the real protocol integration test.              Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run              `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime              at .local/db-tools/postgresql-18.4/pgsql/bin."
+        );
     }
     let tmp = TempDir::new().unwrap();
     let app_data = tmp.path().join("app_data");
@@ -697,8 +699,9 @@ async fn real_protocol_manifest_path_is_published() {
         .unwrap_or_default()
         .is_empty()
     {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping manifest path test");
-        return;
+        panic!(
+            "IMAGEDB_POSTGRES_BIN is not set; cannot run the real protocol integration test.              Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run              `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime              at .local/db-tools/postgresql-18.4/pgsql/bin."
+        );
     }
     let tmp = TempDir::new().unwrap();
     let app_data = tmp.path().join("app_data");

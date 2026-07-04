@@ -9,10 +9,7 @@ use tempfile::TempDir;
 #[tokio::test]
 #[ignore]
 async fn m9_public_command_main_chain_first_run_to_completed_import() {
-    if !ensure_postgres_bin() {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
-        return;
-    }
+    ensure_postgres_bin();
 
     let tmp = TempDir::new().unwrap();
     let app_data = tmp.path().join("app_data");
@@ -245,7 +242,22 @@ fn ensure_postgres_bin() -> bool {
         std::env::set_var("IMAGEDB_POSTGRES_BIN", candidate);
         return true;
     }
-    false
+    // Fail-fast: this is a real-DB test gated behind #[ignore] and run via
+    // `pnpm rust:test:real` (or `--ignored`). Skipping here would let the
+    // suite report green without exercising the real PostgreSQL chain, which
+    // is exactly the false-pass the closure plan forbids. Point the operator
+    // at the exact file we expected so they can fix the environment.
+    panic!(
+        "IMAGEDB_POSTGRES_BIN is not set and no bundled test PostgreSQL was found.\n\
+         Expected one of:\n  \
+           - IMAGEDB_POSTGRES_BIN env var pointing at a pgsql/bin directory\n  \
+           - {} containing postgres.exe\n\
+         Run `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime, or\n\
+         set IMAGEDB_POSTGRES_BIN to a local PostgreSQL 18.x bin directory.\n\
+         (candidate checked: {})",
+        candidate.display(),
+        candidate.display()
+    );
 }
 
 /// Verifies the M9 frozen-plan main-chain invariants that the closure plan
@@ -259,10 +271,7 @@ fn ensure_postgres_bin() -> bool {
 #[tokio::test]
 #[ignore]
 async fn m9_freeze_plan_idempotent_and_summary_matches_commit_set() {
-    if !ensure_postgres_bin() {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
-        return;
-    }
+    ensure_postgres_bin();
 
     let tmp = TempDir::new().unwrap();
     let app_data = tmp.path().join("app_data");
@@ -391,10 +400,7 @@ async fn m9_freeze_plan_idempotent_and_summary_matches_commit_set() {
 #[tokio::test]
 #[ignore]
 async fn m9_committable_run_prefers_ready_over_old_completed() {
-    if !ensure_postgres_bin() {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
-        return;
-    }
+    ensure_postgres_bin();
 
     let tmp = TempDir::new().unwrap();
     let app_data = tmp.path().join("app_data");

@@ -41,6 +41,7 @@ const steps = [
     command: 'pnpm',
     args: ['rust:test:real'],
     skip: skipReal,
+    needsPostgresBin: true,
   },
   {
     id: 'performance',

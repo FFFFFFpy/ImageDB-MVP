@@ -13,10 +13,7 @@ const COMMAND_TIMEOUT_SECS: u64 = 180;
 #[tokio::test]
 #[ignore]
 async fn m9_performance_gate_records_thresholds() {
-    if !ensure_postgres_bin() {
-        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
-        return;
-    }
+    ensure_postgres_bin();
 
     let image_count = std::env::var("IMAGEDB_M9_PERF_IMAGE_COUNT")
         .ok()
@@ -233,5 +230,15 @@ fn ensure_postgres_bin() -> bool {
         std::env::set_var("IMAGEDB_POSTGRES_BIN", candidate);
         return true;
     }
-    false
+    panic!(
+        "IMAGEDB_POSTGRES_BIN is not set and no bundled test PostgreSQL was found.\n\
+         Expected one of:\n  \
+           - IMAGEDB_POSTGRES_BIN env var pointing at a pgsql/bin directory\n  \
+           - {} containing postgres.exe\n\
+         Run `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime, or\n\
+         set IMAGEDB_POSTGRES_BIN to a local PostgreSQL 18.x bin directory.\n\
+         (candidate checked: {})",
+        candidate.display(),
+        candidate.display()
+    );
 }

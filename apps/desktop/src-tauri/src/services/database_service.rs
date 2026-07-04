@@ -1747,8 +1747,9 @@ mod tests {
             .filter(|v| !v.trim().is_empty())
             .is_none()
         {
-            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real external empty init test");
-            return;
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real external PostgreSQL test.                  Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run                  `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime                  at .local/db-tools/postgresql-18.4/pgsql/bin."
+            );
         }
 
         use crate::infrastructure::postgres::PostgresManager;
@@ -1873,8 +1874,9 @@ mod tests {
             .filter(|v| !v.trim().is_empty())
             .is_none()
         {
-            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real external fallback test");
-            return;
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real external PostgreSQL test.                  Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run                  `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime                  at .local/db-tools/postgresql-18.4/pgsql/bin."
+            );
         }
 
         use crate::infrastructure::postgres::PostgresManager;
@@ -2019,8 +2021,9 @@ mod tests {
             .filter(|v| !v.trim().is_empty())
             .is_none()
         {
-            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real external upgrade test");
-            return;
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real external PostgreSQL test.                  Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run                  `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime                  at .local/db-tools/postgresql-18.4/pgsql/bin."
+            );
         }
 
         use crate::infrastructure::postgres::PostgresManager;
@@ -2132,8 +2135,9 @@ mod tests {
             .filter(|v| !v.trim().is_empty())
             .is_none()
         {
-            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real future migration test");
-            return;
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real external PostgreSQL test.                  Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run                  `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime                  at .local/db-tools/postgresql-18.4/pgsql/bin."
+            );
         }
 
         use crate::infrastructure::postgres::PostgresManager;
@@ -2220,8 +2224,9 @@ mod tests {
             .filter(|v| !v.trim().is_empty())
             .is_none()
         {
-            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real external migration test");
-            return;
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real external PostgreSQL test.                  Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run                  `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime                  at .local/db-tools/postgresql-18.4/pgsql/bin."
+            );
         }
 
         use crate::infrastructure::postgres::PostgresManager;

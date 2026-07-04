@@ -10,6 +10,23 @@ if (!env.IMAGEDB_POSTGRES_BIN && existsSync(defaultPgBin)) {
   env.IMAGEDB_POSTGRES_BIN = defaultPgBin;
 }
 
+// Fail-fast: if no PostgreSQL runtime is available, the real-DB tests would
+// either panic (most do now) or — for any that still skip — silently report
+// green without exercising the chain. The closure plan forbids the latter,
+// so refuse to run at all and tell the operator exactly what is missing.
+if (!env.IMAGEDB_POSTGRES_BIN) {
+  console.error(
+    `[real-rust] ABORT: IMAGEDB_POSTGRES_BIN is not set and no packaged runtime was found at\n` +
+      `  ${defaultPgBin}\n` +
+      `Real-DB tests cannot run without a PostgreSQL 18.x runtime. Run one of:\n` +
+      `  - node scripts/package-postgres-runtime.mjs   (build the packaged runtime)\n` +
+      `  - set IMAGEDB_POSTGRES_BIN=<path-to-pgsql-bin>\n`,
+  );
+  process.exit(1);
+} else {
+  console.log(`[real-rust] using PostgreSQL runtime: ${env.IMAGEDB_POSTGRES_BIN}`);
+}
+
 const cargoManifest = 'apps/desktop/src-tauri/Cargo.toml';
 const cargoCommand = 'cargo';
 const suites = [
