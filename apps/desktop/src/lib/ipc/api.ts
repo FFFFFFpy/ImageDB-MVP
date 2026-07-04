@@ -98,6 +98,12 @@ export const api = {
   generateImportPlan: (importRunId: string) =>
     invoke<ImportPlan>('generate_import_plan', { importRunId }),
 
+  freezeImportPlan: (importRunId: string) =>
+    invoke<ImportPlan>('freeze_import_plan', { importRunId }),
+
+  getFrozenImportPlanSummary: (importRunId: string) =>
+    invoke<ImportPlan | null>('get_frozen_import_plan_summary', { importRunId }),
+
   getLatestCompletedImportRun: () => invoke<string | null>('get_latest_completed_import_run'),
 
   getLatestCommittableImportRun: () => invoke<string | null>('get_latest_committable_import_run'),

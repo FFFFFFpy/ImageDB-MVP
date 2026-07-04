@@ -247,3 +247,227 @@ fn ensure_postgres_bin() -> bool {
     }
     false
 }
+
+/// Verifies the M9 frozen-plan main-chain invariants that the closure plan
+/// calls out:
+/// - `freeze_import_plan` is idempotent — a second freeze returns the same
+///   plan summary without creating duplicate plan rows.
+/// - The commit page's frozen summary matches the plan the commit service
+///   actually consumes (no dynamic re-derivation).
+/// - An old `completed` run does not preempt a newer `ready_to_commit` run
+///   on the default commit page (the `completed_at DESC` bug).
+#[tokio::test]
+#[ignore]
+async fn m9_freeze_plan_idempotent_and_summary_matches_commit_set() {
+    if !ensure_postgres_bin() {
+        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let fixture_dir = tmp.path().join("fixtures");
+    let source_root = tmp.path().join("source");
+    let album_dir = source_root.join("album_a");
+    let library_root = tmp.path().join("library");
+    std::fs::create_dir_all(&album_dir).unwrap();
+    std::fs::create_dir_all(&library_root).unwrap();
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    write_test_png(&album_dir.join("sample-original.png"));
+    std::fs::copy(
+        album_dir.join("sample-original.png"),
+        album_dir.join("sample-copy.png"),
+    )
+    .unwrap();
+
+    let app_state = AppState::new(&app_data, fixture_dir).unwrap();
+    crate::commands::initialize_managed_database_for_state(&app_state)
+        .await
+        .unwrap();
+    crate::commands::update_settings_for_state(
+        &app_state,
+        crate::commands::SettingsDto {
+            database_mode: Some("managed".to_string()),
+            library_root: Some(library_root.display().to_string()),
+            external_host: None,
+            external_port: None,
+            external_database: None,
+            external_username: None,
+            external_tls_mode: None,
+            external_ca_cert_path: None,
+            external_client_cert_path: None,
+            external_client_key_path: None,
+            external_connect_timeout_secs: None,
+            external_query_timeout_secs: None,
+            external_profile_name: None,
+            first_run_completed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan = wait_for_scan_terminal(&app_state).await;
+    assert_eq!(
+        scan.state,
+        ImportRunState::ReadyToCommit.to_string(),
+        "{scan:?}"
+    );
+    let import_run_id = uuid::Uuid::parse_str(scan.import_run_id.as_deref().unwrap()).unwrap();
+
+    // First freeze.
+    let first =
+        crate::commands::freeze_import_plan_for_state(&app_state, import_run_id.to_string())
+            .await
+            .unwrap();
+    assert_eq!(first.kept_images.len(), 1);
+
+    // Idempotent re-freeze: same summary, no duplicate rows.
+    let second =
+        crate::commands::freeze_import_plan_for_state(&app_state, import_run_id.to_string())
+            .await
+            .unwrap();
+    assert_eq!(second.kept_images, first.kept_images);
+    assert_eq!(second.excluded_count, first.excluded_count);
+
+    let (client, handle) = {
+        let mgr = app_state.postgres_manager.lock().await;
+        mgr.connect().await.unwrap()
+    };
+    let plan_row_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM import_plans WHERE import_run_id = $1",
+            &[&import_run_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        plan_row_count, 1,
+        "idempotent freeze must not create a second plan row"
+    );
+
+    // Run is now ready_to_commit (the freeze advanced it, or it was already).
+    let run_state: String = client
+        .query_one(
+            "SELECT state FROM import_runs WHERE id = $1",
+            &[&import_run_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(run_state, "ready_to_commit");
+
+    // The frozen summary the commit page reads must match the frozen plan
+    // the commit service will consume — same kept image set, same count.
+    let summary = crate::commands::get_frozen_import_plan_summary_for_state(
+        &app_state,
+        import_run_id.to_string(),
+    )
+    .await
+    .unwrap()
+    .expect("frozen summary must exist after freeze");
+    assert_eq!(summary.kept_images.len(), first.kept_images.len());
+    assert_eq!(summary.excluded_count, first.excluded_count);
+
+    let frozen = ImportRepository::load_frozen_plan(&client, import_run_id)
+        .await
+        .unwrap()
+        .expect("commit service must be able to load the same frozen plan");
+    assert_eq!(frozen.albums.len(), 1);
+    assert_eq!(frozen.albums[0].1.len(), 1);
+    drop(client);
+    handle.abort();
+
+    let mut mgr = app_state.postgres_manager.lock().await;
+    mgr.shutdown().await.unwrap();
+}
+
+/// An old `completed` run must NOT preempt a newer `ready_to_commit` run
+/// on the default commit page. This is the regression guard for the
+/// `get_latest_committable_run` priority fix.
+#[tokio::test]
+#[ignore]
+async fn m9_committable_run_prefers_ready_over_old_completed() {
+    if !ensure_postgres_bin() {
+        eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let fixture_dir = tmp.path().join("fixtures");
+    let source_root = tmp.path().join("source");
+    let library_root = tmp.path().join("library");
+    std::fs::create_dir_all(&library_root).unwrap();
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+
+    let app_state = AppState::new(&app_data, fixture_dir).unwrap();
+    crate::commands::initialize_managed_database_for_state(&app_state)
+        .await
+        .unwrap();
+    crate::commands::update_settings_for_state(
+        &app_state,
+        crate::commands::SettingsDto {
+            database_mode: Some("managed".to_string()),
+            library_root: Some(library_root.display().to_string()),
+            external_host: None,
+            external_port: None,
+            external_database: None,
+            external_username: None,
+            external_tls_mode: None,
+            external_ca_cert_path: None,
+            external_client_cert_path: None,
+            external_client_key_path: None,
+            external_connect_timeout_secs: None,
+            external_query_timeout_secs: None,
+            external_profile_name: None,
+            first_run_completed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Run A: scan, freeze, commit → completed.
+    let album_a = source_root.join("album_a");
+    std::fs::create_dir_all(&album_a).unwrap();
+    write_test_png(&album_a.join("a.png"));
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan_a = wait_for_scan_terminal(&app_state).await;
+    let run_a = uuid::Uuid::parse_str(scan_a.import_run_id.as_deref().unwrap()).unwrap();
+    crate::commands::freeze_import_plan_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
+    crate::commands::start_import_commit_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
+    let commit_a = wait_for_commit_terminal(&app_state).await;
+    assert_eq!(commit_a.state, "completed", "{commit_a:?}");
+
+    // Run B: scan again → ready_to_commit (frozen), NOT committed.
+    let album_b = source_root.join("album_b");
+    std::fs::create_dir_all(&album_b).unwrap();
+    write_test_png(&album_b.join("b.png"));
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan_b = wait_for_scan_terminal(&app_state).await;
+    let run_b = uuid::Uuid::parse_str(scan_b.import_run_id.as_deref().unwrap()).unwrap();
+    crate::commands::freeze_import_plan_for_state(&app_state, run_b.to_string())
+        .await
+        .unwrap();
+
+    // The default commit page must pick run B (ready_to_commit), NOT the
+    // older completed run A — even though run A has a populated completed_at.
+    let latest = crate::commands::get_latest_committable_import_run_for_state(&app_state)
+        .await
+        .unwrap();
+    assert_eq!(latest, Some(run_b.to_string()));
+
+    let mut mgr = app_state.postgres_manager.lock().await;
+    mgr.shutdown().await.unwrap();
+}

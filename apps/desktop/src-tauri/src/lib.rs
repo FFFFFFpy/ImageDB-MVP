@@ -84,6 +84,8 @@ pub fn run() {
             commands::skip_review_album,
             commands::get_review_progress,
             commands::generate_import_plan,
+            commands::freeze_import_plan,
+            commands::get_frozen_import_plan_summary,
             commands::get_latest_completed_import_run,
             commands::get_latest_committable_import_run,
             commands::get_image_preview,

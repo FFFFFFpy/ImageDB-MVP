@@ -202,7 +202,9 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   const handleGeneratePlan = useCallback(async () => {
     if (!importRunId) return;
     try {
-      const plan = await api.generateImportPlan(importRunId);
+      // Freeze the plan as a single atomic transaction so the commit page
+      // can read the frozen summary without re-deriving from candidates.
+      const plan = await api.freezeImportPlan(importRunId);
       setImportPlan(plan);
       setShowPlan(true);
     } catch {

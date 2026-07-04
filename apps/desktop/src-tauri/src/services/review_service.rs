@@ -177,113 +177,178 @@ pub async fn generate_import_plan(
         &albums,
     );
 
-    freeze_generated_import_plan(client, import_run_id, &plan, &albums).await?;
+    // Freezing is a separate, idempotent, transactional step — but the
+    // review page still wants the in-memory plan to preview, so we freeze
+    // here as a side effect (idempotent on re-call) and return the plan.
+    freeze_import_plan(client, import_run_id).await?;
 
     Ok(plan)
 }
 
-async fn freeze_generated_import_plan(
+/// Freeze the import plan for a run in a single database transaction. Reads
+/// the current review/candidate state, builds the plan, writes the three
+/// plan tables + plan_hash + plan state `frozen`, and advances the run to
+/// `ready_to_commit` — all atomically. Idempotent: a second call with an
+/// existing frozen plan reuses it without rewriting rows. This is the
+/// `freeze_import_plan` IPC entry point and the public main-chain freeze.
+pub async fn freeze_import_plan(
     client: &Client,
     import_run_id: Uuid,
-    plan: &ImportPlan,
-    albums: &[AlbumRow],
-) -> Result<(), AppError> {
-    if ImportRepository::load_frozen_plan(client, import_run_id)
-        .await?
-        .is_some()
+) -> Result<ImportPlan, AppError> {
+    // Reuse an already-frozen plan: idempotent. The returned summary is the
+    // frozen view — it is NOT rebuilt from candidates/reviews, so post-freeze
+    // review edits cannot mutate what the commit page will show.
+    if let Some(existing) =
+        ImportRepository::load_frozen_plan_summary(client, import_run_id).await?
     {
-        return Ok(());
+        return Ok(existing);
     }
 
-    if let Some(draft) = ImportRepository::load_draft_plan(client, import_run_id).await? {
-        let hash = crate::services::commit_service::compute_plan_hash(&draft)?;
-        ImportRepository::set_plan_hash(client, draft.plan_id, &hash).await?;
-        ImportRepository::update_import_plan_state(client, draft.plan_id, &PlanState::Frozen)
-            .await?;
-        return Ok(());
+    let progress = ImportRepository::get_review_progress(client, import_run_id).await?;
+    let remaining = progress.total.saturating_sub(progress.decided);
+    if remaining > 0 {
+        return Err(AppError::Internal(format!(
+            "cannot freeze import plan while {remaining} review candidates remain undecided"
+        )));
     }
+
+    let all_images =
+        ImportRepository::get_all_import_images_with_album(client, import_run_id).await?;
+    let all_candidates =
+        ImportRepository::get_all_candidates_for_import_plan(client, import_run_id).await?;
+    let albums = ImportRepository::get_albums_for_run(client, import_run_id).await?;
+
+    let plan = build_import_plan(
+        import_run_id.to_string(),
+        &all_images,
+        &all_candidates,
+        &albums,
+    );
 
     let import_run = ImportRepository::get_import_run_by_id(client, import_run_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
-    let version = next_import_plan_version(client, import_run_id).await?;
-    let plan_id = ImportRepository::create_import_plan(
-        client,
-        import_run_id,
-        version,
-        &import_run.policy_version,
-        import_run.library_root_id,
-    )
-    .await?;
 
-    let kept_ids = parse_kept_image_ids(plan)?;
+    let kept_ids = parse_kept_image_ids(&plan)?;
     let full_images = ImportRepository::get_import_images_by_ids(client, &kept_ids).await?;
     let image_by_id: HashMap<Uuid, ImportImageFullRow> =
         full_images.into_iter().map(|img| (img.id, img)).collect();
 
-    for album in albums {
-        let album_images: Vec<&ImportImageFullRow> = kept_ids
+    let mut kept_images_by_album: HashMap<Uuid, Vec<ImportImageFullRow>> = HashMap::new();
+    for album in &albums {
+        let album_images: Vec<ImportImageFullRow> = kept_ids
             .iter()
-            .filter_map(|id| image_by_id.get(id))
+            .filter_map(|id| image_by_id.get(id).cloned())
             .filter(|img| img.import_album_id == album.id)
             .collect();
-        let plan_album_id = ImportRepository::insert_plan_album(
-            client,
-            plan_id,
-            album.id,
-            &album.source_name,
-            album_images.len() as i32,
-        )
-        .await?;
-
-        for img in album_images {
-            let expected_blake3 = img.blake3.as_deref().ok_or_else(|| {
-                AppError::Internal(format!(
-                    "cannot freeze plan: image {} has no BLAKE3 fingerprint",
-                    img.id
-                ))
-            })?;
-            let target_relative_path =
-                target_relative_path_for_album(&album.source_name, &img.relative_path)?;
-            ImportRepository::insert_plan_image(
-                client,
-                plan_album_id,
-                img.id,
-                &img.source_path,
-                &img.relative_path,
-                &target_relative_path,
-                img.file_size,
-                expected_blake3,
-                img.width,
-                img.height,
-                img.format.as_deref(),
-            )
-            .await?;
+        if !album_images.is_empty() {
+            kept_images_by_album.insert(album.id, album_images);
         }
     }
 
-    let draft = ImportRepository::load_draft_plan(client, import_run_id)
+    // Compute the hash from the same draft shape the commit pipeline will
+    // validate against. We build a transient draft via load_draft_plan after
+    // the transactional insert sets state=frozen; but the hash must be
+    // computed BEFORE the insert to match commit's validate_and_hash. So we
+    // compute it from the in-memory kept set the same way build_import_plan
+    // would, via commit_service::compute_plan_hash on a synthesized draft.
+    let draft =
+        synthesize_draft_for_hash(import_run_id, &import_run, &albums, &kept_images_by_album);
+    let plan_hash = crate::services::commit_service::compute_plan_hash(&draft)?;
+
+    ImportRepository::freeze_import_plan_transactionally(
+        client,
+        import_run_id,
+        &albums,
+        &kept_images_by_album,
+        &import_run.policy_version,
+        import_run.library_root_id,
+        &plan_hash,
+    )
+    .await?;
+
+    // Return the frozen summary (re-read from the persisted tables) so the
+    // caller sees exactly what the commit page will see.
+    ImportRepository::load_frozen_plan_summary(client, import_run_id)
         .await?
         .ok_or_else(|| {
             AppError::Internal(format!(
-                "failed to reload draft import plan for run {import_run_id}"
+                "freeze did not produce a frozen plan for run {import_run_id}"
             ))
-        })?;
-    let hash = crate::services::commit_service::compute_plan_hash(&draft)?;
-    ImportRepository::set_plan_hash(client, plan_id, &hash).await?;
-    ImportRepository::update_import_plan_state(client, plan_id, &PlanState::Frozen).await
+        })
 }
 
-async fn next_import_plan_version(client: &Client, import_run_id: Uuid) -> Result<i32, AppError> {
-    let row = client
-        .query_one(
-            "SELECT COALESCE(MAX(version), 0) + 1 AS next_version
-             FROM import_plans WHERE import_run_id = $1",
-            &[&import_run_id],
-        )
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to query next plan version: {e}")))?;
-    Ok(row.get("next_version"))
+/// Read the frozen plan summary for the commit-confirm page. Returns None
+/// when no frozen plan exists yet. This is the `get_frozen_import_plan_summary`
+/// IPC entry point — the commit page reads this instead of re-generating.
+pub async fn get_frozen_plan_summary(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<Option<ImportPlan>, AppError> {
+    ImportRepository::load_frozen_plan_summary(client, import_run_id).await
+}
+
+/// Build a transient `FrozenPlanRow` purely to compute the plan hash with
+/// the same `compute_plan_hash` the commit pipeline uses for validation.
+/// This keeps the freeze-time hash and commit-time validation identical
+/// without persisting a draft first.
+fn synthesize_draft_for_hash(
+    import_run_id: Uuid,
+    import_run: &crate::repositories::import_repository::ImportRunRecord,
+    albums: &[AlbumRow],
+    kept_images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+) -> crate::repositories::import_repository::FrozenPlanRow {
+    use crate::repositories::import_repository::{PlanAlbumRow, PlanImageRow};
+
+    let plan_id = Uuid::nil();
+    let mut album_rows: Vec<(PlanAlbumRow, Vec<PlanImageRow>)> = Vec::new();
+    for album in albums {
+        let Some(images) = kept_images_by_album.get(&album.id) else {
+            continue;
+        };
+        if images.is_empty() {
+            continue;
+        }
+        let plan_album_id = Uuid::nil();
+        let plan_album = PlanAlbumRow {
+            plan_album_id,
+            import_album_id: album.id,
+            target_relative_path: album.source_name.clone(),
+            expected_image_count: images.len() as i32,
+            album_plan_hash: None,
+        };
+        let mut plan_images: Vec<PlanImageRow> = Vec::new();
+        for img in images {
+            let target_relative_path =
+                target_relative_path_for_album(&album.source_name, &img.relative_path)
+                    .unwrap_or_else(|_| img.relative_path.clone());
+            let expected_blake3 = img.blake3.clone().unwrap_or_default();
+            plan_images.push(PlanImageRow {
+                id: Uuid::nil(),
+                plan_album_id,
+                import_image_id: img.id,
+                source_path: img.source_path.clone(),
+                source_relative_path: img.relative_path.clone(),
+                target_relative_path,
+                expected_file_size: img.file_size,
+                expected_blake3,
+                width: img.width,
+                height: img.height,
+                format: img.format.clone(),
+            });
+        }
+        album_rows.push((plan_album, plan_images));
+    }
+
+    crate::repositories::import_repository::FrozenPlanRow {
+        plan_id,
+        import_run_id,
+        library_root_id: import_run.library_root_id,
+        plan_state: PlanState::Draft.to_string(),
+        plan_hash: None,
+        policy_version: import_run.policy_version.clone(),
+        albums: album_rows,
+    }
 }
 
 fn parse_kept_image_ids(plan: &ImportPlan) -> Result<Vec<Uuid>, AppError> {

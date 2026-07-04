@@ -34,4 +34,3 @@ D:\MyProjects\Agent\ImageDB-MVP\.codex-plans\M6.5-M9-closure
 ```
 
 然后把 `prompts/CODEX_EXECUTE_NO_QODER.md` 或 `prompts/CODEX_EXECUTE_WITH_QODER.md` 交给 Codex。
-

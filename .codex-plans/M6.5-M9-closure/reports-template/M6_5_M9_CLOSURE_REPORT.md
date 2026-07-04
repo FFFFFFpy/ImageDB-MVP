@@ -39,17 +39,17 @@ Head commit:
 
 ## Verification Commands
 
-| Command | Result | Notes |
-|---|---|---|
-| pnpm install | | |
-| pnpm format:check | | |
-| pnpm typecheck | | |
-| pnpm test:unit | | |
-| pnpm rust:test | | |
-| pnpm rust:clippy | | |
-| pnpm rust:test:real | | |
-| pnpm build | | |
-| pnpm release:gate | | |
+| Command             | Result | Notes |
+| ------------------- | ------ | ----- |
+| pnpm install        |        |       |
+| pnpm format:check   |        |       |
+| pnpm typecheck      |        |       |
+| pnpm test:unit      |        |       |
+| pnpm rust:test      |        |       |
+| pnpm rust:clippy    |        |       |
+| pnpm rust:test:real |        |       |
+| pnpm build          |        |       |
+| pnpm release:gate   |        |       |
 
 ## Release Artifact Check
 

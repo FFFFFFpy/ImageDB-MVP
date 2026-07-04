@@ -133,6 +133,63 @@ pub(crate) async fn generate_import_plan_for_state(
     result
 }
 
+/// Freeze the import plan for a run as a single atomic database
+/// transaction. Writes the three plan tables + plan_hash, transitions the
+/// plan to `frozen`, and advances the run to `ready_to_commit`. Idempotent —
+/// re-freezing returns the existing frozen plan summary. This is the public
+/// main-chain freeze entry point called from the review flow.
+#[tauri::command]
+pub async fn freeze_import_plan(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<ImportPlan, String> {
+    freeze_import_plan_for_state(&state, import_run_id).await
+}
+
+pub(crate) async fn freeze_import_plan_for_state(
+    state: &AppState,
+    import_run_id: String,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::freeze_import_plan(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+/// Read the frozen plan summary for the commit-confirm page. Returns the
+/// persisted frozen view (kept images, counts, skipped albums) — never
+/// re-derives from candidates/reviews, so post-freeze edits cannot change
+/// what the commit page shows. Returns `null` when no frozen plan exists.
+#[tauri::command]
+pub async fn get_frozen_import_plan_summary(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<Option<ImportPlan>, String> {
+    get_frozen_import_plan_summary_for_state(&state, import_run_id).await
+}
+
+pub(crate) async fn get_frozen_import_plan_summary_for_state(
+    state: &AppState,
+    import_run_id: String,
+) -> Result<Option<ImportPlan>, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::get_frozen_plan_summary(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
 #[tauri::command]
 pub async fn get_latest_completed_import_run(
     state: State<'_, AppState>,

@@ -68,8 +68,8 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   });
 
   const planQuery = useQuery({
-    queryKey: ['commitImportPlan', latestRun.data],
-    queryFn: () => api.generateImportPlan(latestRun.data!),
+    queryKey: ['frozenImportPlanSummary', latestRun.data],
+    queryFn: () => api.getFrozenImportPlanSummary(latestRun.data!),
     enabled: !!latestRun.data && phase === 'confirm',
   });
 
@@ -151,6 +151,20 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
             <p>{String(planQuery.error)}</p>
             <button className="btn-primary" onClick={() => onNavigate('review')}>
               Go to Review
+            </button>
+          </div>
+        )}
+        {!planQuery.isLoading && !planQuery.isError && latestRun.data && !planQuery.data && (
+          <div className="commit-error">
+            <p>
+              This import run does not have a frozen plan yet. Review the run and freeze the plan
+              before committing.
+            </p>
+            <button className="btn-primary" onClick={() => onNavigate('review')}>
+              Go to Review
+            </button>
+            <button className="btn-secondary" onClick={() => onNavigate('scan')}>
+              Go to Scan
             </button>
           </div>
         )}

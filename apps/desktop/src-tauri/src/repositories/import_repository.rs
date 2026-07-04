@@ -2,12 +2,31 @@
 
 use crate::domain::import_state::{
     Decision, DecisionSource, DecodeState, DuplicateScope, ImportAlbumState, ImportImageState,
-    ImportRunState, MatchType, SCAN_POLICY_VERSION,
+    ImportPlan, ImportPlanImage, ImportRunState, MatchType, SCAN_POLICY_VERSION,
 };
 use crate::domain::state_machine::{FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
+use std::collections::HashMap;
 use tokio_postgres::Client;
 use uuid::Uuid;
+
+/// Strip the album-name prefix (forward or backward slash) from a source
+/// relative path and normalize the remainder to a forward-slash target
+/// relative path. Mirrors `review_service::target_relative_path_for_album`
+/// so the repository can build target paths while freezing without depending
+/// on the service layer.
+fn target_relative_path_for_album_name(
+    album_name: &str,
+    source_relative_path: &str,
+) -> Result<String, AppError> {
+    let slash_prefix = format!("{album_name}/");
+    let backslash_prefix = format!("{album_name}\\");
+    let rel = source_relative_path
+        .strip_prefix(&slash_prefix)
+        .or_else(|| source_relative_path.strip_prefix(&backslash_prefix))
+        .unwrap_or(source_relative_path);
+    crate::services::commit_service::normalize_relative_path(rel)
+}
 
 pub struct ImportRepository;
 
@@ -176,6 +195,7 @@ pub struct ImportAlbumFullRow {
     pub state: String,
 }
 
+#[derive(Clone)]
 pub struct ImportImageFullRow {
     pub id: Uuid,
     pub source_path: String,
@@ -1779,6 +1799,246 @@ impl ImportRepository {
     }
 
     // ── Frozen plan full load (immutable commit source of truth) ──────
+
+    /// Atomically freeze an import plan: write the plan header, all plan
+    /// albums, all plan images, the plan hash, transition the plan to
+    /// `frozen`, and (when the run is still `review_required`) advance the
+    /// run to `ready_to_commit` — all inside a single `BEGIN`/`COMMIT`. A
+    /// crash mid-freeze cannot leave a half-written plan.
+    ///
+    /// `albums` is the full album set for the run (each carrying its source
+    /// name) and `kept_images_by_album` is, per album id, the images the
+    /// plan keeps (already resolved to full rows with BLAKE3 etc.). Albums
+    /// with zero kept images contribute no `import_plan_albums` row.
+    pub async fn freeze_import_plan_transactionally(
+        client: &Client,
+        import_run_id: Uuid,
+        albums: &[AlbumRow],
+        kept_images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+        policy_version: &str,
+        library_root_id: Uuid,
+        plan_hash: &[u8],
+    ) -> Result<Uuid, AppError> {
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to begin freeze transaction: {e}")))?;
+
+        let result = async {
+            // Idempotent: if a frozen plan already exists for this run,
+            // reuse it without writing duplicates.
+            if let Some(existing) =
+                Self::load_plan_in_state(client, import_run_id, "frozen").await?
+            {
+                return Ok(existing.plan_id);
+            }
+
+            let version = Self::next_import_plan_version(client, import_run_id).await?;
+            let plan_id = Self::create_import_plan(
+                client,
+                import_run_id,
+                version,
+                policy_version,
+                library_root_id,
+            )
+            .await?;
+
+            for album in albums {
+                let Some(images) = kept_images_by_album.get(&album.id) else {
+                    continue;
+                };
+                if images.is_empty() {
+                    continue;
+                }
+                let plan_album_id = Self::insert_plan_album(
+                    client,
+                    plan_id,
+                    album.id,
+                    &album.source_name,
+                    images.len() as i32,
+                )
+                .await?;
+
+                for img in images {
+                    let expected_blake3 = img.blake3.as_deref().ok_or_else(|| {
+                        AppError::Internal(format!(
+                            "cannot freeze plan: image {} has no BLAKE3 fingerprint",
+                            img.id
+                        ))
+                    })?;
+                    let target_relative_path = target_relative_path_for_album_name(
+                        &album.source_name,
+                        &img.relative_path,
+                    )?;
+                    Self::insert_plan_image(
+                        client,
+                        plan_album_id,
+                        img.id,
+                        &img.source_path,
+                        &img.relative_path,
+                        &target_relative_path,
+                        img.file_size,
+                        expected_blake3,
+                        img.width,
+                        img.height,
+                        img.format.as_deref(),
+                    )
+                    .await?;
+                }
+            }
+
+            Self::set_plan_hash(client, plan_id, plan_hash).await?;
+            Self::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
+
+            // Advance the run to ready_to_commit so the commit page picks it
+            // up. The state-machine transition `review_required → finalize →
+            // ready_to_commit` is the validated path; a run that is already
+            // `ready_to_commit` (no review was needed) stays put.
+            let run = Self::get_import_run_by_id(client, import_run_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(format!("import run {import_run_id} not found"))
+                })?;
+            if run.state != ImportRunState::ReadyToCommit.to_string()
+                && run.state != ImportRunState::Committing.to_string()
+            {
+                Self::update_import_run_state(
+                    client,
+                    import_run_id,
+                    &ImportRunState::ReadyToCommit,
+                )
+                .await?;
+            }
+
+            Ok(plan_id)
+        }
+        .await;
+
+        match result {
+            Ok(plan_id) => {
+                client.batch_execute("COMMIT").await.map_err(|e| {
+                    AppError::Internal(format!("failed to commit freeze transaction: {e}"))
+                })?;
+                Ok(plan_id)
+            }
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Next 1-based version number for a new import plan on this run.
+    async fn next_import_plan_version(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<i32, AppError> {
+        let row = client
+            .query_one(
+                "SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                 FROM import_plans WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query next plan version: {e}")))?;
+        Ok(row.get("next_version"))
+    }
+
+    /// Read the frozen plan for a run and project it back into the public
+    /// `ImportPlan` shape the commit page renders. This is the single
+    /// source of truth for the commit-confirm view — it must NOT be derived
+    /// by re-running `build_import_plan` (which would reflect post-freeze
+    /// candidate/review edits the frozen plan intentionally ignores).
+    ///
+    /// `total_images` and `skipped_albums` come from the run's import
+    /// albums/images (frozen at scan time, immutable for the run), not from
+    /// the frozen plan rows themselves — the plan only persists what is
+    /// kept, so `excluded_count` is `total_images - kept_images.len()`.
+    pub async fn load_frozen_plan_summary(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Option<ImportPlan>, AppError> {
+        let Some(frozen) = Self::load_frozen_plan(client, import_run_id).await? else {
+            return Ok(None);
+        };
+
+        let mut kept_images: Vec<ImportPlanImage> = Vec::new();
+        for (album, images) in &frozen.albums {
+            for img in images {
+                kept_images.push(ImportPlanImage {
+                    image_id: img.import_image_id.to_string(),
+                    source_path: img.source_path.clone(),
+                    relative_path: img.target_relative_path.clone(),
+                    file_size: img.expected_file_size,
+                    album_name: album.target_relative_path.clone(),
+                });
+            }
+        }
+        // Stable order by target path so the commit-confirm view does not
+        // flicker between reads.
+        kept_images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+        let total_images: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_images ii
+                 JOIN import_albums ia ON ii.import_album_id = ia.id
+                 WHERE ia.import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count import images: {e}")))?
+            .get(0);
+
+        let total_albums: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_albums WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count import albums: {e}")))?
+            .get(0);
+
+        // Skipped albums: import albums with no plan album in the frozen plan.
+        let plan_album_ids: Vec<Uuid> = frozen
+            .albums
+            .iter()
+            .map(|(a, _)| a.import_album_id)
+            .collect();
+        let skipped_rows = if plan_album_ids.is_empty() {
+            client
+                .query(
+                    "SELECT source_name FROM import_albums WHERE import_run_id = $1
+                     ORDER BY source_name",
+                    &[&import_run_id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to query skipped albums: {e}")))?
+        } else {
+            client
+                .query(
+                    "SELECT source_name FROM import_albums WHERE import_run_id = $1
+                     AND id <> ALL($2)
+                     ORDER BY source_name",
+                    &[&import_run_id, &plan_album_ids],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to query skipped albums: {e}")))?
+        };
+        let skipped_albums: Vec<String> = skipped_rows
+            .iter()
+            .map(|r| r.get::<_, String>("source_name"))
+            .collect();
+
+        let kept_count = kept_images.len() as u64;
+        Ok(Some(ImportPlan {
+            import_run_id: import_run_id.to_string(),
+            total_albums: total_albums as u32,
+            total_images: total_images as u32,
+            kept_images,
+            excluded_count: (total_images as u64).saturating_sub(kept_count) as u32,
+            skipped_albums,
+        }))
+    }
 
     /// Load the active committable plan for a run: the frozen plan if one
     /// exists, otherwise the most recently consumed plan (so idempotent

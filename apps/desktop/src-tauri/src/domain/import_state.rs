@@ -362,7 +362,7 @@ pub struct ReviewProgress {
     pub all_decided: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportPlanImage {
     pub image_id: String,
     pub source_path: String,
