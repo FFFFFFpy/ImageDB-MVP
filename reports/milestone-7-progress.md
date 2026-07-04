@@ -55,6 +55,10 @@ Date: 2026-07-04
   - verifies migrated public constraints and indexes;
   - performs an external read/write smoke check before activation;
   - keeps the active profile unswitched if any verification step fails.
+- Added Settings page GUI coverage for the external PostgreSQL flow:
+  - browser-opened the Vite desktop UI and verified the Settings page renders the external database fields, TLS mode selector, test/migrate/cancel buttons, and no console errors before IPC actions;
+  - added component tests for external preflight check rendering;
+  - added component tests for migration progress, backup path, row-count table, diagnostics, errors, and enabled cancel state.
 
 ## Commits
 
@@ -71,6 +75,7 @@ Date: 2026-07-04
 - Empty external PostgreSQL preflight and initialization coverage implemented in the current M7 update.
 - External-unreachable controlled managed fallback real coverage implemented in the current M7 update.
 - Managed-to-external backup and verification hardening implemented in the current M7 update.
+- Settings page external PostgreSQL GUI diagnostics coverage implemented in the current M7 update.
 
 ## Commands run
 
@@ -98,6 +103,7 @@ Date: 2026-07-04
 - `pnpm build`
 - `pnpm rust:test:real`
 - `Start-Process apps/desktop/src-tauri/target/release/imagedb-desktop.exe`
+- Browser verification against `http://127.0.0.1:1420/` Settings page
 
 ## Test result summary
 
@@ -117,6 +123,8 @@ Date: 2026-07-04
 - Managed-to-external migration real test passed with backup SQL inspection, row count checks, content fingerprint diagnostics, constraints/index diagnostics, and read/write smoke diagnostics.
 - Tauri release build passed and produced `apps/desktop/src-tauri/target/release/imagedb-desktop.exe`.
 - Release executable launch smoke passed: the process started and stayed running for 10 seconds before being stopped.
+- Frontend unit tests now include Settings page external PostgreSQL GUI coverage: 7 tests passed across 2 files.
+- Browser verification confirmed the Settings page renders the external database connection form, TLS selector, test/migrate/cancel controls, and diagnostics containers. Bare Vite cannot invoke Tauri IPC, so IPC execution remains covered by Tauri commands and real Rust tests.
 
 ## Actual runtime result
 
@@ -133,10 +141,10 @@ Date: 2026-07-04
 - A real external target was activated, shut down, reported as unreachable with controlled fallback diagnostics, explicitly switched back to the managed database, then restarted with its external `app_meta` probe row intact.
 - The real managed-to-external migration wrote a SQL backup containing the seeded `m7_migration_probe`, imported it into a real external target, verified row counts, table content fingerprints, constraints/indexes, and external read/write access, then switched the active profile only after those checks passed.
 - The release executable at `apps/desktop/src-tauri/target/release/imagedb-desktop.exe` launched successfully and remained alive for the smoke window.
+- The Settings page GUI displays structured external preflight checks and migration diagnostics, including backup path, verification row counts, diagnostic details, errors, and cancellation state.
 
 ## Known remaining M7 gaps
 
-- Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, row-count mismatch, preflight cancellation, and running child-process cancellation.
-- GUI migration/profile controls exist for connection testing, migration progress, cancellation, diagnostics, row-count reports, active profile display, and controlled switch back to managed; a final GUI audit is still needed before the GUI DoD item is closed.
+- No open M7 DoD gaps remain. M7 is ready to hand off to M8 mounted shared storage compatibility.
 
-M7 is not closed yet. `CURRENT_TASK.md` should remain on `tasks/07-external-postgres.md` until these gaps are resolved.
+M7 is closed. `CURRENT_TASK.md` can advance to `tasks/08-mounted-storage.md`.

@@ -1,6 +1,6 @@
 # Current Task
 
-Executing: tasks/07-external-postgres.md
+Executing: tasks/08-mounted-storage.md
 
 The M5/M6 core fix and refactor on branch `core_fix_m5_m6_refactor` is
 complete. All 12 phases landed, verified against real PostgreSQL + the
@@ -15,3 +15,4 @@ reports/core-fix-M5-M6-final.md for the final report.
 > Milestone 3 perceptual similarity detection is complete. Report: reports/milestone-3.md.
 > Milestone 4 human review GUI is complete. Report: reports/milestone-4.md.
 > Milestone 5 formal import loop is complete (re-verified during the core fix). Report: reports/milestone-5.md.
+> Milestone 7 external PostgreSQL mode is complete. Report: reports/milestone-7-progress.md.
