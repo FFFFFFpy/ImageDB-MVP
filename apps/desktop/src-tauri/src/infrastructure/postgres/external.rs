@@ -118,6 +118,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use native_tls::TlsAcceptor;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    const TEST_LOCALHOST_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDBDCCAeygAwIBAgIUfUUEpAN1YcxG6Y7pp0oVNhTG+rkwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMzA4MDY1OVoXDTI3MDcw
+NDA4MDY1OVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAz9RjgOI7K0YMC5qk+XHxmE74khtGIUnUt8IWKsnfKepW
+uaoOTLePdr4wQ+NjFoBST/2Y+EJqCxvm4BiJXYk8QZpKX42jEZ2vzkBNsQOuBE0v
+s0Y0UU5+ldvzdCJQnQjENL8A6WhJ59WdMXkvyp6kKzhYLKQT7XiQUGfb3DaAhBra
+zw5Gt+U1apZvEBeBobKMjLrTIRQN8mTF0NtsIwpzg+NSH/lX20zKrOfSeJ5JiKqP
+ThKkdptq5gmCTTgl785ml3kGgbyBGhYrunuFLWV9Sa7+j2vf0NnNMeziGp5jzY4E
+U94e5XdK/4YENCc2hQdvQ7+Oi66+jzSM73ARYLK6vQIDAQABo04wTDAUBgNVHREE
+DTALgglsb2NhbGhvc3QwDwYDVR0TAQH/BAUwAwEB/zATBgNVHSUEDDAKBggrBgEF
+BQcDATAOBgNVHQ8BAf8EBAMCAaYwDQYJKoZIhvcNAQELBQADggEBAC2ADKiGpQTv
+NGdvQCCafg13FgIBoa4sUtVm5e9p2j/6F1jwv+4PihcnatmCgkLK4qdwd6o1jXPD
+RArc85wg/fitETFZq1cTEaBXpaincHac1tNMtb+ZrVZRUYZcR1+eeiUIYY7k39qL
+9nfVm+1yAHk4rkEfb03z2QKFPo9N1lU/yUr/LEtQAOBsCZkrjp9wdnUJJpuqwJwu
+m6Ms6ZRAUMtKW3q9o91zOq6ZMb8eN81Z/OL6R/mFy40oJRTWmCyuC1vWmbi2Yifi
+B4UMnDAM24HrGpft91ZgBkq6ibE0zWHOxaLl1zdEiy1zAtFpUANjr2hue1lhqlkT
+TwsTf8hSNTc=
+-----END CERTIFICATE-----"#;
+
+    const TEST_LOCALHOST_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDP1GOA4jsrRgwL
+mqT5cfGYTviSG0YhSdS3whYqyd8p6la5qg5Mt492vjBD42MWgFJP/Zj4QmoLG+bg
+GIldiTxBmkpfjaMRna/OQE2xA64ETS+zRjRRTn6V2/N0IlCdCMQ0vwDpaEnn1Z0x
+eS/KnqQrOFgspBPteJBQZ9vcNoCEGtrPDka35TVqlm8QF4GhsoyMutMhFA3yZMXQ
+22wjCnOD41If+VfbTMqs59J4nkmIqo9OEqR2m2rmCYJNOCXvzmaXeQaBvIEaFiu6
+e4UtZX1Jrv6Pa9/Q2c0x7OIanmPNjgRT3h7ld0r/hgQ0JzaFB29Dv46Lrr6PNIzv
+cBFgsrq9AgMBAAECgf9drP/9B3iy5mRDDE8Rf4pqdDPslWGFZw3SKyfniaJBN+xr
+K3t/G9KtqJgD3dr3A323P/3zHiwEc5yGqkEodVJS4EkB46FxpBdXEQEpW8snRfCd
+5TId2QaR4eQFRn42Ji0IdZhIcs+zcor1TyXmptlnZjU6bNg1SsHBlAiwsiHBOVP1
+3Yam0Td0Y4VzWA84wDfyTKFSJuqKQ3K72Ccu/fsx6etLgz7UmCQCfTzwzEHZ+tim
+vdvA8hariQmAbjQKNbSmwrNB0wLzkp0Wgy4JYoPATQR4QbqMETgezLX0MxjUA6x0
+n28NdSEQeqsOeWgwEg06FIpQ5/jK6OVATEp5/mkCgYEA698n9FEaHVctt82OD6uX
+k1J/Wi5L4SeLWESJPVWNJYzAq89kqD3fyRlVEN3GLIj/pjxtJt+ZkpCOOGyLTtm8
+YaqJpofChbaHStS2XTShILBS/fFi7jv1do2aTEU3lK+FLRPgFGZ77JIjn5W81Ut5
+pDIiIajhJ7hHfVQsEkhBJukCgYEA4ZCget2g3AJ8AEzo34TWV+Q/sB6/IshPQe5S
+M6RrpE6Jn+fJ2uB6/OiVhYLF38kb6l1IXcd5/3hApJ16/xYVKdpR4Do8JkWCw59P
+Dh36aM8eHKbrhSOUC+3rVQXUIOXVRJGJtU+jyJYcNhq2sR70hBKSz3FSwul0BzAW
+OpgdeLUCgYAK3oGs1H/rkjTdH2/IcRPPCiIsOa3tdjEJpD7ewK58aHwIbsooppFF
+ZxFwcYfMTZPaSTaOcAdXpamoF/hjbc0sgvtM3TythLe/TwYITYCPTRDF+vWgHMs2
+51eQ5C+nfl8YsK3GwuI7CJDzrabB/XRhiJ3iBzI47lj9AX/2Z7X44QKBgQCVcjox
+TXfPbMH1fP9pYFyXHP3pVWWzyN1iRGEoIA7FbNeYH31IzCQQPpUaQRuS+m7JZ4aT
+w58b2POTXVdpfJsHAMPweQTzImjR7VH2e3w2RsufliRDMOBcywR5b4QtS7lyVa7U
+dvB/7JzCaA6U6Xp9qsSkNmPsCbq7LGv95FzaZQKBgQCbxiYVNLYAhvWrNj2+5dOa
+0nBrrtJd/eRSO0gQkjrzdSvfi1x4z228q3XX+hjich3d4OQNWIsv1B5l6x4XX+NK
+e1bDxkgd3VEOsTuTtn7z/ajJmrByDAOJXHf7Owqmu4VRV6/uDdfNgLhVKRXkfE7g
+svMuf5iOfkujHO2necKFjw==
+-----END PRIVATE KEY-----"#;
 
     fn config() -> ConnectionConfig {
         ConnectionConfig {
@@ -134,6 +187,32 @@ mod tests {
             query_timeout_secs: 1,
             profile_name: None,
         }
+    }
+
+    fn spawn_localhost_tls_server() -> (u16, thread::JoinHandle<()>) {
+        let identity = Identity::from_pkcs8(
+            TEST_LOCALHOST_CERT.as_bytes(),
+            TEST_LOCALHOST_KEY.as_bytes(),
+        )
+        .expect("test TLS identity should parse");
+        let acceptor = TlsAcceptor::new(identity).expect("test TLS acceptor should build");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test TLS server");
+        let port = listener.local_addr().expect("local address").port();
+        let handle = thread::spawn(move || {
+            if let Ok((socket, _)) = listener.accept() {
+                let _ = acceptor.accept(socket);
+            }
+        });
+        (port, handle)
+    }
+
+    fn trusted_localhost_connector(temp: &tempfile::TempDir, tls_mode: TlsMode) -> TlsConnector {
+        let ca_path = temp.path().join("localhost-ca.pem");
+        std::fs::write(&ca_path, TEST_LOCALHOST_CERT).unwrap();
+        let mut cfg = config();
+        cfg.tls_mode = tls_mode;
+        cfg.ca_cert_path = Some(ca_path.display().to_string());
+        build_tls_connector(&cfg).expect("trusted test connector should build")
     }
 
     #[test]
@@ -181,5 +260,56 @@ mod tests {
         assert!(err
             .to_string()
             .contains("failed to parse client certificate/key pair"));
+    }
+
+    #[test]
+    fn verify_full_rejects_trusted_certificate_hostname_mismatch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let connector = trusted_localhost_connector(&temp, TlsMode::VerifyFull);
+
+        let (port, server) = spawn_localhost_tls_server();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect test TLS server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        connector
+            .connect("localhost", stream)
+            .expect("trusted localhost certificate should be accepted for localhost");
+        server.join().expect("localhost TLS server thread");
+
+        let connector = trusted_localhost_connector(&temp, TlsMode::VerifyFull);
+        let (port, server) = spawn_localhost_tls_server();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect test TLS server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        connector
+            .connect("127.0.0.1", stream)
+            .expect_err("verify_full must reject a trusted certificate for the wrong hostname");
+        server.join().expect("mismatch TLS server thread");
+    }
+
+    #[test]
+    fn verify_ca_accepts_trusted_certificate_hostname_mismatch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let connector = trusted_localhost_connector(&temp, TlsMode::VerifyCa);
+        let (port, server) = spawn_localhost_tls_server();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect test TLS server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        connector
+            .connect("127.0.0.1", stream)
+            .expect("verify_ca should validate CA while allowing hostname mismatch");
+        server.join().expect("verify_ca TLS server thread");
     }
 }

@@ -33,6 +33,10 @@ Date: 2026-07-04
   - client identity is loaded from PEM certificate plus unencrypted PKCS#8 PEM key;
   - malformed CA/client PEM inputs fail before any database profile can be activated.
 - Added a running-child cancellation regression for the migration command runner. The test starts a long-running subprocess, requests cancellation after it has started, verifies it exits promptly, and confirms progress is marked `cancelled` without switching profiles.
+- Added a local TLS server hostname-mismatch regression:
+  - a trusted certificate for `localhost` succeeds under `verify_full` when connecting as `localhost`;
+  - the same trusted certificate is rejected under `verify_full` when connecting as `127.0.0.1`;
+  - `verify_ca` accepts the trusted certificate with the hostname mismatch, proving the TLS modes differ intentionally.
 
 ## Commits
 
@@ -44,6 +48,7 @@ Date: 2026-07-04
 - Existing external ImageDB database upgrade/reject coverage implemented in the current M7 update.
 - Client certificate/private key TLS loading and negative PEM validation implemented in the current M7 update.
 - Running migration subprocess cancellation implemented in the current M7 update.
+- Strict TLS hostname verification implemented in the current M7 update.
 
 ## Commands run
 
@@ -59,18 +64,20 @@ Date: 2026-07-04
 - `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_external_existing_database_ -- --ignored --nocapture --test-threads=1`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml tls_connector_`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml cancellable_migration_command_kills_running_child_and_marks_progress -- --nocapture`
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml trusted_certificate_hostname_mismatch -- --nocapture`
 
 ## Test result summary
 
 - Frontend typecheck passed.
 - Frontend unit tests passed.
-- Rust unit tests passed: 171 passed, 1 ignored.
+- Rust unit tests passed: 173 passed, 1 ignored.
 - Clippy passed with `-D warnings`.
 - Real PostgreSQL suite passed, including the external migration test and external existing-database compatibility tests.
 - External migration cancellation regression passed.
 - Migration history validation unit tests passed.
 - TLS connector negative tests passed for missing client cert/key pairs, malformed CA PEM, and malformed client certificate/key PEM.
 - Running migration subprocess cancellation test passed.
+- Strict TLS hostname-mismatch tests passed.
 
 ## Actual runtime result
 
@@ -81,10 +88,10 @@ Date: 2026-07-04
 - A real external target seeded with `9999_future` was rejected by preflight as an unknown ImageDB migration history and was not activated.
 - TLS connector unit coverage verified that invalid CA/client PEM material and incomplete client cert/key configuration are rejected before attempting an external connection.
 - The cancellable command regression started a 30-second child process, cancelled it after startup, finished in under the 5-second timeout, and left migration progress in `cancelled` state.
+- A local TLS test server using a `localhost` certificate was trusted by the client; `verify_full` accepted `localhost`, rejected `127.0.0.1`, and `verify_ca` accepted `127.0.0.1`.
 
 ## Known remaining M7 gaps
 
-- TLS negative coverage still lacks a real hostname-mismatch server test.
 - Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, row-count mismatch, preflight cancellation, and running child-process cancellation.
 
 M7 is not closed yet. `CURRENT_TASK.md` should remain on `tasks/07-external-postgres.md` until these gaps are resolved.
