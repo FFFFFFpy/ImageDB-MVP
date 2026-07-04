@@ -1,5 +1,40 @@
 # M9 Progress Report
 
+## 2026-07-04: Installation, reinstall, uninstall, and data retention gate
+
+### Implemented
+
+- Added `IMAGEDB_APP_DATA_DIR` support during desktop startup so release-install smoke tests can use an isolated app-data directory instead of touching the user's real local profile data.
+- Added `scripts/run-m9-installation-gate.mjs` and `pnpm release:install-gate`.
+- The gate verifies the built NSIS installer exists, installs silently into `.local/m9-install-gate/ImageDB`, verifies the installed executable, verifies the installed `postgres-runtime` files, launches the installed executable for a smoke window, runs a same-version overwrite install, uninstalls silently, and verifies app data is retained after uninstall.
+- Marked the M9 installation, upgrade/reinstall, uninstall, and data-retention DoD item complete for the current MVP release package.
+
+### Modified Files
+
+- `apps/desktop/src-tauri/src/lib.rs`
+- `package.json`
+- `scripts/run-m9-installation-gate.mjs`
+- `checklists/M9_DOD.md`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `pnpm release:install-gate`: passed.
+
+### Actual Runtime Result
+
+- The NSIS installer `apps/desktop/src-tauri/target/release/bundle/nsis/ImageDB_0.1.0_x64-setup.exe` installed successfully into `.local/m9-install-gate/ImageDB`.
+- The installed app executable was discovered as `imagedb-desktop.exe`, launched from the installed directory, stayed alive for the 5-second smoke window, and was then stopped.
+- The installed runtime contained `postgres.exe`, `pg_ctl.exe`, `initdb.exe`, `psql.exe`, `pg_dump.exe`, `vector.dll`, `vector.control`, and `vector--0.8.3.sql`.
+- A same-version overwrite install completed successfully.
+- Silent uninstall completed, removed the installed main executable, and preserved `.local/m9-install-gate/app-data/data-retention-sentinel.txt`.
+
+### Known Limits
+
+- The upgrade check is a same-version overwrite install against the current `0.1.0` installer; there is no historical prior-version installer artifact in this repository to verify a true older-version-to-newer-version upgrade.
+- The gate uses `IMAGEDB_APP_DATA_DIR` to isolate app data under `.local/m9-install-gate/app-data`.
+- This closes only the installation gate DoD item; GUI/IPC main-chain, public cancellation/crash matrix, performance/stability thresholds, final release gate, and final M6.5-M9 report remain open.
+
 ## 2026-07-04: Windows release build and installer artifacts
 
 ### Implemented

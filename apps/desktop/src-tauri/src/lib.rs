@@ -22,9 +22,15 @@ pub fn run() {
                 }
             }
 
-            let app_data_dir = dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("ImageDB");
+            let app_data_dir = std::env::var("IMAGEDB_APP_DATA_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    dirs::data_local_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join("ImageDB")
+                });
 
             std::fs::create_dir_all(&app_data_dir).ok();
             infrastructure::logging::init_logging(&app_data_dir);
