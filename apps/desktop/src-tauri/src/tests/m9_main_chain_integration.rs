@@ -154,6 +154,55 @@ async fn m9_public_command_main_chain_first_run_to_completed_import() {
     mgr.shutdown().await.unwrap();
 }
 
+/// Regression guard for the "restart returns NotInitialized" bug: after the
+/// app initializes a managed cluster and is restarted (the in-process
+/// `server_running` flag reset, cluster still on disk), `get_state` must
+/// bring the server back up and report Connected — not NotInitialized.
+/// Without this, the dashboard shows NotInitialized and every scan fails
+/// with "connect failed: error connecting to server".
+#[tokio::test]
+#[ignore]
+async fn m9_managed_cluster_restarts_on_app_relaunch() {
+    use crate::domain::DatabaseStatus;
+    ensure_postgres_bin();
+
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let fixture_dir = tmp.path().join("fixtures");
+    std::fs::create_dir_all(&app_data).unwrap();
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+
+    let app_state = AppState::new(&app_data, fixture_dir).unwrap();
+    let initialized = crate::commands::initialize_managed_database_for_state(&app_state)
+        .await
+        .unwrap();
+    assert!(
+        matches!(initialized.status, DatabaseStatus::Connected),
+        "initial init must succeed: {:?}",
+        initialized
+    );
+
+    // Simulate an app relaunch: stop the server process. The on-disk cluster
+    // remains; the in-memory server_running flag is false.
+    {
+        let mut mgr = app_state.postgres_manager.lock().await;
+        mgr.shutdown().await.unwrap();
+        assert!(!mgr.is_server_running());
+        assert!(mgr.cluster_files_exist());
+    }
+
+    // get_state must restart the server and report Connected.
+    let state = app_state.database_service.get_state().await;
+    assert!(
+        matches!(state.status, DatabaseStatus::Connected),
+        "get_state must restart the managed cluster after relaunch: {:?}",
+        state
+    );
+
+    let mut mgr = app_state.postgres_manager.lock().await;
+    mgr.shutdown().await.unwrap();
+}
+
 async fn wait_for_scan_terminal(app_state: &AppState) -> ScanProgress {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

@@ -356,7 +356,7 @@ impl PostgresManager {
         })
     }
 
-    fn cluster_files_exist(&self) -> bool {
+    pub fn cluster_files_exist(&self) -> bool {
         self.data_dir.join("PG_VERSION").is_file()
             && self.data_dir.join("base").is_dir()
             && self.data_dir.join("global").is_dir()

@@ -620,6 +620,64 @@ impl DatabaseService {
                     None,
                     mgr.diagnostics().to_vec(),
                 )
+            } else if mgr.cluster_files_exist() {
+                // An initialized cluster exists on disk (PG_VERSION, base/,
+                // global/, pg_wal/) but the server is not running in this
+                // process — i.e. the app was restarted. Bring the managed
+                // instance back up instead of reporting NotInitialized
+                // (which would block the dashboard and every scan/commit).
+                match mgr.initialize().await {
+                    Ok(probe) if probe.connection_ok => match mgr.connect().await {
+                        Ok((client, handle)) => {
+                            let pgvector = client
+                            .query_one(
+                                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')",
+                                &[],
+                            )
+                            .await
+                            .map(|row| row.get::<_, bool>(0))
+                            .unwrap_or(false);
+                            let migration_version = MigrationRunner::current_version(&client)
+                                .await
+                                .ok()
+                                .flatten();
+                            handle.abort();
+                            (
+                                DatabaseStatus::Connected,
+                                pgvector,
+                                migration_version,
+                                vec!["Managed PostgreSQL restarted on launch".to_string()],
+                            )
+                        }
+                        Err(e) => (
+                            DatabaseStatus::Error(e.to_string()),
+                            false,
+                            None,
+                            vec![e.to_string()],
+                        ),
+                    },
+                    Ok(probe) => {
+                        // initialize() could not reach the server (e.g.
+                        // pg_ctl start failed). Surface the diagnostics so
+                        // the user can act, but keep the cluster on disk.
+                        let mut diags = probe.diagnostics.clone();
+                        if diags.is_empty() {
+                            diags = mgr.diagnostics().to_vec();
+                        }
+                        (
+                            DatabaseStatus::Error("Managed PostgreSQL failed to start".to_string()),
+                            false,
+                            None,
+                            diags,
+                        )
+                    }
+                    Err(e) => (
+                        DatabaseStatus::Error(e.to_string()),
+                        false,
+                        None,
+                        vec![e.to_string()],
+                    ),
+                }
             } else {
                 (DatabaseStatus::NotInitialized, false, None, vec![])
             };
