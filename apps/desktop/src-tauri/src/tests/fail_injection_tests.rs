@@ -14,10 +14,12 @@
 use crate::domain::import_state::{DecodeState, ImportImageState};
 use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 use crate::repositories::import_repository::{ImportRepository, NewImportImage};
-use crate::services::commit_service;
+use crate::services::commit_service::{self, COMMIT_MARKER_FILE_NAME};
 use crate::services::recovery_service;
 use crate::services::source_snapshot_service::capture_source_album_snapshot;
-use crate::tests::fail_injection::{clear_fault_point, set_fault_point, CommitFaultPoint};
+use crate::tests::fail_injection::{
+    clear_fault_point, set_fault_point, set_force_conservative_publish, CommitFaultPoint,
+};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -39,6 +41,7 @@ async fn setup_full_env() -> (
     let source_root = tmp.path().join("source");
     let library_root = tmp.path().join("library");
     let album_path = source_root.join("album_a");
+    std::fs::create_dir_all(&library_root).unwrap();
     std::fs::create_dir_all(&album_path).unwrap();
     std::fs::write(album_path.join("photo1.png"), b"photo one data").unwrap();
     std::fs::write(album_path.join("photo2.png"), b"photo two data").unwrap();
@@ -398,6 +401,53 @@ async fn fail_injection_after_manifest_write() {
     .await;
     drive_recovery(pg.clone(), run_id).await;
     assert_recovered(pg.clone(), &lib_root).await;
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn fail_injection_conservative_before_commit_marker_recovers() {
+    let (_tmp, pg, run_id, lib_root, _album) = setup_full_env().await;
+    set_force_conservative_publish(true);
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::BeforeCommitMarker,
+    )
+    .await;
+    set_force_conservative_publish(false);
+
+    let publish_dir = lib_root.join("Albums").join("album_a");
+    assert!(
+        publish_dir.exists(),
+        "conservative publish should have created the target before marker fault"
+    );
+    assert!(
+        publish_dir
+            .join(".imagedb")
+            .join(".imagedb-manifest.json")
+            .exists(),
+        "manifest should have been published before marker fault"
+    );
+    assert!(
+        !publish_dir
+            .join(".imagedb")
+            .join(COMMIT_MARKER_FILE_NAME)
+            .exists(),
+        "commit marker must be absent at the injected failure point"
+    );
+
+    drive_recovery(pg.clone(), run_id).await;
+    assert_recovered(pg.clone(), &lib_root).await;
+    assert!(
+        publish_dir
+            .join(".imagedb")
+            .join(COMMIT_MARKER_FILE_NAME)
+            .exists(),
+        "recovery must write the missing conservative commit marker"
+    );
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
 }

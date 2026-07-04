@@ -195,3 +195,35 @@
 
 - 当前实现会重新探测并记录 volume identity，但尚未把初始 volume identity 持久化到事务行，因此还不能严格证明“同一路径重新挂载到不同设备”。
 - 真实 SMB/NAS 人工断连、重新挂载、Recovery 收敛门禁尚未执行。
+
+## 2026-07-04: Conservative marker recovery real-db gate
+
+### 实现内容
+
+- 为 `fail-injection` 测试增加仅测试环境可用的 ConservativeMounted 发布策略强制开关，正式构建不暴露该开关。
+- 新增 `BeforeCommitMarker` 故障点，覆盖 ConservativeMounted 已复制文件与 manifest、但尚未写入 `.imagedb-commit.json` 的中断窗口。
+- 补充真实 PostgreSQL + 真实文件系统测试：commit 在 marker 前中断后，Recovery 重新验证已发布 manifest 和文件集合，补写 commit marker，继续 DB commit 与 source archive，最终收敛到 `source_archived`。
+- 修正 fail-injection 测试环境：预创建 library root，使 M8 `StorageCapabilities` 探测符合正式主链前置条件。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/services/commit_service.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `checklists/M8_DOD.md`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib fail_injection_conservative_before_commit_marker_recovers -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- 测试确认 marker 前中断时目标目录和 manifest 已存在，但 `.imagedb/.imagedb-commit.json` 不存在。
+- Recovery 运行后 `.imagedb/.imagedb-commit.json` 被补写，事务最终达到 `source_archived`，图库记录存在。
+
+### 已知限制
+
+- 该测试使用本机真实文件系统强制 ConservativeMounted 策略，不等同于真实 SMB/NAS 人工断网门禁。
+- 真实挂载共享存储故障测试仍未完成。

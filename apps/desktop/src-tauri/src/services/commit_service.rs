@@ -1598,6 +1598,11 @@ pub(crate) async fn stream_copy_with_hash(
 pub(crate) fn select_commit_publish_strategy(
     library_root: &Path,
 ) -> Result<CommitPublishStrategy, AppError> {
+    #[cfg(feature = "fail-injection")]
+    if crate::tests::fail_injection::force_conservative_publish() {
+        return Ok(CommitPublishStrategy::ConservativeMounted);
+    }
+
     let capabilities = probe_storage_capabilities(library_root);
     match capabilities.publish_strategy {
         StoragePublishStrategy::StrongLocal => Ok(CommitPublishStrategy::StrongLocal),
@@ -1820,6 +1825,9 @@ async fn publish_verified_staging_conservatively(
         .await
         .map_err(|e| AppError::IoError(format!("publish manifest rename failed: {e}")))?;
     sync_parent_dir(&target_manifest).await?;
+
+    #[cfg(feature = "fail-injection")]
+    maybe_fault(CommitFaultPoint::BeforeCommitMarker, "before commit marker")?;
 
     write_commit_marker(
         publish_dir,

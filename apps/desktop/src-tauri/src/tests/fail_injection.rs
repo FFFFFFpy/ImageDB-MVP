@@ -20,12 +20,14 @@ pub(crate) enum CommitFaultPoint {
     AfterDbCommit = 8,
     BeforeSourceArchive = 9,
     DuringSourceArchive = 10,
-    Panic = 11,
+    BeforeCommitMarker = 11,
+    Panic = 12,
 }
 
 /// Global fault injection state (thread-safe).
 static FAULT_POINT: AtomicU8 = AtomicU8::new(255);
 static FAULT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static FORCE_CONSERVATIVE_PUBLISH: AtomicU8 = AtomicU8::new(0);
 
 /// Set the active fault point for the next commit operation.
 pub(crate) fn set_fault_point(fault: CommitFaultPoint) {
@@ -36,6 +38,14 @@ pub(crate) fn set_fault_point(fault: CommitFaultPoint) {
 /// Clear the active fault point.
 pub(crate) fn clear_fault_point() {
     FAULT_POINT.store(255, Ordering::SeqCst);
+}
+
+pub(crate) fn set_force_conservative_publish(enabled: bool) {
+    FORCE_CONSERVATIVE_PUBLISH.store(u8::from(enabled), Ordering::SeqCst);
+}
+
+pub(crate) fn force_conservative_publish() -> bool {
+    FORCE_CONSERVATIVE_PUBLISH.load(Ordering::SeqCst) == 1
 }
 
 /// Check if a fault should be triggered at the given point.
