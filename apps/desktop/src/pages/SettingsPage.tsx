@@ -113,6 +113,10 @@ export function SettingsPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
   });
 
+  const exportDiagnostics = useMutation({
+    mutationFn: api.exportDiagnostics,
+  });
+
   const migration = migrationProgress.data;
   const migrationRunning = migration?.state === 'running' || startMigration.isPending;
   const effectiveLibraryRoot = libRoot || settings.data?.library_root || '';
@@ -185,8 +189,33 @@ export function SettingsPage() {
             <button onClick={() => switchManaged.mutate()} disabled={switchManaged.isPending}>
               {switchManaged.isPending ? '切换中…' : '切回托管库'}
             </button>
+            <button
+              onClick={() => exportDiagnostics.mutate()}
+              disabled={exportDiagnostics.isPending}
+            >
+              {exportDiagnostics.isPending ? 'Exporting...' : 'Export diagnostics'}
+            </button>
             {switchManaged.isError && (
               <pre className="status-err">{String(switchManaged.error)}</pre>
+            )}
+            {exportDiagnostics.data && (
+              <div className="check-result">
+                <table>
+                  <tbody>
+                    <tr>
+                      <td>Diagnostics package</td>
+                      <td className="mono">{exportDiagnostics.data.path}</td>
+                    </tr>
+                    <tr>
+                      <td>Redacted</td>
+                      <td>{exportDiagnostics.data.redacted ? 'yes' : 'no'}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {exportDiagnostics.isError && (
+              <pre className="status-err">{String(exportDiagnostics.error)}</pre>
             )}
           </div>
         )}

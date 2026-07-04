@@ -22,6 +22,10 @@ mod manifest_validation_integration;
 mod m9_main_chain_integration;
 
 #[cfg(test)]
+#[cfg(feature = "real-db-tests")]
+mod m9_diagnostics_integration;
+
+#[cfg(test)]
 #[cfg(all(feature = "real-db-tests", feature = "fail-injection"))]
 mod m9_public_recovery_integration;
 

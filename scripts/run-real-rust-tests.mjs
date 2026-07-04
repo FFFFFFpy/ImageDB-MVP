@@ -27,6 +27,10 @@ const suites = [
     filter: 'm9_main_chain_exact_duplicate_import_freezes_plan_and_commits',
   },
   {
+    name: 'M9 diagnostics export',
+    filter: 'm9_diagnostics_export_redacts_secrets_and_image_content',
+  },
+  {
     name: 'M9 public recovery command path',
     filter: 'm9_public_recovery_',
     features: 'real-db-tests,fail-injection',

@@ -1,5 +1,61 @@
 # M9 Progress Report
 
+## 2026-07-04: Diagnostics export
+
+### Implemented
+
+- Added a diagnostics export service and Tauri command that writes a JSON diagnostics package under the app data `diagnostics` directory.
+- The package includes app version, PostgreSQL and pgvector versions, schema/migration state, database mode/status, storage capability report, recent import task summaries, recovery diagnostics, and redacted recent logs.
+- Redaction removes passwords, connection URI credentials, tokens/secrets, key paths, absolute filesystem paths, recovery file paths, and image file paths. The export never includes image bytes or preview data.
+- Added a Settings page action that calls the public IPC command and shows the exported diagnostics package path.
+- Added redaction unit coverage, a Settings page GUI test, and a real PostgreSQL + real filesystem M9 diagnostics export test. The real test writes secret and image-content sentinels, exports diagnostics through the command-facing path, and verifies those sentinels are absent from the JSON.
+- Added the diagnostics export real test to `scripts/run-real-rust-tests.mjs`.
+- Marked the M9 diagnostics DoD item complete.
+
+### Modified Files
+
+- `apps/desktop/src-tauri/src/services/diagnostics_service.rs`
+- `apps/desktop/src-tauri/src/commands/diagnostics.rs`
+- `apps/desktop/src-tauri/src/state.rs`
+- `apps/desktop/src-tauri/src/services/mod.rs`
+- `apps/desktop/src-tauri/src/commands/mod.rs`
+- `apps/desktop/src-tauri/src/lib.rs`
+- `apps/desktop/src-tauri/src/tests/m9_diagnostics_integration.rs`
+- `apps/desktop/src-tauri/src/tests/mod.rs`
+- `apps/desktop/src/lib/ipc/api.ts`
+- `apps/desktop/src/lib/ipc/types.ts`
+- `apps/desktop/src/pages/SettingsPage.tsx`
+- `apps/desktop/src/pages/SettingsPage.test.tsx`
+- `scripts/run-real-rust-tests.mjs`
+- `checklists/M9_DOD.md`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib diagnostics_service -- --nocapture`: passed, 2 tests.
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib m9_diagnostics_export_redacts_secrets_and_image_content -- --ignored --test-threads=1 --nocapture`: passed, 1 test.
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check`: passed.
+- `node --check scripts/run-real-rust-tests.mjs`: passed.
+- `pnpm test:unit -- SettingsPage`: passed, 11 tests.
+- `pnpm typecheck`: passed.
+- `pnpm format:check`: passed.
+- `pnpm test:unit`: passed, 11 tests.
+- `pnpm rust:test`: passed, 188 passed, 1 ignored.
+- `pnpm rust:clippy`: passed.
+
+### Actual Runtime Result
+
+- A managed PostgreSQL database initialized successfully in a temporary app-data directory.
+- The diagnostics export command wrote `imagedb-diagnostics-*.json` under that app-data `diagnostics` directory.
+- The JSON contained PostgreSQL version, pgvector version, latest migration version, storage capability data, and redacted log lines.
+- The JSON did not contain the test password sentinel, PostgreSQL URI secret sentinel, image-content sentinel, or image filename.
+
+### Known Limits
+
+- The diagnostics package is a JSON file, not a zipped multi-file bundle.
+- The Settings page currently displays the exported package path but does not open the containing folder.
+- This closes only the diagnostics export DoD item; GUI/IPC main-chain, full public recovery matrix, installer/upgrade, performance, release build, and final release gate items remain open.
+
 ## 2026-07-04: Public recovery command path smoke
 
 ### Implemented

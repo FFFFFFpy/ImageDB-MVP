@@ -67,6 +67,7 @@ impl Default for ExternalMigrationState {
 }
 
 pub struct AppState {
+    pub app_data_dir: PathBuf,
     pub postgres_manager: Arc<Mutex<PostgresManager>>,
     pub settings: Arc<Mutex<SettingsStore>>,
     pub database_service: DatabaseService,
@@ -91,6 +92,7 @@ impl AppState {
         );
 
         Ok(Self {
+            app_data_dir: app_data_dir.to_path_buf(),
             postgres_manager,
             settings,
             database_service,

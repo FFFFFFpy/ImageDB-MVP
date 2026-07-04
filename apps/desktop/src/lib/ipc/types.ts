@@ -11,6 +11,14 @@ export interface DatabaseState {
   diagnostics: DiagnosticItem[];
 }
 
+export interface DiagnosticsExportResult {
+  path: string;
+  generated_at: string;
+  file_count: number;
+  redacted: boolean;
+  byte_size: number;
+}
+
 export interface ManagedDbConfig {
   data_dir: string;
   port: number;

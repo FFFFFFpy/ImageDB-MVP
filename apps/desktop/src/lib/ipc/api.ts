@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AppSettings,
   DatabaseState,
+  DiagnosticsExportResult,
   ExternalCheckResult,
   ExternalConnectionConfig,
   AllProbeResults,
@@ -52,6 +53,8 @@ export const api = {
     invoke<ExternalMigrationProgress>('get_external_migration_progress'),
 
   shutdownDatabase: () => invoke<void>('shutdown_database'),
+
+  exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_diagnostics'),
 
   getSettings: () => invoke<AppSettings>('get_settings'),
 

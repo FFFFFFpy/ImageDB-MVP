@@ -14,6 +14,7 @@ vi.mock('../lib/ipc/api', () => ({
     cancelExternalMigration: vi.fn(),
     shutdownDatabase: vi.fn(),
     switchToManagedDatabase: vi.fn(),
+    exportDiagnostics: vi.fn(),
     updateSettings: vi.fn(),
     probeStorageCapabilities: vi.fn(),
   },
@@ -116,6 +117,13 @@ beforeEach(() => {
     free_space: { status: 'supported', detail: '1024 bytes available' },
     volume_identity: { status: 'supported', detail: 'volume_serial_number=1' },
     diagnostics: [],
+  });
+  mockedApi.exportDiagnostics.mockResolvedValue({
+    path: 'C:/imagedb/diagnostics/imagedb-diagnostics-20260704T000000Z.json',
+    generated_at: '2026-07-04T00:00:00Z',
+    file_count: 1,
+    redacted: true,
+    byte_size: 1024,
   });
 });
 
@@ -235,5 +243,17 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     expect(screen.getByText(/directory sync_all could not be verified/)).toBeInTheDocument();
     expect(screen.getByText('策略依据 (1)')).toBeInTheDocument();
     expect(mockedApi.probeStorageCapabilities).toHaveBeenCalledWith('C:/ImageLibrary');
+  });
+
+  test('exports diagnostics from the settings page', async () => {
+    renderSettingsPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Export diagnostics' }));
+
+    expect(
+      await screen.findByText(/imagedb-diagnostics-20260704T000000Z\.json/),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Redacted')).toBeInTheDocument();
+    expect(mockedApi.exportDiagnostics).toHaveBeenCalledTimes(1);
   });
 });
