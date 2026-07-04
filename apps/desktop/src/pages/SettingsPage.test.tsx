@@ -211,7 +211,7 @@ describe('SettingsPage external PostgreSQL GUI', () => {
 
     renderSettingsPage();
 
-    expect(await screen.findByText('verify')).toBeInTheDocument();
+    expect(await screen.findByText('校验数据')).toBeInTheDocument();
     expect(screen.getByText('未切换')).toBeInTheDocument();
     expect(screen.getByText(/managed-to-external\.sql/)).toBeInTheDocument();
     expect(screen.getByText('app_meta')).toBeInTheDocument();
@@ -248,12 +248,12 @@ describe('SettingsPage external PostgreSQL GUI', () => {
   test('exports diagnostics from the settings page', async () => {
     renderSettingsPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Export diagnostics' }));
+    fireEvent.click(await screen.findByRole('button', { name: '导出诊断' }));
 
     expect(
       await screen.findByText(/imagedb-diagnostics-20260704T000000Z\.json/),
     ).toBeInTheDocument();
-    expect(screen.getByText('Redacted')).toBeInTheDocument();
+    expect(screen.getByText('敏感信息已隐藏')).toBeInTheDocument();
     expect(mockedApi.exportDiagnostics).toHaveBeenCalledTimes(1);
   });
 });

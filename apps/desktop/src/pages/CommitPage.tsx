@@ -32,9 +32,9 @@ function stageLabel(stage: string | undefined): string {
   if (!stage) return '准备中';
   const map: Record<string, string> = {
     preparing: '准备事务',
-    committing: '复制到 staging',
+    committing: '复制到暂存区',
     processing_album: '处理图集',
-    verifying: '验证 staging',
+    verifying: '验证暂存区',
     verified: '已验证',
     publishing: '发布目录',
     published: '已发布',
@@ -133,38 +133,35 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   if (phase === 'confirm') {
     return (
       <div className="commit-page">
-        <h1>Import Commit</h1>
+        <h1>提交确认</h1>
 
-        {latestRun.isLoading && <p>Loading latest completed import run...</p>}
+        {latestRun.isLoading && <p>正在加载可提交的导入任务…</p>}
         {!latestRun.data && !latestRun.isLoading && (
           <div className="commit-empty">
-            <p>No completed import run is ready to commit.</p>
+            <p>当前没有可提交的导入任务。</p>
             <button className="btn-primary" onClick={() => onNavigate('scan')}>
-              Go to Scan
+              前往扫描
             </button>
           </div>
         )}
 
-        {planQuery.isLoading && <p>Preparing import plan...</p>}
+        {planQuery.isLoading && <p>正在准备导入计划…</p>}
         {planQuery.isError && (
           <div className="commit-error">
             <p>{String(planQuery.error)}</p>
             <button className="btn-primary" onClick={() => onNavigate('review')}>
-              Go to Review
+              前往审核
             </button>
           </div>
         )}
         {!planQuery.isLoading && !planQuery.isError && latestRun.data && !planQuery.data && (
           <div className="commit-error">
-            <p>
-              This import run does not have a frozen plan yet. Review the run and freeze the plan
-              before committing.
-            </p>
+            <p>该导入任务尚未冻结计划。请先在审核页冻结计划后再提交。</p>
             <button className="btn-primary" onClick={() => onNavigate('review')}>
-              Go to Review
+              前往审核
             </button>
             <button className="btn-secondary" onClick={() => onNavigate('scan')}>
-              Go to Scan
+              前往扫描
             </button>
           </div>
         )}
@@ -174,25 +171,25 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
             <div className="commit-stats">
               <div className="stat-card">
                 <div className="stat-value">{plan.total_albums}</div>
-                <div className="stat-label">Albums</div>
+                <div className="stat-label">图集数</div>
               </div>
               <div className="stat-card">
                 <div className="stat-value">{plan.kept_images.length}</div>
-                <div className="stat-label">Kept Images</div>
+                <div className="stat-label">保留图片</div>
               </div>
               <div className="stat-card">
                 <div className="stat-value">{plan.excluded_count}</div>
-                <div className="stat-label">Excluded</div>
+                <div className="stat-label">排除</div>
               </div>
               <div className="stat-card">
                 <div className="stat-value">{formatFileSize(totalFileSize)}</div>
-                <div className="stat-label">Estimated Size</div>
+                <div className="stat-label">预计大小</div>
               </div>
             </div>
 
             {plan.skipped_albums.length > 0 && (
               <div className="commit-section">
-                <h3>Skipped Albums</h3>
+                <h3>跳过的图集</h3>
                 <ul>
                   {plan.skipped_albums.map((album) => (
                     <li key={album}>{album}</li>
@@ -202,13 +199,13 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
             )}
 
             <div className="commit-section">
-              <h3>Files To Commit</h3>
+              <h3>待提交文件</h3>
               <table className="commit-table">
                 <thead>
                   <tr>
-                    <th>Album</th>
-                    <th>File</th>
-                    <th>Size</th>
+                    <th>图集</th>
+                    <th>文件</th>
+                    <th>大小</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -231,7 +228,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
                 onClick={handleStartCommit}
                 disabled={commitMutation.isPending || plan.kept_images.length === 0}
               >
-                {commitMutation.isPending ? 'Starting...' : 'Commit Import'}
+                {commitMutation.isPending ? '提交中…' : '提交导入'}
               </button>
             </div>
           </div>
@@ -248,7 +245,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
     return (
       <div className="commit-page">
-        <h1>Committing Import</h1>
+        <h1>提交进行中</h1>
         <div className="commit-progress">
           <div className="progress-bar-container">
             <div className="progress-bar" style={{ width: `${pct}%` }} />
@@ -256,14 +253,14 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
           <div className="progress-text">{pct}%</div>
 
           <div className="progress-details">
-            <div>Stage: {progress?.current_stage ?? 'preparing'}</div>
-            {progress?.current_album && <div>Album: {progress.current_album}</div>}
+            <div>阶段: {stageLabel(progress?.current_stage)}</div>
+            {progress?.current_album && <div>当前图集: {progress.current_album}</div>}
             <div>
-              Albums: {progress?.albums_completed ?? 0} / {progress?.albums_total ?? 0}
+              图集: {progress?.albums_completed ?? 0} / {progress?.albums_total ?? 0}
             </div>
-            <div>Images committed: {progress?.images_committed ?? 0}</div>
-            <div>Skipped: {progress?.albums_skipped ?? 0}</div>
-            <div>Failed: {progress?.albums_failed ?? 0}</div>
+            <div>已提交图片: {progress?.images_committed ?? 0}</div>
+            <div>跳过: {progress?.albums_skipped ?? 0}</div>
+            <div>失败: {progress?.albums_failed ?? 0}</div>
           </div>
 
           {/* Detailed staging pipeline progress */}
@@ -292,7 +289,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
                       : ''
                 }
               >
-                复制到 staging
+                复制到暂存区
               </li>
               <li
                 className={
@@ -313,7 +310,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
                       : ''
                 }
               >
-                验证 staging
+                验证暂存区
               </li>
               <li
                 className={
@@ -371,7 +368,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
           {progress && progress.errors.length > 0 && (
             <div className="commit-errors">
-              <h3>Errors</h3>
+              <h3>错误</h3>
               <ul>
                 {progress.errors.map((item, index) => (
                   <li key={`${index}-${item}`}>{item}</li>
@@ -382,7 +379,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
           <div className="commit-actions">
             <button className="btn-danger" onClick={handleCancel}>
-              Cancel
+              取消
             </button>
           </div>
         </div>
@@ -414,7 +411,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
         <div className="commit-stats">
           <div className="stat-card">
             <div className="stat-value">{progress?.albums_total ?? 0}</div>
-            <div className="stat-label">Albums</div>
+            <div className="stat-label">图集数</div>
           </div>
           <div className="stat-card success">
             <div className="stat-value">
@@ -422,19 +419,19 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
                 (progress?.albums_skipped ?? 0) -
                 (progress?.albums_failed ?? 0)}
             </div>
-            <div className="stat-label">Committed</div>
+            <div className="stat-label">已提交</div>
           </div>
           <div className="stat-card">
             <div className="stat-value">{progress?.albums_skipped ?? 0}</div>
-            <div className="stat-label">Skipped</div>
+            <div className="stat-label">跳过</div>
           </div>
           <div className="stat-card danger">
             <div className="stat-value">{progress?.albums_failed ?? 0}</div>
-            <div className="stat-label">Failed</div>
+            <div className="stat-label">失败</div>
           </div>
           <div className="stat-card">
             <div className="stat-value">{progress?.images_committed ?? 0}</div>
-            <div className="stat-label">Images</div>
+            <div className="stat-label">图片</div>
           </div>
         </div>
       </div>

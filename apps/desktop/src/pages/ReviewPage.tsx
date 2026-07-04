@@ -28,35 +28,40 @@ function formatFileSize(bytes: number): string {
 }
 
 function formatDistance(val: number | null): string {
-  if (val === null) return 'N/A';
+  if (val === null) return '无';
   return val.toString();
 }
 
 function formatMatchType(t: string): string {
   const map: Record<string, string> = {
-    file_exact: 'File Exact',
-    pixel_exact: 'Pixel Exact',
-    perceptual_near: 'Perceptual Near',
-    perceptual_similar: 'Perceptual Similar',
+    file_exact: '文件完全一致',
+    pixel_exact: '像素完全一致',
+    perceptual_near: '感知近似',
+    perceptual_similar: '感知相似',
   };
   return map[t] ?? t;
 }
 
 function formatScope(s: string): string {
-  return s === 'intra_album' ? 'Intra-Album' : s === 'library' ? 'Library' : s;
+  const map: Record<string, string> = {
+    intra_album: '图集内',
+    cross_album: '跨图集',
+    library: '历史图库',
+  };
+  return map[s] ?? s;
 }
 
 function formatTransform(t: string | null): string {
-  if (!t) return 'N/A';
+  if (!t) return '无';
   const map: Record<string, string> = {
-    identity: 'Identity',
-    rot90: 'Rotate 90',
-    rot180: 'Rotate 180',
-    rot270: 'Rotate 270',
-    flip_h: 'Flip Horizontal',
-    flip_v: 'Flip Vertical',
-    transpose: 'Transpose',
-    transverse: 'Transverse',
+    identity: '不变',
+    rot90: '旋转 90 度',
+    rot180: '旋转 180 度',
+    rot270: '旋转 270 度',
+    flip_h: '水平翻转',
+    flip_v: '垂直翻转',
+    transpose: '主对角线翻转',
+    transverse: '副对角线翻转',
   };
   return map[t] ?? t;
 }
@@ -301,15 +306,15 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   if (!importRunId) {
     return (
       <div className="review-page">
-        <h1>Review</h1>
+        <h1>审核</h1>
         {runQuery.isLoading ? (
-          <p>Loading latest import run...</p>
+          <p>正在加载最近的导入任务...</p>
         ) : (
           <div className="empty-state">
-            <h1>No Completed Import</h1>
-            <p>Complete a scan first, then come back to review duplicate candidates.</p>
+            <h1>没有可审核的导入</h1>
+            <p>请先完成一次扫描，然后回来审核重复候选。</p>
             <button className="btn-primary" onClick={() => onNavigate('scan')}>
-              Go to Scan
+              前往扫描
             </button>
           </div>
         )}
@@ -326,19 +331,16 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   if (totalCandidates === 0) {
     return (
       <div className="review-page">
-        <h1>Review</h1>
+        <h1>审核</h1>
         <div className="empty-state">
-          <h1>No Review Candidates</h1>
-          <p>
-            This import run has no uncertain duplicate candidates to review. You can proceed
-            directly to the import plan.
-          </p>
+          <h1>没有待审核候选</h1>
+          <p>该导入任务没有需要人工确认的重复候选，可以直接生成导入计划。</p>
           <div className="toolbar" style={{ justifyContent: 'center', marginTop: '1rem' }}>
             <button className="btn-primary" onClick={handleGeneratePlan}>
-              Generate Import Plan
+              生成导入计划
             </button>
             <button className="btn-secondary" onClick={() => onNavigate('dashboard')}>
-              Back to Dashboard
+              返回工作台
             </button>
           </div>
         </div>
@@ -349,29 +351,29 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   if (showPlan && importPlan) {
     return (
       <div className="review-page">
-        <h1>Import Plan</h1>
+        <h1>导入计划</h1>
         <div className="import-plan-summary">
           <div className="import-plan-stats">
             <div className="scan-progress-card">
-              <h3>Albums</h3>
+              <h3>图集数</h3>
               <p>{importPlan.total_albums}</p>
             </div>
             <div className="scan-progress-card">
-              <h3>Total Images</h3>
+              <h3>图片总数</h3>
               <p>{importPlan.total_images}</p>
             </div>
             <div className="scan-progress-card ok">
-              <h3>Kept</h3>
+              <h3>保留</h3>
               <p>{importPlan.kept_images.length}</p>
             </div>
             <div className="scan-progress-card warn">
-              <h3>Excluded</h3>
+              <h3>排除</h3>
               <p>{importPlan.excluded_count}</p>
             </div>
           </div>
           {importPlan.skipped_albums.length > 0 && (
             <div className="import-plan-skipped">
-              <h3>Skipped Albums</h3>
+              <h3>跳过的图集</h3>
               <ul>
                 {importPlan.skipped_albums.map((a) => (
                   <li key={a}>{a}</li>
@@ -380,13 +382,13 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
             </div>
           )}
           <div className="import-plan-kept">
-            <h3>Kept Images ({importPlan.kept_images.length})</h3>
+            <h3>保留图片 ({importPlan.kept_images.length})</h3>
             <table className="import-plan-table">
               <thead>
                 <tr>
-                  <th>Album</th>
-                  <th>File</th>
-                  <th>Size</th>
+                  <th>图集</th>
+                  <th>文件</th>
+                  <th>大小</th>
                 </tr>
               </thead>
               <tbody>
@@ -403,10 +405,10 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
         </div>
         <div className="toolbar">
           <button className="btn-primary" onClick={() => onNavigate('commit')}>
-            Proceed to Commit
+            前往提交
           </button>
           <button className="btn-secondary" onClick={() => setShowPlan(false)}>
-            Back to Review
+            返回审核
           </button>
         </div>
       </div>
@@ -416,15 +418,15 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   if (allDecided) {
     return (
       <div className="review-page">
-        <h1>Review Complete</h1>
+        <h1>审核完成</h1>
         <div className="empty-state">
-          <h1>All Candidates Reviewed</h1>
+          <h1>所有候选已审核</h1>
           <p>
-            {progress?.decided_count} of {progress?.total_review_candidates} candidates decided.
+            已处理 {progress?.decided_count} / {progress?.total_review_candidates} 个候选。
           </p>
           <div className="toolbar" style={{ justifyContent: 'center' }}>
             <button className="btn-primary" onClick={handleGeneratePlan}>
-              Generate Import Plan
+              生成导入计划
             </button>
           </div>
         </div>
@@ -442,32 +444,32 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
     <div className="review-page" ref={containerRef}>
       <div className="review-header">
         <h1>
-          Review{' '}
+          审核{' '}
           <span className="review-counter">
-            {currentIndex + 1} / {undecidedQueue.length} undecided
-            {progress && ` (${progress.decided_count}/${progress.total_review_candidates} total)`}
+            {currentIndex + 1} / {undecidedQueue.length} 个待定
+            {progress && `（总计 ${progress.decided_count}/${progress.total_review_candidates}）`}
           </span>
         </h1>
         <div className="review-header-actions">
           <button
             className={`btn-secondary ${overlayMode ? 'active' : ''}`}
             onClick={() => setOverlayMode((m) => !m)}
-            title="Toggle overlay mode (O)"
+            title="切换叠加模式 (O)"
           >
-            Overlay
+            叠加
           </button>
           <button
             className="btn-secondary"
             onClick={() => setView(DEFAULT_VIEW)}
-            title="Reset zoom (R)"
+            title="重置缩放 (R)"
           >
-            Reset View
+            重置视图
           </button>
         </div>
       </div>
 
       {detailQuery.isLoading || !detail ? (
-        <div className="review-loading">Loading candidate...</div>
+        <div className="review-loading">正在加载候选...</div>
       ) : (
         <>
           <div
@@ -478,25 +480,25 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
             onMouseLeave={handleMouseUp}
           >
             <div className="review-image-panel left-panel">
-              <div className="review-image-label">Source</div>
+              <div className="review-image-label">源图片</div>
               <div className="review-image-container">
                 {leftPreview ? (
-                  <img src={leftPreview} alt="Source" style={imageStyle} draggable={false} />
+                  <img src={leftPreview} alt="源图片" style={imageStyle} draggable={false} />
                 ) : (
-                  <div className="review-image-placeholder">No preview</div>
+                  <div className="review-image-placeholder">没有预览</div>
                 )}
               </div>
             </div>
             <div className="review-image-panel right-panel">
               <div className="review-image-label">
-                {detail.scope === 'library' ? 'Library Match' : 'Candidate'}
+                {detail.scope === 'library' ? '历史图库匹配' : '候选图片'}
               </div>
               <div className="review-image-container">
                 {overlayMode ? (
                   rightPreview ? (
                     <img
                       src={rightPreview}
-                      alt="Candidate"
+                      alt="候选图片"
                       style={{
                         ...imageStyle,
                         opacity: overlayOpacity,
@@ -508,9 +510,9 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
                     />
                   ) : null
                 ) : rightPreview ? (
-                  <img src={rightPreview} alt="Candidate" style={imageStyle} draggable={false} />
+                  <img src={rightPreview} alt="候选图片" style={imageStyle} draggable={false} />
                 ) : (
-                  <div className="review-image-placeholder">No preview</div>
+                  <div className="review-image-placeholder">没有预览</div>
                 )}
               </div>
             </div>
@@ -518,7 +520,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
 
           {overlayMode && (
             <div className="overlay-opacity-control">
-              <label>Overlay Opacity: {Math.round(overlayOpacity * 100)}%</label>
+              <label>叠加透明度: {Math.round(overlayOpacity * 100)}%</label>
               <input
                 type="range"
                 min="0"
@@ -531,112 +533,112 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
 
           <div className="review-info-grid">
             <div className="review-info-card">
-              <h3>Source Image</h3>
+              <h3>源图片</h3>
               <table>
                 <tbody>
                   <tr>
-                    <td>Dimensions</td>
+                    <td>尺寸</td>
                     <td>
                       {detail.source_image_width && detail.source_image_height
                         ? `${detail.source_image_width} x ${detail.source_image_height}`
-                        : 'N/A'}
+                        : '无'}
                     </td>
                   </tr>
                   <tr>
-                    <td>File Size</td>
+                    <td>文件大小</td>
                     <td>{formatFileSize(detail.source_image_file_size)}</td>
                   </tr>
                   <tr>
-                    <td>Path</td>
+                    <td>路径</td>
                     <td className="mono">{detail.source_image_path}</td>
                   </tr>
                 </tbody>
               </table>
             </div>
             <div className="review-info-card">
-              <h3>{detail.scope === 'library' ? 'Library Match' : 'Candidate'}</h3>
+              <h3>{detail.scope === 'library' ? '历史图库匹配' : '候选图片'}</h3>
               <table>
                 <tbody>
                   <tr>
-                    <td>Dimensions</td>
+                    <td>尺寸</td>
                     <td>
                       {detail.scope === 'library'
                         ? detail.candidate_library_image_width &&
                           detail.candidate_library_image_height
                           ? `${detail.candidate_library_image_width} x ${detail.candidate_library_image_height}`
-                          : 'N/A'
+                          : '无'
                         : detail.candidate_source_image_width &&
                             detail.candidate_source_image_height
                           ? `${detail.candidate_source_image_width} x ${detail.candidate_source_image_height}`
-                          : 'N/A'}
+                          : '无'}
                     </td>
                   </tr>
                   <tr>
-                    <td>File Size</td>
+                    <td>文件大小</td>
                     <td>
                       {detail.scope === 'library'
                         ? detail.candidate_library_image_file_size
                           ? formatFileSize(detail.candidate_library_image_file_size)
-                          : 'N/A'
+                          : '无'
                         : detail.candidate_source_image_file_size
                           ? formatFileSize(detail.candidate_source_image_file_size)
-                          : 'N/A'}
+                          : '无'}
                     </td>
                   </tr>
                   <tr>
-                    <td>Path</td>
+                    <td>路径</td>
                     <td className="mono">
                       {detail.candidate_source_image_path ??
                         detail.candidate_library_image_path ??
-                        'N/A'}
+                        '无'}
                     </td>
                   </tr>
                 </tbody>
               </table>
             </div>
             <div className="review-info-card">
-              <h3>Match Details</h3>
+              <h3>匹配详情</h3>
               <table>
                 <tbody>
                   <tr>
-                    <td>Album</td>
+                    <td>图集</td>
                     <td>{detail.album_name}</td>
                   </tr>
                   <tr>
-                    <td>Scope</td>
+                    <td>范围</td>
                     <td>{formatScope(detail.scope)}</td>
                   </tr>
                   <tr>
-                    <td>Match Type</td>
+                    <td>匹配类型</td>
                     <td>{formatMatchType(detail.match_type)}</td>
                   </tr>
                   <tr>
-                    <td>Transform</td>
+                    <td>变换</td>
                     <td>{formatTransform(detail.transform_type)}</td>
                   </tr>
                   <tr>
-                    <td>BLAKE3 Equal</td>
-                    <td>{detail.blake3_equal ? 'Yes' : 'No'}</td>
+                    <td>BLAKE3 相同</td>
+                    <td>{detail.blake3_equal ? '是' : '否'}</td>
                   </tr>
                   <tr>
-                    <td>Pixel Hash Equal</td>
-                    <td>{detail.pixel_hash_equal ? 'Yes' : 'No'}</td>
+                    <td>像素哈希相同</td>
+                    <td>{detail.pixel_hash_equal ? '是' : '否'}</td>
                   </tr>
                   <tr>
-                    <td>Gradient Dist.</td>
+                    <td>梯度距离</td>
                     <td>{formatDistance(detail.gradient_distance)}</td>
                   </tr>
                   <tr>
-                    <td>Block Dist.</td>
+                    <td>分块距离</td>
                     <td>{formatDistance(detail.block_distance)}</td>
                   </tr>
                   <tr>
-                    <td>Median Dist.</td>
+                    <td>中值距离</td>
                     <td>{formatDistance(detail.median_distance)}</td>
                   </tr>
                   {detail.confidence !== null && (
                     <tr>
-                      <td>Confidence</td>
+                      <td>置信度</td>
                       <td>{(detail.confidence * 100).toFixed(1)}%</td>
                     </tr>
                   )}
@@ -648,14 +650,14 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
           <div className="review-actions">
             <div className="review-nav">
               <button className="btn-secondary" onClick={handlePrev} disabled={currentIndex === 0}>
-                Previous
+                上一个
               </button>
               <button
                 className="btn-secondary"
                 onClick={handleNext}
                 disabled={currentIndex >= undecidedQueue.length - 1}
               >
-                Next
+                下一个
               </button>
             </div>
             <div className="review-decision-buttons">
@@ -663,41 +665,39 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
                 className="btn-primary"
                 onClick={() => handleDecision('keep_source')}
                 disabled={submitting}
-                title="Keep source image (1)"
+                title="保留源图片 (1)"
               >
-                Keep Source [1]
+                保留源图片 [1]
               </button>
               <button
                 className="btn-primary"
                 onClick={() => handleDecision('keep_candidate')}
                 disabled={submitting}
-                title="Keep candidate image (2)"
+                title="保留候选图片 (2)"
               >
-                Keep {detail.scope === 'library' ? 'Library' : 'Candidate'} [2]
+                保留{detail.scope === 'library' ? '历史图库图片' : '候选图片'} [2]
               </button>
               <button
                 className="btn-secondary"
                 onClick={() => handleDecision('keep_all')}
                 disabled={submitting}
-                title="Keep both images (3)"
+                title="两张都保留 (3)"
               >
-                Keep All [3]
+                全部保留 [3]
               </button>
               <button
                 className="btn-danger"
                 onClick={handleSkipAlbum}
                 disabled={submitting}
-                title="Skip all candidates in this album (4)"
+                title="跳过该图集的所有候选 (4)"
               >
-                Skip Album [4]
+                跳过图集 [4]
               </button>
             </div>
           </div>
 
           <div className="review-shortcuts-hint">
-            <span>
-              Keyboard: 1-4 decide, Arrows navigate, O overlay, R reset view, Scroll zoom, Drag pan
-            </span>
+            <span>快捷键: 1-4 作出决定，方向键切换，O 叠加，R 重置视图，滚轮缩放，拖拽平移</span>
           </div>
         </>
       )}

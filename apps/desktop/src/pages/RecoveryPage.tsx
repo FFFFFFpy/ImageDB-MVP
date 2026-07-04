@@ -12,7 +12,7 @@ function formatState(state: string): string {
   const map: Record<string, string> = {
     planned: '准备事务',
     staging: '复制文件',
-    verifying: '验证 staging',
+    verifying: '验证暂存区',
     verified: '已验证',
     publishing: '发布目录',
     published: '已发布',
@@ -183,15 +183,15 @@ function RecoveryCard({ tx, recovering, reverifying, onRecover, onReverify }: Re
           <h4>证据</h4>
           <ul>
             <li className={tx.staging_exists ? 'present' : 'missing'}>
-              staging: {tx.staging_exists ? '存在' : '缺失'}
+              暂存区: {tx.staging_exists ? '存在' : '缺失'}
             </li>
             <li className={tx.target_exists ? 'present' : 'missing'}>
               正式目录: {tx.target_exists ? '存在' : '缺失'}
             </li>
             <li className={tx.manifest_exists ? 'present' : 'missing'}>
-              manifest: {tx.manifest_exists ? '存在' : '缺失'}
+              清单: {tx.manifest_exists ? '存在' : '缺失'}
             </li>
-            {tx.plan_hash && <li>plan hash: {tx.plan_hash.slice(0, 12)}...</li>}
+            {tx.plan_hash && <li>计划哈希: {tx.plan_hash.slice(0, 12)}...</li>}
           </ul>
         </div>
 

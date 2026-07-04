@@ -1,12 +1,17 @@
 import type { DiagnosticItem, TaggedStatus } from './ipc/types';
 
 const statusLabels: Record<string, string> = {
+  NotInitialized: '未初始化',
+  Initializing: '初始化中',
+  Ready: '就绪',
+  Connected: '已连接',
   not_initialized: '未初始化',
   initializing: '初始化中',
   ready: '就绪',
   connected: '已连接',
   Error: '错误',
   BinariesMissing: '缺少 PostgreSQL 运行文件',
+  binaries_missing: '缺少 PostgreSQL 运行文件',
 };
 
 function snakeCase(input: string): string {
@@ -24,7 +29,7 @@ export function formatTaggedStatus(status: TaggedStatus | null | undefined): str
   if (typeof status === 'string') {
     return statusLabels[status] ?? status;
   }
-  if (!status) return '未知';
+  if (!status) return '正在读取状态';
   const [[key, value] = []] = Object.entries(status);
   if (!key) return '未知';
   const label = statusLabels[key] ?? snakeCase(key);

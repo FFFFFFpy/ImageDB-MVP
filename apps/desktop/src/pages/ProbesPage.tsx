@@ -12,6 +12,26 @@ import type {
 
 type TabKey = 'postgres' | 'fingerprint' | 'file_tx';
 
+function formatFileTransactionState(state: string): string {
+  const map: Record<string, string> = {
+    planned: '已计划',
+    staging: '复制到暂存区',
+    verifying: '验证中',
+    verified: '已验证',
+    publishing: '发布中',
+    published: '已发布',
+    db_committing: '数据库确认中',
+    library_committed: '已正式入库',
+    source_archiving: '源图集归档中',
+    source_archived: '源图集已归档',
+    cleanup_required: '需要清理',
+    conflict: '发生冲突',
+    failed: '失败',
+    cancelled: '已取消',
+  };
+  return map[state.toLowerCase()] ?? state;
+}
+
 export function ProbesPage() {
   const [tab, setTab] = useState<TabKey>('postgres');
   const [pgResult, setPgResult] = useState<PostgresProbeResult | null>(null);
@@ -178,7 +198,7 @@ function FpResultView({ result }: { result: ImageFingerprintProbeResult }) {
         <div key={i} className="fingerprint-card">
           <p className="mono">
             {fp.file_path.split(/[/\\]/).pop()} ({fp.format}, {fp.width}x{fp.height}, {fp.file_size}{' '}
-            bytes)
+            字节)
           </p>
           <table>
             <tbody>
@@ -191,19 +211,19 @@ function FpResultView({ result }: { result: ImageFingerprintProbeResult }) {
                 <td className="mono">{fp.blake3.slice(0, 32)}...</td>
               </tr>
               <tr>
-                <td>Pixel Hash</td>
+                <td>像素哈希</td>
                 <td className="mono">{fp.pixel_hash}</td>
               </tr>
               <tr>
-                <td>Gradient Hash</td>
+                <td>梯度哈希</td>
                 <td className="mono">{fp.gradient_hash}</td>
               </tr>
               <tr>
-                <td>Block Hash</td>
+                <td>分块哈希</td>
                 <td className="mono">{fp.block_hash}</td>
               </tr>
               <tr>
-                <td>Median Hash</td>
+                <td>中值哈希</td>
                 <td className="mono">{fp.median_hash}</td>
               </tr>
             </tbody>
@@ -226,7 +246,7 @@ function FtResultView({ result }: { result: FileTransactionProbeResult }) {
           </tr>
           <tr>
             <td>状态</td>
-            <td>{result.state}</td>
+            <td>{formatFileTransactionState(result.state)}</td>
           </tr>
           <tr>
             <td>BLAKE3 校验</td>
@@ -241,7 +261,7 @@ function FtResultView({ result }: { result: FileTransactionProbeResult }) {
             <td>{result.published_files.length}</td>
           </tr>
           <tr>
-            <td>Manifest</td>
+            <td>清单</td>
             <td className="mono">{result.manifest_path ?? '-'}</td>
           </tr>
         </tbody>

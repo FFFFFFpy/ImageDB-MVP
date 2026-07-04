@@ -24,13 +24,16 @@ export function App() {
   const needsOnboarding = settings.data ? !settings.data.first_run_completed : false;
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
-  const handleOnboardingComplete = () => {
+  const handleOnboardingComplete = async () => {
     // Invalidate settings + database status so first_run_completed and the
     // connected DB state are re-fetched fresh, then navigate without a full
     // page reload (a reload would drop all in-memory React state and force
     // the user to re-wait while the DB status poll repopulates).
-    queryClient.invalidateQueries({ queryKey: ['settings'] });
-    queryClient.invalidateQueries({ queryKey: ['database-status'] });
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['settings'] }),
+      queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+    ]);
+    await queryClient.refetchQueries({ queryKey: ['settings'], type: 'active' });
     navigate('dashboard');
   };
 

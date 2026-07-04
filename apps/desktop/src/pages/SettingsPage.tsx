@@ -25,6 +25,33 @@ const storageTypeLabels = {
   unknown: '未知',
 };
 
+function formatMigrationState(state: string): string {
+  const map: Record<string, string> = {
+    idle: '空闲',
+    running: '迁移中',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+  };
+  return map[state] ?? state;
+}
+
+function formatMigrationStage(stage: string): string {
+  const map: Record<string, string> = {
+    idle: '空闲',
+    preflight: '预检查',
+    backup: '备份托管库',
+    schema: '准备结构',
+    copy: '复制数据',
+    verify: '校验数据',
+    switch_profile: '切换配置',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+  };
+  return map[stage] ?? stage;
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
 
@@ -193,7 +220,7 @@ export function SettingsPage() {
               onClick={() => exportDiagnostics.mutate()}
               disabled={exportDiagnostics.isPending}
             >
-              {exportDiagnostics.isPending ? 'Exporting...' : 'Export diagnostics'}
+              {exportDiagnostics.isPending ? '导出中...' : '导出诊断'}
             </button>
             {switchManaged.isError && (
               <pre className="status-err">{String(switchManaged.error)}</pre>
@@ -203,12 +230,12 @@ export function SettingsPage() {
                 <table>
                   <tbody>
                     <tr>
-                      <td>Diagnostics package</td>
+                      <td>诊断包</td>
                       <td className="mono">{exportDiagnostics.data.path}</td>
                     </tr>
                     <tr>
-                      <td>Redacted</td>
-                      <td>{exportDiagnostics.data.redacted ? 'yes' : 'no'}</td>
+                      <td>敏感信息已隐藏</td>
+                      <td>{exportDiagnostics.data.redacted ? '是' : '否'}</td>
                     </tr>
                   </tbody>
                 </table>
@@ -287,7 +314,7 @@ export function SettingsPage() {
             />
           </label>
           <label>
-            Profile 名称
+            配置名称
             <input value={extProfileName} onChange={(e) => setExtProfileName(e.target.value)} />
           </label>
         </div>
@@ -332,7 +359,7 @@ export function SettingsPage() {
                   <td>{testExt.data.can_create_tables ? '有' : '无'}</td>
                 </tr>
                 <tr>
-                  <td>Schema 权限</td>
+                  <td>模式权限</td>
                   <td>{testExt.data.can_modify_schema ? '有' : '无'}</td>
                 </tr>
                 <tr>
@@ -373,11 +400,11 @@ export function SettingsPage() {
               <tbody>
                 <tr>
                   <td>状态</td>
-                  <td>{migration.state}</td>
+                  <td>{formatMigrationState(migration.state)}</td>
                 </tr>
                 <tr>
                   <td>阶段</td>
-                  <td>{migration.current_stage}</td>
+                  <td>{formatMigrationStage(migration.current_stage)}</td>
                 </tr>
                 <tr>
                   <td>切换结果</td>
@@ -439,7 +466,7 @@ export function SettingsPage() {
           <input
             value={libRoot}
             onChange={(e) => setLibRoot(e.target.value)}
-            placeholder="/path/to/library"
+            placeholder="例如 D:\ImageLibrary"
           />
         </label>
         <button

@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { DatabaseState, ExternalConnectionConfig } from '../lib/ipc/types';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
@@ -10,23 +10,30 @@ interface OnboardingPageProps {
 
 export function OnboardingPage({ onComplete }: OnboardingPageProps) {
   const [mode, setMode] = useState<'managed' | 'external' | null>(null);
+  const [connectedState, setConnectedState] = useState<DatabaseState | null>(null);
+  const queryClient = useQueryClient();
 
   const dbStatus = useQuery({
     queryKey: ['database-status'],
     queryFn: api.getDatabaseStatus,
-    refetchInterval: 3000,
+    refetchInterval: 2000,
   });
-  const databaseState = dbStatus.data;
+  const databaseState = connectedState ?? dbStatus.data;
 
+  // When the DB becomes connected (either via the initial mutation or the
+  // poll), surface a single, unambiguous "进入应用" button. Never auto-
+  // navigate — the user must click the button so they always see the entry.
   if (databaseState && taggedStatusCode(databaseState.status) === 'connected') {
     return (
       <div className="onboarding-page">
         <h1>数据库已就绪</h1>
         <p>数据库连接正常，可以开始使用 ImageDB。</p>
         <DbStateSummary state={databaseState} />
-        <button className="btn-primary" onClick={onComplete}>
-          进入应用
-        </button>
+        <div className="onboarding-actions">
+          <button className="btn-primary" onClick={onComplete}>
+            进入应用
+          </button>
+        </div>
       </div>
     );
   }
@@ -55,8 +62,22 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
         </div>
       </div>
 
-      {mode === 'managed' && <ManagedSetup onComplete={onComplete} />}
-      {mode === 'external' && <ExternalSetup onComplete={onComplete} />}
+      {mode === 'managed' && (
+        <ManagedSetup
+          onConnected={(state) => {
+            setConnectedState(state);
+            queryClient.invalidateQueries({ queryKey: ['database-status'] });
+          }}
+        />
+      )}
+      {mode === 'external' && (
+        <ExternalSetup
+          onConnected={(state) => {
+            setConnectedState(state);
+            queryClient.invalidateQueries({ queryKey: ['database-status'] });
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -106,12 +127,12 @@ function DbStateSummary({ state }: { state: DatabaseState }) {
   );
 }
 
-function ManagedSetup({ onComplete }: { onComplete: () => void }) {
+function ManagedSetup({ onConnected }: { onConnected: (state: DatabaseState) => void }) {
   const init = useMutation({
     mutationFn: api.initializeManagedDatabase,
     onSuccess: (state) => {
       if (taggedStatusCode(state.status) === 'connected') {
-        onComplete();
+        onConnected(state);
       }
     },
   });
@@ -125,11 +146,14 @@ function ManagedSetup({ onComplete }: { onComplete: () => void }) {
       </button>
       {init.data && <DbStateSummary state={init.data} />}
       {init.isError && <pre className="status-err">{String(init.error)}</pre>}
+      {init.data && taggedStatusCode(init.data.status) === 'connected' && (
+        <p className="status-ok">初始化成功，点击上方「进入应用」继续。</p>
+      )}
     </div>
   );
 }
 
-function ExternalSetup({ onComplete }: { onComplete: () => void }) {
+function ExternalSetup({ onConnected }: { onConnected: (state: DatabaseState) => void }) {
   const [host, setHost] = useState('127.0.0.1');
   const [port, setPort] = useState('5432');
   const [database, setDatabase] = useState('imagedb');
@@ -162,7 +186,7 @@ function ExternalSetup({ onComplete }: { onComplete: () => void }) {
     mutationFn: () => api.initializeExternalDatabase(buildConfig()),
     onSuccess: (state) => {
       if (taggedStatusCode(state.status) === 'connected') {
-        onComplete();
+        onConnected(state);
       }
     },
   });

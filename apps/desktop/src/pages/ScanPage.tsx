@@ -21,6 +21,13 @@ interface ScanProgressEvent {
   errors: string[];
 }
 
+interface ScanDraft {
+  sourcePath: string;
+  sourceInfo: ScanSourceInfo | null;
+}
+
+const SCAN_DRAFT_STORAGE_KEY = 'imagedb.scan.draft';
+
 const STAGE_LABELS: Record<string, string> = {
   idle: '空闲',
   scanning: '扫描目录',
@@ -31,6 +38,39 @@ const STAGE_LABELS: Record<string, string> = {
   cancelled: '已取消',
   failed: '失败',
 };
+
+function isScanSourceInfo(value: unknown): value is ScanSourceInfo {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<ScanSourceInfo>;
+  return (
+    typeof candidate.path === 'string' &&
+    Array.isArray(candidate.albums) &&
+    candidate.albums.every((album) => typeof album === 'string') &&
+    typeof candidate.album_count === 'number'
+  );
+}
+
+function loadScanDraft(): ScanDraft {
+  try {
+    const raw = window.localStorage.getItem(SCAN_DRAFT_STORAGE_KEY);
+    if (!raw) return { sourcePath: '', sourceInfo: null };
+    const parsed = JSON.parse(raw) as Partial<ScanDraft>;
+    return {
+      sourcePath: typeof parsed.sourcePath === 'string' ? parsed.sourcePath : '',
+      sourceInfo: isScanSourceInfo(parsed.sourceInfo) ? parsed.sourceInfo : null,
+    };
+  } catch {
+    return { sourcePath: '', sourceInfo: null };
+  }
+}
+
+function saveScanDraft(draft: ScanDraft) {
+  try {
+    window.localStorage.setItem(SCAN_DRAFT_STORAGE_KEY, JSON.stringify(draft));
+  } catch {
+    // The draft is only a UI convenience; scanning itself does not depend on it.
+  }
+}
 
 export function isTerminalScanState(state: string | null | undefined): boolean {
   return (
@@ -49,8 +89,10 @@ export function nextRouteForScanState(state: string | null | undefined): Route |
 }
 
 export function ScanPage({ onNavigate }: ScanPageProps) {
-  const [sourcePath, setSourcePath] = useState('');
-  const [sourceInfo, setSourceInfo] = useState<ScanSourceInfo | null>(null);
+  const [sourcePath, setSourcePath] = useState(() => loadScanDraft().sourcePath);
+  const [sourceInfo, setSourceInfo] = useState<ScanSourceInfo | null>(
+    () => loadScanDraft().sourceInfo,
+  );
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
@@ -62,6 +104,36 @@ export function ScanPage({ onNavigate }: ScanPageProps) {
   useEffect(() => {
     return () => {
       eventListenerRef.current?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    saveScanDraft({ sourcePath, sourceInfo });
+  }, [sourcePath, sourceInfo]);
+
+  // Restore an in-progress or completed scan when the page (re)mounts so
+  // navigating away and back does not wipe the scan state. The scan run
+  // lives in the backend; the page just needs to re-attach.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await api.getScanProgress();
+        if (cancelled) return;
+        if (p && p.state && p.state !== 'idle' && p.import_run_id) {
+          setProgress(p);
+          if (isTerminalScanState(p.state)) {
+            setIsScanning(false);
+          } else {
+            setIsScanning(true);
+          }
+        }
+      } catch {
+        // ignore — no scan in flight
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
