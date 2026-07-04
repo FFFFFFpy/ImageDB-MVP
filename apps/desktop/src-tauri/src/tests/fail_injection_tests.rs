@@ -18,8 +18,8 @@ use crate::services::commit_service::{self, COMMIT_MARKER_FILE_NAME};
 use crate::services::recovery_service;
 use crate::services::source_snapshot_service::capture_source_album_snapshot;
 use crate::tests::fail_injection::{
-    clear_fault_point, set_fault_point, set_force_conservative_publish, set_forced_available_space,
-    CommitFaultPoint,
+    clear_fault_point, set_fault_point, set_force_conservative_publish,
+    set_force_storage_unwritable, set_forced_available_space, CommitFaultPoint,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -571,6 +571,87 @@ async fn fail_injection_recovery_insufficient_space_pauses_then_recovers() {
                 .unwrap_or_default()
                 .contains("insufficient free space"),
             "last_error should explain the space gate: {last_error:?}"
+        );
+        drop(client);
+        handle.abort();
+    }
+
+    drive_recovery(pg.clone(), run_id).await;
+    assert_recovered(pg.clone(), &lib_root).await;
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn fail_injection_recovery_unwritable_storage_pauses_then_recovers() {
+    let (_tmp, pg, run_id, lib_root, _album_path) = setup_full_env().await;
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::AfterDbWrite,
+    )
+    .await;
+
+    let tx_id: Uuid = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let id: Uuid = client
+            .query_one(
+                "SELECT id FROM file_transactions ORDER BY started_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        handle.abort();
+        id
+    };
+
+    set_force_storage_unwritable(true);
+    let paused = recovery_service::recover_transaction(pg.clone(), tx_id)
+        .await
+        .expect("recovery should pause cleanly when storage is not writable");
+    set_force_storage_unwritable(false);
+
+    assert_eq!(paused.final_state, "staging");
+    assert!(!paused.recovered);
+    assert!(
+        paused.message.contains("not currently writable"),
+        "expected unwritable-storage pause, got {}",
+        paused.message
+    );
+
+    {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let row = client
+            .query_one(
+                "SELECT ft.state, ft.last_error, ir.state
+                 FROM file_transactions ft
+                 JOIN import_runs ir ON ir.id = ft.import_run_id
+                 WHERE ft.id = $1",
+                &[&tx_id],
+            )
+            .await
+            .unwrap();
+        let tx_state: String = row.get(0);
+        let last_error: Option<String> = row.get(1);
+        let run_state: String = row.get(2);
+        assert_eq!(tx_state, "staging");
+        assert_eq!(run_state, "recovery_required");
+        assert!(
+            last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not currently writable"),
+            "last_error should explain the writable gate: {last_error:?}"
         );
         drop(client);
         handle.abort();

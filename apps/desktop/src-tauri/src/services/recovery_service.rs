@@ -880,6 +880,14 @@ fn recovery_storage_preflight(
     current: TransactionState,
     plan_images: &[PlanImageRow],
 ) -> Option<String> {
+    #[cfg(feature = "fail-injection")]
+    if crate::tests::fail_injection::force_storage_unwritable() {
+        return Some(format!(
+            "recovery paused: library root '{}' is not currently writable after storage reprobe (writable is Unsupported: injected read-only storage)",
+            library_root.display()
+        ));
+    }
+
     let capabilities = probe_storage_capabilities(library_root);
     let required_bytes = estimated_recovery_write_bytes(current, plan_images);
     #[cfg(feature = "fail-injection")]

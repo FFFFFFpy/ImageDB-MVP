@@ -349,3 +349,36 @@
 ### 已知限制
 
 - 该测试覆盖未知目标目录 preflight 冲突；真实挂载共享存储门禁仍未完成。
+
+## 2026-07-04: Recovery unwritable-storage gate
+
+### 实现内容
+
+- 新增仅 `fail-injection` 测试构建可用的不可写存储注入点，正式构建仍使用真实 `StorageCapabilities` 探测判断可写性。
+- 新增真实 PostgreSQL + 真实文件系统故障注入测试，覆盖 Recovery 在图库根不可写时的暂停行为。
+- commit 在 `AfterDbWrite` 中断后，测试强制 Recovery 看到不可写/只读存储。
+- Recovery 必须暂停，保持 transaction 为 `staging`，父 import run 保持 `recovery_required`，并写入可诊断的 `last_error`。
+- 清除不可写故障后，同一 transaction 可继续恢复并最终收敛到 `source_archived`。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/services/recovery_service.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib fail_injection_recovery_unwritable_storage_pauses_then_recovers -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- 不可写时 Recovery 返回 `final_state=staging`、`recovered=false`，消息包含 `not currently writable`。
+- 数据库中 transaction 保持 `staging`，import run 保持 `recovery_required`，未产生完成状态。
+- 清除不可写故障后，Recovery 成功完成后续提交闭环。
+
+### 已知限制
+
+- 该测试使用 fail-injection 模拟只读/不可写，不是实际修改 Windows ACL 或真实 NAS 只读权限。
+- 超时和真实挂载共享存储门禁仍需要单独证据。
