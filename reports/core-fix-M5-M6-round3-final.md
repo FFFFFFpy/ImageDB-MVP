@@ -30,15 +30,15 @@ branch, no release artifact upload.**
 
 ## 2. Completed phases
 
-| Phase | What | Commit |
-| ----- | ---- | ------ |
-| P0 | cancel-before-prewrite → `cancelled` + GUI re-entry | 6fe7f84 |
-| P1 mid-copy cancel | `stream_copy_with_hash` cancel token, checked per 64 KiB chunk | eb326e1 |
-| P1 empty-plan strict | `Err(_)` no longer tolerated; only empty set completes | eb326e1 |
-| P1 redundant hash | migration 0009 drops `import_albums.source_snapshot_hash` | eb326e1 |
-| P2 snapshot concurrency | `SNAPSHOT_CONCURRENCY` semaphore (bound 2) + cancel-aware walk | eb326e1 |
-| P1 false-coverage tests | 5 tests rewritten to actually verify their named scenario | 4f231ce |
-| verification | full build + real test execution | (verified) |
+| Phase                   | What                                                           | Commit     |
+| ----------------------- | -------------------------------------------------------------- | ---------- |
+| P0                      | cancel-before-prewrite → `cancelled` + GUI re-entry            | 6fe7f84    |
+| P1 mid-copy cancel      | `stream_copy_with_hash` cancel token, checked per 64 KiB chunk | eb326e1    |
+| P1 empty-plan strict    | `Err(_)` no longer tolerated; only empty set completes         | eb326e1    |
+| P1 redundant hash       | migration 0009 drops `import_albums.source_snapshot_hash`      | eb326e1    |
+| P2 snapshot concurrency | `SNAPSHOT_CONCURRENCY` semaphore (bound 2) + cancel-aware walk | eb326e1    |
+| P1 false-coverage tests | 5 tests rewritten to actually verify their named scenario      | 4f231ce    |
+| verification            | full build + real test execution                               | (verified) |
 
 ## 3. Cancel-before-prewrite + GUI re-entry
 
@@ -130,13 +130,13 @@ large album can be aborted promptly.
 
 ## 8. False-coverage tests fixed
 
-| # | Test | What was wrong | Fix |
-| - | ---- | -------------- | --- |
-| 1 | setup_env | doc claimed "nested file" but none existed | now creates `sub/meta.xmp` |
-| 2 | plan_image_escape_does_not_complete | was a happy-path smoke test, no escape | now tampers source_path outside the album root (byte-identical so staging BLAKE3 passes) and asserts the archive-stage escape check fires |
-| 3 | snapshot_path_mismatch_surfaces_conflict | accepted `source_archived` as valid | now asserts `conflict` strictly |
-| 4 | source_album_with_symlink_rejected | Windows branch created a regular-file stub | now creates a real directory junction via `mklink /J` |
-| 5 | cancellation_recovery_mid_staging_resumable | pre-start cancel (no transaction) | 64 MiB file + concurrent cancel trigger that fires after copy starts |
+| #   | Test                                        | What was wrong                             | Fix                                                                                                                                       |
+| --- | ------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | setup_env                                   | doc claimed "nested file" but none existed | now creates `sub/meta.xmp`                                                                                                                |
+| 2   | plan_image_escape_does_not_complete         | was a happy-path smoke test, no escape     | now tampers source_path outside the album root (byte-identical so staging BLAKE3 passes) and asserts the archive-stage escape check fires |
+| 3   | snapshot_path_mismatch_surfaces_conflict    | accepted `source_archived` as valid        | now asserts `conflict` strictly                                                                                                           |
+| 4   | source_album_with_symlink_rejected          | Windows branch created a regular-file stub | now creates a real directory junction via `mklink /J`                                                                                     |
+| 5   | cancellation_recovery_mid_staging_resumable | pre-start cancel (no transaction)          | 64 MiB file + concurrent cancel trigger that fires after copy starts                                                                      |
 
 ## 9. Full build results
 
