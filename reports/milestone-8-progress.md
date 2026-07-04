@@ -124,3 +124,44 @@
 
 - Recovery 目前按动作持有租约，尚未在长时间单文件恢复复制中做分块 heartbeat。
 - 断连/只读/空间不足恢复、路径逃逸增强和真实挂载共享存储故障门禁仍未完成。
+
+## 2026-07-04: Path safety hardening
+
+### 实现内容
+
+- 加强目标相对路径校验：
+  - 禁止绝对路径、盘符前缀、`..`、空路径；
+  - 规范化分隔符为 `/`；
+  - 拒绝 Windows 保留名；
+  - 拒绝尾随点或空格；
+  - 检查单组件长度和相对路径总长度。
+- 加强同一 album 内目标路径冲突检查：
+  - 检测大小写折叠冲突；
+  - 检测 Unicode NFC 规范化后的冲突。
+- 发布前检查目标目录现有祖先，拒绝 symlink / reparse point 祖先，避免目标路径逃逸图库根。
+- `publish_verified_staging` 统一执行目标祖先检查，覆盖 StrongLocal、ConservativeMounted 以及 Recovery 重新发布路径。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/Cargo.toml`
+- `apps/desktop/src-tauri/Cargo.lock`
+- `apps/desktop/src-tauri/src/services/commit_service.rs`
+- `apps/desktop/src-tauri/src/services/recovery_service.rs`
+- `checklists/M8_DOD.md`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml commit_service::tests::`：35 passed。
+
+### 实际运行结果
+
+- 单元测试验证保留名、尾随点/空格、长组件、长相对路径被拒绝。
+- 单元测试验证大小写冲突和 Unicode NFC 冲突被拒绝。
+- 单元测试在平台允许创建 symlink 时验证目标祖先 symlink 会被拒绝。
+
+### 已知限制
+
+- 当前路径长度阈值为应用级保守限制，不等同于每个文件系统的精确最大路径能力。
+- 断连/只读/空间不足恢复、保守发布故障注入门禁和真实挂载共享存储故障测试仍未完成。

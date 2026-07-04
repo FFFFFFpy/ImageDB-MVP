@@ -947,6 +947,7 @@ async fn resume_publishing(
             let strategy = select_commit_publish_strategy(library_root)?;
             publish_verified_staging(
                 strategy,
+                library_root,
                 staging,
                 &publish_dir,
                 tx.id,
@@ -1212,6 +1213,7 @@ async fn publish_from_staging(
     let strategy = select_commit_publish_strategy(library_root)?;
     publish_verified_staging(
         strategy,
+        library_root,
         &staging_dir,
         &publish_dir,
         tx.id,

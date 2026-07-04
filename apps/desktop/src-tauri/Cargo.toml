@@ -38,6 +38,7 @@ chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
 rand = "0.8"
 base64 = "0.22"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

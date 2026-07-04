@@ -40,6 +40,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_postgres::Client;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 /// Schema version written into every album manifest.
@@ -47,6 +48,8 @@ pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
 pub const COMMIT_MARKER_SCHEMA_VERSION: &str = "1.0";
 pub const COMMIT_MARKER_FILE_NAME: &str = ".imagedb-commit.json";
 pub const LIBRARY_ROOT_LEASE_TTL_SECS: i64 = 300;
+pub const MAX_TARGET_COMPONENT_CHARS: usize = 240;
+pub const MAX_TARGET_RELATIVE_PATH_CHARS: usize = 512;
 /// Maximum decoded pixel count for a single source file preview.
 #[allow(dead_code)]
 pub const PREVIEW_MAX_PIXELS: u64 = 8_000_000;
@@ -136,6 +139,7 @@ pub(crate) fn normalize_relative_path(rel: &str) -> Result<String, AppError> {
                         "empty path component in '{rel}'"
                     )));
                 }
+                validate_target_component(&s, rel)?;
                 parts.push(s.to_string());
             }
             Component::CurDir => {} // skip "."
@@ -161,26 +165,93 @@ pub(crate) fn normalize_relative_path(rel: &str) -> Result<String, AppError> {
             "target relative path is empty: {rel}"
         )));
     }
-    Ok(parts.join("/"))
+    let normalized = parts.join("/");
+    if normalized.chars().count() > MAX_TARGET_RELATIVE_PATH_CHARS {
+        return Err(AppError::Internal(format!(
+            "target relative path is too long ({} > {}): {normalized}",
+            normalized.chars().count(),
+            MAX_TARGET_RELATIVE_PATH_CHARS
+        )));
+    }
+    Ok(normalized)
+}
+
+fn validate_target_component(component: &str, original: &str) -> Result<(), AppError> {
+    if component.chars().count() > MAX_TARGET_COMPONENT_CHARS {
+        return Err(AppError::Internal(format!(
+            "target path component is too long ({} > {}): {component}",
+            component.chars().count(),
+            MAX_TARGET_COMPONENT_CHARS
+        )));
+    }
+    if component.ends_with(' ') || component.ends_with('.') {
+        return Err(AppError::Internal(format!(
+            "target path component must not end with space or dot: {component}"
+        )));
+    }
+    if is_windows_reserved_component(component) {
+        return Err(AppError::Internal(format!(
+            "target path component uses Windows reserved name '{component}' in '{original}'"
+        )));
+    }
+    Ok(())
+}
+
+fn is_windows_reserved_component(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn normalized_conflict_key(path: &str) -> String {
+    path.nfc().collect::<String>().to_lowercase()
 }
 
 /// Detect case conflicts and duplicate target paths within one album.
 fn check_target_path_conflicts(images: &[PlanImageRow]) -> Result<(), AppError> {
-    let mut seen: HashMap<String, String> = HashMap::new(); // lowercased -> original
+    let mut seen: HashMap<String, String> = HashMap::new(); // folded+NFC -> original
     for img in images {
         let normalized = normalize_relative_path(&img.target_relative_path)?;
-        let lower = normalized.to_lowercase();
-        if let Some(prev) = seen.get(&lower) {
+        let key = normalized_conflict_key(&normalized);
+        if let Some(prev) = seen.get(&key) {
             if prev != &normalized {
                 return Err(AppError::Internal(format!(
-                    "target path case conflict: '{prev}' vs '{normalized}'"
+                    "target path case/Unicode conflict: '{prev}' vs '{normalized}'"
                 )));
             }
             return Err(AppError::Internal(format!(
                 "duplicate target relative path in plan: {normalized}"
             )));
         }
-        seen.insert(lower, normalized);
+        seen.insert(key, normalized);
     }
     Ok(())
 }
@@ -674,6 +745,69 @@ pub(crate) fn path_eq(a: &Path, b: &Path) -> bool {
     }
 }
 
+pub(crate) fn ensure_no_symlink_or_reparse_escape(
+    library_root: &Path,
+    target_path: &Path,
+) -> Result<(), AppError> {
+    let root = library_root.canonicalize().map_err(|e| {
+        AppError::IoError(format!(
+            "cannot canonicalize library root {}: {e}",
+            library_root.display()
+        ))
+    })?;
+    let rel = target_path.strip_prefix(library_root).map_err(|_| {
+        AppError::Internal(format!(
+            "target path {} is outside library root {}",
+            target_path.display(),
+            library_root.display()
+        ))
+    })?;
+
+    let mut current = library_root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::Internal(format!(
+                    "target path escapes library root: {}",
+                    target_path.display()
+                )));
+            }
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(AppError::Internal(format!(
+                        "target ancestor is a symlink/reparse point: {}",
+                        current.display()
+                    )));
+                }
+                let canonical = current.canonicalize().map_err(|e| {
+                    AppError::IoError(format!("cannot canonicalize {}: {e}", current.display()))
+                })?;
+                if !canonical.starts_with(&root) {
+                    return Err(AppError::Internal(format!(
+                        "target ancestor escapes library root: {} -> {}",
+                        current.display(),
+                        canonical.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(AppError::IoError(format!(
+                    "cannot inspect target ancestor {}: {e}",
+                    current.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Commit a single album using the staged file transaction protocol.
 #[allow(clippy::too_many_arguments)]
 async fn commit_single_album(
@@ -756,6 +890,7 @@ async fn commit_single_album(
 
     // The publish dir must not already exist as an unknown directory.
     let publish_dir = library_root.join("Albums").join(&album_relative_path);
+    ensure_no_symlink_or_reparse_escape(library_root, &publish_dir)?;
     // Ensure the publish dir's parent exists so the atomic rename can land.
     // The publish dir itself must NOT exist (created atomically by rename).
     if let Some(parent) = publish_dir.parent() {
@@ -1013,6 +1148,7 @@ async fn commit_single_album(
 
     publish_verified_staging(
         publish_strategy,
+        library_root,
         &staging_dir,
         &publish_dir,
         tx_id,
@@ -1573,6 +1709,7 @@ pub(crate) fn validate_commit_marker(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_verified_staging(
     strategy: CommitPublishStrategy,
+    library_root: &Path,
     staging_dir: &Path,
     publish_dir: &Path,
     tx_id: Uuid,
@@ -1581,6 +1718,7 @@ pub(crate) async fn publish_verified_staging(
     album_relative_path: &str,
     images: &[PlanImageRow],
 ) -> Result<(), AppError> {
+    ensure_no_symlink_or_reparse_escape(library_root, publish_dir)?;
     if publish_dir.exists() {
         return Err(AppError::Internal(format!(
             "target directory appeared during publish: {}",
@@ -2941,6 +3079,28 @@ mod tests {
     }
 
     #[test]
+    fn normalize_rejects_reserved_trailing_and_long_components() {
+        assert!(normalize_relative_path("album/CON.jpg").is_err());
+        assert!(normalize_relative_path("album/NUL").is_err());
+        assert!(normalize_relative_path("album/name.").is_err());
+        assert!(normalize_relative_path("album/name ").is_err());
+        let long = format!("album/{}.jpg", "a".repeat(MAX_TARGET_COMPONENT_CHARS + 1));
+        assert!(normalize_relative_path(&long).is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_long_relative_paths() {
+        let mut rel = String::new();
+        while rel.chars().count() <= MAX_TARGET_RELATIVE_PATH_CHARS {
+            if !rel.is_empty() {
+                rel.push('/');
+            }
+            rel.push_str("segment");
+        }
+        assert!(normalize_relative_path(&rel).is_err());
+    }
+
+    #[test]
     fn normalize_keeps_subdirs() {
         assert_eq!(
             normalize_relative_path("chapter-a/001.jpg").unwrap(),
@@ -2954,6 +3114,15 @@ mod tests {
         let images = vec![
             plan_image("AAA/001.jpg", &[1; 32]),
             plan_image("aaa/001.jpg", &[1; 32]),
+        ];
+        assert!(check_target_path_conflicts(&images).is_err());
+    }
+
+    #[test]
+    fn detect_unicode_normalization_conflict() {
+        let images = vec![
+            plan_image("album/cafe\u{00e9}.jpg", &[1; 32]),
+            plan_image("album/cafee\u{0301}.jpg", &[2; 32]),
         ];
         assert!(check_target_path_conflicts(&images).is_err());
     }
@@ -2974,6 +3143,37 @@ mod tests {
             plan_image("chapter-b/001.jpg", &[2; 32]),
         ];
         assert!(check_target_path_conflicts(&images).is_ok());
+    }
+
+    #[test]
+    fn target_symlink_ancestor_is_rejected_when_platform_allows_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let albums = tmp.path().join("Albums");
+
+        if create_dir_symlink(&outside, &albums).is_err() {
+            return;
+        }
+
+        let target = albums.join("album_a");
+        let err = ensure_no_symlink_or_reparse_escape(tmp.path(), &target)
+            .expect_err("symlink ancestor must be rejected")
+            .to_string();
+        assert!(
+            err.contains("symlink") || err.contains("escape"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
     }
 
     fn plan_image(rel: &str, blake3: &[u8]) -> PlanImageRow {
@@ -3057,6 +3257,7 @@ mod tests {
 
         publish_verified_staging(
             CommitPublishStrategy::ConservativeMounted,
+            tmp.path(),
             &staging,
             &publish,
             tx,
