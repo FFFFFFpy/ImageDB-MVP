@@ -50,6 +50,13 @@ const steps = [
   },
   { id: 'mounted', label: 'mounted SMB storage gate', mounted: true, skip: skipMounted },
   { id: 'build', label: 'pnpm build', command: 'pnpm', args: ['build'], skip: skipBuild },
+  {
+    id: 'verify-artifacts',
+    label: 'pnpm release:verify-artifacts',
+    command: 'pnpm',
+    args: ['release:verify-artifacts'],
+    skip: skipBuild,
+  },
 ];
 
 function shouldRun(step) {

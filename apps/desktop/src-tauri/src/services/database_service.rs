@@ -613,7 +613,8 @@ impl DatabaseService {
             } else if !mgr.binaries_available() {
                 (
                     DatabaseStatus::BinariesMissing(
-                        "PostgreSQL binaries not found on this system".to_string(),
+                        "安装包不完整：缺少内置 PostgreSQL 运行文件，请重新安装 ImageDB。"
+                            .to_string(),
                     ),
                     false,
                     None,
@@ -658,7 +659,7 @@ impl DatabaseService {
             return Ok(DatabaseState {
                 mode: Some(DatabaseMode::ManagedLocal),
                 status: DatabaseStatus::BinariesMissing(
-                    "PostgreSQL binaries not found. Install PostgreSQL or place binaries alongside the application.".to_string(),
+                    "安装包不完整：缺少内置 PostgreSQL 运行文件，请重新安装 ImageDB。".to_string(),
                 ),
                 managed_config: None,
                 external_config: None,

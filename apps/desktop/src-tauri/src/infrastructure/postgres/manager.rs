@@ -179,9 +179,14 @@ impl PostgresManager {
             self.diagnostics
                 .push("Found PostgreSQL binaries via PATH".to_string());
         } else {
+            // A packaged release ships its own PostgreSQL runtime; an end
+            // user should never be told to install PostgreSQL themselves.
+            // Point them at a reinstall of the application instead.
             self.diagnostics.push(format!(
-                "PostgreSQL binaries not found. Searched: {}, /usr/local/bin, /usr/bin, and PATH. \
-                 Install PostgreSQL or place binaries alongside the application executable.",
+                "PostgreSQL runtime not found. The application install is incomplete \
+                 (missing bundled postgres-runtime/bin). Reinstall ImageDB; do not \
+                 install PostgreSQL separately. Searched bundled runtime, {}, \
+                 /usr/local/bin, /usr/bin, and PATH.",
                 exe_dir
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -190,7 +195,7 @@ impl PostgresManager {
         }
     }
 
-    fn try_use_bin_dir(&mut self, base: &std::path::Path, exe_suffix: &str) -> bool {
+    pub(crate) fn try_use_bin_dir(&mut self, base: &std::path::Path, exe_suffix: &str) -> bool {
         let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
         let initdb = base.join(format!("initdb{exe_suffix}"));
         let psql = base.join(format!("psql{exe_suffix}"));
@@ -912,6 +917,85 @@ mod tests {
             "Expected diagnostic about missing binaries, got: {:?}",
             mgr.diagnostics
         );
+        // The user-facing message must guide a reinstall, NOT tell the user
+        // to install PostgreSQL themselves (the release ships its own runtime).
+        assert!(
+            mgr.diagnostics
+                .iter()
+                .any(|d| d.contains("incomplete") && d.contains("Reinstall")),
+            "Expected diagnostic to call the install incomplete and recommend reinstall, got: {:?}",
+            mgr.diagnostics
+        );
+    }
+
+    /// Verify the binary probe accepts a packaged postgres-runtime/bin/ dir
+    /// of the shape the release bundles (via Tauri resources →
+    /// IMAGEDB_POSTGRES_RUNTIME_DIR → locate_binaries → try_use_bin_dir). A
+    /// clean Windows install with only the bundled runtime must be detected
+    /// as available without any system PostgreSQL.
+    #[test]
+    fn test_locator_finds_packaged_runtime_dir() {
+        let tmp = TempDir::new().unwrap();
+        let isolated = tmp.path().join("isolated_app_data");
+        std::fs::create_dir_all(&isolated).unwrap();
+
+        // Simulate the release resource dir:
+        // <resources>/postgres-runtime/bin/{pg_ctl,initdb,psql,pg_dump}
+        let bin_dir = tmp.path().join("postgres-runtime").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe_suffix = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        for name in ["pg_ctl", "initdb", "psql", "pg_dump"] {
+            std::fs::write(bin_dir.join(format!("{name}{exe_suffix}")), b"").unwrap();
+        }
+
+        let mut mgr = PostgresManager::new(&isolated);
+        // Reset to "nothing found" then exercise the probe the resource-dir
+        // path uses, so this test is independent of the host's PostgreSQL.
+        mgr.pg_ctl = None;
+        mgr.initdb = None;
+        mgr.psql = None;
+        mgr.pg_dump = None;
+
+        assert!(mgr.try_use_bin_dir(&bin_dir, exe_suffix));
+        assert!(mgr.binaries_available());
+        assert!(
+            mgr.pg_dump.is_some(),
+            "pg_dump should be discovered alongside the others"
+        );
+    }
+
+    /// When the packaged runtime bin/ is missing required binaries, the
+    /// probe must reject it so the locator falls back to the default search
+    /// (rather than silently succeeding with a partial runtime).
+    #[test]
+    fn test_locator_rejects_incomplete_runtime_dir() {
+        let tmp = TempDir::new().unwrap();
+        let isolated = tmp.path().join("isolated_app_data");
+        std::fs::create_dir_all(&isolated).unwrap();
+
+        let bin_dir = tmp.path().join("postgres-runtime").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe_suffix = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        // Only pg_ctl + initdb present — psql and pg_dump missing.
+        std::fs::write(bin_dir.join(format!("pg_ctl{exe_suffix}")), b"").unwrap();
+        std::fs::write(bin_dir.join(format!("initdb{exe_suffix}")), b"").unwrap();
+
+        let mut mgr = PostgresManager::new(&isolated);
+        mgr.pg_ctl = None;
+        mgr.initdb = None;
+        mgr.psql = None;
+        mgr.pg_dump = None;
+
+        assert!(!mgr.try_use_bin_dir(&bin_dir, exe_suffix));
+        assert!(!mgr.binaries_available());
     }
 
     #[test]
@@ -1112,6 +1196,107 @@ mod tests {
         match tokio::time::timeout(std::time::Duration::from_secs(120), run).await {
             Ok(()) => {}
             Err(_) => panic!("real_pgvector_full_lifecycle timed out after 120s"),
+        }
+    }
+
+    /// Clean Windows bootstrap: simulate a fresh install that has NO system
+    /// PostgreSQL and relies solely on the packaged `postgres-runtime/` the
+    /// installer ships. Sets `IMAGEDB_POSTGRES_RUNTIME_DIR` to the repo's
+    /// packaged runtime (built by `scripts/package-postgres-runtime.mjs`)
+    /// and unsets `IMAGEDB_POSTGRES_BIN`, then runs the full initdb → start →
+    /// pgvector → migration lifecycle using only those binaries.
+    ///
+    /// This is the acceptance test for the M6.5 closure item: "clean Windows
+    /// environment, no system PostgreSQL → initialize managed database →
+    /// CREATE EXTENSION vector → migration succeeds".
+    #[tokio::test]
+    #[ignore]
+    async fn real_packaged_runtime_clean_bootstrap() {
+        use crate::infrastructure::postgres::MigrationRunner;
+
+        // Locate the packaged runtime the installer would ship.
+        let packaged_runtime = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join("windows-x86_64")
+            .join("postgres-runtime");
+        if !packaged_runtime.join("bin").join("postgres.exe").is_file() {
+            eprintln!(
+                "packaged postgres-runtime not found at {}; run `pnpm release:runtime` first; skipping",
+                packaged_runtime.display()
+            );
+            return;
+        }
+
+        // SAFETY: this is an #[ignore] real-db test run with
+        // --test-threads=1, so the env var does not race with other tests.
+        std::env::set_var("IMAGEDB_POSTGRES_RUNTIME_DIR", &packaged_runtime);
+        let prev_bin = std::env::var("IMAGEDB_POSTGRES_BIN").ok();
+        std::env::remove_var("IMAGEDB_POSTGRES_BIN");
+
+        let run = async {
+            let tmp = TempDir::new().expect("create tempfile dir");
+            let app_data = tmp.path().join("app_data");
+            std::fs::create_dir_all(&app_data).expect("create app_data dir");
+
+            let mut mgr = PostgresManager::new(&app_data);
+            assert!(
+                mgr.binaries_available(),
+                "locator should find the packaged runtime via IMAGEDB_POSTGRES_RUNTIME_DIR; diagnostics: {:?}",
+                mgr.diagnostics()
+            );
+            assert!(
+                mgr.diagnostics()
+                    .iter()
+                    .any(|d| d.contains("IMAGEDB_POSTGRES_RUNTIME_DIR")),
+                "expected the locator to credit the runtime dir, got: {:?}",
+                mgr.diagnostics()
+            );
+
+            let result = mgr.initialize().await.expect("initialize");
+            assert!(
+                result.available,
+                "managed PG should be available: {result:?}"
+            );
+            assert!(result.managed);
+            assert!(result.connection_ok);
+            assert!(
+                result.pgvector_available,
+                "CREATE EXTENSION vector must succeed with the packaged runtime"
+            );
+
+            let (client, handle) = mgr.connect().await.expect("connect");
+            let mut client = client;
+            let applied = MigrationRunner::run_pending(&mut client)
+                .await
+                .expect("run_pending");
+            assert!(
+                !applied.is_empty(),
+                "migrations should apply on a fresh bootstrap"
+            );
+            let version = MigrationRunner::current_version(&client)
+                .await
+                .expect("current_version");
+            assert_eq!(
+                version.as_deref(),
+                Some("0010_library_root_leases"),
+                "migration head must be reached on a clean bootstrap"
+            );
+
+            drop(client);
+            handle.abort();
+            mgr.shutdown().await.expect("shutdown");
+        };
+
+        match tokio::time::timeout(std::time::Duration::from_secs(120), run).await {
+            Ok(()) => {}
+            Err(_) => panic!("real_packaged_runtime_clean_bootstrap timed out after 120s"),
+        }
+
+        // Restore env after the run so other real suites in the same
+        // process are unaffected. (This test runs under --test-threads=1.)
+        std::env::remove_var("IMAGEDB_POSTGRES_RUNTIME_DIR");
+        if let Some(prev) = prev_bin {
+            std::env::set_var("IMAGEDB_POSTGRES_BIN", prev);
         }
     }
 }
