@@ -823,7 +823,7 @@ impl DatabaseService {
             ExternalPreflightCheck::fail("permission.schema", "Current role cannot modify schemas")
         });
 
-        let migration_version = timeout(
+        let schema_migrations_exists = timeout(
             query_timeout,
             client.query_one(
                 "SELECT to_regclass('public.schema_migrations') IS NOT NULL",
@@ -838,16 +838,39 @@ impl DatabaseService {
             exists.then_some(())
         });
 
-        let migration_version = if migration_version.is_some() {
-            MigrationRunner::current_version(&client)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
+        let (migration_version, migration_history_ok, migration_history_diagnostic) =
+            if schema_migrations_exists.is_some() {
+                match MigrationRunner::get_applied_migrations(&client).await {
+                    Ok(applied) => {
+                        let current = applied.last().cloned();
+                        match MigrationRunner::validate_applied_versions(&applied) {
+                            Ok(()) => (
+                                current,
+                                true,
+                                format!(
+                                    "ImageDB migration history is compatible; current version: {}",
+                                    applied.last().map(String::as_str).unwrap_or("<empty>")
+                                ),
+                            ),
+                            Err(e) => (current, false, e),
+                        }
+                    }
+                    Err(e) => (
+                        None,
+                        false,
+                        format!("failed to inspect ImageDB migration history: {e}"),
+                    ),
+                }
+            } else {
+                (
+                    None,
+                    true,
+                    "No ImageDB migration table exists; target is empty or unmanaged".to_string(),
+                )
+            };
+        diagnostics.push(migration_history_diagnostic.clone());
 
-        let migration_state_ok = timeout(
+        let image_tables_empty_or_versioned = timeout(
             query_timeout,
             client.query_one(
                 "SELECT NOT EXISTS (
@@ -873,8 +896,17 @@ impl DatabaseService {
         .map(|row| row.get::<_, bool>(0))
         .unwrap_or(false);
 
+        let migration_state_ok = migration_history_ok && image_tables_empty_or_versioned;
         let schema_compatible = migration_state_ok;
-        checks.push(if migration_state_ok {
+        checks.push(if migration_history_ok {
+            ExternalPreflightCheck::pass(
+                "migration.history",
+                "ImageDB migration history is known and upgradeable",
+            )
+        } else {
+            ExternalPreflightCheck::fail("migration.history", migration_history_diagnostic.clone())
+        });
+        checks.push(if image_tables_empty_or_versioned {
             ExternalPreflightCheck::pass(
                 "migration.state",
                 "Migration table state is empty or compatible",
@@ -1400,6 +1432,207 @@ mod tests {
 
         let stored = settings.lock().await;
         assert_ne!(stored.get().database_mode.as_deref(), Some("external"));
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    #[tokio::test]
+    #[ignore]
+    async fn real_external_existing_database_upgrades_from_old_schema() {
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_none()
+        {
+            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real external upgrade test");
+            return;
+        }
+
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::infrastructure::secrets::CredentialStore;
+        use crate::infrastructure::settings::SettingsStore;
+        use tempfile::TempDir;
+
+        const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
+
+        let target_tmp = TempDir::new().unwrap();
+        let settings_tmp = TempDir::new().unwrap();
+        let mut target_manager = PostgresManager::new(target_tmp.path());
+        let target_probe = target_manager.initialize().await.expect("target init");
+        assert!(
+            target_probe.connection_ok,
+            "target init failed: {:?}",
+            target_probe.diagnostics
+        );
+
+        let (target_client, target_handle) =
+            target_manager.connect().await.expect("target connect");
+        target_client
+            .batch_execute(MIGRATION_0001)
+            .await
+            .expect("apply migration 0001");
+        target_client
+            .batch_execute(
+                "CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                INSERT INTO schema_migrations (version) VALUES ('0001_initial');",
+            )
+            .await
+            .expect("seed old migration history");
+        target_handle.abort();
+
+        let manager = Arc::new(Mutex::new(PostgresManager::new(settings_tmp.path())));
+        let settings = Arc::new(Mutex::new(SettingsStore::new(settings_tmp.path()).unwrap()));
+        let credentials =
+            Arc::new(CredentialStore::new_file_for_tests(settings_tmp.path()).unwrap());
+        let service = DatabaseService::new(manager, settings, credentials);
+        let target_config = ConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: target_manager.port(),
+            database: target_manager.database().to_string(),
+            username: target_manager.username().to_string(),
+            password: target_manager.password().map(ToOwned::to_owned),
+            tls_mode: TlsMode::Disable,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 10,
+            query_timeout_secs: 15,
+            profile_name: Some("real-existing-upgrade-test".to_string()),
+        };
+
+        let preflight = service
+            .test_external_connection(&target_config)
+            .await
+            .expect("preflight");
+        assert!(
+            preflight.schema_compatible,
+            "preflight diagnostics: {:?}",
+            preflight.diagnostics
+        );
+        assert_eq!(preflight.migration_version.as_deref(), Some("0001_initial"));
+
+        let state = service
+            .initialize_external(&target_config)
+            .await
+            .expect("initialize external old database");
+        assert_eq!(state.mode, Some(DatabaseMode::External));
+        assert_eq!(
+            state.migration_version.as_deref(),
+            Some(MigrationRunner::latest_version())
+        );
+
+        let (upgraded_client, upgraded_handle) =
+            target_manager.connect().await.expect("target reconnect");
+        let source_snapshot_hash_exists = upgraded_client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'import_albums'
+                      AND column_name = 'source_snapshot_hash'
+                )",
+                &[],
+            )
+            .await
+            .expect("inspect upgraded column")
+            .get::<_, bool>(0);
+        assert!(
+            !source_snapshot_hash_exists,
+            "migration 0009 should drop import_albums.source_snapshot_hash"
+        );
+        upgraded_handle.abort();
+        target_manager.shutdown().await.expect("target shutdown");
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    #[tokio::test]
+    #[ignore]
+    async fn real_external_existing_database_rejects_unknown_future_migration() {
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_none()
+        {
+            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real future migration test");
+            return;
+        }
+
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::infrastructure::secrets::CredentialStore;
+        use crate::infrastructure::settings::SettingsStore;
+        use tempfile::TempDir;
+
+        let target_tmp = TempDir::new().unwrap();
+        let settings_tmp = TempDir::new().unwrap();
+        let mut target_manager = PostgresManager::new(target_tmp.path());
+        let target_probe = target_manager.initialize().await.expect("target init");
+        assert!(
+            target_probe.connection_ok,
+            "target init failed: {:?}",
+            target_probe.diagnostics
+        );
+
+        let (target_client, target_handle) =
+            target_manager.connect().await.expect("target connect");
+        target_client
+            .batch_execute(
+                "CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                INSERT INTO schema_migrations (version) VALUES ('9999_future');",
+            )
+            .await
+            .expect("seed future migration history");
+        target_handle.abort();
+
+        let manager = Arc::new(Mutex::new(PostgresManager::new(settings_tmp.path())));
+        let settings = Arc::new(Mutex::new(SettingsStore::new(settings_tmp.path()).unwrap()));
+        let credentials =
+            Arc::new(CredentialStore::new_file_for_tests(settings_tmp.path()).unwrap());
+        let service = DatabaseService::new(manager, settings, credentials);
+        let target_config = ConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: target_manager.port(),
+            database: target_manager.database().to_string(),
+            username: target_manager.username().to_string(),
+            password: target_manager.password().map(ToOwned::to_owned),
+            tls_mode: TlsMode::Disable,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 10,
+            query_timeout_secs: 15,
+            profile_name: Some("real-future-migration-test".to_string()),
+        };
+
+        let preflight = service
+            .test_external_connection(&target_config)
+            .await
+            .expect("preflight");
+        assert!(!preflight.migration_state_ok);
+        assert!(!preflight.schema_compatible);
+        assert_eq!(preflight.migration_version.as_deref(), Some("9999_future"));
+        assert!(
+            preflight
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("unknown ImageDB migration version")),
+            "preflight diagnostics: {:?}",
+            preflight.diagnostics
+        );
+
+        let state = service
+            .initialize_external(&target_config)
+            .await
+            .expect("initialize external future database");
+        assert!(matches!(state.status, DatabaseStatus::Error(_)));
+        assert_ne!(state.mode, Some(DatabaseMode::ManagedLocal));
+
+        target_manager.shutdown().await.expect("target shutdown");
     }
 
     #[cfg(feature = "real-db-tests")]

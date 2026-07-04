@@ -22,6 +22,11 @@ Date: 2026-07-04
 - Added cancellation checks before preflight, managed source activation, target preparation, backup, import, verification, and final profile switch.
 - Made `pg_dump` and `psql` import cancellable while their child processes are running; cancellation leaves the active profile unswitched and removes an incomplete temporary dump.
 - Added a cancellation regression test that verifies a preflight-stage cancel does not persist or activate an external profile.
+- Hardened ImageDB migration history compatibility checks for external databases:
+  - contiguous known migration prefixes are accepted and upgradeable;
+  - unknown or future migration versions are rejected before activation;
+  - pending migrations refuse incompatible histories before applying SQL.
+- Added real external existing-database tests for upgrading a `0001_initial` database to the current head and rejecting an unknown `9999_future` database.
 
 ## Commits
 
@@ -30,6 +35,7 @@ Date: 2026-07-04
 - `68a7766 feat: migrate managed database to external postgres`
 - `f7eb620 feat: allow switching back to managed database`
 - Background migration progress and cancellation implemented in the current M7 update.
+- Existing external ImageDB database upgrade/reject coverage implemented in the current M7 update.
 
 ## Commands run
 
@@ -41,26 +47,30 @@ Date: 2026-07-04
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_migrate_managed_to_external_ -- --ignored --nocapture --test-threads=1`
 - `pnpm rust:test:real`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml migrate_managed_to_external_cancelled_before_preflight_never_switches`
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml validate_applied_versions`
+- `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_external_existing_database_ -- --ignored --nocapture --test-threads=1`
 
 ## Test result summary
 
 - Frontend typecheck passed.
 - Frontend unit tests passed.
-- Rust unit tests passed: 166 passed, 1 ignored.
+- Rust unit tests passed: 168 passed, 1 ignored.
 - Clippy passed with `-D warnings`.
-- Real PostgreSQL suite passed, including the external migration test.
+- Real PostgreSQL suite passed, including the external migration test and external existing-database compatibility tests.
 - External migration cancellation regression passed.
+- Migration history validation unit tests passed.
 
 ## Actual runtime result
 
 - A real managed PostgreSQL source and a real PostgreSQL target were started from `.local/db-tools/postgresql-18.4/pgsql/bin`.
 - The migration test wrote an `app_meta` probe row into the managed source, exported a SQL backup, imported it into the target, verified table counts, switched the active profile, and confirmed the migrated row in the external target.
 - The cancellation regression set the external migration cancellation flag before preflight, observed `cancelled` progress at the `preflight` stage, and confirmed the external profile was not stored or activated.
+- A real external target seeded with only `0001_initial` preflighted as compatible, initialized through `initialize_external`, upgraded to `0009_drop_redundant_snapshot_hash`, and verified that the dropped legacy column was gone.
+- A real external target seeded with `9999_future` was rejected by preflight as an unknown ImageDB migration history and was not activated.
 
 ## Known remaining M7 gaps
 
 - TLS negative cases (bad CA, bad hostname, client certificate/key handling) are not yet automated.
-- The current migration path supports empty external targets; richer upgrade/merge behavior for an existing populated ImageDB database still needs coverage.
 - Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, row-count mismatch, or user cancellation. A lightweight cancellation regression exists; a real mid-dump or mid-import interruption test is still worth adding if we need stronger process-kill coverage.
 
 M7 is not closed yet. `CURRENT_TASK.md` should remain on `tasks/07-external-postgres.md` until these gaps are resolved.

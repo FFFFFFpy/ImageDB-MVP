@@ -56,10 +56,49 @@ impl MigrationRunner {
         Ok(rows.iter().map(|r| r.get::<_, String>("version")).collect())
     }
 
+    pub fn known_versions() -> Vec<&'static str> {
+        MIGRATIONS.iter().map(|(version, _)| *version).collect()
+    }
+
+    pub fn latest_version() -> &'static str {
+        MIGRATIONS
+            .last()
+            .map(|(version, _)| *version)
+            .expect("at least one database migration must be embedded")
+    }
+
+    pub fn validate_applied_versions(applied: &[String]) -> Result<(), String> {
+        let known = Self::known_versions();
+
+        for version in applied {
+            if !known.contains(&version.as_str()) {
+                return Err(format!(
+                    "unknown ImageDB migration version '{version}'; refusing to use a newer or incompatible database"
+                ));
+            }
+        }
+
+        for (idx, version) in applied.iter().enumerate() {
+            if version != known[idx] {
+                return Err(format!(
+                    "non-contiguous ImageDB migration history: expected '{}' at position {}, found '{}'",
+                    known[idx],
+                    idx + 1,
+                    version
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn run_pending(client: &mut Client) -> Result<Vec<String>, AppError> {
         Self::ensure_schema_migrations_table(client).await?;
 
         let applied = Self::get_applied_migrations(client).await?;
+        Self::validate_applied_versions(&applied).map_err(|e| {
+            AppError::Internal(format!("incompatible ImageDB migration history: {e}"))
+        })?;
         let mut newly_applied = Vec::new();
 
         for (version, sql) in MIGRATIONS {
@@ -130,9 +169,8 @@ mod tests {
 
     #[test]
     fn test_migration_versions_ordered() {
-        let versions: Vec<&str> = MIGRATIONS.iter().map(|(v, _)| *v).collect();
         assert_eq!(
-            versions,
+            MigrationRunner::known_versions(),
             vec![
                 "0001_initial",
                 "0002_indexes",
@@ -145,5 +183,38 @@ mod tests {
                 "0009_drop_redundant_snapshot_hash"
             ]
         );
+        assert_eq!(
+            MigrationRunner::latest_version(),
+            "0009_drop_redundant_snapshot_hash"
+        );
+    }
+
+    #[test]
+    fn test_validate_applied_versions_accepts_empty_and_prefix() {
+        assert!(MigrationRunner::validate_applied_versions(&[]).is_ok());
+        assert!(MigrationRunner::validate_applied_versions(&[
+            "0001_initial".to_string(),
+            "0002_indexes".to_string(),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_applied_versions_rejects_unknown_or_non_contiguous_history() {
+        let unknown = MigrationRunner::validate_applied_versions(&[
+            "0001_initial".to_string(),
+            "9999_future".to_string(),
+        ]);
+        assert!(unknown
+            .expect_err("unknown future migration should fail")
+            .contains("unknown ImageDB migration version"));
+
+        let gap = MigrationRunner::validate_applied_versions(&[
+            "0001_initial".to_string(),
+            "0003_commit_indexes".to_string(),
+        ]);
+        assert!(gap
+            .expect_err("non-contiguous migration history should fail")
+            .contains("non-contiguous ImageDB migration history"));
     }
 }
