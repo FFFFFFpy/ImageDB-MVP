@@ -320,3 +320,32 @@
 
 - 该测试使用 fail-injection 模拟空间不足，不是把真实磁盘写满。
 - 只读、超时和真实挂载共享存储门禁仍需要单独证据。
+
+## 2026-07-04: Unknown target conflict gate
+
+### 实现内容
+
+- 新增真实 PostgreSQL + 真实文件系统测试，覆盖目标图库目录已被外部创建的冲突场景。
+- 在 commit 前预创建 `Albums/album_a` 并写入外部文件，模拟未知目标目录。
+- commit 必须拒绝覆盖或合并文件，返回 `recovery_required`，且不创建 library records。
+- 冲突发生在 file transaction prewrite 前，因此不会制造无法恢复的半事务。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib preexisting_unknown_target_dir_is_not_overwritten_or_completed -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- 预先存在的 `external.txt` 保持原内容，未被删除或覆盖。
+- 计划中的 `photo1.png` 未被写入未知目标目录。
+- `import_runs.state` 为 `recovery_required`，`file_transactions` 数量为 0，`library_images` 数量为 0。
+
+### 已知限制
+
+- 该测试覆盖未知目标目录 preflight 冲突；真实挂载共享存储门禁仍未完成。

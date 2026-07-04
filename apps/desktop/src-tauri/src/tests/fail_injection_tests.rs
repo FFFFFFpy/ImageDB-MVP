@@ -957,6 +957,85 @@ async fn fail_injection_double_commit_detected() {
     m.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+#[ignore]
+async fn preexisting_unknown_target_dir_is_not_overwritten_or_completed() {
+    let (_tmp, pg, run_id, lib_root, _album) = setup_full_env().await;
+    let publish_dir = lib_root.join("Albums").join("album_a");
+    std::fs::create_dir_all(&publish_dir).unwrap();
+    std::fs::write(publish_dir.join("external.txt"), b"external content").unwrap();
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(Mutex::new(
+        crate::domain::import_state::CommitProgress::idle(&run_id.to_string()),
+    ));
+    let result = commit_service::run_import_commit(
+        pg.clone(),
+        lib_root.display().to_string(),
+        run_id,
+        cancelled,
+        progress,
+    )
+    .await
+    .expect("unknown target conflict should return a recovery_required result");
+
+    assert_eq!(result.state, "recovery_required");
+    assert_eq!(result.albums_failed, 1);
+    assert_eq!(result.albums_committed, 0);
+    assert!(
+        publish_dir.join("external.txt").exists(),
+        "pre-existing target content must not be deleted"
+    );
+    assert_eq!(
+        std::fs::read(publish_dir.join("external.txt")).unwrap(),
+        b"external content"
+    );
+    assert!(
+        !publish_dir.join("photo1.png").exists(),
+        "commit must not merge planned files into an unknown target directory"
+    );
+
+    let (client, handle) = {
+        let mgr = pg.lock().await;
+        mgr.connect().await.unwrap()
+    };
+    let run_state: String = client
+        .query_one("SELECT state FROM import_runs WHERE id = $1", &[&run_id])
+        .await
+        .unwrap()
+        .get(0);
+    let tx_count: i64 = client
+        .query_one("SELECT COUNT(*) FROM file_transactions", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let lib_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM library_images li
+             JOIN library_albums la ON la.id = li.album_id
+             WHERE la.relative_path = 'album_a'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(client);
+    handle.abort();
+
+    assert_eq!(run_state, "recovery_required");
+    assert_eq!(
+        tx_count, 0,
+        "target preflight conflict happens before transaction prewrite"
+    );
+    assert_eq!(
+        lib_count, 0,
+        "unknown target must not create library records"
+    );
+
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
 /// M5-A: if the source album dir disappears after the DB commit but before
 /// the archive rename, recovery must succeed by validating the archive
 /// against the frozen plan — not by blindly trusting an empty source slot.
