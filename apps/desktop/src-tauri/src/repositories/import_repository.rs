@@ -1254,26 +1254,52 @@ impl ImportRepository {
         Ok(row.map(|r| r.get("id")))
     }
 
-    /// Find the most recent run that can be (re-)entered from the commit page:
-    /// `completed`, `ready_to_commit`, or `cancelled`. A `cancelled` run with
-    /// no transactions (P0: cancel-before-prewrite) must be re-committable
-    /// rather than stuck — `recovery_required` with transactions is excluded
-    /// because those runs route to the recovery page, not the commit page.
+    /// Find the most recent run that should be (re-)entered from the commit
+    /// page. The default commit page must prefer a freshly-frozen
+    /// `ready_to_commit` run over an older `completed` run; an old completed
+    /// run must not抢占 a newer ready-to-commit run just because it has a
+    /// populated `completed_at`.
     ///
-    /// Only runs that have a frozen plan are eligible, so an aborted scan
-    /// (still in `scanning`/`fingerprinting`/...) is never picked up here.
+    /// Priority (highest first):
+    /// 1. `ready_to_commit` — a frozen plan exists, nothing committed yet.
+    /// 2. `cancelled` with no active file transaction — cancel-before-prewrite
+    ///    (P0) leaves the run re-committable from the same frozen plan; a
+    ///    cancelled run that still has an in-flight transaction routes to the
+    ///    recovery page, not here.
+    ///
+    /// `completed`/`failed`/`recovery_required` runs never enter the default
+    /// commit page. Within a priority tier, the newest run by `started_at`
+    /// wins (the frozen plan is what makes the run committable, not the
+    /// completion timestamp). Only runs with a frozen/consumed plan and a
+    /// non-null `plan_hash` are eligible, so an aborted scan (still in
+    /// `scanning`/`fingerprinting`/...) is never picked up here.
     pub async fn get_latest_committable_run(client: &Client) -> Result<Option<Uuid>, AppError> {
         let row = client
             .query_opt(
                 "SELECT r.id FROM import_runs r
-                 WHERE r.state IN ('completed', 'ready_to_commit', 'cancelled')
+                 WHERE r.state IN ('ready_to_commit', 'cancelled')
                    AND EXISTS (
                        SELECT 1 FROM import_plans p
                        WHERE p.import_run_id = r.id
                          AND p.state IN ('frozen', 'consumed')
                          AND p.plan_hash IS NOT NULL
                    )
-                 ORDER BY r.completed_at DESC NULLS LAST, r.started_at DESC
+                   AND (
+                       r.state = 'ready_to_commit'
+                       OR NOT EXISTS (
+                           SELECT 1 FROM file_transactions ft
+                           WHERE ft.import_run_id = r.id
+                             AND ft.state NOT IN (
+                                 'library_committed', 'source_archived',
+                                 'cancelled', 'failed', 'conflict'
+                             )
+                       )
+                   )
+                 ORDER BY CASE r.state
+                            WHEN 'ready_to_commit' THEN 0
+                            WHEN 'cancelled' THEN 1
+                          END,
+                          r.started_at DESC
                  LIMIT 1",
                 &[],
             )
