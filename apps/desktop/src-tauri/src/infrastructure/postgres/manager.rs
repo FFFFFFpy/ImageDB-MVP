@@ -74,17 +74,26 @@ impl PostgresManager {
             ""
         };
 
+        if let Ok(runtime_dir) = std::env::var("IMAGEDB_POSTGRES_RUNTIME_DIR") {
+            let runtime = PathBuf::from(&runtime_dir);
+            let bin_dir = runtime.join("bin");
+            if self.try_use_bin_dir(&bin_dir, exe_suffix) {
+                self.diagnostics.push(format!(
+                    "Found bundled PostgreSQL runtime via IMAGEDB_POSTGRES_RUNTIME_DIR: {}",
+                    runtime.display()
+                ));
+                return;
+            }
+            self.diagnostics.push(format!(
+                "IMAGEDB_POSTGRES_RUNTIME_DIR='{}' is set but missing bin/pg_ctl/initdb/psql; \
+                 falling back to default search",
+                runtime.display()
+            ));
+        }
+
         if let Ok(env_bin) = std::env::var("IMAGEDB_POSTGRES_BIN") {
             let base = PathBuf::from(&env_bin);
-            let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
-            let initdb = base.join(format!("initdb{exe_suffix}"));
-            let psql = base.join(format!("psql{exe_suffix}"));
-            let pg_dump = base.join(format!("pg_dump{exe_suffix}"));
-            if pg_ctl.exists() && initdb.exists() && psql.exists() {
-                self.pg_ctl = Some(pg_ctl);
-                self.initdb = Some(initdb);
-                self.psql = Some(psql);
-                self.pg_dump = pg_dump.exists().then_some(pg_dump);
+            if self.try_use_bin_dir(&base, exe_suffix) {
                 self.diagnostics.push(format!(
                     "Found PostgreSQL binaries via IMAGEDB_POSTGRES_BIN: {}",
                     base.display()
@@ -98,7 +107,20 @@ impl PostgresManager {
             ));
         }
 
-        let search_paths: Vec<PathBuf> = vec![
+        let mut search_paths: Vec<PathBuf> = vec![
+            {
+                let mut p = exe_dir.clone().unwrap_or_default();
+                p.push("resources");
+                p.push("postgres-runtime");
+                p.push("bin");
+                p
+            },
+            {
+                let mut p = exe_dir.clone().unwrap_or_default();
+                p.push("postgres-runtime");
+                p.push("bin");
+                p
+            },
             {
                 let mut p = exe_dir.clone().unwrap_or_default();
                 p.push("postgres");
@@ -111,17 +133,10 @@ impl PostgresManager {
             #[cfg(target_os = "windows")]
             PathBuf::from("C:\\Program Files\\PostgreSQL\\16\\bin"),
         ];
+        search_paths.retain(|p| !p.as_os_str().is_empty());
 
         for base in &search_paths {
-            let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
-            let initdb = base.join(format!("initdb{exe_suffix}"));
-            let psql = base.join(format!("psql{exe_suffix}"));
-            let pg_dump = base.join(format!("pg_dump{exe_suffix}"));
-            if pg_ctl.exists() && initdb.exists() && psql.exists() {
-                self.pg_ctl = Some(pg_ctl);
-                self.initdb = Some(initdb);
-                self.psql = Some(psql);
-                self.pg_dump = pg_dump.exists().then_some(pg_dump);
+            if self.try_use_bin_dir(base, exe_suffix) {
                 self.diagnostics
                     .push(format!("Found PostgreSQL binaries at: {}", base.display()));
                 return;
@@ -172,6 +187,22 @@ impl PostgresManager {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<unknown exe dir>".to_string())
             ));
+        }
+    }
+
+    fn try_use_bin_dir(&mut self, base: &std::path::Path, exe_suffix: &str) -> bool {
+        let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
+        let initdb = base.join(format!("initdb{exe_suffix}"));
+        let psql = base.join(format!("psql{exe_suffix}"));
+        let pg_dump = base.join(format!("pg_dump{exe_suffix}"));
+        if pg_ctl.exists() && initdb.exists() && psql.exists() {
+            self.pg_ctl = Some(pg_ctl);
+            self.initdb = Some(initdb);
+            self.psql = Some(psql);
+            self.pg_dump = pg_dump.exists().then_some(pg_dump);
+            true
+        } else {
+            false
         }
     }
 

@@ -1,5 +1,56 @@
 # M9 Progress Report
 
+## 2026-07-04: Windows release build and installer artifacts
+
+### Implemented
+
+- Enabled Tauri bundling for the Windows NSIS installer instead of producing only a bare release executable.
+- Added `scripts/package-postgres-runtime.mjs`, which builds the ignored local Tauri resource directory from `.local/db-tools/postgresql-18.4/pgsql` and `.local/db-tools/pgvector-0.8.3-pg18`.
+- Added the packaged `postgres-runtime` resource mapping to `tauri.conf.json`, including PostgreSQL binaries, libraries, share files, pgvector `vector.dll`, pgvector extension SQL/control files, a runtime manifest, and notices.
+- Updated application startup to set `IMAGEDB_POSTGRES_RUNTIME_DIR` from Tauri `resource_dir/postgres-runtime` before `AppState` creates `PostgresManager`.
+- Updated `PostgresManager` to prefer the packaged runtime dir, then explicit `IMAGEDB_POSTGRES_BIN`, then legacy executable/PATH/system locations.
+- Added `scripts/verify-release-artifacts.mjs` and `pnpm release:verify-artifacts` to verify the release executable, NSIS installer, and required packaged runtime files.
+- Added ignore rules so generated local `postgres-runtime` resources are not committed or formatted by Prettier.
+- Marked the M9 Windows release build artifact DoD item complete.
+
+### Modified Files
+
+- `.gitignore`
+- `.prettierignore`
+- `apps/desktop/package.json`
+- `apps/desktop/src-tauri/tauri.conf.json`
+- `apps/desktop/src-tauri/src/lib.rs`
+- `apps/desktop/src-tauri/src/infrastructure/postgres/manager.rs`
+- `package.json`
+- `scripts/package-postgres-runtime.mjs`
+- `scripts/verify-release-artifacts.mjs`
+- `checklists/M9_DOD.md`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `node scripts/package-postgres-runtime.mjs`: passed, generated ignored local `postgres-runtime` resources.
+- `pnpm build`: first attempt compiled the release executable but failed while downloading NSIS with `Peer disconnected`; retry passed.
+- `pnpm release:verify-artifacts`: passed.
+- Release exe smoke: `Start-Process apps/desktop/src-tauri/target/release/imagedb-desktop.exe`, waited 5 seconds, process stayed alive, then stopped it.
+- `pnpm typecheck`: passed.
+- `pnpm format:check`: passed after ignoring generated runtime resources.
+- `pnpm rust:test`: passed, 188 passed, 1 ignored.
+- `pnpm rust:clippy`: passed.
+
+### Actual Runtime Result
+
+- Tauri built the release executable at `apps/desktop/src-tauri/target/release/imagedb-desktop.exe`.
+- Tauri produced the NSIS installer at `apps/desktop/src-tauri/target/release/bundle/nsis/ImageDB_0.1.0_x64-setup.exe` with size 35,092,947 bytes.
+- The generated NSIS script includes `postgres-runtime` resources, including `postgres.exe`, `pg_ctl.exe`, `initdb.exe`, `psql.exe`, `pg_dump.exe`, `vector.dll`, `vector.control`, and `vector--0.8.3.sql`.
+- The release executable launched and stayed alive for the smoke window.
+
+### Known Limits
+
+- This verifies build output and packaged runtime artifacts, but does not install the NSIS package into a clean Windows profile.
+- Installation, upgrade, reinstall, uninstall, and data retention gates remain open.
+- The first build attempt hit a transient NSIS download disconnect; the retry succeeded after the tool download completed.
+
 ## 2026-07-04: Diagnostics export
 
 ### Implemented

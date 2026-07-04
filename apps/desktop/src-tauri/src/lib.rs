@@ -10,35 +10,44 @@ mod state;
 pub mod tests;
 
 use std::path::PathBuf;
+use tauri::Manager;
 
 pub fn run() {
-    let app_data_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ImageDB");
-
-    std::fs::create_dir_all(&app_data_dir).ok();
-
-    infrastructure::logging::init_logging(&app_data_dir);
-
-    match infrastructure::single_instance::SingleInstanceLock::acquire(&app_data_dir) {
-        Ok(_lock) => {
-            std::mem::forget(_lock);
-        }
-        Err(e) => {
-            eprintln!("ImageDB: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    let fixture_dir = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("fixtures");
-
-    let app_state = state::AppState::new(&app_data_dir, fixture_dir)
-        .expect("failed to initialize application state");
-
     tauri::Builder::default()
-        .manage(app_state)
+        .setup(|app| {
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                let runtime_dir = resource_dir.join("postgres-runtime");
+                if runtime_dir.join("bin").is_dir() {
+                    std::env::set_var("IMAGEDB_POSTGRES_RUNTIME_DIR", runtime_dir);
+                }
+            }
+
+            let app_data_dir = dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("ImageDB");
+
+            std::fs::create_dir_all(&app_data_dir).ok();
+            infrastructure::logging::init_logging(&app_data_dir);
+
+            match infrastructure::single_instance::SingleInstanceLock::acquire(&app_data_dir) {
+                Ok(lock) => {
+                    std::mem::forget(lock);
+                }
+                Err(e) => {
+                    eprintln!("ImageDB: {e}");
+                    std::process::exit(1);
+                }
+            }
+
+            let fixture_dir = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("fixtures");
+
+            let app_state = state::AppState::new(&app_data_dir, fixture_dir)
+                .expect("failed to initialize application state");
+            app.manage(app_state);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
             commands::probe_postgres,

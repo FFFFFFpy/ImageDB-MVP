@@ -10,6 +10,7 @@ Thumbs.db
 .env.*
 !.env.example
 apps/desktop/src-tauri/binaries/**/postgres/
+apps/desktop/src-tauri/binaries/**/postgres-runtime/
 apps/desktop/src-tauri/binaries/**/pgvector/
 .local/
 /.reasonix

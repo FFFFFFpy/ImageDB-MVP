@@ -14,6 +14,8 @@
     "rust:test:real": "node scripts/run-real-rust-tests.mjs",
     "check": "pnpm typecheck && pnpm test:unit && pnpm format:check && pnpm rust:clippy && pnpm rust:test",
     "release:gate": "node scripts/run-m9-release-gate.mjs",
+    "release:runtime": "node scripts/package-postgres-runtime.mjs",
+    "release:verify-artifacts": "node scripts/verify-release-artifacts.mjs",
     "release:dataset": "node scripts/verify-m9-acceptance-dataset.mjs"
   },
   "devDependencies": {
