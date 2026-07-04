@@ -22,6 +22,7 @@ import type {
   ReverifyResult,
   ExternalMigrationResult,
   ExternalMigrationProgress,
+  StorageCapabilities,
 } from './types';
 
 export const api = {
@@ -55,6 +56,9 @@ export const api = {
   getSettings: () => invoke<AppSettings>('get_settings'),
 
   updateSettings: (settings: AppSettings) => invoke<AppSettings>('update_settings', { settings }),
+
+  probeStorageCapabilities: (path: string) =>
+    invoke<StorageCapabilities>('probe_storage_capabilities', { path }),
 
   probePostgres: () => invoke<PostgresProbeResult>('probe_postgres'),
 

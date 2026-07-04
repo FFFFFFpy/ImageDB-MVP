@@ -1,6 +1,10 @@
 use crate::infrastructure::settings::AppSettings;
+use crate::infrastructure::storage_capabilities::{
+    probe_storage_capabilities as run_storage_capability_probe, StorageCapabilities,
+};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tauri::State;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,4 +76,13 @@ pub async fn update_settings(
     };
     store.update(app_settings).map_err(|e| format!("{e}"))?;
     Ok(SettingsDto::from(store.get()))
+}
+
+#[tauri::command]
+pub async fn probe_storage_capabilities(path: String) -> Result<StorageCapabilities, String> {
+    if path.trim().is_empty() {
+        return Err("storage path is required".to_string());
+    }
+
+    Ok(run_storage_capability_probe(PathBuf::from(path)))
 }

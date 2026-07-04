@@ -2,7 +2,28 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useState } from 'react';
-import type { ExternalConnectionConfig } from '../lib/ipc/types';
+import type {
+  CapabilityProbe,
+  ExternalConnectionConfig,
+  StorageCapabilities,
+} from '../lib/ipc/types';
+
+const capabilityLabels = {
+  supported: '支持',
+  unsupported: '不支持',
+  unknown: '未知',
+};
+
+const strategyLabels = {
+  strong_local: '强一致',
+  conservative_mounted: '保守可恢复',
+  unsupported: '不支持',
+};
+
+const storageTypeLabels = {
+  mounted_shared: '挂载共享',
+  unknown: '未知',
+};
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
@@ -61,6 +82,10 @@ export function SettingsPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] }),
   });
 
+  const probeStorage = useMutation({
+    mutationFn: () => api.probeStorageCapabilities(libRoot || settings.data?.library_root || ''),
+  });
+
   function buildExternalConfig(): ExternalConnectionConfig {
     return {
       host: extHost,
@@ -90,6 +115,7 @@ export function SettingsPage() {
 
   const migration = migrationProgress.data;
   const migrationRunning = migration?.state === 'running' || startMigration.isPending;
+  const effectiveLibraryRoot = libRoot || settings.data?.library_root || '';
 
   return (
     <div className="settings-page">
@@ -400,7 +426,90 @@ export function SettingsPage() {
         >
           保存
         </button>
+        <button
+          onClick={() => probeStorage.mutate()}
+          disabled={probeStorage.isPending || !effectiveLibraryRoot}
+        >
+          {probeStorage.isPending ? '检测中…' : '检测存储能力'}
+        </button>
+        {probeStorage.data && <StorageCapabilityReport capabilities={probeStorage.data} />}
+        {probeStorage.isError && <pre className="status-err">{String(probeStorage.error)}</pre>}
       </section>
+    </div>
+  );
+}
+
+function StorageCapabilityReport({ capabilities }: { capabilities: StorageCapabilities }) {
+  const rows: Array<[string, CapabilityProbe]> = [
+    ['可读', capabilities.readable],
+    ['可写', capabilities.writable],
+    ['创建目录', capabilities.can_create_dir],
+    ['文件重命名', capabilities.same_dir_file_rename],
+    ['同根重命名', capabilities.same_root_rename],
+    ['目录重命名', capabilities.directory_rename],
+    ['覆盖重命名', capabilities.overwrite_rename],
+    ['文件同步', capabilities.file_sync_all],
+    ['父目录同步', capabilities.parent_dir_sync],
+    ['大小写敏感', capabilities.case_sensitive],
+    ['Unicode 规范化', capabilities.unicode_normalization],
+    ['长路径', capabilities.max_path],
+    ['长文件名', capabilities.max_component],
+    ['文件锁', capabilities.file_lock],
+    ['时间戳精度', capabilities.timestamp_precision],
+    ['可用空间', capabilities.free_space],
+    ['卷身份', capabilities.volume_identity],
+  ];
+
+  return (
+    <div className="check-result">
+      <table>
+        <tbody>
+          <tr>
+            <td>路径</td>
+            <td className="mono">{capabilities.root}</td>
+          </tr>
+          <tr>
+            <td>存储类型</td>
+            <td>{storageTypeLabels[capabilities.storage_type]}</td>
+          </tr>
+          <tr>
+            <td>发布策略</td>
+            <td>{strategyLabels[capabilities.publish_strategy]}</td>
+          </tr>
+          <tr>
+            <td>临时目录清理</td>
+            <td>{capabilities.probe_dir_cleaned ? '完成' : '未完成'}</td>
+          </tr>
+          {rows.map(([label, probe]) => (
+            <tr key={label}>
+              <td>{label}</td>
+              <td>
+                {capabilityLabels[probe.status]} · {probe.detail}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {capabilities.strategy_reasons.length > 0 && (
+        <details className="diagnostics" open>
+          <summary>策略依据 ({capabilities.strategy_reasons.length})</summary>
+          <ul>
+            {capabilities.strategy_reasons.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {capabilities.diagnostics.length > 0 && (
+        <details className="diagnostics">
+          <summary>存储诊断 ({capabilities.diagnostics.length})</summary>
+          <ul>
+            {capabilities.diagnostics.map((d) => (
+              <li key={d}>{d}</li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }

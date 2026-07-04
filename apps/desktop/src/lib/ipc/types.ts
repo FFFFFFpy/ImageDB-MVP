@@ -99,6 +99,43 @@ export interface AppSettings {
   first_run_completed: boolean;
 }
 
+export type CapabilityStatus = 'supported' | 'unsupported' | 'unknown';
+export type PublishStrategy = 'strong_local' | 'conservative_mounted' | 'unsupported';
+export type StorageType = 'mounted_shared' | 'unknown';
+
+export interface CapabilityProbe {
+  status: CapabilityStatus;
+  detail: string;
+}
+
+export interface StorageCapabilities {
+  root: string;
+  probe_version: number;
+  probed_at: string;
+  storage_type: StorageType;
+  publish_strategy: PublishStrategy;
+  strategy_reasons: string[];
+  probe_dir_cleaned: boolean;
+  readable: CapabilityProbe;
+  writable: CapabilityProbe;
+  can_create_dir: CapabilityProbe;
+  same_dir_file_rename: CapabilityProbe;
+  same_root_rename: CapabilityProbe;
+  directory_rename: CapabilityProbe;
+  overwrite_rename: CapabilityProbe;
+  file_sync_all: CapabilityProbe;
+  parent_dir_sync: CapabilityProbe;
+  case_sensitive: CapabilityProbe;
+  unicode_normalization: CapabilityProbe;
+  max_path: CapabilityProbe;
+  max_component: CapabilityProbe;
+  file_lock: CapabilityProbe;
+  timestamp_precision: CapabilityProbe;
+  free_space: CapabilityProbe;
+  volume_identity: CapabilityProbe;
+  diagnostics: string[];
+}
+
 export interface PostgresProbeResult {
   available: boolean;
   managed: boolean;

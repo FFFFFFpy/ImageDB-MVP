@@ -15,6 +15,7 @@ vi.mock('../lib/ipc/api', () => ({
     shutdownDatabase: vi.fn(),
     switchToManagedDatabase: vi.fn(),
     updateSettings: vi.fn(),
+    probeStorageCapabilities: vi.fn(),
   },
 }));
 
@@ -64,6 +65,57 @@ beforeEach(() => {
     diagnostics: [],
     errors: [],
     cancel_requested: false,
+  });
+  mockedApi.probeStorageCapabilities.mockResolvedValue({
+    root: 'C:/ImageLibrary',
+    probe_version: 1,
+    probed_at: '2026-07-04T00:00:00Z',
+    storage_type: 'unknown',
+    publish_strategy: 'conservative_mounted',
+    strategy_reasons: ['parent_dir_sync is Unknown'],
+    probe_dir_cleaned: true,
+    readable: { status: 'supported', detail: 'root can be read' },
+    writable: { status: 'supported', detail: 'file can be created and written' },
+    can_create_dir: { status: 'supported', detail: 'dedicated probe directory created' },
+    same_dir_file_rename: {
+      status: 'supported',
+      detail: 'file rename within one directory succeeded',
+    },
+    same_root_rename: {
+      status: 'supported',
+      detail: 'file rename across sibling directories succeeded',
+    },
+    directory_rename: { status: 'supported', detail: 'directory rename succeeded' },
+    overwrite_rename: {
+      status: 'unsupported',
+      detail: 'rename over existing target failed',
+    },
+    file_sync_all: { status: 'supported', detail: 'file sync_all succeeded' },
+    parent_dir_sync: {
+      status: 'unknown',
+      detail: 'directory sync_all could not be verified',
+    },
+    case_sensitive: {
+      status: 'unsupported',
+      detail: 'case variants resolve to the same path',
+    },
+    unicode_normalization: {
+      status: 'supported',
+      detail: 'composed and decomposed Unicode names remain distinct',
+    },
+    max_path: { status: 'supported', detail: 'created path with 280 characters' },
+    max_component: {
+      status: 'supported',
+      detail: 'created a 240-character path component',
+    },
+    file_lock: { status: 'supported', detail: 'exclusive advisory file lock succeeded' },
+    timestamp_precision: {
+      status: 'supported',
+      detail: 'modified timestamp changed after a 25 ms rewrite',
+    },
+    free_space: { status: 'supported', detail: '1024 bytes available' },
+    volume_identity: { status: 'supported', detail: 'volume_serial_number=1' },
+    diagnostics: [],
   });
 });
 
@@ -167,5 +219,21 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: '取消迁移' })).toBeEnabled();
     });
+  });
+
+  test('renders mounted storage capability report after probing the library root', async () => {
+    renderSettingsPage();
+
+    const input = await screen.findByLabelText('目标图库根目录');
+    fireEvent.change(input, { target: { value: 'C:/ImageLibrary' } });
+    fireEvent.click(screen.getByRole('button', { name: '检测存储能力' }));
+
+    expect(await screen.findByText('保守可恢复')).toBeInTheDocument();
+    expect(screen.getByText('文件同步')).toBeInTheDocument();
+    expect(screen.getByText(/file sync_all succeeded/)).toBeInTheDocument();
+    expect(screen.getByText('父目录同步')).toBeInTheDocument();
+    expect(screen.getByText(/directory sync_all could not be verified/)).toBeInTheDocument();
+    expect(screen.getByText('策略依据 (1)')).toBeInTheDocument();
+    expect(mockedApi.probeStorageCapabilities).toHaveBeenCalledWith('C:/ImageLibrary');
   });
 });
