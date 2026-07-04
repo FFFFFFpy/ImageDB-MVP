@@ -1652,6 +1652,152 @@ mod tests {
     #[cfg(feature = "real-db-tests")]
     #[tokio::test]
     #[ignore]
+    async fn real_external_unreachable_fallback_switches_to_managed_without_touching_external() {
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_none()
+        {
+            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real external fallback test");
+            return;
+        }
+
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::infrastructure::secrets::CredentialStore;
+        use crate::infrastructure::settings::SettingsStore;
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let managed_tmp = TempDir::new().unwrap();
+        let target_tmp = TempDir::new().unwrap();
+        let settings_tmp = TempDir::new().unwrap();
+
+        let managed_manager = Arc::new(Mutex::new(PostgresManager::new(managed_tmp.path())));
+        let settings = Arc::new(Mutex::new(SettingsStore::new(settings_tmp.path()).unwrap()));
+        let credentials =
+            Arc::new(CredentialStore::new_file_for_tests(settings_tmp.path()).unwrap());
+        let service = DatabaseService::new(managed_manager.clone(), settings.clone(), credentials);
+
+        let managed_state = service.initialize_managed().await.expect("managed init");
+        assert_eq!(managed_state.mode, Some(DatabaseMode::ManagedLocal));
+        assert_eq!(managed_state.status, DatabaseStatus::Connected);
+
+        let mut target_manager = PostgresManager::new(target_tmp.path());
+        let target_probe = target_manager.initialize().await.expect("target init");
+        assert!(
+            target_probe.connection_ok,
+            "target init failed: {:?}",
+            target_probe.diagnostics
+        );
+
+        let target_config = ConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: target_manager.port(),
+            database: target_manager.database().to_string(),
+            username: target_manager.username().to_string(),
+            password: target_manager.password().map(ToOwned::to_owned),
+            tls_mode: TlsMode::Disable,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 1,
+            query_timeout_secs: 5,
+            profile_name: Some("real-fallback-external-test".to_string()),
+        };
+
+        let external_state = service
+            .initialize_external(&target_config)
+            .await
+            .expect("initialize external target");
+        assert_eq!(external_state.mode, Some(DatabaseMode::External));
+        assert_eq!(external_state.status, DatabaseStatus::Connected);
+
+        let (target_client, target_handle) =
+            target_manager.connect().await.expect("target connect");
+        target_client
+            .execute(
+                "INSERT INTO app_meta (key, value) VALUES ($1, $2)
+                 ON CONFLICT (key) DO UPDATE SET value = $2",
+                &[&"m7_fallback_probe", &json!({"external": true})],
+            )
+            .await
+            .expect("seed external app_meta");
+        target_handle.abort();
+
+        target_manager.shutdown().await.expect("target shutdown");
+
+        let unreachable = service.get_state().await;
+        assert_eq!(unreachable.mode, Some(DatabaseMode::External));
+        assert!(
+            matches!(unreachable.status, DatabaseStatus::Error(_)),
+            "expected unreachable external error, got {:?}",
+            unreachable.status
+        );
+        assert!(
+            unreachable.diagnostics.iter().any(|d| {
+                d.contains("controlled switch-to-managed action")
+                    && d.contains("without modifying external data")
+            }),
+            "missing controlled fallback diagnostic: {:?}",
+            unreachable.diagnostics
+        );
+
+        let fallback_state = service
+            .switch_to_managed()
+            .await
+            .expect("controlled switch to managed");
+        assert_eq!(fallback_state.mode, Some(DatabaseMode::ManagedLocal));
+        assert_eq!(
+            fallback_state.status,
+            DatabaseStatus::Connected,
+            "managed fallback diagnostics: {:?}",
+            fallback_state.diagnostics
+        );
+        assert!(fallback_state.pgvector_available);
+
+        let stored = settings.lock().await;
+        assert_eq!(stored.get().database_mode.as_deref(), Some("managed_local"));
+        assert_eq!(
+            stored.get().external_profile_name.as_deref(),
+            Some("real-fallback-external-test")
+        );
+        assert!(
+            stored.get().external_host.is_some(),
+            "controlled fallback should retain external profile metadata for later recovery"
+        );
+        drop(stored);
+
+        let restart_probe = target_manager.initialize().await.expect("target restart");
+        assert!(
+            restart_probe.connection_ok,
+            "target restart failed: {:?}",
+            restart_probe.diagnostics
+        );
+        let (target_client, target_handle) =
+            target_manager.connect().await.expect("target reconnect");
+        let external_probe = target_client
+            .query_one(
+                "SELECT value FROM app_meta WHERE key = 'm7_fallback_probe'",
+                &[],
+            )
+            .await
+            .expect("external probe row still exists")
+            .get::<_, serde_json::Value>(0);
+        assert_eq!(external_probe, json!({"external": true}));
+        target_handle.abort();
+
+        managed_manager
+            .lock()
+            .await
+            .shutdown()
+            .await
+            .expect("managed shutdown");
+        target_manager.shutdown().await.expect("target shutdown");
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    #[tokio::test]
+    #[ignore]
     async fn real_external_existing_database_upgrades_from_old_schema() {
         if std::env::var("IMAGEDB_POSTGRES_BIN")
             .ok()

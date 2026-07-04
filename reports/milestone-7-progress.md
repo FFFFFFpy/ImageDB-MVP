@@ -43,6 +43,12 @@ Date: 2026-07-04
   - verifies version, pgvector, extension creation, table/schema permissions, read-write state, UTF-8 encoding, time functions, read-only status, migration state, and schema compatibility preflight fields;
   - initializes pgvector, ImageDB migrations, and `app_meta`;
   - persists the external profile only after initialization succeeds.
+- Added a real external-unreachable fallback test that:
+  - activates a real external PostgreSQL target and writes an external probe row;
+  - shuts down the external target and verifies `get_state` reports controlled switch-to-managed diagnostics without switching automatically;
+  - explicitly switches back to the managed database and verifies managed pgvector connectivity;
+  - restarts the external target and confirms the external probe row was not modified by fallback.
+- Hardened managed PostgreSQL startup after an external profile was active by treating `pg_ctl start` warnings with a ready/already-running log as a usable running server before continuing health checks.
 
 ## Commits
 
@@ -57,6 +63,7 @@ Date: 2026-07-04
 - Strict TLS hostname verification implemented in the current M7 update.
 - External-unreachable managed fallback diagnostics implemented in the current M7 update.
 - Empty external PostgreSQL preflight and initialization coverage implemented in the current M7 update.
+- External-unreachable controlled managed fallback real coverage implemented in the current M7 update.
 
 ## Commands run
 
@@ -75,6 +82,7 @@ Date: 2026-07-04
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml trusted_certificate_hostname_mismatch -- --nocapture`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml external_unreachable_diagnostics_points_to_controlled_managed_fallback`
 - `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_external_empty_database_ -- --ignored --nocapture --test-threads=1`
+- `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_external_unreachable_fallback_switches_to_managed_without_touching_external -- --ignored --nocapture --test-threads=1`
 
 ## Test result summary
 
@@ -90,6 +98,7 @@ Date: 2026-07-04
 - Strict TLS hostname-mismatch tests passed.
 - External-unreachable fallback diagnostics unit test passed.
 - Empty external PostgreSQL preflight/initialization test passed.
+- External-unreachable controlled managed fallback real test passed.
 
 ## Actual runtime result
 
@@ -103,10 +112,12 @@ Date: 2026-07-04
 - A local TLS test server using a `localhost` certificate was trusted by the client; `verify_full` accepted `localhost`, rejected `127.0.0.1`, and `verify_ca` accepted `127.0.0.1`.
 - When an active external profile is unreachable, `get_state` now reports a diagnostic instructing the user to use the controlled switch-to-managed action without modifying external data.
 - A real empty external PostgreSQL target preflighted with all required capability checks passing, then `initialize_external` created pgvector, applied migrations through `0009_drop_redundant_snapshot_hash`, created `app_meta`, switched the active mode to external, and persisted only non-secret external profile metadata.
+- A real external target was activated, shut down, reported as unreachable with controlled fallback diagnostics, explicitly switched back to the managed database, then restarted with its external `app_meta` probe row intact.
 
 ## Known remaining M7 gaps
 
 - Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, row-count mismatch, preflight cancellation, and running child-process cancellation.
-- Controlled fallback to managed has explicit GUI/service affordance and diagnostics, but still needs a stable real PostgreSQL integration test before the DoD item is closed.
+- Managed-to-external migration creates a backup and verifies key table row counts before switching, but the broader task wording still calls for final audit of constraints, indexes, key hashes, and settings/library transaction records before the migration verification DoD is closed.
+- GUI migration/profile controls exist for connection testing, migration progress, cancellation, diagnostics, row-count reports, active profile display, and controlled switch back to managed; a final GUI audit is still needed before the GUI DoD item is closed.
 
 M7 is not closed yet. `CURRENT_TASK.md` should remain on `tasks/07-external-postgres.md` until these gaps are resolved.

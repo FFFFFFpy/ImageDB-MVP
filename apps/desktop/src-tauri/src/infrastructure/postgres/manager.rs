@@ -598,9 +598,14 @@ impl PostgresManager {
                 .ok()
                 .map(|s| s.lines().rev().take(20).collect::<Vec<_>>().join("\n"))
                 .unwrap_or_else(|| "<no postgres log output>".to_string());
-            if log_tail.contains("already running") || log_tail.contains("already started") {
-                self.diagnostics
-                    .push("PostgreSQL server already running".to_string());
+            if log_tail.contains("already running")
+                || log_tail.contains("already started")
+                || log_tail.contains("ready to accept connections")
+            {
+                self.diagnostics.push(
+                    "PostgreSQL server is already running or became ready after start warning"
+                        .to_string(),
+                );
                 self.server_running = true;
             } else {
                 self.diagnostics

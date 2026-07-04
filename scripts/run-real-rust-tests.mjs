@@ -17,6 +17,7 @@ const suites = [
   { name: 'source snapshot verification', filter: 'real_snapshot_' },
   { name: 'review persistence', filter: 'real_review_' },
   { name: 'external empty database init', filter: 'real_external_empty_database_' },
+  { name: 'external unreachable fallback', filter: 'real_external_unreachable_fallback_' },
   { name: 'external existing database compatibility', filter: 'real_external_existing_database_' },
   { name: 'external postgres migration', filter: 'real_migrate_managed_to_external_' },
   { name: 'file transaction protocol', filter: 'real_protocol_' },
