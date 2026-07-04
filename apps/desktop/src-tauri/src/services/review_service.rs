@@ -3,9 +3,10 @@ use crate::domain::import_state::{
     ImportPlan, ImportPlanImage, ReviewCandidateDetail, ReviewCandidateSummary,
     ReviewDecisionAction, ReviewProgress,
 };
+use crate::domain::state_machine::PlanState;
 use crate::error::AppError;
 use crate::repositories::import_repository::{
-    AlbumRow, ImportPlanCandidateRow, ImportPlanImageRow, ImportRepository,
+    AlbumRow, ImportImageFullRow, ImportPlanCandidateRow, ImportPlanImageRow, ImportRepository,
 };
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
@@ -176,7 +177,140 @@ pub async fn generate_import_plan(
         &albums,
     );
 
+    freeze_generated_import_plan(client, import_run_id, &plan, &albums).await?;
+
     Ok(plan)
+}
+
+async fn freeze_generated_import_plan(
+    client: &Client,
+    import_run_id: Uuid,
+    plan: &ImportPlan,
+    albums: &[AlbumRow],
+) -> Result<(), AppError> {
+    if ImportRepository::load_frozen_plan(client, import_run_id)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if let Some(draft) = ImportRepository::load_draft_plan(client, import_run_id).await? {
+        let hash = crate::services::commit_service::compute_plan_hash(&draft)?;
+        ImportRepository::set_plan_hash(client, draft.plan_id, &hash).await?;
+        ImportRepository::update_import_plan_state(client, draft.plan_id, &PlanState::Frozen)
+            .await?;
+        return Ok(());
+    }
+
+    let import_run = ImportRepository::get_import_run_by_id(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    let version = next_import_plan_version(client, import_run_id).await?;
+    let plan_id = ImportRepository::create_import_plan(
+        client,
+        import_run_id,
+        version,
+        &import_run.policy_version,
+        import_run.library_root_id,
+    )
+    .await?;
+
+    let kept_ids = parse_kept_image_ids(plan)?;
+    let full_images = ImportRepository::get_import_images_by_ids(client, &kept_ids).await?;
+    let image_by_id: HashMap<Uuid, ImportImageFullRow> =
+        full_images.into_iter().map(|img| (img.id, img)).collect();
+
+    for album in albums {
+        let album_images: Vec<&ImportImageFullRow> = kept_ids
+            .iter()
+            .filter_map(|id| image_by_id.get(id))
+            .filter(|img| img.import_album_id == album.id)
+            .collect();
+        let plan_album_id = ImportRepository::insert_plan_album(
+            client,
+            plan_id,
+            album.id,
+            &album.source_name,
+            album_images.len() as i32,
+        )
+        .await?;
+
+        for img in album_images {
+            let expected_blake3 = img.blake3.as_deref().ok_or_else(|| {
+                AppError::Internal(format!(
+                    "cannot freeze plan: image {} has no BLAKE3 fingerprint",
+                    img.id
+                ))
+            })?;
+            let target_relative_path =
+                target_relative_path_for_album(&album.source_name, &img.relative_path)?;
+            ImportRepository::insert_plan_image(
+                client,
+                plan_album_id,
+                img.id,
+                &img.source_path,
+                &img.relative_path,
+                &target_relative_path,
+                img.file_size,
+                expected_blake3,
+                img.width,
+                img.height,
+                img.format.as_deref(),
+            )
+            .await?;
+        }
+    }
+
+    let draft = ImportRepository::load_draft_plan(client, import_run_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "failed to reload draft import plan for run {import_run_id}"
+            ))
+        })?;
+    let hash = crate::services::commit_service::compute_plan_hash(&draft)?;
+    ImportRepository::set_plan_hash(client, plan_id, &hash).await?;
+    ImportRepository::update_import_plan_state(client, plan_id, &PlanState::Frozen).await
+}
+
+async fn next_import_plan_version(client: &Client, import_run_id: Uuid) -> Result<i32, AppError> {
+    let row = client
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+             FROM import_plans WHERE import_run_id = $1",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query next plan version: {e}")))?;
+    Ok(row.get("next_version"))
+}
+
+fn parse_kept_image_ids(plan: &ImportPlan) -> Result<Vec<Uuid>, AppError> {
+    plan.kept_images
+        .iter()
+        .map(|img| {
+            Uuid::parse_str(&img.image_id).map_err(|e| {
+                AppError::Internal(format!(
+                    "invalid import plan image id {}: {e}",
+                    img.image_id
+                ))
+            })
+        })
+        .collect()
+}
+
+fn target_relative_path_for_album(
+    album_name: &str,
+    source_relative_path: &str,
+) -> Result<String, AppError> {
+    let slash_prefix = format!("{album_name}/");
+    let backslash_prefix = format!("{album_name}\\");
+    let rel = source_relative_path
+        .strip_prefix(&slash_prefix)
+        .or_else(|| source_relative_path.strip_prefix(&backslash_prefix))
+        .unwrap_or(source_relative_path);
+    crate::services::commit_service::normalize_relative_path(rel)
 }
 
 pub fn build_import_plan(

@@ -18,5 +18,9 @@ mod reconcile_integration;
 mod manifest_validation_integration;
 
 #[cfg(test)]
+#[cfg(feature = "real-db-tests")]
+mod m9_main_chain_integration;
+
+#[cfg(test)]
 #[cfg(all(feature = "real-db-tests", feature = "fail-injection"))]
 mod cancellation_recovery_integration;

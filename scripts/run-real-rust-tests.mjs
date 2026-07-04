@@ -22,6 +22,10 @@ const suites = [
   { name: 'external postgres migration', filter: 'real_migrate_managed_to_external_' },
   { name: 'file transaction protocol', filter: 'real_protocol_' },
   { name: 'formal commit pipeline', filter: 'real_commit_full_pipeline' },
+  {
+    name: 'M9 main chain plan freeze and commit',
+    filter: 'm9_main_chain_exact_duplicate_import_freezes_plan_and_commits',
+  },
   { name: 'strict manifest validation', filter: 'manifest_validation_' },
   { name: 'run-state reconciliation', filter: 'real_reconcile_' },
   {

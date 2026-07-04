@@ -2,7 +2,7 @@ use crate::domain::import_state::{ScanProgress, ScanSourceInfo};
 use crate::services::scan_service;
 use crate::state::AppState;
 use std::sync::atomic::Ordering;
-use tauri::State;
+use tauri::{Emitter, Runtime, State};
 
 #[tauri::command]
 pub async fn validate_source_directory(source_root: String) -> Result<ScanSourceInfo, String> {
@@ -12,10 +12,10 @@ pub async fn validate_source_directory(source_root: String) -> Result<ScanSource
 }
 
 #[tauri::command]
-pub async fn start_scan(
+pub async fn start_scan<R: Runtime>(
     state: State<'_, AppState>,
     source_root: String,
-    app_handle: tauri::AppHandle,
+    app_handle: tauri::AppHandle<R>,
 ) -> Result<String, String> {
     let mut scan_state = state.scan_state.lock().await;
 
@@ -55,7 +55,6 @@ pub async fn start_scan(
 
     let task = tokio::spawn(async move {
         let result = scan_service::run_scan(
-            Some(app_handle_clone),
             postgres_manager,
             settings,
             source_root_clone,
@@ -72,6 +71,25 @@ pub async fn start_scan(
                 errors: vec![e.to_string()],
                 ..ScanProgress::idle()
             },
+        }
+    });
+
+    let event_tracker = progress_tracker.clone();
+    let event_handle = app_handle_clone;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let snapshot = {
+                let progress = event_tracker.lock().await;
+                progress.clone()
+            };
+            let _ = event_handle.emit(scan_service::SCAN_PROGRESS_EVENT, snapshot.clone());
+            if matches!(
+                snapshot.state.as_str(),
+                "ready_to_commit" | "review_required" | "completed" | "cancelled" | "failed"
+            ) {
+                break;
+            }
         }
     });
 

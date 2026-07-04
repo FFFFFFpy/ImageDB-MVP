@@ -19,7 +19,6 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -89,14 +88,7 @@ impl PerceptualHex {
     }
 }
 
-async fn emit_progress(
-    app_handle: Option<&AppHandle>,
-    progress: &ScanProgressEvent,
-    tracker: &Mutex<ScanProgress>,
-) {
-    if let Some(app_handle) = app_handle {
-        let _ = app_handle.emit(SCAN_PROGRESS_EVENT, progress);
-    }
+async fn emit_progress(progress: &ScanProgressEvent, tracker: &Mutex<ScanProgress>) {
     let mut guard = tracker.lock().await;
     *guard = ScanProgress {
         state: progress.state.clone(),
@@ -409,9 +401,8 @@ pub fn validate_source_directory(path: &str) -> Result<ScanProgress, AppError> {
 }
 
 pub async fn run_scan(
-    app_handle: Option<AppHandle>,
     postgres_manager: Arc<Mutex<PostgresManager>>,
-    _settings: Arc<Mutex<SettingsStore>>,
+    settings: Arc<Mutex<SettingsStore>>,
     source_root: String,
     cancelled: Arc<AtomicBool>,
     progress_tracker: Arc<Mutex<ScanProgress>>,
@@ -440,12 +431,18 @@ pub async fn run_scan(
     };
 
     let library_root_id = ImportRepository::upsert_default_library_root(&client).await?;
+    if let Some(library_root) = {
+        let settings = settings.lock().await;
+        settings.get().library_root.clone()
+    } {
+        ImportRepository::update_library_root_path(&client, library_root_id, &library_root).await?;
+    }
 
     let import_run_id =
         ImportRepository::create_import_run(&client, &source_root, library_root_id).await?;
     progress.import_run_id = Some(import_run_id.to_string());
 
-    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+    emit_progress(&progress, &progress_tracker).await;
 
     let albums = match scan_directory_for_albums(&source_path) {
         Ok(albums) => albums,
@@ -463,7 +460,7 @@ pub async fn run_scan(
     };
 
     progress.total_albums = albums.len() as u32;
-    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+    emit_progress(&progress, &progress_tracker).await;
 
     if albums.is_empty() {
         ImportRepository::update_import_run_state(
@@ -474,7 +471,7 @@ pub async fn run_scan(
         .await?;
         progress.state = "completed".to_string();
         progress.current_stage = "completed".to_string();
-        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+        emit_progress(&progress, &progress_tracker).await;
         handle.abort();
         return Ok(ScanProgress::idle());
     }
@@ -526,7 +523,7 @@ pub async fn run_scan(
     )
     .await?;
     progress.current_stage = "fingerprinting".to_string();
-    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+    emit_progress(&progress, &progress_tracker).await;
 
     struct AlbumImageEntry {
         album_db_id: Uuid,
@@ -560,7 +557,7 @@ pub async fn run_scan(
         .await?;
 
         progress.current_album = Some(album_name.clone());
-        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+        emit_progress(&progress, &progress_tracker).await;
 
         let album_path = PathBuf::from(&album_source_path);
         let scanned_images = match scan_album_for_images(&album_path, &album_name) {
@@ -576,7 +573,7 @@ pub async fn run_scan(
                     &ImportAlbumState::Failed,
                 )
                 .await?;
-                emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                emit_progress(&progress, &progress_tracker).await;
                 continue;
             }
         };
@@ -629,7 +626,7 @@ pub async fn run_scan(
                     total_images += 1;
                     progress.total_images = total_images;
                     progress.processed_images = total_images;
-                    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                    emit_progress(&progress, &progress_tracker).await;
                 }
                 Err(e) => {
                     ImportRepository::insert_import_image(
@@ -662,7 +659,7 @@ pub async fn run_scan(
                     total_images += 1;
                     progress.total_images = total_images;
                     progress.processed_images = total_images;
-                    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                    emit_progress(&progress, &progress_tracker).await;
                 }
             }
         }
@@ -684,7 +681,7 @@ pub async fn run_scan(
         .await?;
         progress.state = "cancelled".to_string();
         progress.current_stage = "cancelled".to_string();
-        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+        emit_progress(&progress, &progress_tracker).await;
         handle.abort();
         return Ok(ScanProgress {
             state: "cancelled".to_string(),
@@ -699,7 +696,7 @@ pub async fn run_scan(
     )
     .await?;
     progress.current_stage = "detecting_duplicates".to_string();
-    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+    emit_progress(&progress, &progress_tracker).await;
 
     let mut album_groups: std::collections::HashMap<Uuid, Vec<&AlbumImageEntry>> =
         std::collections::HashMap::new();
@@ -750,7 +747,7 @@ pub async fn run_scan(
                     .await?;
                     duplicate_count += 1;
                     progress.duplicate_count = duplicate_count;
-                    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                    emit_progress(&progress, &progress_tracker).await;
                 } else if pixel_exact {
                     ImportRepository::insert_duplicate_candidate(
                         &client,
@@ -775,7 +772,7 @@ pub async fn run_scan(
                     .await?;
                     duplicate_count += 1;
                     progress.duplicate_count = duplicate_count;
-                    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                    emit_progress(&progress, &progress_tracker).await;
                 } else {
                     if let Some(evidence) = compare_perceptual_intra(&a.fp, &b.fp, thresholds) {
                         let (match_type, decision, source) =
@@ -803,7 +800,7 @@ pub async fn run_scan(
                         .await?;
                         duplicate_count += 1;
                         progress.duplicate_count = duplicate_count;
-                        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                        emit_progress(&progress, &progress_tracker).await;
                     }
                 }
             }
@@ -873,7 +870,7 @@ pub async fn run_scan(
                         .await?;
                         duplicate_count += 1;
                         progress.duplicate_count = duplicate_count;
-                        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                        emit_progress(&progress, &progress_tracker).await;
                     }
                 }
             }
@@ -942,7 +939,7 @@ pub async fn run_scan(
                         .await?;
                         duplicate_count += 1;
                         progress.duplicate_count = duplicate_count;
-                        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                        emit_progress(&progress, &progress_tracker).await;
                     }
                 }
             }
@@ -1008,7 +1005,7 @@ pub async fn run_scan(
                             .await?;
                             duplicate_count += 1;
                             progress.duplicate_count = duplicate_count;
-                            emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+                            emit_progress(&progress, &progress_tracker).await;
                         }
                     }
                 }
@@ -1030,7 +1027,7 @@ pub async fn run_scan(
         progress.state = "failed".to_string();
         progress.current_stage = "failed".to_string();
         progress.errors.push(e.to_string());
-        emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+        emit_progress(&progress, &progress_tracker).await;
         handle.abort();
         return Ok(ScanProgress {
             state: "failed".to_string(),
@@ -1060,7 +1057,7 @@ pub async fn run_scan(
     progress.state = final_run_state.to_string();
     progress.current_stage = final_run_state.to_string();
     progress.current_album = None;
-    emit_progress(app_handle.as_ref(), &progress, &progress_tracker).await;
+    emit_progress(&progress, &progress_tracker).await;
 
     handle.abort();
 
