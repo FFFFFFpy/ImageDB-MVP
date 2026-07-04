@@ -1,0 +1,88 @@
+{
+  "dataset_version": 1,
+  "source_root": "fixtures/m9-acceptance/source",
+  "history_library_root": "fixtures/m9-acceptance/history-library",
+  "albums": [
+    {
+      "relative_path": "01-exact-duplicates",
+      "image_files": 2,
+      "expected": {
+        "exact_duplicate_groups": 1,
+        "auto_excluded_min": 1,
+        "committable_images_after_auto_review": 1
+      }
+    },
+    {
+      "relative_path": "02-reencoded-same-pixels",
+      "image_files": 3,
+      "expected": {
+        "pixel_duplicate_or_similarity_candidates_min": 2,
+        "manual_review_candidates_min": 1
+      }
+    },
+    {
+      "relative_path": "03-unicode-sidecars-相册-é",
+      "image_files": 1,
+      "sidecar_files": ["notes.txt", "cover.xmp", "nested/metadata.json"],
+      "expected": {
+        "unicode_path_accepted": true,
+        "source_snapshot_files_min": 4,
+        "sidecars_archived_with_source": true
+      }
+    },
+    {
+      "relative_path": "04-corrupt-and-empty",
+      "image_files": 2,
+      "expected": {
+        "decoded_images": 1,
+        "decode_errors_min": 1,
+        "valid_neighbor_still_scanned": true
+      }
+    },
+    {
+      "relative_path": "05-empty-album",
+      "image_files": 0,
+      "expected": {
+        "album_record_allowed": true,
+        "committable_images": 0
+      }
+    },
+    {
+      "relative_path": "06-cross-album-a",
+      "image_files": 1,
+      "expected": {
+        "cross_album_duplicate_group": "shared-sample-png"
+      }
+    },
+    {
+      "relative_path": "07-cross-album-b",
+      "image_files": 1,
+      "expected": {
+        "cross_album_duplicate_group": "shared-sample-png"
+      }
+    },
+    {
+      "relative_path": "08-many-small-images",
+      "image_files": 30,
+      "expected": {
+        "scan_smoke_image_count": 30,
+        "bounded_memory_required": true
+      }
+    }
+  ],
+  "history_seed": {
+    "relative_path": "Albums/history-seed",
+    "image_files": 1,
+    "expected": {
+      "library_duplicate_candidates_min": 1
+    }
+  },
+  "release_acceptance_expectations": {
+    "scan_must_complete": true,
+    "review_or_zero_candidate_path_must_complete": true,
+    "plan_freeze_must_complete": true,
+    "commit_must_publish_verified_files": true,
+    "source_archive_must_include_sidecars": true,
+    "database_and_filesystem_must_match": true
+  }
+}
