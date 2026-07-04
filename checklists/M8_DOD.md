@@ -3,7 +3,7 @@
 - [x] StorageCapabilities 探测完成。
 - [x] StrongLocal / ConservativeMounted / Unsupported 策略完成。
 - [x] 未知能力不被乐观视为支持。
-- [ ] 多实例数据库租约完成。
+- [x] 多实例数据库租约完成。
 - [ ] 路径大小写、Unicode、长路径和逃逸检查完成。
 - [ ] 断连、超时、只读和空间不足恢复完成。
 - [ ] 保守发布的提交标记与Recovery完成。

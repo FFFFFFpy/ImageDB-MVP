@@ -52,7 +52,7 @@ beforeEach(() => {
     },
     external_config: null,
     pgvector_available: true,
-    migration_version: '0009_drop_redundant_snapshot_hash',
+    migration_version: '0010_library_root_leases',
     diagnostics: ['managed database ready'],
   });
   mockedApi.getExternalMigrationProgress.mockResolvedValue({
@@ -184,7 +184,7 @@ describe('SettingsPage external PostgreSQL GUI', () => {
       current_stage: 'verify',
       switched: false,
       backup_path: 'C:/imagedb/postgres_backups/external_migrations/managed-to-external.sql',
-      migration_version: '0009_drop_redundant_snapshot_hash',
+      migration_version: '0010_library_root_leases',
       row_counts: [
         {
           table: 'app_meta',

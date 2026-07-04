@@ -69,10 +69,7 @@ async fn real_protocol_migrations_run_on_empty_db() {
     let (_tmp, mgr) = fresh_db().await;
     let (client, handle) = mgr.lock().await.connect().await.unwrap();
     let version = MigrationRunner::current_version(&client).await.unwrap();
-    assert_eq!(
-        version.as_deref(),
-        Some("0009_drop_redundant_snapshot_hash")
-    );
+    assert_eq!(version.as_deref(), Some("0010_library_root_leases"));
     // All state columns now exist with CHECK constraints.
     let count: i64 = client
         .query_one(
@@ -84,6 +81,64 @@ async fn real_protocol_migrations_run_on_empty_db() {
         .unwrap()
         .get(0);
     assert_eq!(count, 5);
+    drop(client);
+    handle.abort();
+    let mut m = mgr.lock().await;
+    m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_protocol_library_root_lease_excludes_second_writer_and_allows_expiry_takeover() {
+    let (_tmp, mgr) = fresh_db().await;
+    let (client, handle) = mgr.lock().await.connect().await.unwrap();
+    seed_run(&client).await;
+    let root_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000a1").unwrap();
+
+    let token1 = uuid::Uuid::new_v4();
+    let lease1 =
+        ImportRepository::acquire_library_root_lease(&client, root_id, "owner-a", token1, 60)
+            .await
+            .expect("owner-a should acquire lease");
+    assert_eq!(lease1.lease_token, token1);
+
+    let token2 = uuid::Uuid::new_v4();
+    let blocked =
+        ImportRepository::acquire_library_root_lease(&client, root_id, "owner-b", token2, 60)
+            .await
+            .expect_err("owner-b must not acquire an active lease");
+    assert!(
+        blocked.to_string().contains("owner-a"),
+        "conflict should name current owner: {blocked}"
+    );
+
+    ImportRepository::release_library_root_lease(&client, root_id, token1)
+        .await
+        .expect("owner-a release");
+    let lease2 =
+        ImportRepository::acquire_library_root_lease(&client, root_id, "owner-b", token2, 60)
+            .await
+            .expect("owner-b should acquire after release");
+    assert_eq!(lease2.lease_token, token2);
+
+    client
+        .execute(
+            "UPDATE library_root_leases
+             SET heartbeat_at = now() - interval '2 seconds',
+                 expires_at = now() - interval '1 second'
+             WHERE library_root_id = $1",
+            &[&root_id],
+        )
+        .await
+        .unwrap();
+    let token3 = uuid::Uuid::new_v4();
+    let lease3 =
+        ImportRepository::acquire_library_root_lease(&client, root_id, "owner-c", token3, 60)
+            .await
+            .expect("expired lease should be taken over");
+    assert_eq!(lease3.owner_instance_id, "owner-c");
+    assert_eq!(lease3.lease_token, token3);
+
     drop(client);
     handle.abort();
     let mut m = mgr.lock().await;

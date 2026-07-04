@@ -342,6 +342,15 @@ pub struct LibraryImageFullRow {
     pub state: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct LibraryRootLeaseRow {
+    pub library_root_id: Uuid,
+    pub owner_instance_id: String,
+    pub lease_token: Uuid,
+    pub heartbeat_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl ImportRepository {
     pub async fn upsert_default_library_root(client: &Client) -> Result<Uuid, AppError> {
         if let Some(row) = client
@@ -389,6 +398,129 @@ impl ImportRepository {
             .await
             .map_err(|e| AppError::Internal(format!("failed to create import run: {e}")))?;
         Ok(id)
+    }
+
+    pub async fn acquire_library_root_lease(
+        client: &Client,
+        library_root_id: Uuid,
+        owner_instance_id: &str,
+        lease_token: Uuid,
+        ttl_secs: i64,
+    ) -> Result<LibraryRootLeaseRow, AppError> {
+        if ttl_secs <= 0 {
+            return Err(AppError::Internal(
+                "library root lease ttl must be positive".to_string(),
+            ));
+        }
+        let ttl = ttl_secs as f64;
+        let row = client
+            .query_opt(
+                "INSERT INTO library_root_leases
+                    (library_root_id, owner_instance_id, lease_token, heartbeat_at, expires_at)
+                 VALUES ($1, $2, $3, now(), now() + ($4 * interval '1 second'))
+                 ON CONFLICT (library_root_id) DO UPDATE SET
+                    owner_instance_id = EXCLUDED.owner_instance_id,
+                    lease_token = EXCLUDED.lease_token,
+                    heartbeat_at = now(),
+                    expires_at = EXCLUDED.expires_at,
+                    updated_at = now()
+                 WHERE library_root_leases.expires_at <= now()
+                    OR library_root_leases.owner_instance_id = EXCLUDED.owner_instance_id
+                    OR library_root_leases.lease_token = EXCLUDED.lease_token
+                 RETURNING library_root_id, owner_instance_id, lease_token, heartbeat_at, expires_at",
+                &[&library_root_id, &owner_instance_id, &lease_token, &ttl],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to acquire library root lease: {e}")))?;
+
+        if let Some(row) = row {
+            return Ok(Self::lease_row_from_row(&row));
+        }
+
+        let holder = Self::get_library_root_lease(client, library_root_id).await?;
+        let msg = match holder {
+            Some(lease) => format!(
+                "library root {library_root_id} is already leased by owner '{}' until {}",
+                lease.owner_instance_id, lease.expires_at
+            ),
+            None => format!("library root {library_root_id} lease is held by another writer"),
+        };
+        Err(AppError::Internal(msg))
+    }
+
+    pub async fn heartbeat_library_root_lease(
+        client: &Client,
+        library_root_id: Uuid,
+        lease_token: Uuid,
+        ttl_secs: i64,
+    ) -> Result<LibraryRootLeaseRow, AppError> {
+        if ttl_secs <= 0 {
+            return Err(AppError::Internal(
+                "library root lease ttl must be positive".to_string(),
+            ));
+        }
+        let ttl = ttl_secs as f64;
+        let row = client
+            .query_opt(
+                "UPDATE library_root_leases
+                 SET heartbeat_at = now(),
+                     expires_at = now() + ($3 * interval '1 second'),
+                     updated_at = now()
+                 WHERE library_root_id = $1 AND lease_token = $2
+                 RETURNING library_root_id, owner_instance_id, lease_token, heartbeat_at, expires_at",
+                &[&library_root_id, &lease_token, &ttl],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to heartbeat library root lease: {e}")))?;
+
+        row.map(|row| Self::lease_row_from_row(&row))
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                "library root {library_root_id} lease heartbeat failed; token is no longer owner"
+            ))
+            })
+    }
+
+    pub async fn release_library_root_lease(
+        client: &Client,
+        library_root_id: Uuid,
+        lease_token: Uuid,
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "DELETE FROM library_root_leases WHERE library_root_id = $1 AND lease_token = $2",
+                &[&library_root_id, &lease_token],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to release library root lease: {e}"))
+            })?;
+        Ok(())
+    }
+
+    pub async fn get_library_root_lease(
+        client: &Client,
+        library_root_id: Uuid,
+    ) -> Result<Option<LibraryRootLeaseRow>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT library_root_id, owner_instance_id, lease_token, heartbeat_at, expires_at
+                 FROM library_root_leases WHERE library_root_id = $1",
+                &[&library_root_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to get library root lease: {e}")))?;
+        Ok(row.map(|row| Self::lease_row_from_row(&row)))
+    }
+
+    fn lease_row_from_row(row: &tokio_postgres::Row) -> LibraryRootLeaseRow {
+        LibraryRootLeaseRow {
+            library_root_id: row.get("library_root_id"),
+            owner_instance_id: row.get("owner_instance_id"),
+            lease_token: row.get("lease_token"),
+            heartbeat_at: row.get("heartbeat_at"),
+            expires_at: row.get("expires_at"),
+        }
     }
 
     pub async fn update_import_run_state(

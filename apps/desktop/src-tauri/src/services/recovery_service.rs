@@ -25,7 +25,7 @@ use crate::services::commit_service::{
     select_commit_publish_strategy, stream_copy_with_hash, sync_parent_dir,
     validate_and_hash_frozen_plan, validate_commit_marker, verify_published_file_set,
     verify_source_snapshot_or_conflict, verify_staging_set, write_commit_marker,
-    write_synced_then_rename,
+    write_synced_then_rename, LIBRARY_ROOT_LEASE_TTL_SECS,
 };
 use crate::services::source_snapshot_service::load_source_album_snapshot;
 use serde::Serialize;
@@ -622,9 +622,19 @@ async fn recover_active_transaction(
         ImportRepository::get_library_root_path(client, library_root_id).await?;
     let library_root = PathBuf::from(&library_root_path);
     let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
+    let lease_owner = format!("imagedb-recovery-{}", Uuid::new_v4());
+    let lease_token = Uuid::new_v4();
+    ImportRepository::acquire_library_root_lease(
+        client,
+        library_root_id,
+        &lease_owner,
+        lease_token,
+        LIBRARY_ROOT_LEASE_TTL_SECS,
+    )
+    .await?;
 
     // Dispatch by state.
-    match current {
+    let outcome = match current {
         TransactionState::Planned | TransactionState::Staging => {
             resume_staging(
                 client,
@@ -689,6 +699,14 @@ async fn recover_active_transaction(
             false,
             format!("no recovery action for state {}", current),
         )),
+    };
+
+    let release_result =
+        ImportRepository::release_library_root_lease(client, library_root_id, lease_token).await;
+    match (outcome, release_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), _) => Err(e),
     }
 }
 

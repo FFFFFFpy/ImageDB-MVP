@@ -46,6 +46,7 @@ use uuid::Uuid;
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
 pub const COMMIT_MARKER_SCHEMA_VERSION: &str = "1.0";
 pub const COMMIT_MARKER_FILE_NAME: &str = ".imagedb-commit.json";
+pub const LIBRARY_ROOT_LEASE_TTL_SECS: i64 = 300;
 /// Maximum decoded pixel count for a single source file preview.
 #[allow(dead_code)]
 pub const PREVIEW_MAX_PIXELS: u64 = 8_000_000;
@@ -337,8 +338,26 @@ async fn execute_commit_pipeline(
     let mut albums_skipped = 0u32;
     let mut albums_failed = 0u32;
     let mut all_errors = Vec::new();
+    let lease_owner = format!("imagedb-commit-{}", Uuid::new_v4());
+    let lease_token = Uuid::new_v4();
+    ImportRepository::acquire_library_root_lease(
+        client,
+        library_root_id,
+        &lease_owner,
+        lease_token,
+        LIBRARY_ROOT_LEASE_TTL_SECS,
+    )
+    .await?;
 
     for (plan_album, images) in &frozen.albums {
+        ImportRepository::heartbeat_library_root_lease(
+            client,
+            library_root_id,
+            lease_token,
+            LIBRARY_ROOT_LEASE_TTL_SECS,
+        )
+        .await?;
+
         if cancelled.load(Ordering::Relaxed) {
             all_errors.push("commit cancelled by user".to_string());
             break;
@@ -364,6 +383,7 @@ async fn execute_commit_pipeline(
             frozen.plan_id,
             &validated_plan_hash,
             cancelled,
+            lease_token,
             commit,
         )
         .await
@@ -429,6 +449,8 @@ async fn execute_commit_pipeline(
         // correctness hook for progress observers.
         reconcile_import_run_state(client, import_run_id).await?;
     }
+
+    ImportRepository::release_library_root_lease(client, library_root_id, lease_token).await?;
 
     // Phase 1: cancellation must NOT manufacture unrecoverable transactions.
     // Previously this block flipped every non-terminal, non-conflict
@@ -663,6 +685,7 @@ async fn commit_single_album(
     plan_id: Uuid,
     plan_hash: &[u8],
     cancelled: &Arc<AtomicBool>,
+    lease_token: Uuid,
     commit: PlanAlbumCommit,
 ) -> Result<CommitAlbumResult, AppError> {
     let PlanAlbumCommit { plan_album, images } = commit;
@@ -810,6 +833,14 @@ async fn commit_single_album(
         .map_err(|e| AppError::IoError(format!("cannot create staging dir: {e}")))?;
 
     for (i, img) in images.iter().enumerate() {
+        ImportRepository::heartbeat_library_root_lease(
+            client,
+            library_root_id,
+            lease_token,
+            LIBRARY_ROOT_LEASE_TTL_SECS,
+        )
+        .await?;
+
         if cancelled.load(Ordering::Relaxed) {
             return Err(AppError::Internal(
                 "commit cancelled before staging".to_string(),
@@ -906,6 +937,13 @@ async fn commit_single_album(
     }
 
     // ── Phase 3: verify the staging set, then write the manifest. ──
+    ImportRepository::heartbeat_library_root_lease(
+        client,
+        library_root_id,
+        lease_token,
+        LIBRARY_ROOT_LEASE_TTL_SECS,
+    )
+    .await?;
     ImportRepository::update_file_transaction_state(
         client,
         tx_id,
@@ -957,6 +995,13 @@ async fn commit_single_album(
     // ── Phase 4: publish. StrongLocal uses the historical whole-directory
     // rename. ConservativeMounted copies verified files and writes an
     // immutable commit marker last.
+    ImportRepository::heartbeat_library_root_lease(
+        client,
+        library_root_id,
+        lease_token,
+        LIBRARY_ROOT_LEASE_TTL_SECS,
+    )
+    .await?;
     let publishing = state_machine::transition_transaction(TransactionState::Verified, "publish")?;
     ImportRepository::update_file_transaction_state(client, tx_id, &publishing, None).await?;
 
@@ -1003,6 +1048,13 @@ async fn commit_single_album(
     maybe_fault(CommitFaultPoint::AfterPublishRename, "after publish rename")?;
 
     // ── Phase 5: DB commit (do NOT delete the publish dir on failure). ──
+    ImportRepository::heartbeat_library_root_lease(
+        client,
+        library_root_id,
+        lease_token,
+        LIBRARY_ROOT_LEASE_TTL_SECS,
+    )
+    .await?;
     let db_committing =
         state_machine::transition_transaction(TransactionState::Published, "db_commit")?;
     ImportRepository::update_file_transaction_state(client, tx_id, &db_committing, None).await?;

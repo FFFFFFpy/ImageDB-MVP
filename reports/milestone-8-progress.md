@@ -84,3 +84,43 @@
 
 - 尚未完成真实 PostgreSQL 故障注入测试：例如 marker 前中断、目标存在但 marker 缺失后的 Recovery 收敛。
 - 多实例数据库租约、断连/只读/空间不足恢复、路径逃逸增强和真实挂载共享存储门禁仍未完成。
+
+## 2026-07-04: Database library-root lease
+
+### 实现内容
+
+- 新增 migration `0010_library_root_leases`，以 PostgreSQL 表 `library_root_leases` 作为同一图库根写入者的权威租约。
+- 租约字段包含 `library_root_id`、`owner_instance_id`、`lease_token`、`heartbeat_at`、`expires_at`。
+- `ImportRepository` 新增 acquire / heartbeat / release / read API。
+- acquire 使用数据库原子 upsert：只有同 owner、同 token 或已过期租约允许续租/接管；活跃的其他 owner 会被明确拒绝。
+- commit 主链在写入 album 前获取图库根租约，写入循环和关键阶段 heartbeat，完成后释放租约。
+- Recovery 的 active transaction 写路径也会获取同一图库根租约，恢复动作结束后释放租约。
+- 存储上的 lock 文件仍未作为权威锁。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/migrations/0010_library_root_leases.sql`
+- `apps/desktop/src-tauri/src/infrastructure/postgres/migration.rs`
+- `apps/desktop/src-tauri/src/infrastructure/postgres/manager.rs`
+- `apps/desktop/src-tauri/src/repositories/import_repository.rs`
+- `apps/desktop/src-tauri/src/services/commit_service.rs`
+- `apps/desktop/src-tauri/src/tests/protocol_integration.rs`
+- `apps/desktop/src/pages/SettingsPage.test.tsx`
+- `checklists/M8_DOD.md`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml migration`：5 passed。
+- `cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_protocol_library_root_lease -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- 真实 PostgreSQL 测试验证：owner-a 持有同一 `library_root_id` 租约时 owner-b 无法获取；owner-a 释放后 owner-b 可获取；租约过期后 owner-c 可接管。
+- migration head 更新为 `0010_library_root_leases`。
+
+### 已知限制
+
+- Recovery 目前按动作持有租约，尚未在长时间单文件恢复复制中做分块 heartbeat。
+- 断连/只读/空间不足恢复、路径逃逸增强和真实挂载共享存储故障门禁仍未完成。
