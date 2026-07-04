@@ -154,11 +154,26 @@ fn scan_album_for_images(
     album_path: &Path,
     album_name: &str,
 ) -> Result<Vec<ScannedImage>, AppError> {
-    let entries = std::fs::read_dir(album_path)?;
     let mut images = Vec::new();
+    walk_album_images(album_path, album_path, album_name, &mut images)?;
+    images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(images)
+}
+
+fn walk_album_images(
+    dir: &Path,
+    album_path: &Path,
+    album_name: &str,
+    images: &mut Vec<ScannedImage>,
+) -> Result<(), AppError> {
+    let entries = std::fs::read_dir(dir)?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            walk_album_images(&path, album_path, album_name, images)?;
+            continue;
+        }
         if !path.is_file() {
             continue;
         }
@@ -176,10 +191,16 @@ fn scan_album_for_images(
             .modified()
             .ok()
             .map(chrono::DateTime::<chrono::Utc>::from);
+        let image_relative_path = path.strip_prefix(album_path).map_err(|e| {
+            AppError::Internal(format!(
+                "failed to derive relative image path for {}: {e}",
+                path.display()
+            ))
+        })?;
         let relative_path = format!(
             "{}/{}",
             album_name,
-            path.file_name().unwrap_or_default().to_string_lossy()
+            normalize_relative_path(image_relative_path)
         );
         images.push(ScannedImage {
             source_path: path,
@@ -188,8 +209,14 @@ fn scan_album_for_images(
             modified_at,
         });
     }
-    images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    Ok(images)
+    Ok(())
+}
+
+fn normalize_relative_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 struct PerceptualEvidence {
@@ -1213,6 +1240,35 @@ mod tests {
             );
             assert!(img.file_size > 0);
         }
+    }
+
+    #[test]
+    fn test_scan_album_for_images_recurses_into_subdirectories() {
+        let tmp = TempDir::new().unwrap();
+        let album = create_test_album(tmp.path(), "vacation");
+        create_test_image(&album, "cover.jpg");
+        let chapter = album.join("chapter_1");
+        let extras = chapter.join("extras");
+        std::fs::create_dir_all(&extras).unwrap();
+        create_test_image(&chapter, "page01.png");
+        create_test_image(&extras, "detail.webp");
+        std::fs::write(extras.join("notes.txt"), "ignored").unwrap();
+
+        let images = scan_album_for_images(&album, "vacation").unwrap();
+        let paths: Vec<&str> = images
+            .iter()
+            .map(|image| image.relative_path.as_str())
+            .collect();
+
+        assert_eq!(paths.len(), 3);
+        assert_eq!(
+            paths,
+            vec![
+                "vacation/chapter_1/extras/detail.webp",
+                "vacation/chapter_1/page01.png",
+                "vacation/cover.jpg",
+            ]
+        );
     }
 
     #[test]
