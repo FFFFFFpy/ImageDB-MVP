@@ -196,10 +196,10 @@ impl PostgresManager {
     }
 
     pub(crate) fn try_use_bin_dir(&mut self, base: &std::path::Path, exe_suffix: &str) -> bool {
-        let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
-        let initdb = base.join(format!("initdb{exe_suffix}"));
-        let psql = base.join(format!("psql{exe_suffix}"));
-        let pg_dump = base.join(format!("pg_dump{exe_suffix}"));
+        let pg_ctl = strip_verbatim_prefix(&base.join(format!("pg_ctl{exe_suffix}")));
+        let initdb = strip_verbatim_prefix(&base.join(format!("initdb{exe_suffix}")));
+        let psql = strip_verbatim_prefix(&base.join(format!("psql{exe_suffix}")));
+        let pg_dump = strip_verbatim_prefix(&base.join(format!("pg_dump{exe_suffix}")));
         if pg_ctl.exists() && initdb.exists() && psql.exists() {
             self.pg_ctl = Some(pg_ctl);
             self.initdb = Some(initdb);
@@ -894,6 +894,34 @@ impl PostgresManager {
     }
 }
 
+/// Strip the Windows verbatim path prefix `\\?\` from a path's string form.
+///
+/// Tauri's `resource_dir()` returns a `\\?\`-prefixed verbatim path on
+/// Windows. PostgreSQL's `initdb` (and `pg_ctl`) derive the path to the
+/// sibling `postgres.exe` from their own executable path; when that path
+/// is verbatim (`\\?\D:\…\bin\initdb.exe`), initdb's internal
+/// normalization mangles it into `//?/D:/…`, Windows rejects it, and
+/// initdb fails with 'initdb 需要程序 "postgres" … 找不到该程序' even though
+/// postgres.exe is right there. Stripping the prefix before we store the
+/// binary paths makes every spawned child (initdb, pg_ctl, psql) receive a
+/// standard path that round-trips correctly.
+fn strip_verbatim_prefix(path: &std::path::Path) -> PathBuf {
+    let s = path.to_str().unwrap_or_default();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // A bare `\\?\C:\…` verbatim disk path → `C:\…`.
+        if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
+            return PathBuf::from(rest);
+        }
+        // `\\?\UNC\server\share` → `\\server\share`.
+        if let Some(unc_rest) = rest.strip_prefix("UNC\\") {
+            return PathBuf::from(format!(r"\\{}", unc_rest));
+        }
+        // Anything else: return the stripped form as-is.
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,6 +993,82 @@ mod tests {
         assert!(
             mgr.pg_dump.is_some(),
             "pg_dump should be discovered alongside the others"
+        );
+    }
+
+    /// Tauri's `resource_dir()` returns a `\\?\`-prefixed verbatim path on
+    /// Windows. PostgreSQL's initdb derives the sibling `postgres.exe` path
+    /// from its own executable path and chokes on the verbatim prefix
+    /// (mangling `\\?\D:\…` into `//?/D:/…` and failing with "initdb needs
+    /// postgres … 找不到该程序"). The probe must strip the prefix before
+    /// storing the binary paths so spawned children receive standard paths.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_locator_strips_verbatim_prefix_from_runtime_path() {
+        let tmp = TempDir::new().unwrap();
+        let isolated = tmp.path().join("isolated_app_data");
+        std::fs::create_dir_all(&isolated).unwrap();
+
+        let bin_dir = tmp.path().join("postgres-runtime").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["pg_ctl", "initdb", "psql", "pg_dump"] {
+            std::fs::write(bin_dir.join(format!("{name}.exe")), b"").unwrap();
+        }
+
+        // Synthesize a verbatim path the way Tauri's resource_dir() does.
+        let plain = bin_dir.to_str().unwrap();
+        let verbatim = PathBuf::from(format!(r"\\?\{plain}"));
+
+        let mut mgr = PostgresManager::new(&isolated);
+        mgr.pg_ctl = None;
+        mgr.initdb = None;
+        mgr.psql = None;
+        mgr.pg_dump = None;
+
+        assert!(mgr.try_use_bin_dir(&verbatim, ".exe"));
+        assert!(mgr.binaries_available());
+        // None of the stored paths may carry the `\\?\` prefix — initdb and
+        // pg_ctl would mangle it.
+        for p in mgr
+            .pg_ctl
+            .iter()
+            .chain(mgr.initdb.iter())
+            .chain(mgr.psql.iter())
+            .chain(mgr.pg_dump.iter())
+        {
+            assert!(
+                !p.to_str().unwrap_or_default().starts_with(r"\\?\"),
+                "stored binary path still verbatim: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_strip_verbatim_prefix_disk_path() {
+        let p = std::path::Path::new(r"\\?\C:\Program Files\Postgres\bin\initdb.exe");
+        assert_eq!(
+            strip_verbatim_prefix(p),
+            PathBuf::from(r"C:\Program Files\Postgres\bin\initdb.exe")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_strip_verbatim_prefix_unc_path() {
+        let p = std::path::Path::new(r"\\?\UNC\server\share\runtime\bin\initdb.exe");
+        assert_eq!(
+            strip_verbatim_prefix(p),
+            PathBuf::from(r"\\server\share\runtime\bin\initdb.exe")
+        );
+    }
+
+    #[test]
+    fn test_strip_verbatim_prefix_plain_path_unchanged() {
+        let p = std::path::Path::new(r"C:\Postgres\bin\initdb.exe");
+        assert_eq!(
+            strip_verbatim_prefix(p),
+            PathBuf::from(r"C:\Postgres\bin\initdb.exe")
         );
     }
 
