@@ -60,6 +60,21 @@ export interface ExternalPreflightCheck {
   message: string;
 }
 
+export interface TableRowCount {
+  table: string;
+  managed_rows: number;
+  external_rows: number;
+  matches: boolean;
+}
+
+export interface ExternalMigrationResult {
+  switched: boolean;
+  backup_path: string | null;
+  migration_version: string | null;
+  row_counts: TableRowCount[];
+  diagnostics: DiagnosticItem[];
+}
+
 export interface AppSettings {
   database_mode: string | null;
   library_root: string | null;

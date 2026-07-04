@@ -42,6 +42,11 @@ export function SettingsPage() {
     mutationFn: () => api.testExternalConnection(buildExternalConfig()),
   });
 
+  const migrateExt = useMutation({
+    mutationFn: () => api.migrateManagedToExternalDatabase(buildExternalConfig()),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+  });
+
   function buildExternalConfig(): ExternalConnectionConfig {
     return {
       host: extHost,
@@ -206,6 +211,13 @@ export function SettingsPage() {
         <button onClick={() => testExt.mutate()} disabled={testExt.isPending}>
           {testExt.isPending ? '测试中…' : '测试连接'}
         </button>
+        <button
+          className="btn-primary"
+          onClick={() => migrateExt.mutate()}
+          disabled={migrateExt.isPending}
+        >
+          {migrateExt.isPending ? '迁移中…' : '从托管库迁移'}
+        </button>
         {testExt.data && (
           <div className="check-result">
             <table>
@@ -266,6 +278,51 @@ export function SettingsPage() {
           </div>
         )}
         {testExt.isError && <pre className="status-err">{String(testExt.error)}</pre>}
+        {migrateExt.data && (
+          <div className="check-result">
+            <table>
+              <tbody>
+                <tr>
+                  <td>切换结果</td>
+                  <td>{migrateExt.data.switched ? '已切换到外部库' : '未切换'}</td>
+                </tr>
+                <tr>
+                  <td>备份</td>
+                  <td className="mono">{migrateExt.data.backup_path ?? '未生成'}</td>
+                </tr>
+                <tr>
+                  <td>迁移版本</td>
+                  <td className="mono">{migrateExt.data.migration_version ?? '未知'}</td>
+                </tr>
+              </tbody>
+            </table>
+            {migrateExt.data.row_counts.length > 0 && (
+              <table>
+                <tbody>
+                  {migrateExt.data.row_counts.map((row) => (
+                    <tr key={row.table}>
+                      <td className="mono">{row.table}</td>
+                      <td>{row.managed_rows}</td>
+                      <td>{row.external_rows}</td>
+                      <td>{row.matches ? '一致' : '不一致'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {migrateExt.data.diagnostics.length > 0 && (
+              <details className="diagnostics">
+                <summary>迁移诊断 ({migrateExt.data.diagnostics.length})</summary>
+                <ul>
+                  {migrateExt.data.diagnostics.map((d, i) => (
+                    <li key={i}>{formatDiagnostic(d)}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        )}
+        {migrateExt.isError && <pre className="status-err">{String(migrateExt.error)}</pre>}
       </section>
 
       <section className="settings-section">

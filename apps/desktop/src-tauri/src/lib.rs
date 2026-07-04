@@ -49,6 +49,7 @@ pub fn run() {
             commands::initialize_managed_database,
             commands::test_external_connection,
             commands::initialize_external_database,
+            commands::migrate_managed_to_external_database,
             commands::shutdown_database,
             commands::get_settings,
             commands::update_settings,

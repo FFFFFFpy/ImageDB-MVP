@@ -1,4 +1,6 @@
-use crate::domain::{ConnectionConfig, DatabaseState, ExternalCheckResult, TlsMode};
+use crate::domain::{
+    ConnectionConfig, DatabaseState, ExternalCheckResult, ExternalMigrationResult, TlsMode,
+};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -81,6 +83,19 @@ pub async fn initialize_external_database(
     let conn_config: ConnectionConfig = config.into();
     service
         .initialize_external(&conn_config)
+        .await
+        .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+pub async fn migrate_managed_to_external_database(
+    state: State<'_, AppState>,
+    config: ExternalConnectionDto,
+) -> Result<ExternalMigrationResult, String> {
+    let service = &state.database_service;
+    let conn_config: ConnectionConfig = config.into();
+    service
+        .migrate_managed_to_external(&conn_config)
         .await
         .map_err(|e| format!("{e}"))
 }

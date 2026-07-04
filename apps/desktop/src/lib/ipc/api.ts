@@ -20,6 +20,7 @@ import type {
   RecoveryDiagnostic,
   RecoveryOutcome,
   ReverifyResult,
+  ExternalMigrationResult,
 } from './types';
 
 export const api = {
@@ -34,6 +35,9 @@ export const api = {
 
   initializeExternalDatabase: (config: ExternalConnectionConfig) =>
     invoke<DatabaseState>('initialize_external_database', { config }),
+
+  migrateManagedToExternalDatabase: (config: ExternalConnectionConfig) =>
+    invoke<ExternalMigrationResult>('migrate_managed_to_external_database', { config }),
 
   shutdownDatabase: () => invoke<void>('shutdown_database'),
 

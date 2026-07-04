@@ -35,6 +35,7 @@ pub struct PostgresManager {
     pg_ctl: Option<PathBuf>,
     initdb: Option<PathBuf>,
     psql: Option<PathBuf>,
+    pg_dump: Option<PathBuf>,
     diagnostics: Vec<String>,
     server_running: bool,
     active_external: Option<ConnectionConfig>,
@@ -52,6 +53,7 @@ impl PostgresManager {
             pg_ctl: None,
             initdb: None,
             psql: None,
+            pg_dump: None,
             diagnostics: Vec::new(),
             server_running: false,
             active_external: None,
@@ -77,10 +79,12 @@ impl PostgresManager {
             let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
             let initdb = base.join(format!("initdb{exe_suffix}"));
             let psql = base.join(format!("psql{exe_suffix}"));
+            let pg_dump = base.join(format!("pg_dump{exe_suffix}"));
             if pg_ctl.exists() && initdb.exists() && psql.exists() {
                 self.pg_ctl = Some(pg_ctl);
                 self.initdb = Some(initdb);
                 self.psql = Some(psql);
+                self.pg_dump = pg_dump.exists().then_some(pg_dump);
                 self.diagnostics.push(format!(
                     "Found PostgreSQL binaries via IMAGEDB_POSTGRES_BIN: {}",
                     base.display()
@@ -112,17 +116,19 @@ impl PostgresManager {
             let pg_ctl = base.join(format!("pg_ctl{exe_suffix}"));
             let initdb = base.join(format!("initdb{exe_suffix}"));
             let psql = base.join(format!("psql{exe_suffix}"));
+            let pg_dump = base.join(format!("pg_dump{exe_suffix}"));
             if pg_ctl.exists() && initdb.exists() && psql.exists() {
                 self.pg_ctl = Some(pg_ctl);
                 self.initdb = Some(initdb);
                 self.psql = Some(psql);
+                self.pg_dump = pg_dump.exists().then_some(pg_dump);
                 self.diagnostics
                     .push(format!("Found PostgreSQL binaries at: {}", base.display()));
                 return;
             }
         }
 
-        for name in ["pg_ctl", "initdb", "psql"] {
+        for name in ["pg_ctl", "initdb", "psql", "pg_dump"] {
             let cmd = if cfg!(target_os = "windows") {
                 "where"
             } else {
@@ -137,8 +143,18 @@ impl PostgresManager {
                             "pg_ctl" => self.pg_ctl = Some(pb),
                             "initdb" => self.initdb = Some(pb),
                             "psql" => self.psql = Some(pb),
+                            "pg_dump" => self.pg_dump = Some(pb),
                             _ => {}
                         }
+                    }
+                }
+            }
+
+            if let Some(psql) = &self.psql {
+                if self.pg_dump.is_none() {
+                    let pg_dump = psql.with_file_name(format!("pg_dump{exe_suffix}"));
+                    if pg_dump.exists() {
+                        self.pg_dump = Some(pg_dump);
                     }
                 }
             }
@@ -185,8 +201,24 @@ impl PostgresManager {
         &self.username
     }
 
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+
     pub fn database(&self) -> &str {
         &self.database
+    }
+
+    pub fn psql_path(&self) -> Option<&std::path::Path> {
+        self.psql.as_deref()
+    }
+
+    pub fn pg_dump_path(&self) -> Option<&std::path::Path> {
+        self.pg_dump.as_deref()
+    }
+
+    pub fn app_data_dir(&self) -> Option<&std::path::Path> {
+        self.data_dir.parent()
     }
 
     pub fn is_server_running(&self) -> bool {
@@ -836,6 +868,7 @@ mod tests {
         mgr.pg_ctl = None;
         mgr.initdb = None;
         mgr.psql = None;
+        mgr.pg_dump = None;
 
         assert!(!mgr.binaries_available());
         assert!(
@@ -893,6 +926,7 @@ mod tests {
         mgr.pg_ctl = None;
         mgr.initdb = None;
         mgr.psql = None;
+        mgr.pg_dump = None;
 
         let result = mgr.initialize().await.unwrap();
         assert!(!result.available);
@@ -912,6 +946,7 @@ mod tests {
             pg_ctl: None,
             initdb: None,
             psql: None,
+            pg_dump: None,
             diagnostics: Vec::new(),
             server_running: false,
             active_external: None,

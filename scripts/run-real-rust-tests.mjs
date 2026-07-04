@@ -16,6 +16,7 @@ const suites = [
   { name: 'scan persistence', filter: 'real_scan_' },
   { name: 'source snapshot verification', filter: 'real_snapshot_' },
   { name: 'review persistence', filter: 'real_review_' },
+  { name: 'external postgres migration', filter: 'real_migrate_managed_to_external_' },
   { name: 'file transaction protocol', filter: 'real_protocol_' },
   { name: 'formal commit pipeline', filter: 'real_commit_full_pipeline' },
   { name: 'strict manifest validation', filter: 'manifest_validation_' },

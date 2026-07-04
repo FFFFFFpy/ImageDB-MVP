@@ -32,7 +32,7 @@ impl CredentialStore {
     }
 
     #[cfg(test)]
-    fn new_file_for_tests(app_data_dir: &Path) -> Result<Self, AppError> {
+    pub(crate) fn new_file_for_tests(app_data_dir: &Path) -> Result<Self, AppError> {
         let dir = app_data_dir.join(CREDENTIALS_DIR);
         std::fs::create_dir_all(&dir)?;
         Ok(Self {
@@ -54,7 +54,7 @@ impl CredentialStore {
             }
             #[cfg(test)]
             CredentialBackend::File { dir } => {
-                let file_path = dir.join(key);
+                let file_path = dir.join(test_file_key(key));
                 std::fs::write(&file_path, value).map_err(|e| {
                     AppError::Internal(format!("failed to write credential '{key}': {e}"))
                 })?;
@@ -89,7 +89,7 @@ impl CredentialStore {
             }
             #[cfg(test)]
             CredentialBackend::File { dir } => {
-                let file_path = dir.join(key);
+                let file_path = dir.join(test_file_key(key));
                 if file_path.exists() {
                     let value = std::fs::read_to_string(&file_path).map_err(|e| {
                         AppError::Internal(format!("failed to read credential '{key}': {e}"))
@@ -117,7 +117,7 @@ impl CredentialStore {
             }
             #[cfg(test)]
             CredentialBackend::File { dir } => {
-                let file_path = dir.join(key);
+                let file_path = dir.join(test_file_key(key));
                 if file_path.exists() {
                     std::fs::remove_file(&file_path).map_err(|e| {
                         AppError::Internal(format!("failed to delete credential '{key}': {e}"))
@@ -131,6 +131,11 @@ impl CredentialStore {
 
 pub fn external_profile_key(host: &str, port: u16, database: &str, username: &str) -> String {
     format!("{username}@{host}:{port}/{database}")
+}
+
+#[cfg(test)]
+fn test_file_key(key: &str) -> String {
+    blake3::hash(key.as_bytes()).to_hex().to_string()
 }
 
 #[cfg(test)]

@@ -90,6 +90,15 @@ impl TlsMode {
             Self::VerifyFull => "verify_full",
         }
     }
+
+    pub fn libpq_sslmode(&self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
 }
 
 fn default_external_connect_timeout_secs() -> u64 {
@@ -167,6 +176,23 @@ pub struct ExternalCheckResult {
     pub schema_compatible: bool,
     pub migration_version: Option<String>,
     pub checks: Vec<ExternalPreflightCheck>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableRowCount {
+    pub table: String,
+    pub managed_rows: i64,
+    pub external_rows: i64,
+    pub matches: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalMigrationResult {
+    pub switched: bool,
+    pub backup_path: Option<String>,
+    pub migration_version: Option<String>,
+    pub row_counts: Vec<TableRowCount>,
     pub diagnostics: Vec<String>,
 }
 
