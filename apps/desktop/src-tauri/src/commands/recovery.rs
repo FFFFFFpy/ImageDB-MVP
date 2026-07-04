@@ -56,6 +56,12 @@ pub struct ReverifyResultDto {
 pub async fn scan_recoverable_transactions(
     state: State<'_, AppState>,
 ) -> Result<Vec<RecoveryDiagnosticDto>, String> {
+    scan_recoverable_transactions_for_state(&state).await
+}
+
+pub(crate) async fn scan_recoverable_transactions_for_state(
+    state: &AppState,
+) -> Result<Vec<RecoveryDiagnosticDto>, String> {
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
         mgr.connect().await.map_err(|e| format!("{e}"))?
@@ -92,6 +98,13 @@ pub async fn recover_transaction(
     state: State<'_, AppState>,
     transaction_id: String,
 ) -> Result<RecoveryOutcomeDto, String> {
+    recover_transaction_for_state(&state, transaction_id).await
+}
+
+pub(crate) async fn recover_transaction_for_state(
+    state: &AppState,
+    transaction_id: String,
+) -> Result<RecoveryOutcomeDto, String> {
     let tx_id = Uuid::parse_str(&transaction_id).map_err(|e| format!("invalid UUID: {e}"))?;
     let pg = state.postgres_manager.clone();
     let outcome = recovery_service::recover_transaction(pg, tx_id)
@@ -111,6 +124,13 @@ pub async fn recover_transaction(
 #[tauri::command]
 pub async fn reverify_transaction(
     state: State<'_, AppState>,
+    transaction_id: String,
+) -> Result<ReverifyResultDto, String> {
+    reverify_transaction_for_state(&state, transaction_id).await
+}
+
+pub(crate) async fn reverify_transaction_for_state(
+    state: &AppState,
     transaction_id: String,
 ) -> Result<ReverifyResultDto, String> {
     let tx_id = Uuid::parse_str(&transaction_id).map_err(|e| format!("invalid UUID: {e}"))?;

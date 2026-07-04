@@ -9,6 +9,13 @@ pub async fn start_import_commit(
     state: State<'_, AppState>,
     import_run_id: String,
 ) -> Result<String, String> {
+    start_import_commit_for_state(&state, import_run_id).await
+}
+
+pub(crate) async fn start_import_commit_for_state(
+    state: &AppState,
+    import_run_id: String,
+) -> Result<String, String> {
     let run_id = uuid::Uuid::parse_str(&import_run_id).map_err(|e| format!("invalid UUID: {e}"))?;
 
     let mut commit_state = state.commit_state.lock().await;
@@ -81,6 +88,10 @@ pub async fn start_import_commit(
 
 #[tauri::command]
 pub async fn cancel_import_commit(state: State<'_, AppState>) -> Result<String, String> {
+    cancel_import_commit_for_state(&state).await
+}
+
+pub(crate) async fn cancel_import_commit_for_state(state: &AppState) -> Result<String, String> {
     let commit_state = state.commit_state.lock().await;
     if let Some(ref handle) = commit_state.active {
         handle.cancelled.store(true, Ordering::Relaxed);
@@ -119,6 +130,12 @@ async fn resolve_commit_handle(handle: crate::state::CommitHandle) -> CommitProg
 
 #[tauri::command]
 pub async fn get_commit_progress(state: State<'_, AppState>) -> Result<CommitProgress, String> {
+    get_commit_progress_for_state(&state).await
+}
+
+pub(crate) async fn get_commit_progress_for_state(
+    state: &AppState,
+) -> Result<CommitProgress, String> {
     let mut commit_state = state.commit_state.lock().await;
     if commit_state
         .active

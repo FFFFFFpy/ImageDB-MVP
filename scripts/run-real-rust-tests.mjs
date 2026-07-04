@@ -26,6 +26,11 @@ const suites = [
     name: 'M9 main chain plan freeze and commit',
     filter: 'm9_main_chain_exact_duplicate_import_freezes_plan_and_commits',
   },
+  {
+    name: 'M9 public recovery command path',
+    filter: 'm9_public_recovery_',
+    features: 'real-db-tests,fail-injection',
+  },
   { name: 'strict manifest validation', filter: 'manifest_validation_' },
   { name: 'run-state reconciliation', filter: 'real_reconcile_' },
   {

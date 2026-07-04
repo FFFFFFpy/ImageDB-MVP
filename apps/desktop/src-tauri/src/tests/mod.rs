@@ -23,4 +23,8 @@ mod m9_main_chain_integration;
 
 #[cfg(test)]
 #[cfg(all(feature = "real-db-tests", feature = "fail-injection"))]
+mod m9_public_recovery_integration;
+
+#[cfg(test)]
+#[cfg(all(feature = "real-db-tests", feature = "fail-injection"))]
 mod cancellation_recovery_integration;

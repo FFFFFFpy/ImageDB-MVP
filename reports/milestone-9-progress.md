@@ -1,5 +1,38 @@
 # M9 Progress Report
 
+## 2026-07-04: Public recovery command path smoke
+
+### Implemented
+
+- Split commit and recovery Tauri commands into command-facing helpers that accept `&AppState`, keeping the Tauri commands as thin adapters while making the same command logic testable without the unsupported Tauri mock IPC runtime.
+- Added a real PostgreSQL + real filesystem test for the public recovery path: start commit through command-facing logic, inject a crash after staging copy, observe `recovery_required`, scan recoverable transactions through the recovery command path, reverify, and recover through repeated recovery command calls until `source_archived`.
+- Added the public recovery command-path suite to `scripts/run-real-rust-tests.mjs`.
+
+### Modified Files
+
+- `apps/desktop/src-tauri/src/commands/commit.rs`
+- `apps/desktop/src-tauri/src/commands/recovery.rs`
+- `apps/desktop/src-tauri/src/tests/m9_public_recovery_integration.rs`
+- `apps/desktop/src-tauri/src/tests/mod.rs`
+- `scripts/run-real-rust-tests.mjs`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests,fail-injection --lib m9_public_recovery_command_path_recovers_after_staging_crash -- --ignored --test-threads=1 --nocapture`: passed, 1 test.
+
+### Actual Runtime Result
+
+- Commit was started through command-facing logic and faulted after staging copy.
+- Commit progress surfaced `recovery_required`.
+- Recovery diagnostics found one recoverable transaction, and reverify returned `resume`.
+- Repeated recovery command calls advanced the transaction to `source_archived`.
+- The import run reached `completed`, and the library contained the committed image row.
+
+### Known Limits
+
+- This is a public command-path smoke for one crash/recovery scenario, not the full cancellation and crash recovery matrix. The broader service-layer matrix remains covered by existing `cancellation_recovery_` tests, but the M9 DoD item should stay open until the required matrix is verified through public command paths.
+
 ## 2026-07-04: GUI main-chain navigation fixes
 
 ### Implemented
