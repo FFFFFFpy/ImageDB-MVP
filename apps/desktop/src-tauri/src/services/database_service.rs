@@ -342,6 +342,13 @@ impl DatabaseService {
         Ok(())
     }
 
+    fn external_unreachable_diagnostics(error: impl Into<String>) -> Vec<String> {
+        vec![
+            error.into(),
+            "Active external PostgreSQL profile is unreachable; use the controlled switch-to-managed action to fall back without modifying external data".to_string(),
+        ]
+    }
+
     pub async fn get_state(&self) -> DatabaseState {
         let mut mgr = self.postgres_manager.lock().await;
         let settings = self.settings.lock().await;
@@ -385,7 +392,7 @@ impl DatabaseService {
                             DatabaseStatus::Error(e.to_string()),
                             false,
                             None,
-                            vec![e.to_string()],
+                            Self::external_unreachable_diagnostics(e.to_string()),
                         ),
                     },
                     Ok(None) => (
@@ -1485,6 +1492,21 @@ mod tests {
         assert_eq!(progress.current_stage, "test long-running import");
         assert!(progress.cancel_requested);
         assert!(!progress.switched);
+    }
+
+    #[test]
+    fn external_unreachable_diagnostics_points_to_controlled_managed_fallback() {
+        let diagnostics = DatabaseService::external_unreachable_diagnostics(
+            "external TLS connection failed: connection refused",
+        );
+        assert_eq!(
+            diagnostics.first().map(String::as_str),
+            Some("external TLS connection failed: connection refused")
+        );
+        assert!(diagnostics.iter().any(|d| {
+            d.contains("controlled switch-to-managed action")
+                && d.contains("without modifying external data")
+        }));
     }
 
     #[cfg(windows)]

@@ -37,6 +37,7 @@ Date: 2026-07-04
   - a trusted certificate for `localhost` succeeds under `verify_full` when connecting as `localhost`;
   - the same trusted certificate is rejected under `verify_full` when connecting as `127.0.0.1`;
   - `verify_ca` accepts the trusted certificate with the hostname mismatch, proving the TLS modes differ intentionally.
+- Added explicit diagnostics for unreachable active external profiles that direct the GUI/user to the controlled switch-to-managed action without modifying external data.
 
 ## Commits
 
@@ -49,6 +50,7 @@ Date: 2026-07-04
 - Client certificate/private key TLS loading and negative PEM validation implemented in the current M7 update.
 - Running migration subprocess cancellation implemented in the current M7 update.
 - Strict TLS hostname verification implemented in the current M7 update.
+- External-unreachable managed fallback diagnostics implemented in the current M7 update.
 
 ## Commands run
 
@@ -65,12 +67,13 @@ Date: 2026-07-04
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml tls_connector_`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml cancellable_migration_command_kills_running_child_and_marks_progress -- --nocapture`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml trusted_certificate_hostname_mismatch -- --nocapture`
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml external_unreachable_diagnostics_points_to_controlled_managed_fallback`
 
 ## Test result summary
 
 - Frontend typecheck passed.
 - Frontend unit tests passed.
-- Rust unit tests passed: 173 passed, 1 ignored.
+- Rust unit tests passed: 174 passed, 1 ignored.
 - Clippy passed with `-D warnings`.
 - Real PostgreSQL suite passed, including the external migration test and external existing-database compatibility tests.
 - External migration cancellation regression passed.
@@ -78,6 +81,7 @@ Date: 2026-07-04
 - TLS connector negative tests passed for missing client cert/key pairs, malformed CA PEM, and malformed client certificate/key PEM.
 - Running migration subprocess cancellation test passed.
 - Strict TLS hostname-mismatch tests passed.
+- External-unreachable fallback diagnostics unit test passed.
 
 ## Actual runtime result
 
@@ -89,9 +93,11 @@ Date: 2026-07-04
 - TLS connector unit coverage verified that invalid CA/client PEM material and incomplete client cert/key configuration are rejected before attempting an external connection.
 - The cancellable command regression started a 30-second child process, cancelled it after startup, finished in under the 5-second timeout, and left migration progress in `cancelled` state.
 - A local TLS test server using a `localhost` certificate was trusted by the client; `verify_full` accepted `localhost`, rejected `127.0.0.1`, and `verify_ca` accepted `127.0.0.1`.
+- When an active external profile is unreachable, `get_state` now reports a diagnostic instructing the user to use the controlled switch-to-managed action without modifying external data.
 
 ## Known remaining M7 gaps
 
 - Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, row-count mismatch, preflight cancellation, and running child-process cancellation.
+- Controlled fallback to managed has explicit GUI/service affordance and diagnostics, but still needs a stable real PostgreSQL integration test before the DoD item is closed.
 
 M7 is not closed yet. `CURRENT_TASK.md` should remain on `tasks/07-external-postgres.md` until these gaps are resolved.
