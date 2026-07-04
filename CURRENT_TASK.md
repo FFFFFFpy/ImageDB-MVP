@@ -1,6 +1,6 @@
 # Current Task
 
-Executing: tasks/08-mounted-storage.md
+Executing: tasks/09-release-closure.md
 
 The M5/M6 core fix and refactor on branch `core_fix_m5_m6_refactor` is
 complete. All 12 phases landed, verified against real PostgreSQL + the
@@ -16,3 +16,4 @@ reports/core-fix-M5-M6-final.md for the final report.
 > Milestone 4 human review GUI is complete. Report: reports/milestone-4.md.
 > Milestone 5 formal import loop is complete (re-verified during the core fix). Report: reports/milestone-5.md.
 > Milestone 7 external PostgreSQL mode is complete. Report: reports/milestone-7-progress.md.
+> Milestone 8 mounted shared storage compatibility is complete. Report: reports/milestone-8-progress.md.

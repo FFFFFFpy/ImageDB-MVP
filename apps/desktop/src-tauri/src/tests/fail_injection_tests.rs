@@ -13,6 +13,8 @@
 //! Mounted storage gate:
 //!   IMAGEDB_POSTGRES_BIN=/path/to/pgsql/bin \
 //!   IMAGEDB_MOUNTED_LIBRARY_ROOT=/already-mounted/share \
+//!   IMAGEDB_MOUNTED_LOCAL_PATH=Z: \
+//!   IMAGEDB_MOUNTED_REMOTE_PATH=\\\\server\\share \
 //!   cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml \
 //!       --features fail-injection,real-db-tests --lib \
 //!       mounted_storage_gate_library_root_disconnect_pauses_then_recovers \
@@ -332,6 +334,54 @@ async fn assert_recovered(pg_manager: Arc<Mutex<PostgresManager>>, library_root:
     handle.abort();
 }
 
+struct MountedMapping {
+    local_path: String,
+    remote_path: String,
+}
+
+fn mounted_mapping_from_env(library_root: &std::path::Path) -> Option<MountedMapping> {
+    let local_path = std::env::var("IMAGEDB_MOUNTED_LOCAL_PATH").ok()?;
+    let remote_path = std::env::var("IMAGEDB_MOUNTED_REMOTE_PATH").ok()?;
+    let root = library_root.display().to_string();
+    assert!(
+        root.to_ascii_lowercase()
+            .starts_with(&local_path.to_ascii_lowercase()),
+        "IMAGEDB_MOUNTED_LIBRARY_ROOT must live under IMAGEDB_MOUNTED_LOCAL_PATH: root={root}, local_path={local_path}"
+    );
+    Some(MountedMapping {
+        local_path,
+        remote_path,
+    })
+}
+
+fn run_powershell(command: &str) {
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", command])
+        .output()
+        .expect("powershell command should start");
+    assert!(
+        output.status.success(),
+        "powershell command failed: {command}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn disconnect_mapping(mapping: &MountedMapping) {
+    run_powershell(&format!(
+        "Remove-SmbMapping -LocalPath '{}' -Force -UpdateProfile:$false",
+        mapping.local_path.replace('\'', "''")
+    ));
+}
+
+fn reconnect_mapping(mapping: &MountedMapping) {
+    run_powershell(&format!(
+        "New-SmbMapping -LocalPath '{}' -RemotePath '{}' -Persistent $false | Out-Null",
+        mapping.local_path.replace('\'', "''"),
+        mapping.remote_path.replace('\'', "''")
+    ));
+}
+
 #[tokio::test]
 #[ignore]
 async fn fail_injection_after_db_write() {
@@ -502,8 +552,13 @@ async fn mounted_storage_gate_library_root_disconnect_pauses_then_recovers() {
         id
     };
 
+    let mapping = mounted_mapping_from_env(&lib_root);
     let disconnected_root = lib_root.with_extension("offline");
-    std::fs::rename(&lib_root, &disconnected_root).unwrap();
+    if let Some(mapping) = &mapping {
+        disconnect_mapping(mapping);
+    } else {
+        std::fs::rename(&lib_root, &disconnected_root).unwrap();
+    }
 
     let paused = recovery_service::recover_transaction(pg.clone(), tx_id)
         .await
@@ -516,7 +571,11 @@ async fn mounted_storage_gate_library_root_disconnect_pauses_then_recovers() {
         paused.message
     );
 
-    std::fs::rename(&disconnected_root, &lib_root).unwrap();
+    if let Some(mapping) = &mapping {
+        reconnect_mapping(mapping);
+    } else {
+        std::fs::rename(&disconnected_root, &lib_root).unwrap();
+    }
     drive_recovery(pg.clone(), run_id).await;
     assert_recovered(pg.clone(), &lib_root).await;
 

@@ -474,3 +474,37 @@
 
 - 该 harness 依赖操作者提供真实已挂载共享目录。未提供 `IMAGEDB_MOUNTED_LIBRARY_ROOT` 时测试会失败并说明所需环境。
 - 当前故障动作以重命名测试专用 library root 模拟挂载路径不可见；物理断网/重新挂载仍需要在真实 SMB/NAS 环境中人工配合执行。
+
+## 2026-07-04: Real SMB mapping fault gate passed
+
+### 实现内容
+
+- 扩展 `mounted_storage_gate_library_root_disconnect_pauses_then_recovers`：当提供 `IMAGEDB_MOUNTED_LOCAL_PATH` 与 `IMAGEDB_MOUNTED_REMOTE_PATH` 时，测试不再用目录重命名模拟断连，而是调用 `Remove-SmbMapping` 断开映射盘，再调用 `New-SmbMapping` 重新挂载。
+- 使用 Windows 默认 SMB administrative share `\\localhost\D$` 映射到临时盘符，在映射盘路径下创建测试 library root，并运行真实 PostgreSQL + SMB 映射路径的恢复门槛。
+- Recovery 在映射盘断开后必须暂停并保持 `staging/recovery_required`，重新映射后继续恢复到 `source_archived`，并校验 DB 与发布文件一致。
+- `checklists/M8_DOD.md` 已勾选“真实挂载共享存储故障测试通过”，`CURRENT_TASK.md` 推进到 `tasks/09-release-closure.md`。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `checklists/M8_DOD.md`
+- `CURRENT_TASK.md`
+- `PROJECT_PLAN.md`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib --no-run mounted_storage_gate_library_root_disconnect_pauses_then_recovers`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin; IMAGEDB_MOUNTED_LIBRARY_ROOT=<mapped-drive>\MyProjects\Agent\ImageDB-MVP\.local\m8-smb-admin-<run>; IMAGEDB_MOUNTED_LOCAL_PATH=<mapped-drive>; IMAGEDB_MOUNTED_REMOTE_PATH=\\localhost\D$; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib mounted_storage_gate_library_root_disconnect_pauses_then_recovers -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- `New-SmbShare` 创建临时共享因当前进程无管理权限失败，错误为 Windows System Error 5 / Access is denied；因此未依赖新建系统共享。
+- `\\localhost\D$` 可访问，测试脚本将其临时映射到空闲盘符后运行 gate；测试内部断开该 SMB 映射，Recovery 返回暂停状态，随后重新映射并恢复完成。
+- 测试结束后脚本删除临时 SMB 映射和 `.local/m8-smb-admin-*` 测试目录。
+
+### 已知限制
+
+- 本次真实共享存储门槛使用 Windows 本机 SMB loopback administrative share 验证，不是外部 NAS 设备。
+- M9 发布门禁仍需在最终验收中覆盖外部共享/NAS、完整 GUI 主链、安装包、升级和发布构建。

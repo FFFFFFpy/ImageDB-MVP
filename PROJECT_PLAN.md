@@ -230,7 +230,7 @@ READY
 
 ### 当前状态
 
-截至 2026-07-04，M5/M6 核心修复与恢复闭环已完成，并通过真实 PostgreSQL 18.4 + pgvector 0.8.3 与真实文件系统验证。当前任务为 `tasks/07-external-postgres.md`。
+截至 2026-07-04，M8 已挂载共享目录兼容验证已完成，并通过真实 PostgreSQL 18.4 + pgvector 0.8.3、真实文件系统与 Windows SMB 映射故障恢复测试。当前任务为 `tasks/09-release-closure.md`。
 
 M6.5 的干净 Windows 安装包、无预装数据库、非 ASCII 安装路径、升级、卸载和恢复行为必须在 M9 发布门禁中重新验证。
 
