@@ -1,5 +1,40 @@
 # M9 Progress Report
 
+## 2026-07-04: GUI main-chain navigation fixes
+
+### Implemented
+
+- Fixed the scan page terminal-state handling for the real scan states `ready_to_commit` and `review_required`; the GUI no longer stays in a scanning state after the backend has finished.
+- Added next-step navigation from scan completion: `review_required` routes to Review, and `ready_to_commit` routes to Commit.
+- Added a Proceed to Commit action on the Review import-plan screen, so a user who generates/freeze-confirms the plan can continue the public GUI chain without guessing the sidebar destination.
+- Added frontend tests for scan terminal-state routing.
+
+### Modified Files
+
+- `apps/desktop/src/app/App.tsx`
+- `apps/desktop/src/pages/ScanPage.tsx`
+- `apps/desktop/src/pages/ScanPage.test.tsx`
+- `apps/desktop/src/pages/ReviewPage.tsx`
+- `apps/desktop/tsconfig.tsbuildinfo`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `pnpm test:unit`: passed, 10 tests.
+- `pnpm typecheck`: passed.
+- `pnpm format:check`: passed.
+- `pnpm --filter @imagedb/desktop build:web`: passed.
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib m9_main_chain_exact_duplicate_import_freezes_plan_and_commits -- --ignored --test-threads=1 --nocapture`: passed after removing the unsupported Tauri test IPC harness.
+
+### Actual Runtime Result
+
+- The frontend now treats the backend's actual post-scan states as terminal and exposes the expected next public workflow action.
+- The backend main-chain smoke remains green with real PostgreSQL and real filesystem commit evidence.
+
+### Known Limits
+
+- A Tauri `mock_builder` IPC harness still fails before test execution on this Windows environment with `STATUS_ENTRYPOINT_NOT_FOUND` when enabling Tauri's `test` feature, so this update fixes and tests the GUI flow logic but does not yet close the full live GUI/IPC DoD item.
+
 ## 2026-07-04: Main import chain smoke
 
 ### Implemented

@@ -41,7 +41,7 @@ export function App() {
               onGoScan={() => navigate('scan')}
             />
           )}
-          {route === 'scan' && <ScanPage />}
+          {route === 'scan' && <ScanPage onNavigate={navigate} />}
           {route === 'review' && <ReviewPage onNavigate={navigate} />}
           {route === 'commit' && <CommitPage onNavigate={navigate} />}
           {route === 'recovery' && <RecoveryPage onNavigate={navigate} />}

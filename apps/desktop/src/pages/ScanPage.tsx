@@ -2,6 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { api } from '../lib/ipc/api';
 import type { ScanProgress, ScanSourceInfo } from '../lib/ipc/types';
+import type { Route } from '../hooks/use-router';
+
+interface ScanPageProps {
+  onNavigate: (route: Route) => void;
+}
 
 interface ScanProgressEvent {
   state: string;
@@ -27,7 +32,23 @@ const STAGE_LABELS: Record<string, string> = {
   failed: '失败',
 };
 
-export function ScanPage() {
+export function isTerminalScanState(state: string | null | undefined): boolean {
+  return (
+    state === 'ready_to_commit' ||
+    state === 'review_required' ||
+    state === 'completed' ||
+    state === 'cancelled' ||
+    state === 'failed'
+  );
+}
+
+export function nextRouteForScanState(state: string | null | undefined): Route | null {
+  if (state === 'review_required') return 'review';
+  if (state === 'ready_to_commit') return 'commit';
+  return null;
+}
+
+export function ScanPage({ onNavigate }: ScanPageProps) {
   const [sourcePath, setSourcePath] = useState('');
   const [sourceInfo, setSourceInfo] = useState<ScanSourceInfo | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -72,11 +93,7 @@ export function ScanPage() {
 
     const unlisten = await listen<ScanProgressEvent>('scan-progress', (event) => {
       setScanEvent(event.payload);
-      if (
-        event.payload.state === 'completed' ||
-        event.payload.state === 'cancelled' ||
-        event.payload.state === 'failed'
-      ) {
+      if (isTerminalScanState(event.payload.state)) {
         setIsScanning(false);
       }
     });
@@ -114,10 +131,8 @@ export function ScanPage() {
   }, [isScanning]);
 
   const displayProgress = scanEvent ?? progress;
-  const isFinished =
-    displayProgress?.state === 'completed' ||
-    displayProgress?.state === 'cancelled' ||
-    displayProgress?.state === 'failed';
+  const isFinished = isTerminalScanState(displayProgress?.state);
+  const nextRoute = nextRouteForScanState(displayProgress?.state);
 
   return (
     <div className="scan-page">
@@ -234,6 +249,11 @@ export function ScanPage() {
 
           {isFinished && (
             <div className="scan-action-section">
+              {nextRoute && (
+                <button className="btn-primary" onClick={() => onNavigate(nextRoute)}>
+                  {nextRoute === 'review' ? '鍓嶅線瀹℃牳' : '鍓嶅線鎻愪氦'}
+                </button>
+              )}
               <button
                 className="btn-secondary"
                 onClick={() => {

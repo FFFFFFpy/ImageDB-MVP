@@ -400,6 +400,9 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
           </div>
         </div>
         <div className="toolbar">
+          <button className="btn-primary" onClick={() => onNavigate('commit')}>
+            Proceed to Commit
+          </button>
           <button className="btn-secondary" onClick={() => setShowPlan(false)}>
             Back to Review
           </button>
