@@ -196,6 +196,82 @@ pub struct ExternalMigrationResult {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalMigrationProgress {
+    pub state: String,
+    pub current_stage: String,
+    pub switched: bool,
+    pub backup_path: Option<String>,
+    pub migration_version: Option<String>,
+    pub row_counts: Vec<TableRowCount>,
+    pub diagnostics: Vec<String>,
+    pub errors: Vec<String>,
+    pub cancel_requested: bool,
+}
+
+impl ExternalMigrationProgress {
+    pub fn idle() -> Self {
+        Self {
+            state: "idle".to_string(),
+            current_stage: "idle".to_string(),
+            switched: false,
+            backup_path: None,
+            migration_version: None,
+            row_counts: Vec::new(),
+            diagnostics: Vec::new(),
+            errors: Vec::new(),
+            cancel_requested: false,
+        }
+    }
+
+    pub fn running(stage: &str) -> Self {
+        Self {
+            state: "running".to_string(),
+            current_stage: stage.to_string(),
+            ..Self::idle()
+        }
+    }
+
+    pub fn completed(result: &ExternalMigrationResult) -> Self {
+        Self {
+            state: "completed".to_string(),
+            current_stage: if result.switched {
+                "switched".to_string()
+            } else {
+                "not_switched".to_string()
+            },
+            switched: result.switched,
+            backup_path: result.backup_path.clone(),
+            migration_version: result.migration_version.clone(),
+            row_counts: result.row_counts.clone(),
+            diagnostics: result.diagnostics.clone(),
+            errors: Vec::new(),
+            cancel_requested: false,
+        }
+    }
+
+    pub fn cancelled(stage: &str, diagnostics: Vec<String>) -> Self {
+        Self {
+            state: "cancelled".to_string(),
+            current_stage: stage.to_string(),
+            diagnostics,
+            cancel_requested: true,
+            errors: vec!["external migration cancelled by user; profile not switched".to_string()],
+            ..Self::idle()
+        }
+    }
+
+    pub fn failed(stage: &str, error: String, diagnostics: Vec<String>) -> Self {
+        Self {
+            state: "failed".to_string(),
+            current_stage: stage.to_string(),
+            diagnostics,
+            errors: vec![error],
+            ..Self::idle()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PreflightStatus {

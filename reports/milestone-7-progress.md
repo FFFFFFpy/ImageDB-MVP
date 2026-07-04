@@ -18,6 +18,10 @@ Date: 2026-07-04
 - Added an explicit settings-page action to switch back to the managed database.
 - Added GUI fields and diagnostics for TLS/preflight/migration status.
 - Added a real PostgreSQL integration test for managed-to-external migration and included it in `pnpm rust:test:real`.
+- Converted managed-to-external migration into a background task with structured progress, polling IPC, GUI status display, and user cancellation.
+- Added cancellation checks before preflight, managed source activation, target preparation, backup, import, verification, and final profile switch.
+- Made `pg_dump` and `psql` import cancellable while their child processes are running; cancellation leaves the active profile unswitched and removes an incomplete temporary dump.
+- Added a cancellation regression test that verifies a preflight-stage cancel does not persist or activate an external profile.
 
 ## Commits
 
@@ -25,6 +29,7 @@ Date: 2026-07-04
 - `bcbfe39 feat: support external postgres preflight and tls`
 - `68a7766 feat: migrate managed database to external postgres`
 - `f7eb620 feat: allow switching back to managed database`
+- Background migration progress and cancellation implemented in the current M7 update.
 
 ## Commands run
 
@@ -35,25 +40,27 @@ Date: 2026-07-04
 - `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_migrate_managed_to_external_ -- --ignored --nocapture --test-threads=1`
 - `pnpm rust:test:real`
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml migrate_managed_to_external_cancelled_before_preflight_never_switches`
 
 ## Test result summary
 
 - Frontend typecheck passed.
 - Frontend unit tests passed.
-- Rust unit tests passed: 165 passed, 1 ignored.
+- Rust unit tests passed: 166 passed, 1 ignored.
 - Clippy passed with `-D warnings`.
-- Real PostgreSQL suite passed, including the new external migration test.
+- Real PostgreSQL suite passed, including the external migration test.
+- External migration cancellation regression passed.
 
 ## Actual runtime result
 
 - A real managed PostgreSQL source and a real PostgreSQL target were started from `.local/db-tools/postgresql-18.4/pgsql/bin`.
 - The migration test wrote an `app_meta` probe row into the managed source, exported a SQL backup, imported it into the target, verified table counts, switched the active profile, and confirmed the migrated row in the external target.
+- The cancellation regression set the external migration cancellation flag before preflight, observed `cancelled` progress at the `preflight` stage, and confirmed the external profile was not stored or activated.
 
 ## Known remaining M7 gaps
 
-- Migration is still a direct command, not a background task with progress events and cancellation.
 - TLS negative cases (bad CA, bad hostname, client certificate/key handling) are not yet automated.
 - The current migration path supports empty external targets; richer upgrade/merge behavior for an existing populated ImageDB database still needs coverage.
-- Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, or row-count mismatch, but there is not yet a dedicated real interruption/cancel test.
+- Failure rollback is covered by refusing to switch on failed preflight, non-empty target, import failure, row-count mismatch, or user cancellation. A lightweight cancellation regression exists; a real mid-dump or mid-import interruption test is still worth adding if we need stronger process-kill coverage.
 
 M7 is not closed yet. `CURRENT_TASK.md` should remain on `tasks/07-external-postgres.md` until these gaps are resolved.

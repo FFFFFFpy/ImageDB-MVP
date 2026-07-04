@@ -1,4 +1,5 @@
 use crate::domain::import_state::{CommitProgress, ScanProgress};
+use crate::domain::ExternalMigrationProgress;
 use crate::infrastructure::postgres::PostgresManager;
 use crate::infrastructure::secrets::CredentialStore;
 use crate::infrastructure::settings::SettingsStore;
@@ -46,6 +47,25 @@ impl Default for CommitState {
     }
 }
 
+pub struct ExternalMigrationHandle {
+    pub cancelled: Arc<AtomicBool>,
+    pub task: tokio::task::JoinHandle<ExternalMigrationProgress>,
+}
+
+pub struct ExternalMigrationState {
+    pub active: Option<ExternalMigrationHandle>,
+    pub progress_tracker: Arc<Mutex<ExternalMigrationProgress>>,
+}
+
+impl Default for ExternalMigrationState {
+    fn default() -> Self {
+        Self {
+            active: None,
+            progress_tracker: Arc::new(Mutex::new(ExternalMigrationProgress::idle())),
+        }
+    }
+}
+
 pub struct AppState {
     pub postgres_manager: Arc<Mutex<PostgresManager>>,
     pub settings: Arc<Mutex<SettingsStore>>,
@@ -53,6 +73,7 @@ pub struct AppState {
     pub fixture_dir: PathBuf,
     pub scan_state: Arc<Mutex<ScanState>>,
     pub commit_state: Arc<Mutex<CommitState>>,
+    pub external_migration_state: Arc<Mutex<ExternalMigrationState>>,
 }
 
 impl AppState {
@@ -76,6 +97,7 @@ impl AppState {
             fixture_dir,
             scan_state: Arc::new(Mutex::new(ScanState::default())),
             commit_state: Arc::new(Mutex::new(CommitState::default())),
+            external_migration_state: Arc::new(Mutex::new(ExternalMigrationState::default())),
         })
     }
 }

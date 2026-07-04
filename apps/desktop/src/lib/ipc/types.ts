@@ -75,6 +75,13 @@ export interface ExternalMigrationResult {
   diagnostics: DiagnosticItem[];
 }
 
+export interface ExternalMigrationProgress extends ExternalMigrationResult {
+  state: string;
+  current_stage: string;
+  errors: string[];
+  cancel_requested: boolean;
+}
+
 export interface AppSettings {
   database_mode: string | null;
   library_root: string | null;

@@ -42,9 +42,23 @@ export function SettingsPage() {
     mutationFn: () => api.testExternalConnection(buildExternalConfig()),
   });
 
-  const migrateExt = useMutation({
-    mutationFn: () => api.migrateManagedToExternalDatabase(buildExternalConfig()),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+  const migrationProgress = useQuery({
+    queryKey: ['external-migration-progress'],
+    queryFn: api.getExternalMigrationProgress,
+    refetchInterval: 1000,
+  });
+
+  const startMigration = useMutation({
+    mutationFn: () => api.startManagedToExternalMigration(buildExternalConfig()),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] });
+      queryClient.invalidateQueries({ queryKey: ['database-status'] });
+    },
+  });
+
+  const cancelMigration = useMutation({
+    mutationFn: api.cancelExternalMigration,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] }),
   });
 
   function buildExternalConfig(): ExternalConnectionConfig {
@@ -73,6 +87,9 @@ export function SettingsPage() {
     mutationFn: api.switchToManagedDatabase,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
   });
+
+  const migration = migrationProgress.data;
+  const migrationRunning = migration?.state === 'running' || startMigration.isPending;
 
   return (
     <div className="settings-page">
@@ -224,10 +241,16 @@ export function SettingsPage() {
         </button>
         <button
           className="btn-primary"
-          onClick={() => migrateExt.mutate()}
-          disabled={migrateExt.isPending}
+          onClick={() => startMigration.mutate()}
+          disabled={migrationRunning}
         >
-          {migrateExt.isPending ? '迁移中…' : '从托管库迁移'}
+          {migrationRunning ? '迁移中…' : '从托管库迁移'}
+        </button>
+        <button
+          onClick={() => cancelMigration.mutate()}
+          disabled={!migrationRunning || cancelMigration.isPending}
+        >
+          {cancelMigration.isPending ? '取消中…' : '取消迁移'}
         </button>
         {testExt.data && (
           <div className="check-result">
@@ -289,28 +312,40 @@ export function SettingsPage() {
           </div>
         )}
         {testExt.isError && <pre className="status-err">{String(testExt.error)}</pre>}
-        {migrateExt.data && (
+        {migration && migration.state !== 'idle' && (
           <div className="check-result">
             <table>
               <tbody>
                 <tr>
+                  <td>状态</td>
+                  <td>{migration.state}</td>
+                </tr>
+                <tr>
+                  <td>阶段</td>
+                  <td>{migration.current_stage}</td>
+                </tr>
+                <tr>
                   <td>切换结果</td>
-                  <td>{migrateExt.data.switched ? '已切换到外部库' : '未切换'}</td>
+                  <td>{migration.switched ? '已切换到外部库' : '未切换'}</td>
                 </tr>
                 <tr>
                   <td>备份</td>
-                  <td className="mono">{migrateExt.data.backup_path ?? '未生成'}</td>
+                  <td className="mono">{migration.backup_path ?? '未生成'}</td>
                 </tr>
                 <tr>
                   <td>迁移版本</td>
-                  <td className="mono">{migrateExt.data.migration_version ?? '未知'}</td>
+                  <td className="mono">{migration.migration_version ?? '未知'}</td>
+                </tr>
+                <tr>
+                  <td>取消请求</td>
+                  <td>{migration.cancel_requested ? '已请求' : '无'}</td>
                 </tr>
               </tbody>
             </table>
-            {migrateExt.data.row_counts.length > 0 && (
+            {migration.row_counts.length > 0 && (
               <table>
                 <tbody>
-                  {migrateExt.data.row_counts.map((row) => (
+                  {migration.row_counts.map((row) => (
                     <tr key={row.table}>
                       <td className="mono">{row.table}</td>
                       <td>{row.managed_rows}</td>
@@ -321,19 +356,25 @@ export function SettingsPage() {
                 </tbody>
               </table>
             )}
-            {migrateExt.data.diagnostics.length > 0 && (
+            {migration.diagnostics.length > 0 && (
               <details className="diagnostics">
-                <summary>迁移诊断 ({migrateExt.data.diagnostics.length})</summary>
+                <summary>迁移诊断 ({migration.diagnostics.length})</summary>
                 <ul>
-                  {migrateExt.data.diagnostics.map((d, i) => (
+                  {migration.diagnostics.map((d, i) => (
                     <li key={i}>{formatDiagnostic(d)}</li>
                   ))}
                 </ul>
               </details>
             )}
+            {migration.errors.length > 0 && (
+              <pre className="status-err">{migration.errors.join('\n')}</pre>
+            )}
           </div>
         )}
-        {migrateExt.isError && <pre className="status-err">{String(migrateExt.error)}</pre>}
+        {startMigration.isError && <pre className="status-err">{String(startMigration.error)}</pre>}
+        {cancelMigration.isError && (
+          <pre className="status-err">{String(cancelMigration.error)}</pre>
+        )}
       </section>
 
       <section className="settings-section">

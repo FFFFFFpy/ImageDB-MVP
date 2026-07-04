@@ -1,6 +1,7 @@
 use crate::domain::{
     ConnectionConfig, DatabaseMode, DatabaseState, DatabaseStatus, ExternalCheckResult,
-    ExternalMigrationResult, ExternalPreflightCheck, ManagedDbConfig, TableRowCount, TlsMode,
+    ExternalMigrationProgress, ExternalMigrationResult, ExternalPreflightCheck, ManagedDbConfig,
+    TableRowCount, TlsMode,
 };
 use crate::error::AppError;
 use crate::infrastructure::postgres::{connect_external, MigrationRunner, PostgresManager};
@@ -8,11 +9,15 @@ use crate::infrastructure::secrets::{external_profile_key, CredentialStore};
 use crate::infrastructure::settings::AppSettings;
 use crate::infrastructure::settings::SettingsStore;
 use chrono::Utc;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 
+#[derive(Clone)]
 pub struct DatabaseService {
     postgres_manager: Arc<Mutex<PostgresManager>>,
     settings: Arc<Mutex<SettingsStore>>,
@@ -222,22 +227,119 @@ impl DatabaseService {
         }
     }
 
-    async fn run_command_checked(
+    async fn run_command_checked_with_cancel(
         mut command: Command,
         label: &str,
         diagnostics: &mut Vec<String>,
+        cancelled: Option<Arc<AtomicBool>>,
+        progress_tracker: Option<Arc<Mutex<ExternalMigrationProgress>>>,
     ) -> Result<(), AppError> {
-        let output = command
-            .output()
-            .await
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
             .map_err(|e| AppError::Internal(format!("failed to launch {label}: {e}")))?;
-        if output.status.success() {
-            diagnostics.push(format!("{label}: OK"));
-            return Ok(());
-        }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(AppError::Internal(format!("{label} failed: {stderr}")))
+        loop {
+            if Self::migration_cancel_requested(&cancelled) {
+                let _ = child.kill().await;
+                let msg = format!("external migration cancelled during {label}");
+                diagnostics.push(msg.clone());
+                Self::set_external_migration_cancelled(
+                    &progress_tracker,
+                    label,
+                    diagnostics.clone(),
+                )
+                .await;
+                return Err(AppError::Internal(msg));
+            }
+
+            match child
+                .try_wait()
+                .map_err(|e| AppError::Internal(format!("failed to wait for {label}: {e}")))?
+            {
+                Some(status) if status.success() => {
+                    diagnostics.push(format!("{label}: OK"));
+                    return Ok(());
+                }
+                Some(_status) => {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr).await;
+                    }
+                    return Err(AppError::Internal(format!("{label} failed: {stderr}")));
+                }
+                None => sleep(Duration::from_millis(200)).await,
+            }
+        }
+    }
+
+    fn migration_cancel_requested(cancelled: &Option<Arc<AtomicBool>>) -> bool {
+        cancelled
+            .as_ref()
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    async fn set_external_migration_progress<F>(
+        progress_tracker: &Option<Arc<Mutex<ExternalMigrationProgress>>>,
+        update: F,
+    ) where
+        F: FnOnce(&mut ExternalMigrationProgress),
+    {
+        if let Some(tracker) = progress_tracker {
+            let mut progress = tracker.lock().await;
+            update(&mut progress);
+        }
+    }
+
+    async fn set_external_migration_stage(
+        progress_tracker: &Option<Arc<Mutex<ExternalMigrationProgress>>>,
+        stage: &str,
+        diagnostics: &[String],
+    ) {
+        Self::set_external_migration_progress(progress_tracker, |progress| {
+            progress.state = "running".to_string();
+            progress.current_stage = stage.to_string();
+            progress.diagnostics = diagnostics.to_vec();
+        })
+        .await;
+    }
+
+    async fn set_external_migration_cancelled(
+        progress_tracker: &Option<Arc<Mutex<ExternalMigrationProgress>>>,
+        stage: &str,
+        diagnostics: Vec<String>,
+    ) {
+        Self::set_external_migration_progress(progress_tracker, |progress| {
+            *progress = ExternalMigrationProgress::cancelled(stage, diagnostics);
+        })
+        .await;
+    }
+
+    async fn finish_external_migration_progress(
+        progress_tracker: &Option<Arc<Mutex<ExternalMigrationProgress>>>,
+        result: &ExternalMigrationResult,
+    ) {
+        Self::set_external_migration_progress(progress_tracker, |progress| {
+            *progress = ExternalMigrationProgress::completed(result);
+        })
+        .await;
+    }
+
+    async fn check_external_migration_cancelled(
+        cancelled: &Option<Arc<AtomicBool>>,
+        progress_tracker: &Option<Arc<Mutex<ExternalMigrationProgress>>>,
+        stage: &str,
+        diagnostics: &[String],
+    ) -> Result<(), AppError> {
+        if Self::migration_cancel_requested(cancelled) {
+            Self::set_external_migration_cancelled(progress_tracker, stage, diagnostics.to_vec())
+                .await;
+            return Err(AppError::Internal(format!(
+                "external migration cancelled during {stage}; profile not switched"
+            )));
+        }
+        Ok(())
     }
 
     pub async fn get_state(&self) -> DatabaseState {
@@ -876,9 +978,37 @@ impl DatabaseService {
         &self,
         config: &ConnectionConfig,
     ) -> Result<ExternalMigrationResult, AppError> {
+        self.migrate_managed_to_external_inner(config, None, None)
+            .await
+    }
+
+    pub async fn migrate_managed_to_external_with_control(
+        &self,
+        config: &ConnectionConfig,
+        cancelled: Arc<AtomicBool>,
+        progress_tracker: Arc<Mutex<ExternalMigrationProgress>>,
+    ) -> Result<ExternalMigrationResult, AppError> {
+        self.migrate_managed_to_external_inner(config, Some(cancelled), Some(progress_tracker))
+            .await
+    }
+
+    async fn migrate_managed_to_external_inner(
+        &self,
+        config: &ConnectionConfig,
+        cancelled: Option<Arc<AtomicBool>>,
+        progress_tracker: Option<Arc<Mutex<ExternalMigrationProgress>>>,
+    ) -> Result<ExternalMigrationResult, AppError> {
         let effective_config = self.with_stored_password(config)?;
         let mut diagnostics = Vec::new();
 
+        Self::set_external_migration_stage(&progress_tracker, "preflight", &diagnostics).await;
+        Self::check_external_migration_cancelled(
+            &cancelled,
+            &progress_tracker,
+            "preflight",
+            &diagnostics,
+        )
+        .await?;
         let check = self.test_external_connection(&effective_config).await?;
         diagnostics.extend(check.diagnostics.clone());
         if !check.connection_ok
@@ -890,15 +1020,25 @@ impl DatabaseService {
             || !check.schema_compatible
             || !check.pgvector_available
         {
-            return Ok(ExternalMigrationResult {
+            let result = ExternalMigrationResult {
                 switched: false,
                 backup_path: None,
                 migration_version: None,
                 row_counts: Vec::new(),
                 diagnostics,
-            });
+            };
+            Self::finish_external_migration_progress(&progress_tracker, &result).await;
+            return Ok(result);
         }
 
+        Self::set_external_migration_stage(&progress_tracker, "managed_source", &diagnostics).await;
+        Self::check_external_migration_cancelled(
+            &cancelled,
+            &progress_tracker,
+            "managed_source",
+            &diagnostics,
+        )
+        .await?;
         let (
             managed_client,
             managed_handle,
@@ -915,13 +1055,15 @@ impl DatabaseService {
             if !mgr.is_server_running() {
                 let probe = mgr.initialize().await?;
                 if !probe.connection_ok {
-                    return Ok(ExternalMigrationResult {
+                    let result = ExternalMigrationResult {
                         switched: false,
                         backup_path: None,
                         migration_version: None,
                         row_counts: Vec::new(),
                         diagnostics: probe.diagnostics,
-                    });
+                    };
+                    Self::finish_external_migration_progress(&progress_tracker, &result).await;
+                    return Ok(result);
                 }
                 diagnostics.extend(probe.diagnostics);
             } else {
@@ -969,6 +1111,19 @@ impl DatabaseService {
             )
         };
 
+        Self::set_external_migration_stage(&progress_tracker, "external_target", &diagnostics)
+            .await;
+        if let Err(e) = Self::check_external_migration_cancelled(
+            &cancelled,
+            &progress_tracker,
+            "external_target",
+            &diagnostics,
+        )
+        .await
+        {
+            managed_handle.abort();
+            return Err(e);
+        }
         let (mut external_client, external_handle) = connect_external(&effective_config).await?;
         if Self::external_target_has_rows(&external_client).await? {
             external_handle.abort();
@@ -977,13 +1132,15 @@ impl DatabaseService {
                 "External target already contains ImageDB rows; migration refused before switch"
                     .to_string(),
             );
-            return Ok(ExternalMigrationResult {
+            let result = ExternalMigrationResult {
                 switched: false,
                 backup_path: None,
                 migration_version: None,
                 row_counts: Vec::new(),
                 diagnostics,
-            });
+            };
+            Self::finish_external_migration_progress(&progress_tracker, &result).await;
+            return Ok(result);
         }
 
         external_client
@@ -997,6 +1154,18 @@ impl DatabaseService {
         MigrationRunner::run_pending(&mut external_client).await?;
         external_handle.abort();
 
+        Self::set_external_migration_stage(&progress_tracker, "backup", &diagnostics).await;
+        if let Err(e) = Self::check_external_migration_cancelled(
+            &cancelled,
+            &progress_tracker,
+            "backup",
+            &diagnostics,
+        )
+        .await
+        {
+            managed_handle.abort();
+            return Err(e);
+        }
         tokio::fs::create_dir_all(&backup_dir).await?;
         let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
         let backup_path = backup_dir.join(format!("managed-to-external-{stamp}.sql"));
@@ -1016,9 +1185,41 @@ impl DatabaseService {
         if let Some(password) = &source_password {
             dump.env("PGPASSWORD", password);
         }
-        Self::run_command_checked(dump, "managed pg_dump", &mut diagnostics).await?;
-        tokio::fs::rename(&tmp_backup_path, &backup_path).await?;
+        if let Err(e) = Self::run_command_checked_with_cancel(
+            dump,
+            "managed pg_dump",
+            &mut diagnostics,
+            cancelled.clone(),
+            progress_tracker.clone(),
+        )
+        .await
+        {
+            let _ = tokio::fs::remove_file(&tmp_backup_path).await;
+            managed_handle.abort();
+            return Err(e);
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_backup_path, &backup_path).await {
+            managed_handle.abort();
+            return Err(e.into());
+        }
+        Self::set_external_migration_progress(&progress_tracker, |progress| {
+            progress.backup_path = Some(backup_path.display().to_string());
+            progress.diagnostics = diagnostics.clone();
+        })
+        .await;
 
+        Self::set_external_migration_stage(&progress_tracker, "import", &diagnostics).await;
+        if let Err(e) = Self::check_external_migration_cancelled(
+            &cancelled,
+            &progress_tracker,
+            "import",
+            &diagnostics,
+        )
+        .await
+        {
+            managed_handle.abort();
+            return Err(e);
+        }
         let mut import = Command::new(&psql);
         import
             .arg("--set=ON_ERROR_STOP=1")
@@ -1032,8 +1233,31 @@ impl DatabaseService {
             import.env("PGPASSWORD", password);
         }
         Self::apply_psql_tls_env(&mut import, &effective_config);
-        Self::run_command_checked(import, "external psql import", &mut diagnostics).await?;
+        if let Err(e) = Self::run_command_checked_with_cancel(
+            import,
+            "external psql import",
+            &mut diagnostics,
+            cancelled.clone(),
+            progress_tracker.clone(),
+        )
+        .await
+        {
+            managed_handle.abort();
+            return Err(e);
+        }
 
+        Self::set_external_migration_stage(&progress_tracker, "verify", &diagnostics).await;
+        if let Err(e) = Self::check_external_migration_cancelled(
+            &cancelled,
+            &progress_tracker,
+            "verify",
+            &diagnostics,
+        )
+        .await
+        {
+            managed_handle.abort();
+            return Err(e);
+        }
         let (external_client, external_handle) = connect_external(&effective_config).await?;
         let row_counts =
             Self::compare_migration_row_counts(&managed_client, &external_client).await?;
@@ -1047,26 +1271,38 @@ impl DatabaseService {
                 "External migration row count verification failed; profile not switched"
                     .to_string(),
             );
-            return Ok(ExternalMigrationResult {
+            let result = ExternalMigrationResult {
                 switched: false,
                 backup_path: Some(backup_path.display().to_string()),
                 migration_version,
                 row_counts,
                 diagnostics,
-            });
+            };
+            Self::finish_external_migration_progress(&progress_tracker, &result).await;
+            return Ok(result);
         }
 
+        Self::set_external_migration_stage(&progress_tracker, "switch", &diagnostics).await;
+        Self::check_external_migration_cancelled(
+            &cancelled,
+            &progress_tracker,
+            "switch",
+            &diagnostics,
+        )
+        .await?;
         self.store_and_activate_external_profile(&effective_config)
             .await?;
         diagnostics.push("External database verified and activated".to_string());
 
-        Ok(ExternalMigrationResult {
+        let result = ExternalMigrationResult {
             switched: true,
             backup_path: Some(backup_path.display().to_string()),
             migration_version,
             row_counts,
             diagnostics,
-        })
+        };
+        Self::finish_external_migration_progress(&progress_tracker, &result).await;
+        Ok(result)
     }
 }
 
@@ -1116,6 +1352,54 @@ mod tests {
         assert_eq!(parse_postgres_major("MySQL 8.0"), None);
         assert_eq!(parse_postgres_major("PostgreSQL abc"), None);
         assert_eq!(parse_postgres_major(""), None);
+    }
+
+    #[tokio::test]
+    async fn migrate_managed_to_external_cancelled_before_preflight_never_switches() {
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::infrastructure::secrets::CredentialStore;
+        use crate::infrastructure::settings::SettingsStore;
+        use tempfile::TempDir;
+
+        let app_tmp = TempDir::new().unwrap();
+        let settings_tmp = TempDir::new().unwrap();
+        let manager = Arc::new(Mutex::new(PostgresManager::new(app_tmp.path())));
+        let settings = Arc::new(Mutex::new(SettingsStore::new(settings_tmp.path()).unwrap()));
+        let credentials =
+            Arc::new(CredentialStore::new_file_for_tests(settings_tmp.path()).unwrap());
+        let service = DatabaseService::new(manager, settings.clone(), credentials);
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let progress = Arc::new(Mutex::new(ExternalMigrationProgress::idle()));
+        let config = ConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            database: "imagedb".to_string(),
+            username: "imagedb".to_string(),
+            password: Some("secret".to_string()),
+            tls_mode: TlsMode::Disable,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 1,
+            query_timeout_secs: 1,
+            profile_name: Some("cancel-test".to_string()),
+        };
+
+        let err = service
+            .migrate_managed_to_external_with_control(&config, cancelled, progress.clone())
+            .await
+            .expect_err("cancelled migration should return an error");
+        assert!(err.to_string().contains("cancelled"));
+
+        let p = progress.lock().await;
+        assert_eq!(p.state, "cancelled");
+        assert_eq!(p.current_stage, "preflight");
+        assert!(p.cancel_requested);
+        assert!(!p.switched);
+        drop(p);
+
+        let stored = settings.lock().await;
+        assert_ne!(stored.get().database_mode.as_deref(), Some("external"));
     }
 
     #[cfg(feature = "real-db-tests")]

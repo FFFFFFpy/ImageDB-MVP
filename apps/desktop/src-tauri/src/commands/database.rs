@@ -1,8 +1,10 @@
 use crate::domain::{
-    ConnectionConfig, DatabaseState, ExternalCheckResult, ExternalMigrationResult, TlsMode,
+    ConnectionConfig, DatabaseState, ExternalCheckResult, ExternalMigrationProgress,
+    ExternalMigrationResult, TlsMode,
 };
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
 use tauri::State;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,6 +111,133 @@ pub async fn migrate_managed_to_external_database(
         .migrate_managed_to_external(&conn_config)
         .await
         .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+pub async fn start_managed_to_external_migration(
+    state: State<'_, AppState>,
+    config: ExternalConnectionDto,
+) -> Result<String, String> {
+    let conn_config: ConnectionConfig = config.into();
+    let mut migration_state = state.external_migration_state.lock().await;
+
+    if migration_state
+        .active
+        .as_ref()
+        .map(|handle| handle.task.is_finished())
+        .unwrap_or(false)
+    {
+        if let Some(handle) = migration_state.active.take() {
+            let progress = resolve_external_migration_handle(handle).await;
+            let mut tracker = migration_state.progress_tracker.lock().await;
+            *tracker = progress;
+        }
+    }
+
+    if migration_state.active.is_some() {
+        return Err("An external migration is already running".to_string());
+    }
+
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+        ExternalMigrationProgress::running("queued"),
+    ));
+    let service = state.database_service.clone();
+
+    let cancelled_clone = cancelled.clone();
+    let tracker_clone = progress_tracker.clone();
+    let task = tokio::spawn(async move {
+        let result = service
+            .migrate_managed_to_external_with_control(
+                &conn_config,
+                cancelled_clone.clone(),
+                tracker_clone.clone(),
+            )
+            .await;
+
+        match result {
+            Ok(_) => {
+                let progress = tracker_clone.lock().await;
+                progress.clone()
+            }
+            Err(_e) if cancelled_clone.load(Ordering::Relaxed) => {
+                let mut progress = tracker_clone.lock().await;
+                if progress.state != "cancelled" {
+                    let stage = progress.current_stage.clone();
+                    let diagnostics = progress.diagnostics.clone();
+                    *progress = ExternalMigrationProgress::cancelled(&stage, diagnostics);
+                }
+                progress.clone()
+            }
+            Err(e) => {
+                let mut progress = tracker_clone.lock().await;
+                let stage = progress.current_stage.clone();
+                let diagnostics = progress.diagnostics.clone();
+                *progress = ExternalMigrationProgress::failed(&stage, e.to_string(), diagnostics);
+                progress.clone()
+            }
+        }
+    });
+
+    migration_state.active = Some(crate::state::ExternalMigrationHandle { cancelled, task });
+    migration_state.progress_tracker = progress_tracker;
+
+    Ok("external migration started".to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_external_migration(state: State<'_, AppState>) -> Result<String, String> {
+    let migration_state = state.external_migration_state.lock().await;
+    if let Some(ref handle) = migration_state.active {
+        handle.cancelled.store(true, Ordering::Relaxed);
+        let mut progress = migration_state.progress_tracker.lock().await;
+        progress.cancel_requested = true;
+        Ok("external migration cancellation requested".to_string())
+    } else {
+        Err("No active external migration".to_string())
+    }
+}
+
+async fn resolve_external_migration_handle(
+    handle: crate::state::ExternalMigrationHandle,
+) -> ExternalMigrationProgress {
+    match handle.task.await {
+        Ok(progress) => progress,
+        Err(join_err) => {
+            let msg = if join_err.is_panic() {
+                let panic_msg = join_err
+                    .into_panic()
+                    .downcast::<String>()
+                    .map(|s| *s)
+                    .unwrap_or_else(|_| "external migration task panicked".to_string());
+                format!("panic: {panic_msg}")
+            } else {
+                "external migration task cancelled".to_string()
+            };
+            ExternalMigrationProgress::failed("failed", msg, Vec::new())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_external_migration_progress(
+    state: State<'_, AppState>,
+) -> Result<ExternalMigrationProgress, String> {
+    let mut migration_state = state.external_migration_state.lock().await;
+    if migration_state
+        .active
+        .as_ref()
+        .map(|handle| handle.task.is_finished())
+        .unwrap_or(false)
+    {
+        if let Some(handle) = migration_state.active.take() {
+            let progress = resolve_external_migration_handle(handle).await;
+            let mut tracker = migration_state.progress_tracker.lock().await;
+            *tracker = progress;
+        }
+    }
+    let tracker = migration_state.progress_tracker.lock().await;
+    Ok(tracker.clone())
 }
 
 #[tauri::command]
