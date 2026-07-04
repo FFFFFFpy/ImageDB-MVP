@@ -287,3 +287,36 @@
 
 - 该测试模拟的是源挂载路径消失/恢复，不是物理 SMB/NAS 断网。
 - 只读、超时和真实空间耗尽仍需要单独门禁证据。
+
+## 2026-07-04: Recovery insufficient-space gate
+
+### 实现内容
+
+- 新增仅 `fail-injection` 测试构建可用的 available-space 注入点，正式构建仍使用 `fs2::available_space` 读取真实文件系统。
+- 新增真实 PostgreSQL + 真实文件系统故障注入测试，覆盖 Recovery 在可用空间不足时的暂停行为。
+- commit 在 `AfterDbWrite` 中断后，测试强制 Recovery 看到 0 bytes available。
+- Recovery 必须暂停，保持 transaction 为 `staging`，父 import run 保持 `recovery_required`，并写入可诊断的 `last_error`。
+- 清除空间故障后，同一 transaction 可继续恢复并最终收敛到 `source_archived`。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/services/recovery_service.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib fail_injection_recovery_insufficient_space_pauses_then_recovers -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- 空间不足时 Recovery 返回 `final_state=staging`、`recovered=false`，消息包含 `insufficient free space`。
+- 数据库中 transaction 保持 `staging`，import run 保持 `recovery_required`，未产生完成状态。
+- 清除空间故障后，Recovery 成功完成后续提交闭环。
+
+### 已知限制
+
+- 该测试使用 fail-injection 模拟空间不足，不是把真实磁盘写满。
+- 只读、超时和真实挂载共享存储门禁仍需要单独证据。

@@ -882,6 +882,11 @@ fn recovery_storage_preflight(
 ) -> Option<String> {
     let capabilities = probe_storage_capabilities(library_root);
     let required_bytes = estimated_recovery_write_bytes(current, plan_images);
+    #[cfg(feature = "fail-injection")]
+    let available_space = crate::tests::fail_injection::forced_available_space()
+        .map(Ok)
+        .unwrap_or_else(|| fs2::available_space(library_root));
+    #[cfg(not(feature = "fail-injection"))]
     let available_space = fs2::available_space(library_root);
     recovery_storage_preflight_message(
         library_root,

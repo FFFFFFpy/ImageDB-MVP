@@ -4,7 +4,7 @@
 //! during commit operations to test recovery paths. The actual test
 //! functions are in the `tests` submodule (only compiled in test mode).
 #![allow(dead_code)]
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// Fault injection points in the commit pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +28,7 @@ pub(crate) enum CommitFaultPoint {
 static FAULT_POINT: AtomicU8 = AtomicU8::new(255);
 static FAULT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static FORCE_CONSERVATIVE_PUBLISH: AtomicU8 = AtomicU8::new(0);
+static FORCED_AVAILABLE_SPACE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Set the active fault point for the next commit operation.
 pub(crate) fn set_fault_point(fault: CommitFaultPoint) {
@@ -46,6 +47,17 @@ pub(crate) fn set_force_conservative_publish(enabled: bool) {
 
 pub(crate) fn force_conservative_publish() -> bool {
     FORCE_CONSERVATIVE_PUBLISH.load(Ordering::SeqCst) == 1
+}
+
+pub(crate) fn set_forced_available_space(bytes: Option<u64>) {
+    FORCED_AVAILABLE_SPACE.store(bytes.unwrap_or(u64::MAX), Ordering::SeqCst);
+}
+
+pub(crate) fn forced_available_space() -> Option<u64> {
+    match FORCED_AVAILABLE_SPACE.load(Ordering::SeqCst) {
+        u64::MAX => None,
+        bytes => Some(bytes),
+    }
 }
 
 /// Check if a fault should be triggered at the given point.
