@@ -49,6 +49,11 @@ async fn setup_env() -> (
     std::fs::write(album_path.join("photo1.png"), b"photo one data").unwrap();
     std::fs::write(album_path.join("photo2.png"), b"photo two data").unwrap();
     std::fs::write(album_path.join("description.txt"), b"album notes").unwrap();
+    // Nested file so the source snapshot is non-trivial (matches the
+    // setup_env doc comment — previously this was claimed but missing).
+    let nested = album_path.join("sub");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("meta.xmp"), b"<xmp>data</xmp>").unwrap();
 
     let mut manager = PostgresManager::new(&app_data);
     assert!(manager.binaries_available(), "binaries missing");
@@ -253,19 +258,155 @@ async fn drive_recovery(pg_manager: Arc<Mutex<PostgresManager>>) {
 }
 
 /// 1. Cancel during copy (mid-staging) leaves a recoverable transaction,
-/// not a `failed` one. Recovery can resume it.
+/// not a `failed` one. This test uses a large source file (~4 MiB) so the
+/// copy loop runs many 64 KiB chunks, and sets the cancel flag from a
+/// concurrent task after the copy has actually started. The transaction
+/// must land in a recoverable mid-flight state (NOT `failed`/`cancelled`),
+/// and Recovery must then drive it to `source_archived` + `completed`.
 #[tokio::test]
 #[ignore]
 async fn cancellation_recovery_mid_staging_resumable() {
     let (_tmp, pg, run_id, lib_root, _album, _lrid, _aid) = setup_env().await;
-    // Inject a fault during copy to leave the transaction mid-staging, then
-    // request cancellation. We use the fail-injection infra to land the
-    // transaction in `staging` before the cancel signal is observed.
-    crate::tests::fail_injection::set_fault_point(
-        crate::tests::fail_injection::CommitFaultPoint::DuringCopy,
-    );
-    let cancelled = Arc::new(AtomicBool::new(true));
+
+    // Replace photo1.png with a large file so the stream copy runs for many
+    // chunks (64 MiB / 64 KiB = 1024 iterations), giving the cancel trigger
+    // a wide window to fire mid-copy. The blake3 stored on the plan image
+    // must match, so recompute + rewrite both the on-disk file and the
+    // persisted expected_blake3.
+    let large_bytes = vec![0xABu8; 64 * 1024 * 1024];
+    let large_path = _album.join("photo1.png");
+    std::fs::write(&large_path, &large_bytes).unwrap();
+    let new_blake3 = blake3::hash(&large_bytes).as_bytes().to_vec();
+    let new_size = large_bytes.len() as i64;
+    {
+        let (client, handle) = pg.lock().await.connect().await.unwrap();
+        // Find photo1.png's import_image_id via its relative_path (which
+        // uses '/' separators regardless of OS), then update the plan image
+        // row that references it. Matching by source_path is OS-separator
+        // sensitive, so this is more robust.
+        let img_id: Uuid = client
+            .query_one(
+                "SELECT ii.id FROM import_images ii
+                 JOIN import_albums ia ON ia.id = ii.import_album_id
+                 WHERE ia.import_run_id = $1 AND ii.relative_path LIKE $2",
+                &[&run_id, &"%/photo1.png".to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let affected = client
+            .execute(
+                "UPDATE import_plan_images SET expected_blake3 = $1, expected_file_size = $2
+                 WHERE import_image_id = $3",
+                &[&new_blake3, &new_size, &img_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "UPDATE should land on exactly one plan image");
+        // Verify the UPDATE actually landed.
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_plan_images WHERE expected_blake3 = $1",
+                &[&new_blake3],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 1);
+        // Recompute + reset the frozen plan hash so the tamper is the only
+        // inconsistency (otherwise a hash mismatch surfaces first and
+        // masks the escape check). The plan is frozen, so load it via
+        // load_frozen_plan (load_draft_plan only loads 'draft' state).
+        let frozen = ImportRepository::load_frozen_plan(&client, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let hash = commit_service::compute_plan_hash(&frozen).unwrap();
+        client
+            .execute(
+                "UPDATE import_plans SET plan_hash = $1 WHERE import_run_id = $2 AND state = 'frozen'",
+                &[&hash, &run_id],
+            )
+            .await
+            .unwrap();
+        // Also update the captured source snapshot so archive-stage
+        // verification still matches the large file.
+        client
+            .execute(
+                "DELETE FROM source_album_snapshot_files WHERE snapshot_id = (
+                    SELECT id FROM source_album_snapshots WHERE import_album_id = (
+                        SELECT id FROM import_albums WHERE import_run_id = $1 LIMIT 1
+                    )
+                )",
+                &[&run_id],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        handle.abort();
+    }
+    // Re-capture the source snapshot so it matches the large file.
+    {
+        let (client, handle) = pg.lock().await.connect().await.unwrap();
+        // Delete the old snapshot header so capture re-inserts cleanly.
+        client
+            .execute(
+                "DELETE FROM source_album_snapshots WHERE import_album_id = (
+                    SELECT id FROM import_albums WHERE import_run_id = $1 LIMIT 1
+                )",
+                &[&run_id],
+            )
+            .await
+            .unwrap();
+        let album_id: Uuid = client
+            .query_one(
+                "SELECT id FROM import_albums WHERE import_run_id = $1 LIMIT 1",
+                &[&run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        crate::services::source_snapshot_service::capture_source_album_snapshot(
+            &client, run_id, album_id, &_album,
+        )
+        .await
+        .unwrap();
+        drop(client);
+        handle.abort();
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(CommitProgress::idle(&run_id.to_string())));
+
+    // Spawn a delayed cancel trigger: wait until the commit task reaches
+    // `processing_album` (the album loop started, prewrite is in progress
+    // or done), then set the flag. The 64 MiB file gives the stream copy
+    // many chunks; `stream_copy_with_hash` checks the flag before each
+    // read chunk, so the cancel will land mid-copy (not before prewrite,
+    // not after the file completes).
+    let progress_for_cancel = progress.clone();
+    let cancelled_for_cancel = cancelled.clone();
+    let cancel_handle = tokio::spawn(async move {
+        // Wait up to 5s for the commit to reach the processing stage.
+        for _ in 0..500 {
+            let stage = {
+                let p = progress_for_cancel.lock().await;
+                p.current_stage.clone()
+            };
+            if stage == "processing_album" || stage == "committing" {
+                // Small delay so the prewrite completes and the copy loop
+                // is actually running before we cancel. The 64 MiB file
+                // ensures the copy is still in flight when the flag flips.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                cancelled_for_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Timed out waiting — cancel anyway so the test terminates.
+        cancelled_for_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
     let _ = commit_service::run_import_commit(
         pg.clone(),
         lib_root.display().to_string(),
@@ -274,76 +415,72 @@ async fn cancellation_recovery_mid_staging_resumable() {
         progress,
     )
     .await;
-    crate::tests::fail_injection::clear_fault_point();
+    let _ = cancel_handle.await;
 
-    // The transaction (if any was prewritten before the cancel/fault landed)
-    // must NOT be `failed` or `cancelled` — it must be a recoverable
-    // mid-flight state (staging/verifying/etc) OR no transaction at all.
-    // Cancel must never manufacture an unrecoverable terminal transaction.
+    // The transaction must exist (prewrite happened before cancel) and be
+    // in a recoverable mid-flight state — NOT `failed`/`cancelled`.
     let (client, handle) = pg.lock().await.connect().await.unwrap();
-    let tx_state: Option<String> = client
-        .query_opt(
+    let tx_state: String = client
+        .query_one(
             "SELECT state FROM file_transactions ORDER BY started_at DESC LIMIT 1",
             &[],
         )
         .await
         .unwrap()
-        .map(|r| r.get::<_, String>(0));
+        .get(0);
     drop(client);
     handle.abort();
-    if let Some(state) = tx_state {
-        assert_ne!(
-            state, "failed",
-            "cancel must not manufacture a `failed` terminal transaction"
-        );
-        assert_ne!(state, "cancelled");
-        assert_ne!(state, "source_archived");
-    }
-    // If no transaction was prewritten, the run is simply recoverable —
-    // there is nothing to recover, and that is also acceptable.
+    assert_ne!(
+        tx_state, "failed",
+        "cancel mid-copy must NOT manufacture a `failed` terminal transaction"
+    );
+    assert_ne!(tx_state, "cancelled");
+    assert_ne!(
+        tx_state, "source_archived",
+        "cancel must stop before archive"
+    );
 
-    // Simulate app restart: drop the manager (no-op here, manager is shared)
-    // and drive recovery to convergence.
+    // Simulate app restart: drive recovery to convergence.
     drive_recovery(pg.clone()).await;
 
-    // After recovery: if a transaction existed, it must have converged to
-    // source_archived and the run to `completed`. If no transaction
-    // existed (cancel landed before prewrite), the run stays
-    // `recovery_required` — that is also acceptable and is NOT a failure.
+    // Recovery must converge the mid-flight transaction to source_archived
+    // and the run to `completed`.
     let (client, handle) = pg.lock().await.connect().await.unwrap();
     let (state, _completed_at) = run_state(&client, run_id).await;
-    let final_tx_state: Option<String> = client
-        .query_opt(
+    let final_tx_state: String = client
+        .query_one(
             "SELECT state FROM file_transactions ORDER BY started_at DESC LIMIT 1",
             &[],
         )
         .await
         .unwrap()
-        .map(|r| r.get::<_, String>(0));
+        .get(0);
+    let final_tx_error: Option<String> = client
+        .query_one(
+            "SELECT last_error FROM file_transactions ORDER BY started_at DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
     drop(client);
     handle.abort();
-    if let Some(ts) = final_tx_state {
-        assert_eq!(
-            ts, "source_archived",
-            "recovery must converge the mid-flight transaction to source_archived, got {ts}"
-        );
-        assert_eq!(
-            state, "completed",
-            "run should complete after recovery drives the cancelled transaction forward"
-        );
-    } else {
-        // No transaction prewritten; run is legitimately recovery_required.
-        assert!(
-            state == "recovery_required" || state == "cancelled",
-            "unexpected state after cancel-before-prewrite: {state}"
-        );
-    }
+    assert_eq!(
+        final_tx_state, "source_archived",
+        "recovery must converge the mid-copy-cancelled transaction to source_archived, got {final_tx_state} (last_error={final_tx_error:?})"
+    );
+    assert_eq!(
+        state, "completed",
+        "run should complete after recovery drives the cancelled transaction forward"
+    );
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
 }
 
 /// 2. Cancel before any file transaction is prewritten: the run is left
-/// `recovery_required` (not silently `completed`), with NO transaction row.
+/// `cancelled` (P0 fix — not `recovery_required`, which is a GUI deadlock
+/// with no transaction to recover), with NO transaction row. The frozen
+/// plan is intact so the user can re-enter the commit page.
 #[tokio::test]
 #[ignore]
 async fn cancellation_before_prewrite_no_transaction() {
@@ -362,13 +499,26 @@ async fn cancellation_before_prewrite_no_transaction() {
     drop(client);
     handle.abort();
     assert_eq!(tx_count, 0, "no transaction should have been prewritten");
-    // Either recovery_required (no transactions, plan non-empty) or
-    // cancelled (user-explicit). Both are acceptable; `completed` is NOT.
-    assert!(
-        state == "recovery_required" || state == "cancelled",
-        "unexpected state after cancel-before-prewrite: {state}"
+    // P0: with no transaction, the run must be `cancelled` (user-explicit
+    // terminal), NOT `recovery_required` (which has no recovery path).
+    assert_eq!(
+        state, "cancelled",
+        "cancel-before-prewrite with no transactions must be `cancelled`, got {state}"
     );
-    assert_ne!(state, "completed");
+    // The frozen plan is intact, so the run is re-committable.
+    let (client, handle) = pg.lock().await.connect().await.unwrap();
+    let latest: Option<String> = client
+        .query_opt(
+            "SELECT id::text FROM import_runs
+             WHERE id = $1 AND state = 'cancelled'",
+            &[&run_id],
+        )
+        .await
+        .unwrap()
+        .map(|r| r.get::<_, String>(0));
+    drop(client);
+    handle.abort();
+    assert!(latest.is_some());
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
 }
@@ -869,25 +1019,29 @@ async fn empty_plan_no_transactions_completes() {
 }
 
 /// 10. Source snapshot path disagrees with import album source_path →
-/// recovery surfaces a conflict (not auto-fix).
+/// recovery surfaces a conflict (not auto-fix). The commit's archive
+/// stage calls `validate_snapshot_album_path_identity`, which must reject
+/// the mismatch as a conflict — never silently `source_archived`.
 #[tokio::test]
 #[ignore]
 async fn snapshot_path_mismatch_surfaces_conflict() {
     let (_tmp, pg, run_id, lib_root, _album, _lrid, album_id) = setup_env().await;
     // Tamper with the persisted snapshot's source_album_path so it
     // disagrees with import_albums.source_path.
-    let (client, handle) = pg.lock().await.connect().await.unwrap();
-    client
-        .execute(
-            "UPDATE source_album_snapshots SET source_album_path = '/different/path' WHERE import_album_id = $1",
-            &[&album_id],
-        )
-        .await
-        .unwrap();
-    drop(client);
-    handle.abort();
+    {
+        let (client, handle) = pg.lock().await.connect().await.unwrap();
+        client
+            .execute(
+                "UPDATE source_album_snapshots SET source_album_path = '/different/path' WHERE import_album_id = $1",
+                &[&album_id],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        handle.abort();
+    }
 
-    // Run commit; the archive phase should surface a conflict.
+    // Run commit; the archive phase must surface a conflict.
     let cancelled = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(CommitProgress::idle(&run_id.to_string())));
     let _ = commit_service::run_import_commit(
@@ -910,9 +1064,13 @@ async fn snapshot_path_mismatch_surfaces_conflict() {
         .get(0);
     drop(client);
     handle.abort();
-    assert!(
-        tx_state == "conflict" || tx_state == "source_archived",
-        "expected conflict or (if archive already happened) source_archived; got {tx_state}"
+    // P1 fix: previously this accepted `source_archived` as a valid
+    // outcome, which would mask a real validation failure. The identity
+    // check must reject the mismatch as a conflict — never silently
+    // mark the album source_archived.
+    assert_eq!(
+        tx_state, "conflict",
+        "snapshot path mismatch must surface as conflict, got {tx_state}"
     );
     // The run must NOT be completed silently.
     let (client, handle) = pg.lock().await.connect().await.unwrap();
@@ -924,35 +1082,113 @@ async fn snapshot_path_mismatch_surfaces_conflict() {
     m.shutdown().await.unwrap();
 }
 
-/// 11. Plan image source_path escapes source_root → rejected (defense in
-/// depth). Covered by the unit test `validate_plan_image_sources_escapes_root_rejected`;
-/// here we additionally assert the run does not complete.
+/// 11. Plan image source_path escapes source_root → commit rejects it
+/// and the run does NOT silently complete. This drives the real commit
+/// pipeline with a plan whose second image's source_path points outside
+/// the source album root, so `validate_plan_image_sources` must reject it.
 #[tokio::test]
 #[ignore]
 async fn plan_image_escape_does_not_complete() {
-    let (_tmp, pg, run_id, _lib_root, _album, _lrid, _aid) = setup_env().await;
-    // The setup already produced a valid plan; this test is a smoke test
-    // that the run can complete normally (proving the happy path still
-    // works after all the Phase 1-6 changes).
+    let (_tmp, pg, run_id, lib_root, album_path, _lrid, _aid) = setup_env().await;
+    // Tamper: rewrite the second plan image's source_path to point at a
+    // file outside the source album root. The frozen plan hash was set
+    // during setup_env, so this also breaks the plan hash — but the
+    // commit pipeline calls validate_plan_image_sources AFTER loading the
+    // frozen plan, and a hash mismatch would surface first. To test the
+    // escape check in isolation, we recompute and reset the plan hash
+    // after the tamper so the only failure is the escape.
+    //
+    // The outside file is a byte-exact copy of photo2.png so the staging
+    // BLAKE3 check passes (otherwise the copy rejects the file before the
+    // archive-stage escape check can fire).
+    let outside_path = album_path.parent().unwrap().join("outside.png");
+    std::fs::write(&outside_path, b"photo two data").unwrap();
+
+    {
+        let (client, handle) = pg.lock().await.connect().await.unwrap();
+        // Point photo2.png's plan image source_path at the outside file.
+        // Find the import image by relative_path (OS-separator-safe),
+        // then update its plan image row.
+        let img_id: Uuid = client
+            .query_one(
+                "SELECT ii.id FROM import_images ii
+                 JOIN import_albums ia ON ia.id = ii.import_album_id
+                 WHERE ia.import_run_id = $1 AND ii.relative_path LIKE $2",
+                &[&run_id, &"%/photo2.png".to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let affected = client
+            .execute(
+                "UPDATE import_plan_images SET source_path = $1
+                 WHERE import_image_id = $2",
+                &[&outside_path.display().to_string(), &img_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "UPDATE should land on exactly one plan image");
+        // Recompute + reset the frozen plan hash so the tamper is the only
+        // inconsistency (otherwise a hash mismatch surfaces first and
+        // masks the escape check). The plan is frozen.
+        let frozen = ImportRepository::load_frozen_plan(&client, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let hash = commit_service::compute_plan_hash(&frozen).unwrap();
+        // Update the plan row's hash directly.
+        client
+            .execute(
+                "UPDATE import_plans SET plan_hash = $1 WHERE import_run_id = $2 AND state = 'frozen'",
+                &[&hash, &run_id],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        handle.abort();
+    }
+
     let cancelled = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(Mutex::new(CommitProgress::idle(&run_id.to_string())));
     let result = commit_service::run_import_commit(
         pg.clone(),
-        _lib_root.display().to_string(),
+        lib_root.display().to_string(),
         run_id,
         cancelled,
         progress,
     )
     .await
-    .unwrap();
-    assert_eq!(result.state, "completed");
-    assert_eq!(result.albums_committed, 1);
+    // The escape surfaces as a failed album result (recovery_required),
+    // not a top-level Err — the pipeline isolates per-album failures.
+    .expect("commit should return Ok with a failed album, not a top-level Err");
+    // Collect the error from album_results + top-level errors and confirm
+    // the escape check fired.
+    let combined: Vec<String> = result
+        .album_results
+        .iter()
+        .filter_map(|r| r.error.clone())
+        .chain(result.errors.iter().cloned())
+        .collect();
+    let msg = combined.join("; ");
+    assert!(
+        msg.contains("escapes") || msg.contains("escape"),
+        "expected escape error, got: {msg}"
+    );
+    assert_eq!(result.albums_failed, 1);
+
+    // The run must NOT be completed.
+    let (client, handle) = pg.lock().await.connect().await.unwrap();
+    let (state, _) = run_state(&client, run_id).await;
+    drop(client);
+    handle.abort();
+    assert_ne!(state, "completed");
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
 }
 
-/// 12. A source album containing a symlink is rejected (snapshot capture
-/// fails with an explicit error, not silent hashing).
+/// 12. A source album containing a symlink (Unix) or directory junction
+/// (Windows) is rejected (snapshot capture fails with an explicit error,
+/// not silent hashing).
 #[tokio::test]
 #[ignore]
 async fn source_album_with_symlink_rejected() {
@@ -960,35 +1196,72 @@ async fn source_album_with_symlink_rejected() {
     let album = tmp.path().join("sym_album");
     std::fs::create_dir_all(&album).unwrap();
     std::fs::write(album.join("real.png"), b"data").unwrap();
-    // Create a symlink pointing outside the album.
-    let outside = tmp.path().join("outside.txt");
-    std::fs::write(&outside, b"secret").unwrap();
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&outside, album.join("link.png")).unwrap();
-    }
-    #[cfg(windows)]
-    {
-        // Symlinks on Windows require privileges; fall back to a .lnk stub
-        // which is a regular file (the snapshot will capture it). The real
-        // symlink test runs on Unix CI. Skip the assertion on Windows.
-        let _ = outside;
-        std::fs::write(album.join("link.png"), b"stub").unwrap();
-    }
+    // A real directory outside the album for the link/junction to point at.
+    let outside_dir = tmp.path().join("outside_dir");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("secret.png"), b"secret").unwrap();
 
-    let result = crate::services::source_snapshot_service::collect_album_files(&album);
     #[cfg(unix)]
     {
-        let err = result.expect_err("symlink must be rejected");
+        // File symlink → must be rejected.
+        std::os::unix::fs::symlink(outside_dir.join("secret.png"), album.join("link.png")).unwrap();
+        let err = crate::services::source_snapshot_service::collect_album_files(&album)
+            .expect_err("file symlink must be rejected");
         assert!(
             err.to_string().contains("symlink"),
             "expected symlink rejection, got: {err}"
         );
+
+        // Directory symlink → also rejected.
+        let album2 = tmp.path().join("sym_album2");
+        std::fs::create_dir_all(&album2).unwrap();
+        std::fs::write(album2.join("real.png"), b"data").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, album2.join("linkdir")).unwrap();
+        let err2 = crate::services::source_snapshot_service::collect_album_files(&album2)
+            .expect_err("dir symlink must be rejected");
+        assert!(err2.to_string().contains("symlink"));
     }
-    #[cfg(not(unix))]
+
+    #[cfg(windows)]
     {
-        // On Windows the regular-file stub is captured; just assert success.
-        let _ = result.unwrap();
+        // Create a directory junction (reparse point) pointing outside the
+        // album. Junctions are created via `mklink /J` (cmd builtin) — they
+        // do NOT require the SeCreateSymbolicLinkPrivilege that real
+        // symlinks need, so this runs unprivileged.
+        let junction = album.join("linkdir");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junction.display().to_string(),
+                &outside_dir.display().to_string(),
+            ])
+            .status()
+            .expect("failed to run mklink");
+        assert!(status.success(), "mklink /J failed: {status}");
+
+        let err = crate::services::source_snapshot_service::collect_album_files(&album)
+            .expect_err("directory junction / reparse point must be rejected");
+        // On Windows, `mklink /J` junctions are reported as symlinks by
+        // `std::fs::FileType::is_symlink()`, so the rejection message names
+        // "symlink". Other reparse-point types hit the 0x400 attribute
+        // branch and name "reparse point / junction". Either is an
+        // acceptable rejection of a special entry.
+        assert!(
+            err.to_string().contains("symlink")
+                || err.to_string().contains("reparse point")
+                || err.to_string().contains("junction"),
+            "expected reparse-point rejection, got: {err}"
+        );
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No special-file test on other platforms; just confirm the happy
+        // path so the test is not a no-op.
+        let _ = crate::services::source_snapshot_service::collect_album_files(&album)
+            .expect("regular album must snapshot cleanly");
     }
 }
 

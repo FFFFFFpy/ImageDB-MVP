@@ -547,7 +547,12 @@ async fn fail_injection_cancel_during_commit() {
 
     if tx_count == 0 {
         // Cancellation landed before prewrite: no transaction to recover.
-        // The run should be recoverable (not silently completed).
+        // P0 fix: the run is `cancelled` (user-explicit terminal), not
+        // `recovery_required` — `recovery_required` with no transaction is a
+        // GUI deadlock (the recovery page shows "no recoverable
+        // transactions" and the commit page won't re-select the run).
+        // `cancelled` lets the user re-enter the commit page for the same
+        // frozen plan.
         let (client, handle) = {
             let mgr = pg.lock().await;
             mgr.connect().await.unwrap()
@@ -560,8 +565,8 @@ async fn fail_injection_cancel_during_commit() {
         drop(client);
         handle.abort();
         assert!(
-            run_state == "recovery_required" || run_state == "completed",
-            "unexpected run state after cancel: {run_state}"
+            run_state == "cancelled" || run_state == "completed",
+            "unexpected run state after cancel-before-prewrite: {run_state} (expected cancelled)"
         );
     } else {
         // A transaction exists; recovery must converge it.

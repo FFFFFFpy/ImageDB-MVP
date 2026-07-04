@@ -26,16 +26,16 @@ PR, no remote branch, no release artifact upload.**
 
 ## 2. Completed phases
 
-| Phase | What | Commit |
-| ----- | ---- | ------ |
-| 1 | cancel preserves recoverable transaction states; failed/cancelled → terminal-but-not-recovered | b7c98c6 |
-| 2 | persisted DB state is the sole source of truth (no overlays) | b7c98c6 |
-| 3 | empty plan validates transaction invariants before completing | b7c98c6 |
-| 4 | archive root from persisted `import_runs.source_root`; path identity chain | b7c98c6 |
-| 5 | snapshot hashing in `spawn_blocking`; special files rejected | 953b65b |
-| 6 | `completed_at` always the persisted DB value (read back) | b7c98c6 |
-| 7 | 15 new real failure tests + pgvector assertion fix | ee34f57 |
-| 8 | final adversarial review + full build + real test execution | (verified) |
+| Phase | What                                                                                           | Commit     |
+| ----- | ---------------------------------------------------------------------------------------------- | ---------- |
+| 1     | cancel preserves recoverable transaction states; failed/cancelled → terminal-but-not-recovered | b7c98c6    |
+| 2     | persisted DB state is the sole source of truth (no overlays)                                   | b7c98c6    |
+| 3     | empty plan validates transaction invariants before completing                                  | b7c98c6    |
+| 4     | archive root from persisted `import_runs.source_root`; path identity chain                     | b7c98c6    |
+| 5     | snapshot hashing in `spawn_blocking`; special files rejected                                   | 953b65b    |
+| 6     | `completed_at` always the persisted DB value (read back)                                       | b7c98c6    |
+| 7     | 15 new real failure tests + pgvector assertion fix                                             | ee34f57    |
+| 8     | final adversarial review + full build + real test execution                                    | (verified) |
 
 ## 3. Cancellation + recovery semantics
 
@@ -115,23 +115,23 @@ Never silently hashed or skipped. The album is rejected with an explicit
 filesystem tests driving the real Service layer (Commit Service, Recovery
 Service, Repository). All 15 pass.
 
-| # | Scenario | Result |
-| - | -------- | ------ |
-| 1 | cancel during copy leaves a recoverable transaction | ✓ |
-| 2 | cancel before prewrite — no transaction, recovery_required | ✓ |
-| 3 | recovery continues the original transaction after restart | ✓ |
-| 4 | re-running commit does not create a second transaction | ✓ |
-| 5 | failed/cancelled not reported recovered=true | ✓ |
-| 6 | recovery_required not mapped to a completion overlay | ✓ |
-| 7 | empty plan + active transaction → recovery_required | ✓ |
-| 8 | empty plan + conflict → recovery_required | ✓ |
-| 9 | empty plan + no transactions → completed | ✓ |
-| 10 | snapshot path mismatch → conflict | ✓ |
-| 11 | happy-path commit still completes | ✓ |
-| 12 | source album with symlink rejected | ✓ |
-| 13 | repeated reconcile returns the same persisted completed_at | ✓ |
-| 14 | two consecutive recovery passes converge (idempotent) | ✓ |
-| 15 | conflict does not delete source files | ✓ |
+| #   | Scenario                                                   | Result |
+| --- | ---------------------------------------------------------- | ------ |
+| 1   | cancel during copy leaves a recoverable transaction        | ✓      |
+| 2   | cancel before prewrite — no transaction, recovery_required | ✓      |
+| 3   | recovery continues the original transaction after restart  | ✓      |
+| 4   | re-running commit does not create a second transaction     | ✓      |
+| 5   | failed/cancelled not reported recovered=true               | ✓      |
+| 6   | recovery_required not mapped to a completion overlay       | ✓      |
+| 7   | empty plan + active transaction → recovery_required        | ✓      |
+| 8   | empty plan + conflict → recovery_required                  | ✓      |
+| 9   | empty plan + no transactions → completed                   | ✓      |
+| 10  | snapshot path mismatch → conflict                          | ✓      |
+| 11  | happy-path commit still completes                          | ✓      |
+| 12  | source album with symlink rejected                         | ✓      |
+| 13  | repeated reconcile returns the same persisted completed_at | ✓      |
+| 14  | two consecutive recovery passes converge (idempotent)      | ✓      |
+| 15  | conflict does not delete source files                      | ✓      |
 
 Also fixed a stale migration-version assertion in
 `real_pgvector_full_lifecycle` (was asserting `0007_transaction_links`

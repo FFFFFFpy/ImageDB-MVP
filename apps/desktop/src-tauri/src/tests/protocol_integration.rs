@@ -69,7 +69,10 @@ async fn real_protocol_migrations_run_on_empty_db() {
     let (_tmp, mgr) = fresh_db().await;
     let (client, handle) = mgr.lock().await.connect().await.unwrap();
     let version = MigrationRunner::current_version(&client).await.unwrap();
-    assert_eq!(version.as_deref(), Some("0008_source_album_snapshots"));
+    assert_eq!(
+        version.as_deref(),
+        Some("0009_drop_redundant_snapshot_hash")
+    );
     // All state columns now exist with CHECK constraints.
     let count: i64 = client
         .query_one(
