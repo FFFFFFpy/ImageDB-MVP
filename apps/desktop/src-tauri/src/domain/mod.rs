@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DatabaseMode {
     ManagedLocal,
     External,
@@ -60,6 +61,45 @@ impl fmt::Display for DatabaseStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    Disable,
+    Require,
+    VerifyCa,
+    #[default]
+    VerifyFull,
+}
+
+impl TlsMode {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "disable" => Some(Self::Disable),
+            "require" => Some(Self::Require),
+            "verify_ca" => Some(Self::VerifyCa),
+            "verify_full" => Some(Self::VerifyFull),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Require => "require",
+            Self::VerifyCa => "verify_ca",
+            Self::VerifyFull => "verify_full",
+        }
+    }
+}
+
+fn default_external_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_external_query_timeout_secs() -> u64 {
+    15
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub host: String,
@@ -67,6 +107,20 @@ pub struct ConnectionConfig {
     pub database: String,
     pub username: String,
     pub password: Option<String>,
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_key_path: Option<String>,
+    #[serde(default = "default_external_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_external_query_timeout_secs")]
+    pub query_timeout_secs: u64,
+    #[serde(default)]
+    pub profile_name: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -80,6 +134,8 @@ impl ConnectionConfig {
         if let Some(ref pw) = self.password {
             parts.push(format!("password={pw}"));
         }
+        parts.push(format!("sslmode={}", self.tls_mode.as_str()));
+        parts.push(format!("connect_timeout={}", self.connect_timeout_secs));
         parts.join(" ")
     }
 }
@@ -97,9 +153,62 @@ pub struct ExternalCheckResult {
     pub connection_ok: bool,
     pub version: Option<String>,
     pub version_ok: bool,
+    pub tls_mode: TlsMode,
+    pub tls_ok: bool,
     pub pgvector_available: bool,
+    pub can_create_extension: bool,
     pub can_create_tables: bool,
+    pub can_modify_schema: bool,
+    pub read_write_ok: bool,
+    pub encoding_ok: bool,
+    pub timezone_ok: bool,
+    pub not_read_only: bool,
+    pub migration_state_ok: bool,
+    pub schema_compatible: bool,
+    pub migration_version: Option<String>,
+    pub checks: Vec<ExternalPreflightCheck>,
     pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalPreflightCheck {
+    pub code: String,
+    pub status: PreflightStatus,
+    pub message: String,
+}
+
+impl ExternalPreflightCheck {
+    pub fn pass(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            status: PreflightStatus::Pass,
+            message: message.into(),
+        }
+    }
+
+    pub fn warn(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            status: PreflightStatus::Warn,
+            message: message.into(),
+        }
+    }
+
+    pub fn fail(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            status: PreflightStatus::Fail,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

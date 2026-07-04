@@ -1,5 +1,6 @@
 use crate::domain::import_state::{CommitProgress, ScanProgress};
 use crate::infrastructure::postgres::PostgresManager;
+use crate::infrastructure::secrets::CredentialStore;
 use crate::infrastructure::settings::SettingsStore;
 use crate::services::DatabaseService;
 use std::path::PathBuf;
@@ -61,7 +62,12 @@ impl AppState {
     ) -> Result<Self, crate::error::AppError> {
         let postgres_manager = Arc::new(Mutex::new(PostgresManager::new(app_data_dir)));
         let settings = Arc::new(Mutex::new(SettingsStore::new(app_data_dir)?));
-        let database_service = DatabaseService::new(postgres_manager.clone(), settings.clone());
+        let credentials = Arc::new(CredentialStore::new(app_data_dir)?);
+        let database_service = DatabaseService::new(
+            postgres_manager.clone(),
+            settings.clone(),
+            credentials.clone(),
+        );
 
         Ok(Self {
             postgres_manager,

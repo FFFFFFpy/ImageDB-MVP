@@ -16,6 +16,13 @@ vi.mock('@tauri-apps/api/core', () => ({
         external_port: null,
         external_database: null,
         external_username: null,
+        external_tls_mode: null,
+        external_ca_cert_path: null,
+        external_client_cert_path: null,
+        external_client_key_path: null,
+        external_connect_timeout_secs: null,
+        external_query_timeout_secs: null,
+        external_profile_name: null,
         first_run_completed: true,
       });
     }

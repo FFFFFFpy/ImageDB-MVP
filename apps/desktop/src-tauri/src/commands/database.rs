@@ -1,4 +1,4 @@
-use crate::domain::{ConnectionConfig, DatabaseState, ExternalCheckResult};
+use crate::domain::{ConnectionConfig, DatabaseState, ExternalCheckResult, TlsMode};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -10,6 +10,13 @@ pub struct ExternalConnectionDto {
     pub database: String,
     pub username: String,
     pub password: Option<String>,
+    pub tls_mode: Option<String>,
+    pub ca_cert_path: Option<String>,
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+    pub connect_timeout_secs: Option<u64>,
+    pub query_timeout_secs: Option<u64>,
+    pub profile_name: Option<String>,
 }
 
 impl From<ExternalConnectionDto> for ConnectionConfig {
@@ -20,6 +27,17 @@ impl From<ExternalConnectionDto> for ConnectionConfig {
             database: dto.database,
             username: dto.username,
             password: dto.password,
+            tls_mode: dto
+                .tls_mode
+                .as_deref()
+                .and_then(TlsMode::from_str_opt)
+                .unwrap_or_default(),
+            ca_cert_path: dto.ca_cert_path,
+            client_cert_path: dto.client_cert_path,
+            client_key_path: dto.client_key_path,
+            connect_timeout_secs: dto.connect_timeout_secs.unwrap_or(10),
+            query_timeout_secs: dto.query_timeout_secs.unwrap_or(15),
+            profile_name: dto.profile_name,
         }
     }
 }

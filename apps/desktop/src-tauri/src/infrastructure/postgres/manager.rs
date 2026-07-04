@@ -1,4 +1,6 @@
+use crate::domain::ConnectionConfig;
 use crate::error::AppError;
+use crate::infrastructure::postgres::connect_external;
 use rand::Rng;
 use serde::Serialize;
 use std::net::TcpListener;
@@ -35,6 +37,7 @@ pub struct PostgresManager {
     psql: Option<PathBuf>,
     diagnostics: Vec<String>,
     server_running: bool,
+    active_external: Option<ConnectionConfig>,
 }
 
 impl PostgresManager {
@@ -51,6 +54,7 @@ impl PostgresManager {
             psql: None,
             diagnostics: Vec::new(),
             server_running: false,
+            active_external: None,
         };
         mgr.locate_binaries();
         mgr.load_saved_config();
@@ -187,6 +191,18 @@ impl PostgresManager {
 
     pub fn is_server_running(&self) -> bool {
         self.server_running
+    }
+
+    pub fn use_external_profile(&mut self, config: ConnectionConfig) {
+        self.active_external = Some(config);
+    }
+
+    pub fn use_managed_profile(&mut self) {
+        self.active_external = None;
+    }
+
+    pub fn active_external_profile(&self) -> Option<&ConnectionConfig> {
+        self.active_external.as_ref()
     }
 
     pub fn connection_string(&self) -> String {
@@ -762,6 +778,10 @@ impl PostgresManager {
     pub async fn connect(
         &self,
     ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), AppError> {
+        if let Some(config) = &self.active_external {
+            return connect_external(config).await;
+        }
+
         let conn_str = self.connection_string();
         let (client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
             .await
@@ -894,6 +914,7 @@ mod tests {
             psql: None,
             diagnostics: Vec::new(),
             server_running: false,
+            active_external: None,
         };
 
         let conn_str = mgr.connection_string();

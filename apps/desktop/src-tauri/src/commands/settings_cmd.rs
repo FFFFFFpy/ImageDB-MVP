@@ -11,6 +11,13 @@ pub struct SettingsDto {
     pub external_port: Option<u16>,
     pub external_database: Option<String>,
     pub external_username: Option<String>,
+    pub external_tls_mode: Option<String>,
+    pub external_ca_cert_path: Option<String>,
+    pub external_client_cert_path: Option<String>,
+    pub external_client_key_path: Option<String>,
+    pub external_connect_timeout_secs: Option<u64>,
+    pub external_query_timeout_secs: Option<u64>,
+    pub external_profile_name: Option<String>,
     pub first_run_completed: bool,
 }
 
@@ -23,6 +30,13 @@ impl From<&AppSettings> for SettingsDto {
             external_port: s.external_port,
             external_database: s.external_database.clone(),
             external_username: s.external_username.clone(),
+            external_tls_mode: s.external_tls_mode.clone(),
+            external_ca_cert_path: s.external_ca_cert_path.clone(),
+            external_client_cert_path: s.external_client_cert_path.clone(),
+            external_client_key_path: s.external_client_key_path.clone(),
+            external_connect_timeout_secs: s.external_connect_timeout_secs,
+            external_query_timeout_secs: s.external_query_timeout_secs,
+            external_profile_name: s.external_profile_name.clone(),
             first_run_completed: s.first_run_completed,
         }
     }
@@ -47,6 +61,13 @@ pub async fn update_settings(
         external_port: settings.external_port,
         external_database: settings.external_database,
         external_username: settings.external_username,
+        external_tls_mode: settings.external_tls_mode,
+        external_ca_cert_path: settings.external_ca_cert_path,
+        external_client_cert_path: settings.external_client_cert_path,
+        external_client_key_path: settings.external_client_key_path,
+        external_connect_timeout_secs: settings.external_connect_timeout_secs,
+        external_query_timeout_secs: settings.external_query_timeout_secs,
+        external_profile_name: settings.external_profile_name,
         first_run_completed: settings.first_run_completed,
     };
     store.update(app_settings).map_err(|e| format!("{e}"))?;

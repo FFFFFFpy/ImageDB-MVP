@@ -19,6 +19,20 @@ pub struct AppSettings {
     #[serde(default)]
     pub external_username: Option<String>,
     #[serde(default)]
+    pub external_tls_mode: Option<String>,
+    #[serde(default)]
+    pub external_ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub external_client_cert_path: Option<String>,
+    #[serde(default)]
+    pub external_client_key_path: Option<String>,
+    #[serde(default)]
+    pub external_connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub external_query_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub external_profile_name: Option<String>,
+    #[serde(default)]
     pub first_run_completed: bool,
 }
 

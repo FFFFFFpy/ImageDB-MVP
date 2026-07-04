@@ -24,15 +24,40 @@ export interface ExternalConnectionConfig {
   database: string;
   username: string;
   password?: string;
+  tls_mode?: 'disable' | 'require' | 'verify_ca' | 'verify_full';
+  ca_cert_path?: string | null;
+  client_cert_path?: string | null;
+  client_key_path?: string | null;
+  connect_timeout_secs?: number;
+  query_timeout_secs?: number;
+  profile_name?: string | null;
 }
 
 export interface ExternalCheckResult {
   connection_ok: boolean;
   version: string | null;
   version_ok: boolean;
+  tls_mode: 'disable' | 'require' | 'verify_ca' | 'verify_full';
+  tls_ok: boolean;
   pgvector_available: boolean;
+  can_create_extension: boolean;
   can_create_tables: boolean;
+  can_modify_schema: boolean;
+  read_write_ok: boolean;
+  encoding_ok: boolean;
+  timezone_ok: boolean;
+  not_read_only: boolean;
+  migration_state_ok: boolean;
+  schema_compatible: boolean;
+  migration_version: string | null;
+  checks: ExternalPreflightCheck[];
   diagnostics: DiagnosticItem[];
+}
+
+export interface ExternalPreflightCheck {
+  code: string;
+  status: 'pass' | 'warn' | 'fail';
+  message: string;
 }
 
 export interface AppSettings {
@@ -42,6 +67,13 @@ export interface AppSettings {
   external_port: number | null;
   external_database: string | null;
   external_username: string | null;
+  external_tls_mode: string | null;
+  external_ca_cert_path: string | null;
+  external_client_cert_path: string | null;
+  external_client_key_path: string | null;
+  external_connect_timeout_secs: number | null;
+  external_query_timeout_secs: number | null;
+  external_profile_name: string | null;
   first_run_completed: boolean;
 }
 

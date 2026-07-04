@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
-import type { DatabaseState } from '../lib/ipc/types';
+import type { DatabaseState, ExternalConnectionConfig } from '../lib/ipc/types';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useState } from 'react';
 
@@ -135,27 +135,31 @@ function ExternalSetup({ onComplete }: { onComplete: () => void }) {
   const [database, setDatabase] = useState('imagedb');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [tlsMode, setTlsMode] =
+    useState<NonNullable<ExternalConnectionConfig['tls_mode']>>('verify_full');
+  const [caCertPath, setCaCertPath] = useState('');
+
+  function buildConfig(): ExternalConnectionConfig {
+    return {
+      host,
+      port: parseInt(port, 10),
+      database,
+      username,
+      password: password || undefined,
+      tls_mode: tlsMode,
+      ca_cert_path: caCertPath || null,
+      connect_timeout_secs: 10,
+      query_timeout_secs: 15,
+      profile_name: 'default',
+    };
+  }
 
   const testConn = useMutation({
-    mutationFn: () =>
-      api.testExternalConnection({
-        host,
-        port: parseInt(port, 10),
-        database,
-        username,
-        password: password || undefined,
-      }),
+    mutationFn: () => api.testExternalConnection(buildConfig()),
   });
 
   const initExt = useMutation({
-    mutationFn: () =>
-      api.initializeExternalDatabase({
-        host,
-        port: parseInt(port, 10),
-        database,
-        username,
-        password: password || undefined,
-      }),
+    mutationFn: () => api.initializeExternalDatabase(buildConfig()),
     onSuccess: (state) => {
       if (taggedStatusCode(state.status) === 'connected') {
         onComplete();
@@ -186,6 +190,24 @@ function ExternalSetup({ onComplete }: { onComplete: () => void }) {
         <label>
           密码
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        <label>
+          TLS 模式
+          <select
+            value={tlsMode}
+            onChange={(e) =>
+              setTlsMode(e.target.value as NonNullable<ExternalConnectionConfig['tls_mode']>)
+            }
+          >
+            <option value="verify_full">验证 CA 和主机名</option>
+            <option value="verify_ca">验证 CA</option>
+            <option value="require">仅要求加密</option>
+            <option value="disable">禁用</option>
+          </select>
+        </label>
+        <label>
+          CA 证书路径
+          <input value={caCertPath} onChange={(e) => setCaCertPath(e.target.value)} />
         </label>
       </div>
       <div className="toolbar">
@@ -220,8 +242,31 @@ function ExternalSetup({ onComplete }: { onComplete: () => void }) {
                 <td>建表权限</td>
                 <td>{testConn.data.can_create_tables ? '有' : '无'}</td>
               </tr>
+              <tr>
+                <td>读写</td>
+                <td>{testConn.data.read_write_ok ? '可写' : '不可写'}</td>
+              </tr>
+              <tr>
+                <td>迁移状态</td>
+                <td>{testConn.data.migration_state_ok ? '兼容' : '不兼容'}</td>
+              </tr>
             </tbody>
           </table>
+          {testConn.data.checks.length > 0 && (
+            <table>
+              <tbody>
+                {testConn.data.checks.map((check) => (
+                  <tr key={check.code}>
+                    <td className="mono">{check.code}</td>
+                    <td>
+                      {check.status === 'pass' ? '通过' : check.status === 'warn' ? '警告' : '失败'}
+                    </td>
+                    <td>{check.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
           {testConn.data.diagnostics.length > 0 && (
             <details className="diagnostics">
               <summary>诊断信息</summary>

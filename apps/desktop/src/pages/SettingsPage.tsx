@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useState } from 'react';
+import type { ExternalConnectionConfig } from '../lib/ipc/types';
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
@@ -22,6 +23,14 @@ export function SettingsPage() {
   const [extDb, setExtDb] = useState('imagedb');
   const [extUser, setExtUser] = useState('');
   const [extPass, setExtPass] = useState('');
+  const [extTlsMode, setExtTlsMode] =
+    useState<NonNullable<ExternalConnectionConfig['tls_mode']>>('verify_full');
+  const [extCaCert, setExtCaCert] = useState('');
+  const [extClientCert, setExtClientCert] = useState('');
+  const [extClientKey, setExtClientKey] = useState('');
+  const [extConnectTimeout, setExtConnectTimeout] = useState('10');
+  const [extQueryTimeout, setExtQueryTimeout] = useState('15');
+  const [extProfileName, setExtProfileName] = useState('default');
   const [libRoot, setLibRoot] = useState('');
 
   const saveSettings = useMutation({
@@ -30,15 +39,25 @@ export function SettingsPage() {
   });
 
   const testExt = useMutation({
-    mutationFn: () =>
-      api.testExternalConnection({
-        host: extHost,
-        port: parseInt(extPort, 10),
-        database: extDb,
-        username: extUser,
-        password: extPass || undefined,
-      }),
+    mutationFn: () => api.testExternalConnection(buildExternalConfig()),
   });
+
+  function buildExternalConfig(): ExternalConnectionConfig {
+    return {
+      host: extHost,
+      port: parseInt(extPort, 10),
+      database: extDb,
+      username: extUser,
+      password: extPass || undefined,
+      tls_mode: extTlsMode,
+      ca_cert_path: extCaCert || null,
+      client_cert_path: extClientCert || null,
+      client_key_path: extClientKey || null,
+      connect_timeout_secs: parseInt(extConnectTimeout, 10),
+      query_timeout_secs: parseInt(extQueryTimeout, 10),
+      profile_name: extProfileName || null,
+    };
+  }
 
   const shutdown = useMutation({
     mutationFn: api.shutdownDatabase,
@@ -137,6 +156,52 @@ export function SettingsPage() {
             密码
             <input type="password" value={extPass} onChange={(e) => setExtPass(e.target.value)} />
           </label>
+          <label>
+            TLS 模式
+            <select
+              value={extTlsMode}
+              onChange={(e) =>
+                setExtTlsMode(e.target.value as NonNullable<ExternalConnectionConfig['tls_mode']>)
+              }
+            >
+              <option value="verify_full">验证 CA 和主机名</option>
+              <option value="verify_ca">验证 CA</option>
+              <option value="require">仅要求加密</option>
+              <option value="disable">禁用</option>
+            </select>
+          </label>
+          <label>
+            CA 证书路径
+            <input value={extCaCert} onChange={(e) => setExtCaCert(e.target.value)} />
+          </label>
+          <label>
+            客户端证书路径
+            <input value={extClientCert} onChange={(e) => setExtClientCert(e.target.value)} />
+          </label>
+          <label>
+            客户端私钥路径
+            <input value={extClientKey} onChange={(e) => setExtClientKey(e.target.value)} />
+          </label>
+          <label>
+            连接超时（秒）
+            <input
+              type="number"
+              value={extConnectTimeout}
+              onChange={(e) => setExtConnectTimeout(e.target.value)}
+            />
+          </label>
+          <label>
+            查询超时（秒）
+            <input
+              type="number"
+              value={extQueryTimeout}
+              onChange={(e) => setExtQueryTimeout(e.target.value)}
+            />
+          </label>
+          <label>
+            Profile 名称
+            <input value={extProfileName} onChange={(e) => setExtProfileName(e.target.value)} />
+          </label>
         </div>
         <button onClick={() => testExt.mutate()} disabled={testExt.isPending}>
           {testExt.isPending ? '测试中…' : '测试连接'}
@@ -158,11 +223,46 @@ export function SettingsPage() {
                   <td>{testExt.data.pgvector_available ? '可用' : '不可用'}</td>
                 </tr>
                 <tr>
+                  <td>TLS</td>
+                  <td>{testExt.data.tls_ok ? '启用' : '禁用或失败'}</td>
+                </tr>
+                <tr>
                   <td>建表权限</td>
                   <td>{testExt.data.can_create_tables ? '有' : '无'}</td>
                 </tr>
+                <tr>
+                  <td>Schema 权限</td>
+                  <td>{testExt.data.can_modify_schema ? '有' : '无'}</td>
+                </tr>
+                <tr>
+                  <td>读写</td>
+                  <td>{testExt.data.read_write_ok ? '可写' : '不可写'}</td>
+                </tr>
+                <tr>
+                  <td>迁移状态</td>
+                  <td>{testExt.data.migration_state_ok ? '兼容' : '不兼容'}</td>
+                </tr>
               </tbody>
             </table>
+            {testExt.data.checks.length > 0 && (
+              <table>
+                <tbody>
+                  {testExt.data.checks.map((check) => (
+                    <tr key={check.code}>
+                      <td className="mono">{check.code}</td>
+                      <td>
+                        {check.status === 'pass'
+                          ? '通过'
+                          : check.status === 'warn'
+                            ? '警告'
+                            : '失败'}
+                      </td>
+                      <td>{check.message}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         )}
         {testExt.isError && <pre className="status-err">{String(testExt.error)}</pre>}
