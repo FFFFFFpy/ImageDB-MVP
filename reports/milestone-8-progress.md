@@ -42,6 +42,45 @@
 
 ### 已知限制
 
-- 本次尚未把 commit service 的发布流程切换为 StrongLocal 或 ConservativeMounted。
+- 当时尚未把 commit service 的发布流程切换为 StrongLocal 或 ConservativeMounted；后续 “Publish strategy integration” 已接入。
 - 多实例数据库租约、保守发布提交标记与 Recovery、断连恢复、路径逃逸规则和真实挂载共享存储故障门禁仍未完成。
 - Windows 卷身份探测当前返回 `unknown`，后续需要稳定 Win32 API 绑定或等价实现。
+
+## 2026-07-04: Publish strategy integration
+
+### 实现内容
+
+- commit 主链在提交前对图库根执行 `StorageCapabilities` 探测，并根据结果选择：
+  - `StrongLocal`：继续使用整目录 rename 发布；
+  - `ConservativeMounted`：逐文件复制到目标目录、校验 BLAKE3、复制 manifest，最后写入 `.imagedb/.imagedb-commit.json`；
+  - `Unsupported`：拒绝提交，不写图库。
+- 新增 `CommitMarker`，绑定 transaction ID、plan hash、manifest hash、完整文件集合和 publish strategy version。
+- 新提交的发布目录必须具备合法 commit marker；幂等验证会拒绝缺失或不匹配的 marker。
+- Recovery 的 `publishing` 路径接入策略选择；目标目录已存在时会重新校验 manifest、文件集合和 commit marker，缺 marker 时在校验通过后补写 marker。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/services/commit_service.rs`
+- `apps/desktop/src-tauri/src/services/recovery_service.rs`
+- `checklists/M8_DOD.md`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml commit_marker`：2 passed。
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml conservative_publish`：1 passed。
+- `pnpm rust:clippy`：passed。
+- `pnpm rust:test`：180 passed, 1 ignored。
+- `pnpm format:check`：passed。
+
+### 实际运行结果
+
+- 单元测试在真实临时目录中执行 ConservativeMounted 发布，确认文件和 manifest 被复制到目标目录、`.imagedb-commit.json` 被写入、staging 被清理。
+- marker 校验测试确认 plan hash 不匹配会被拒绝。
+- 缺失 marker 会被作为无效发布证据暴露，不会被静默视为完成。
+
+### 已知限制
+
+- 尚未完成真实 PostgreSQL 故障注入测试：例如 marker 前中断、目标存在但 marker 缺失后的 Recovery 收敛。
+- 多实例数据库租约、断连/只读/空间不足恢复、路径逃逸增强和真实挂载共享存储门禁仍未完成。

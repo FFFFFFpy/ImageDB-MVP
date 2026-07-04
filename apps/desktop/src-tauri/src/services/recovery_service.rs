@@ -21,8 +21,10 @@ use crate::repositories::import_repository::{
 };
 use crate::services::commit_service::{
     build_manifest, commit_library_records_transaction, detect_extra_published_files,
-    normalize_relative_path, read_manifest_with_hash, stream_copy_with_hash, sync_parent_dir,
-    validate_and_hash_frozen_plan, verify_source_snapshot_or_conflict, verify_staging_set,
+    normalize_relative_path, publish_verified_staging, read_commit_marker, read_manifest_with_hash,
+    select_commit_publish_strategy, stream_copy_with_hash, sync_parent_dir,
+    validate_and_hash_frozen_plan, validate_commit_marker, verify_published_file_set,
+    verify_source_snapshot_or_conflict, verify_staging_set, write_commit_marker,
     write_synced_then_rename,
 };
 use crate::services::source_snapshot_service::load_source_album_snapshot;
@@ -924,16 +926,20 @@ async fn resume_publishing(
 
     if let Some(staging) = &staging_dir {
         if staging.exists() && !publish_dir.exists() {
-            // Retry the atomic rename.
-            if let Some(parent) = publish_dir.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| AppError::IoError(format!("cannot create publish parent: {e}")))?;
-            }
-            tokio::fs::rename(staging, &publish_dir)
-                .await
-                .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
-            sync_parent_dir(&publish_dir).await?;
+            let strategy = select_commit_publish_strategy(library_root)?;
+            publish_verified_staging(
+                strategy,
+                staging,
+                &publish_dir,
+                tx.id,
+                plan_hash,
+                tx.manifest_hash.as_deref().ok_or_else(|| {
+                    AppError::Internal("transaction has no manifest_hash".to_string())
+                })?,
+                album_relative_path,
+                plan_images,
+            )
+            .await?;
             // Manifest moved with the rename: record the published path.
             let published_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
             if !published_manifest.exists() {
@@ -1062,6 +1068,43 @@ async fn resume_publishing(
             .await?;
             return Ok((TransactionState::Conflict.to_string(), false, full));
         }
+        verify_published_file_set(&publish_dir, plan_images).await?;
+        match read_commit_marker(&publish_dir) {
+            Ok(marker) => {
+                if let Err(msg) = validate_commit_marker(
+                    &marker,
+                    tx.id,
+                    plan_hash,
+                    &raw_hash,
+                    album_relative_path,
+                    plan_images,
+                ) {
+                    let full = format!(
+                        "conflict: target {} has mismatched commit marker: {msg}",
+                        publish_dir.display()
+                    );
+                    ImportRepository::update_file_transaction_state(
+                        client,
+                        tx.id,
+                        &TransactionState::Conflict,
+                        Some(&full),
+                    )
+                    .await?;
+                    return Ok((TransactionState::Conflict.to_string(), false, full));
+                }
+            }
+            Err(_) => {
+                write_commit_marker(
+                    &publish_dir,
+                    tx.id,
+                    plan_hash,
+                    &raw_hash,
+                    album_relative_path,
+                    plan_images,
+                )
+                .await?;
+            }
+        }
         ImportRepository::update_file_transaction_state(
             client,
             tx.id,
@@ -1138,34 +1181,28 @@ async fn publish_from_staging(
     write_synced_then_rename(&tmp, &final_m, manifest_json.as_bytes()).await?;
     ImportRepository::set_transaction_hashes(client, tx.id, None, Some(&manifest_hash)).await?;
 
-    // Atomic publish.
+    // Publish using the currently verified storage strategy.
     let publishing = state_machine::transition_transaction(TransactionState::Verified, "publish")?;
     ImportRepository::update_file_transaction_state(client, tx.id, &publishing, None).await?;
 
     let publish_dir = library_root.join("Albums").join(album_relative_path);
-    if publish_dir.exists() {
-        let msg = format!(
-            "target already exists during publish: {}",
-            publish_dir.display()
-        );
-        ImportRepository::update_file_transaction_state(
-            client,
-            tx.id,
-            &TransactionState::Conflict,
-            Some(&msg),
-        )
-        .await?;
-        return Ok((TransactionState::Conflict.to_string(), false, msg));
-    }
     if let Some(parent) = publish_dir.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| AppError::IoError(format!("cannot create publish parent: {e}")))?;
     }
-    tokio::fs::rename(&staging_dir, &publish_dir)
-        .await
-        .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
-    sync_parent_dir(&publish_dir).await?;
+    let strategy = select_commit_publish_strategy(library_root)?;
+    publish_verified_staging(
+        strategy,
+        &staging_dir,
+        &publish_dir,
+        tx.id,
+        plan_hash,
+        &manifest_hash,
+        album_relative_path,
+        plan_images,
+    )
+    .await?;
     // Manifest moved with the rename: record the published path.
     let published_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
     if !published_manifest.exists() {

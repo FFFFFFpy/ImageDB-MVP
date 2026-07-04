@@ -1,7 +1,7 @@
 # M8 Definition of Done
 
 - [x] StorageCapabilities 探测完成。
-- [ ] StrongLocal / ConservativeMounted / Unsupported 策略完成。
+- [x] StrongLocal / ConservativeMounted / Unsupported 策略完成。
 - [x] 未知能力不被乐观视为支持。
 - [ ] 多实例数据库租约完成。
 - [ ] 路径大小写、Unicode、长路径和逃逸检查完成。

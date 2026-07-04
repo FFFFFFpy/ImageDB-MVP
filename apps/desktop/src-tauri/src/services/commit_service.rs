@@ -19,6 +19,9 @@ use crate::domain::import_state::{
 use crate::domain::state_machine::{self, FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
 use crate::infrastructure::postgres::PostgresManager;
+use crate::infrastructure::storage_capabilities::{
+    probe_storage_capabilities, PublishStrategy as StoragePublishStrategy,
+};
 use crate::repositories::import_repository::{
     FrozenPlanRow, ImportRepository, PlanAlbumRow, PlanImageRow, SnapshotFileRecord,
 };
@@ -41,6 +44,8 @@ use uuid::Uuid;
 
 /// Schema version written into every album manifest.
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
+pub const COMMIT_MARKER_SCHEMA_VERSION: &str = "1.0";
+pub const COMMIT_MARKER_FILE_NAME: &str = ".imagedb-commit.json";
 /// Maximum decoded pixel count for a single source file preview.
 #[allow(dead_code)]
 pub const PREVIEW_MAX_PIXELS: u64 = 8_000_000;
@@ -81,6 +86,31 @@ pub struct AlbumManifestImage {
     pub height: Option<i32>,
     pub format: Option<String>,
     pub fingerprint_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitMarker {
+    pub schema_version: String,
+    pub transaction_id: String,
+    pub plan_hash: String,
+    pub manifest_hash: String,
+    pub publish_strategy_version: String,
+    pub album_relative_path: String,
+    pub image_count: u32,
+    pub files: Vec<CommitMarkerFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitMarkerFile {
+    pub relative_path: String,
+    pub file_size: i64,
+    pub blake3: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitPublishStrategy {
+    StrongLocal,
+    ConservativeMounted,
 }
 
 /// A single album ready to commit, derived from the frozen plan.
@@ -291,6 +321,7 @@ async fn execute_commit_pipeline(
     // Rule 4: validate and hash the immutable plan up front. Commit and
     // recovery both use this function so a tampered plan fails consistently.
     let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
+    let publish_strategy = select_commit_publish_strategy(&library_root)?;
 
     {
         let mut p = progress_tracker.lock().await;
@@ -327,6 +358,7 @@ async fn execute_commit_pipeline(
         match commit_single_album(
             client,
             &library_root,
+            publish_strategy,
             library_root_id,
             import_run_id,
             frozen.plan_id,
@@ -625,6 +657,7 @@ pub(crate) fn path_eq(a: &Path, b: &Path) -> bool {
 async fn commit_single_album(
     client: &mut Client,
     library_root: &Path,
+    publish_strategy: CommitPublishStrategy,
     library_root_id: Uuid,
     import_run_id: Uuid,
     plan_id: Uuid,
@@ -921,7 +954,9 @@ async fn commit_single_album(
     #[cfg(feature = "fail-injection")]
     maybe_fault(CommitFaultPoint::AfterManifestWrite, "after manifest write")?;
 
-    // ── Phase 4: atomic publish (rename whole staging dir → publish dir). ──
+    // ── Phase 4: publish. StrongLocal uses the historical whole-directory
+    // rename. ConservativeMounted copies verified files and writes an
+    // immutable commit marker last.
     let publishing = state_machine::transition_transaction(TransactionState::Verified, "publish")?;
     ImportRepository::update_file_transaction_state(client, tx_id, &publishing, None).await?;
 
@@ -931,17 +966,17 @@ async fn commit_single_album(
         "before publish rename",
     )?;
 
-    // The publish dir must not exist (checked above; re-check defensively).
-    if publish_dir.exists() {
-        return Err(AppError::Internal(format!(
-            "target directory appeared during publish: {}",
-            publish_dir.display()
-        )));
-    }
-    tokio::fs::rename(&staging_dir, &publish_dir)
-        .await
-        .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
-    sync_parent_dir(&publish_dir).await?;
+    publish_verified_staging(
+        publish_strategy,
+        &staging_dir,
+        &publish_dir,
+        tx_id,
+        plan_hash,
+        &manifest_hash,
+        &album_relative_path,
+        &images,
+    )
+    .await?;
 
     // The manifest moved with the rename: record the published path on the
     // transaction and expose it via CommitAlbumResult. The staging path no
@@ -1370,6 +1405,300 @@ pub(crate) async fn stream_copy_with_hash(
         .await
         .map_err(|e| AppError::IoError(format!("sync error: {e}")))?;
     Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+pub(crate) fn select_commit_publish_strategy(
+    library_root: &Path,
+) -> Result<CommitPublishStrategy, AppError> {
+    let capabilities = probe_storage_capabilities(library_root);
+    match capabilities.publish_strategy {
+        StoragePublishStrategy::StrongLocal => Ok(CommitPublishStrategy::StrongLocal),
+        StoragePublishStrategy::ConservativeMounted => {
+            Ok(CommitPublishStrategy::ConservativeMounted)
+        }
+        StoragePublishStrategy::Unsupported => Err(AppError::Internal(format!(
+            "library root '{}' is unsupported for commit: {}",
+            library_root.display(),
+            capabilities.strategy_reasons.join("; ")
+        ))),
+    }
+}
+
+pub(crate) fn build_commit_marker(
+    tx_id: Uuid,
+    plan_hash: &[u8],
+    manifest_hash: &[u8],
+    album_relative_path: &str,
+    images: &[PlanImageRow],
+) -> CommitMarker {
+    let mut files: Vec<CommitMarkerFile> = images
+        .iter()
+        .map(|img| CommitMarkerFile {
+            relative_path: normalize_relative_path(&img.target_relative_path)
+                .unwrap_or_else(|_| img.target_relative_path.clone()),
+            file_size: img.expected_file_size,
+            blake3: bytes_to_hex(&img.expected_blake3),
+        })
+        .collect();
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+    CommitMarker {
+        schema_version: COMMIT_MARKER_SCHEMA_VERSION.to_string(),
+        transaction_id: tx_id.to_string(),
+        plan_hash: bytes_to_hex(plan_hash),
+        manifest_hash: bytes_to_hex(manifest_hash),
+        publish_strategy_version: "m8-conservative-marker-v1".to_string(),
+        album_relative_path: album_relative_path.to_string(),
+        image_count: images.len() as u32,
+        files,
+    }
+}
+
+pub(crate) fn read_commit_marker(publish_dir: &Path) -> Result<CommitMarker, AppError> {
+    let marker_path = publish_dir.join(".imagedb").join(COMMIT_MARKER_FILE_NAME);
+    let raw = std::fs::read(&marker_path).map_err(|e| {
+        AppError::Internal(format!(
+            "cannot read commit marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    serde_json::from_slice(&raw)
+        .map_err(|e| AppError::Internal(format!("cannot parse commit marker: {e}")))
+}
+
+pub(crate) fn validate_commit_marker(
+    marker: &CommitMarker,
+    tx_id: Uuid,
+    plan_hash: &[u8],
+    manifest_hash: &[u8],
+    album_relative_path: &str,
+    images: &[PlanImageRow],
+) -> Result<(), String> {
+    let expected =
+        build_commit_marker(tx_id, plan_hash, manifest_hash, album_relative_path, images);
+    if marker.schema_version != expected.schema_version {
+        return Err(format!(
+            "commit marker schema_version {} != expected {}",
+            marker.schema_version, expected.schema_version
+        ));
+    }
+    if marker.transaction_id != expected.transaction_id {
+        return Err(format!(
+            "commit marker transaction_id {} != expected {}",
+            marker.transaction_id, expected.transaction_id
+        ));
+    }
+    if marker.plan_hash != expected.plan_hash {
+        return Err(format!(
+            "commit marker plan_hash {} != expected {}",
+            marker.plan_hash, expected.plan_hash
+        ));
+    }
+    if marker.manifest_hash != expected.manifest_hash {
+        return Err(format!(
+            "commit marker manifest_hash {} != expected {}",
+            marker.manifest_hash, expected.manifest_hash
+        ));
+    }
+    if marker.album_relative_path != expected.album_relative_path {
+        return Err(format!(
+            "commit marker album_relative_path '{}' != expected '{}'",
+            marker.album_relative_path, expected.album_relative_path
+        ));
+    }
+    if marker.image_count != expected.image_count {
+        return Err(format!(
+            "commit marker image_count {} != expected {}",
+            marker.image_count, expected.image_count
+        ));
+    }
+    if marker.files != expected.files {
+        return Err("commit marker file set does not match frozen plan".to_string());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_verified_staging(
+    strategy: CommitPublishStrategy,
+    staging_dir: &Path,
+    publish_dir: &Path,
+    tx_id: Uuid,
+    plan_hash: &[u8],
+    manifest_hash: &[u8],
+    album_relative_path: &str,
+    images: &[PlanImageRow],
+) -> Result<(), AppError> {
+    if publish_dir.exists() {
+        return Err(AppError::Internal(format!(
+            "target directory appeared during publish: {}",
+            publish_dir.display()
+        )));
+    }
+
+    match strategy {
+        CommitPublishStrategy::StrongLocal => {
+            tokio::fs::rename(staging_dir, publish_dir)
+                .await
+                .map_err(|e| AppError::IoError(format!("atomic publish rename failed: {e}")))?;
+            sync_parent_dir(publish_dir).await?;
+        }
+        CommitPublishStrategy::ConservativeMounted => {
+            publish_verified_staging_conservatively(
+                staging_dir,
+                publish_dir,
+                tx_id,
+                plan_hash,
+                manifest_hash,
+                album_relative_path,
+                images,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    write_commit_marker(
+        publish_dir,
+        tx_id,
+        plan_hash,
+        manifest_hash,
+        album_relative_path,
+        images,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_verified_staging_conservatively(
+    staging_dir: &Path,
+    publish_dir: &Path,
+    tx_id: Uuid,
+    plan_hash: &[u8],
+    manifest_hash: &[u8],
+    album_relative_path: &str,
+    images: &[PlanImageRow],
+) -> Result<(), AppError> {
+    tokio::fs::create_dir_all(publish_dir)
+        .await
+        .map_err(|e| AppError::IoError(format!("cannot create conservative target dir: {e}")))?;
+
+    for img in images {
+        let target_rel = normalize_relative_path(&img.target_relative_path)?;
+        let staged_path = staging_dir.join(&target_rel);
+        let target_path = publish_dir.join(&target_rel);
+        if let Some(parent) = target_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| AppError::IoError(format!("cannot create target subdir: {e}")))?;
+        }
+        let part_path = publish_dir.join(format!("{target_rel}.part"));
+        let _ = tokio::fs::remove_file(&part_path).await;
+        let actual = stream_copy_with_hash(&staged_path, &part_path, None).await?;
+        if actual != img.expected_blake3 {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(AppError::Internal(format!(
+                "conservative publish hash mismatch for {}",
+                target_path.display()
+            )));
+        }
+        tokio::fs::rename(&part_path, &target_path)
+            .await
+            .map_err(|e| AppError::IoError(format!("publish file rename failed: {e}")))?;
+        sync_parent_dir(&target_path).await?;
+    }
+
+    let staging_manifest = staging_dir.join(".imagedb").join(".imagedb-manifest.json");
+    let target_manifest = publish_dir.join(".imagedb").join(".imagedb-manifest.json");
+    if let Some(parent) = target_manifest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| AppError::IoError(format!("cannot create target manifest dir: {e}")))?;
+    }
+    let target_manifest_part = publish_dir
+        .join(".imagedb")
+        .join(".imagedb-manifest.json.part");
+    let actual_manifest_hash =
+        stream_copy_with_hash(&staging_manifest, &target_manifest_part, None).await?;
+    if actual_manifest_hash != manifest_hash {
+        let _ = tokio::fs::remove_file(&target_manifest_part).await;
+        return Err(AppError::Internal(
+            "conservative publish manifest hash mismatch".to_string(),
+        ));
+    }
+    tokio::fs::rename(&target_manifest_part, &target_manifest)
+        .await
+        .map_err(|e| AppError::IoError(format!("publish manifest rename failed: {e}")))?;
+    sync_parent_dir(&target_manifest).await?;
+
+    write_commit_marker(
+        publish_dir,
+        tx_id,
+        plan_hash,
+        manifest_hash,
+        album_relative_path,
+        images,
+    )
+    .await?;
+    tokio::fs::remove_dir_all(staging_dir)
+        .await
+        .map_err(|e| AppError::IoError(format!("cannot remove conservative staging dir: {e}")))?;
+    sync_parent_dir(staging_dir).await?;
+    Ok(())
+}
+
+pub(crate) async fn write_commit_marker(
+    publish_dir: &Path,
+    tx_id: Uuid,
+    plan_hash: &[u8],
+    manifest_hash: &[u8],
+    album_relative_path: &str,
+    images: &[PlanImageRow],
+) -> Result<(), AppError> {
+    let marker = build_commit_marker(tx_id, plan_hash, manifest_hash, album_relative_path, images);
+    let marker_json = serde_json::to_string_pretty(&marker)
+        .map_err(|e| AppError::Internal(format!("commit marker serialize failed: {e}")))?;
+    let marker_dir = publish_dir.join(".imagedb");
+    tokio::fs::create_dir_all(&marker_dir)
+        .await
+        .map_err(|e| AppError::IoError(format!("cannot create marker dir: {e}")))?;
+    let marker_tmp = marker_dir.join(".imagedb-commit.json.tmp");
+    let marker_file = marker_dir.join(COMMIT_MARKER_FILE_NAME);
+    write_synced_then_rename(&marker_tmp, &marker_file, marker_json.as_bytes()).await
+}
+
+pub(crate) async fn verify_published_file_set(
+    publish_dir: &Path,
+    images: &[PlanImageRow],
+) -> Result<(), AppError> {
+    for img in images {
+        let target_rel = normalize_relative_path(&img.target_relative_path)?;
+        let file_path = publish_dir.join(&target_rel);
+        let meta = tokio::fs::metadata(&file_path).await.map_err(|e| {
+            AppError::IoError(format!(
+                "published file missing {}: {e}",
+                file_path.display()
+            ))
+        })?;
+        if meta.len() != img.expected_file_size as u64 {
+            return Err(AppError::Internal(format!(
+                "published file size mismatch for {}: expected {} got {}",
+                file_path.display(),
+                img.expected_file_size,
+                meta.len()
+            )));
+        }
+        let actual = hash_existing_file(&file_path).await?;
+        if actual != img.expected_blake3 {
+            return Err(AppError::Internal(format!(
+                "published BLAKE3 mismatch for {}: expected {} got {}",
+                file_path.display(),
+                bytes_to_hex(&img.expected_blake3),
+                bytes_to_hex(&actual)
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_synced_then_rename(
@@ -1866,7 +2195,6 @@ async fn walk_and_verify(
     Ok(())
 }
 
-#[cfg(test)]
 async fn hash_existing_file(path: &Path) -> Result<Vec<u8>, AppError> {
     let mut f = tokio::fs::File::open(path)
         .await
@@ -2334,6 +2662,25 @@ pub async fn verify_complete_evidence(
         return Ok(IdempotencyVerdict::Conflict(msg));
     }
 
+    let marker = match read_commit_marker(&publish_dir) {
+        Ok(marker) => marker,
+        Err(e) => {
+            return Ok(IdempotencyVerdict::Conflict(format!(
+                "commit marker missing or invalid: {e}"
+            )));
+        }
+    };
+    if let Err(msg) = validate_commit_marker(
+        &marker,
+        existing_tx.id,
+        plan_hash,
+        &raw_manifest_hash,
+        album_relative_path,
+        images,
+    ) {
+        return Ok(IdempotencyVerdict::Conflict(msg));
+    }
+
     // file_operations rows must cover the plan images exactly and match
     // expected_size / expected_blake3 / target_path for this transaction.
     let ops = ImportRepository::get_file_operations(client, existing_tx.id).await?;
@@ -2503,7 +2850,10 @@ pub(crate) async fn detect_extra_published_files(
                 Err(_) => return Some(format!("strip_prefix failed for {}", path.display())),
             };
             // Management files are allowed.
-            if rel == ".imagedb/.imagedb-manifest.json" || rel == ".imagedb-manifest.json" {
+            if rel == ".imagedb/.imagedb-manifest.json"
+                || rel == ".imagedb-manifest.json"
+                || rel == format!(".imagedb/{COMMIT_MARKER_FILE_NAME}")
+            {
                 continue;
             }
             if rel.starts_with(".imagedb/") {
@@ -2606,6 +2956,88 @@ mod tests {
         assert_eq!(back.plan_hash, bytes_to_hex(&[1u8; 32]));
         assert_eq!(back.image_count, 1);
         assert_eq!(back.images[0].blake3, bytes_to_hex(&[7u8; 32]));
+    }
+
+    #[test]
+    fn commit_marker_binds_transaction_plan_manifest_and_files() {
+        let tx = Uuid::new_v4();
+        let images = vec![plan_image("a/1.jpg", &[7; 32])];
+        let marker = build_commit_marker(tx, &[1; 32], &[2; 32], "album_a", &images);
+
+        validate_commit_marker(&marker, tx, &[1; 32], &[2; 32], "album_a", &images)
+            .expect("marker should match its source data");
+
+        let err = validate_commit_marker(&marker, tx, &[9; 32], &[2; 32], "album_a", &images)
+            .unwrap_err();
+        assert!(
+            err.contains("plan_hash"),
+            "marker must reject a mismatched plan hash: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conservative_publish_copies_files_writes_marker_and_removes_staging() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging").join("album_a");
+        let publish = tmp.path().join("Albums").join("album_a");
+        tokio::fs::create_dir_all(staging.join("a")).await.unwrap();
+        tokio::fs::create_dir_all(staging.join(".imagedb"))
+            .await
+            .unwrap();
+
+        let image_bytes = b"published image bytes";
+        let image_hash = blake3::hash(image_bytes).as_bytes().to_vec();
+        tokio::fs::write(staging.join("a/1.jpg"), image_bytes)
+            .await
+            .unwrap();
+        let manifest_bytes = br#"{"schema_version":"test"}"#;
+        let manifest_hash = blake3::hash(manifest_bytes).as_bytes().to_vec();
+        tokio::fs::write(
+            staging.join(".imagedb/.imagedb-manifest.json"),
+            manifest_bytes,
+        )
+        .await
+        .unwrap();
+
+        let mut image = plan_image("a/1.jpg", &image_hash);
+        image.expected_file_size = image_bytes.len() as i64;
+        let tx = Uuid::new_v4();
+
+        publish_verified_staging(
+            CommitPublishStrategy::ConservativeMounted,
+            &staging,
+            &publish,
+            tx,
+            &[1; 32],
+            &manifest_hash,
+            "album_a",
+            &[image.clone()],
+        )
+        .await
+        .unwrap();
+
+        assert!(publish.join("a/1.jpg").exists());
+        assert!(publish.join(".imagedb/.imagedb-manifest.json").exists());
+        assert!(publish
+            .join(".imagedb")
+            .join(COMMIT_MARKER_FILE_NAME)
+            .exists());
+        assert!(!staging.exists(), "conservative staging should be cleaned");
+
+        let marker = read_commit_marker(&publish).unwrap();
+        validate_commit_marker(&marker, tx, &[1; 32], &manifest_hash, "album_a", &[image]).unwrap();
+    }
+
+    #[test]
+    fn missing_commit_marker_is_not_valid_publish_evidence() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".imagedb")).unwrap();
+
+        let err = read_commit_marker(tmp.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("commit marker"),
+            "missing marker must be surfaced as invalid publish evidence: {err}"
+        );
     }
 
     #[test]
