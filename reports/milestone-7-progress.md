@@ -38,6 +38,11 @@ Date: 2026-07-04
   - the same trusted certificate is rejected under `verify_full` when connecting as `127.0.0.1`;
   - `verify_ca` accepts the trusted certificate with the hostname mismatch, proving the TLS modes differ intentionally.
 - Added explicit diagnostics for unreachable active external profiles that direct the GUI/user to the controlled switch-to-managed action without modifying external data.
+- Added a real empty external PostgreSQL initialization test that:
+  - starts a real empty target database;
+  - verifies version, pgvector, extension creation, table/schema permissions, read-write state, UTF-8 encoding, time functions, read-only status, migration state, and schema compatibility preflight fields;
+  - initializes pgvector, ImageDB migrations, and `app_meta`;
+  - persists the external profile only after initialization succeeds.
 
 ## Commits
 
@@ -51,6 +56,7 @@ Date: 2026-07-04
 - Running migration subprocess cancellation implemented in the current M7 update.
 - Strict TLS hostname verification implemented in the current M7 update.
 - External-unreachable managed fallback diagnostics implemented in the current M7 update.
+- Empty external PostgreSQL preflight and initialization coverage implemented in the current M7 update.
 
 ## Commands run
 
@@ -68,6 +74,7 @@ Date: 2026-07-04
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml cancellable_migration_command_kills_running_child_and_marks_progress -- --nocapture`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml trusted_certificate_hostname_mismatch -- --nocapture`
 - `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml external_unreachable_diagnostics_points_to_controlled_managed_fallback`
+- `$env:IMAGEDB_POSTGRES_BIN=(Resolve-Path -LiteralPath .local/db-tools/postgresql-18.4/pgsql/bin).Path; cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib real_external_empty_database_ -- --ignored --nocapture --test-threads=1`
 
 ## Test result summary
 
@@ -75,13 +82,14 @@ Date: 2026-07-04
 - Frontend unit tests passed.
 - Rust unit tests passed: 174 passed, 1 ignored.
 - Clippy passed with `-D warnings`.
-- Real PostgreSQL suite passed, including the external migration test and external existing-database compatibility tests.
+- Real PostgreSQL suite passed, including the external empty database initialization test, external migration test, and external existing-database compatibility tests.
 - External migration cancellation regression passed.
 - Migration history validation unit tests passed.
 - TLS connector negative tests passed for missing client cert/key pairs, malformed CA PEM, and malformed client certificate/key PEM.
 - Running migration subprocess cancellation test passed.
 - Strict TLS hostname-mismatch tests passed.
 - External-unreachable fallback diagnostics unit test passed.
+- Empty external PostgreSQL preflight/initialization test passed.
 
 ## Actual runtime result
 
@@ -94,6 +102,7 @@ Date: 2026-07-04
 - The cancellable command regression started a 30-second child process, cancelled it after startup, finished in under the 5-second timeout, and left migration progress in `cancelled` state.
 - A local TLS test server using a `localhost` certificate was trusted by the client; `verify_full` accepted `localhost`, rejected `127.0.0.1`, and `verify_ca` accepted `127.0.0.1`.
 - When an active external profile is unreachable, `get_state` now reports a diagnostic instructing the user to use the controlled switch-to-managed action without modifying external data.
+- A real empty external PostgreSQL target preflighted with all required capability checks passing, then `initialize_external` created pgvector, applied migrations through `0009_drop_redundant_snapshot_hash`, created `app_meta`, switched the active mode to external, and persisted only non-secret external profile metadata.
 
 ## Known remaining M7 gaps
 

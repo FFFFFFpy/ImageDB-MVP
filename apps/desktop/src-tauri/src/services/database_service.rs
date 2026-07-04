@@ -1526,6 +1526,132 @@ mod tests {
     #[cfg(feature = "real-db-tests")]
     #[tokio::test]
     #[ignore]
+    async fn real_external_empty_database_preflights_and_initializes_schema() {
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_none()
+        {
+            eprintln!("IMAGEDB_POSTGRES_BIN not set; skipping real external empty init test");
+            return;
+        }
+
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::infrastructure::secrets::CredentialStore;
+        use crate::infrastructure::settings::SettingsStore;
+        use tempfile::TempDir;
+
+        let service_tmp = TempDir::new().unwrap();
+        let target_tmp = TempDir::new().unwrap();
+        let settings_tmp = TempDir::new().unwrap();
+
+        let service_manager = Arc::new(Mutex::new(PostgresManager::new(service_tmp.path())));
+        let settings = Arc::new(Mutex::new(SettingsStore::new(settings_tmp.path()).unwrap()));
+        let credentials =
+            Arc::new(CredentialStore::new_file_for_tests(settings_tmp.path()).unwrap());
+        let service = DatabaseService::new(service_manager, settings.clone(), credentials);
+
+        let mut target_manager = PostgresManager::new(target_tmp.path());
+        let target_probe = target_manager.initialize().await.expect("target init");
+        assert!(
+            target_probe.connection_ok,
+            "target init failed: {:?}",
+            target_probe.diagnostics
+        );
+
+        let target_config = ConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: target_manager.port(),
+            database: target_manager.database().to_string(),
+            username: target_manager.username().to_string(),
+            password: target_manager.password().map(ToOwned::to_owned),
+            tls_mode: TlsMode::Disable,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 10,
+            query_timeout_secs: 15,
+            profile_name: Some("real-empty-external-test".to_string()),
+        };
+
+        let preflight = service
+            .test_external_connection(&target_config)
+            .await
+            .expect("preflight empty external target");
+        assert!(preflight.connection_ok, "{:?}", preflight.diagnostics);
+        assert!(preflight.version_ok, "{:?}", preflight.diagnostics);
+        assert!(preflight.pgvector_available, "{:?}", preflight.diagnostics);
+        assert!(
+            preflight.can_create_extension,
+            "{:?}",
+            preflight.diagnostics
+        );
+        assert!(preflight.can_create_tables, "{:?}", preflight.diagnostics);
+        assert!(preflight.can_modify_schema, "{:?}", preflight.diagnostics);
+        assert!(preflight.read_write_ok, "{:?}", preflight.diagnostics);
+        assert!(preflight.encoding_ok, "{:?}", preflight.diagnostics);
+        assert!(preflight.timezone_ok, "{:?}", preflight.diagnostics);
+        assert!(preflight.not_read_only, "{:?}", preflight.diagnostics);
+        assert!(preflight.migration_state_ok, "{:?}", preflight.diagnostics);
+        assert!(preflight.schema_compatible, "{:?}", preflight.diagnostics);
+        assert_eq!(preflight.migration_version, None);
+
+        let state = service
+            .initialize_external(&target_config)
+            .await
+            .expect("initialize empty external database");
+        assert_eq!(state.mode, Some(DatabaseMode::External));
+        assert_eq!(state.status, DatabaseStatus::Connected);
+        assert!(state.pgvector_available);
+        assert_eq!(
+            state.migration_version.as_deref(),
+            Some(MigrationRunner::latest_version())
+        );
+
+        let (target_client, target_handle) =
+            target_manager.connect().await.expect("target reconnect");
+        let vector_installed = target_client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')",
+                &[],
+            )
+            .await
+            .expect("inspect vector extension")
+            .get::<_, bool>(0);
+        assert!(vector_installed);
+        let schema_version = MigrationRunner::current_version(&target_client)
+            .await
+            .expect("current version");
+        assert_eq!(
+            schema_version.as_deref(),
+            Some(MigrationRunner::latest_version())
+        );
+        let app_meta_exists = target_client
+            .query_one("SELECT to_regclass('public.app_meta') IS NOT NULL", &[])
+            .await
+            .expect("inspect app_meta")
+            .get::<_, bool>(0);
+        assert!(app_meta_exists);
+        target_handle.abort();
+
+        let stored = settings.lock().await;
+        assert_eq!(stored.get().database_mode.as_deref(), Some("external"));
+        assert_eq!(
+            stored.get().external_profile_name.as_deref(),
+            Some("real-empty-external-test")
+        );
+        assert!(
+            stored.get().external_host.is_some(),
+            "external settings should retain non-secret profile metadata"
+        );
+        drop(stored);
+
+        target_manager.shutdown().await.expect("target shutdown");
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    #[tokio::test]
+    #[ignore]
     async fn real_external_existing_database_upgrades_from_old_schema() {
         if std::env::var("IMAGEDB_POSTGRES_BIN")
             .ok()
