@@ -257,3 +257,33 @@
 
 - 该测试模拟的是挂载点路径消失/恢复，不是物理 SMB/NAS 断网。
 - 只读、超时和真实空间耗尽仍需要单独门禁证据。
+
+## 2026-07-04: Source-root disconnect recovery gate
+
+### 实现内容
+
+- 新增真实 PostgreSQL + 真实文件系统故障注入测试，覆盖源图集所在挂载点消失后的 Recovery 行为。
+- commit 在 `AfterDbWrite` 中断后，测试将 source root 重命名为 offline 路径，模拟源共享目录断开。
+- Recovery 在源文件不可见时必须暂停，保持 transaction 为 `staging`，父 import run 保持 `recovery_required`，并写入可诊断的 `last_error`。
+- source root 恢复后，同一 transaction 可由 Recovery 继续 staging、publish、DB commit 和 source archive，最终收敛到 `source_archived`。
+
+### 修改文件
+
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `reports/milestone-8-progress.md`
+
+### 执行命令与测试结果
+
+- `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml`：passed。
+- `IMAGEDB_POSTGRES_BIN=D:\MyProjects\Agent\ImageDB-MVP\.local\db-tools\postgresql-18.4\pgsql\bin cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib fail_injection_source_root_disconnect_pauses_then_recovers -- --ignored --test-threads=1`：1 passed。
+
+### 实际运行结果
+
+- 源目录不可见时 Recovery 返回 `final_state=staging`、`recovered=false`，消息包含 `source file unavailable`。
+- 数据库中 transaction 保持 `staging`，import run 保持 `recovery_required`，未产生完成状态。
+- 恢复 source root 后，Recovery 成功完成后续提交闭环。
+
+### 已知限制
+
+- 该测试模拟的是源挂载路径消失/恢复，不是物理 SMB/NAS 断网。
+- 只读、超时和真实空间耗尽仍需要单独门禁证据。
