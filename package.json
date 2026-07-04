@@ -12,7 +12,8 @@
     "rust:clippy": "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
     "rust:test": "cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml",
     "rust:test:real": "node scripts/run-real-rust-tests.mjs",
-    "check": "pnpm typecheck && pnpm test:unit && pnpm format:check && pnpm rust:clippy && pnpm rust:test"
+    "check": "pnpm typecheck && pnpm test:unit && pnpm format:check && pnpm rust:clippy && pnpm rust:test",
+    "release:gate": "node scripts/run-m9-release-gate.mjs"
   },
   "devDependencies": {
     "prettier": "^3.0.0"
