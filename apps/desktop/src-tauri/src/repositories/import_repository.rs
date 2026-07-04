@@ -309,6 +309,7 @@ pub struct SnapshotFileRecord {
 }
 
 /// Input struct for inserting a snapshot file.
+#[derive(Debug)]
 pub struct NewSnapshotFile {
     pub relative_path: String,
     pub file_type: String,
@@ -1111,12 +1112,43 @@ impl ImportRepository {
             .query_opt(
                 "SELECT id FROM import_runs
                  WHERE state = 'completed'
-                 ORDER BY completed_at DESC
+                 ORDER BY completed_at DESC NULLS LAST, started_at DESC
                  LIMIT 1",
                 &[],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to query latest run: {e}")))?;
+
+        Ok(row.map(|r| r.get("id")))
+    }
+
+    /// Find the most recent run that can be (re-)entered from the commit page:
+    /// `completed`, `ready_to_commit`, or `cancelled`. A `cancelled` run with
+    /// no transactions (P0: cancel-before-prewrite) must be re-committable
+    /// rather than stuck — `recovery_required` with transactions is excluded
+    /// because those runs route to the recovery page, not the commit page.
+    ///
+    /// Only runs that have a frozen plan are eligible, so an aborted scan
+    /// (still in `scanning`/`fingerprinting`/...) is never picked up here.
+    pub async fn get_latest_committable_run(client: &Client) -> Result<Option<Uuid>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT r.id FROM import_runs r
+                 WHERE r.state IN ('completed', 'ready_to_commit', 'cancelled')
+                   AND EXISTS (
+                       SELECT 1 FROM import_plans p
+                       WHERE p.import_run_id = r.id
+                         AND p.state IN ('frozen', 'consumed')
+                         AND p.plan_hash IS NOT NULL
+                   )
+                 ORDER BY r.completed_at DESC NULLS LAST, r.started_at DESC
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query latest committable run: {e}"))
+            })?;
 
         Ok(row.map(|r| r.get("id")))
     }
@@ -2053,17 +2085,12 @@ impl ImportRepository {
                     })?;
             }
 
-            client
-                .execute(
-                    "UPDATE import_albums SET source_snapshot_hash = $1 WHERE id = $2",
-                    &[&snapshot_hash, &import_album_id],
-                )
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!(
-                        "failed to update import_albums.source_snapshot_hash: {e}"
-                    ))
-                })?;
+            // NOTE: the snapshot hash is the single source of truth on
+            // source_album_snapshots.snapshot_hash. We deliberately do NOT
+            // mirror it onto import_albums.source_snapshot_hash anymore —
+            // migration 0009 dropped that column because the commit /
+            // recovery main chain never cross-checked it, so it was
+            // redundant-evidence rather than a real guard.
 
             Ok(())
         }
@@ -2127,19 +2154,5 @@ impl ImportRepository {
                 blake3: r.get("blake3"),
             })
             .collect())
-    }
-
-    pub async fn get_source_snapshot_hash_for_album(
-        client: &Client,
-        import_album_id: Uuid,
-    ) -> Result<Option<Vec<u8>>, AppError> {
-        let row = client
-            .query_opt(
-                "SELECT source_snapshot_hash FROM import_albums WHERE id = $1",
-                &[&import_album_id],
-            )
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to query album snapshot hash: {e}")))?;
-        Ok(row.and_then(|r| r.get("source_snapshot_hash")))
     }
 }

@@ -78,6 +78,8 @@ export const api = {
 
   getLatestCompletedImportRun: () => invoke<string | null>('get_latest_completed_import_run'),
 
+  getLatestCommittableImportRun: () => invoke<string | null>('get_latest_committable_import_run'),
+
   getImagePreview: (candidateId: string, imageSide: string) =>
     invoke<ImagePreview>('get_image_preview', { candidateId, imageSide }),
 

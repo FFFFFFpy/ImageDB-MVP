@@ -136,6 +136,30 @@ pub async fn get_latest_completed_import_run(
     result
 }
 
+/// Find the most recent run that can be (re-)entered from the commit page:
+/// `completed`, `ready_to_commit`, or `cancelled`. Used by the CommitPage so
+/// a run cancelled before any transaction was prewritten (P0 fix) is
+/// re-committable rather than stuck at `recovery_required` with no
+/// transaction to recover.
+#[tauri::command]
+pub async fn get_latest_committable_import_run(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result =
+        crate::repositories::import_repository::ImportRepository::get_latest_committable_run(
+            &client,
+        )
+        .await
+        .map(|opt| opt.map(|id| id.to_string()))
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
 #[derive(serde::Serialize)]
 pub struct ImagePreview {
     pub data_url: String,

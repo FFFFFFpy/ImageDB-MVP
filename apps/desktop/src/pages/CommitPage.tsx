@@ -57,9 +57,14 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   const [importRunId, setImportRunId] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Use the committable query (P0): picks up `completed`, `ready_to_commit`,
+  // and `cancelled` runs with a frozen plan, so a run cancelled before any
+  // transaction was prewritten can be re-committed from the same frozen plan
+  // instead of getting stuck at `recovery_required` with no transaction to
+  // recover.
   const latestRun = useQuery({
-    queryKey: ['latestCompletedImportRun'],
-    queryFn: api.getLatestCompletedImportRun,
+    queryKey: ['latestCommittableImportRun'],
+    queryFn: api.getLatestCommittableImportRun,
   });
 
   const planQuery = useQuery({

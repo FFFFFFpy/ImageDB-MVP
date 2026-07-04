@@ -63,6 +63,7 @@ pub fn run() {
             commands::get_review_progress,
             commands::generate_import_plan,
             commands::get_latest_completed_import_run,
+            commands::get_latest_committable_import_run,
             commands::get_image_preview,
             commands::start_import_commit,
             commands::cancel_import_commit,

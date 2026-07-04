@@ -429,7 +429,41 @@ async fn execute_commit_pipeline(
     // user-explicit state.
     let reconciled = reconcile_import_run_state(client, import_run_id).await?;
 
-    let final_state = match reconciled.state {
+    // P0 fix: when the commit was cancelled and the reconciler would leave
+    // the run at `recovery_required` but there are NO file_transactions for
+    // this run, `recovery_required` is a GUI deadlock — the recovery page
+    // shows "no recoverable transactions" and the commit page won't
+    // re-select the run (it only picks up `completed` runs). The correct
+    // state for "cancelled before any transaction was prewritten" is
+    // `cancelled` (a user-initiated terminal label), which lets the user
+    // re-enter the commit page for the same frozen plan.
+    //
+    // If at least one transaction exists (even mid-flight), `recovery_required`
+    // is correct: Recovery can drive it forward.
+    let final_state = if cancelled.load(Ordering::Relaxed)
+        && reconciled.state == ImportRunState::RecoveryRequired
+    {
+        let tx_count = ImportRepository::get_all_transactions_for_run(client, import_run_id)
+            .await?
+            .len();
+        if tx_count == 0 {
+            // No transaction to recover → user-explicit terminal label so the
+            // run can be re-committed from the frozen plan.
+            ImportRepository::update_import_run_state(
+                client,
+                import_run_id,
+                &ImportRunState::Cancelled,
+            )
+            .await?;
+            ImportRunState::Cancelled
+        } else {
+            reconciled.state
+        }
+    } else {
+        reconciled.state
+    };
+
+    let final_state = match final_state {
         ImportRunState::Completed => "completed",
         ImportRunState::RecoveryRequired => "recovery_required",
         ImportRunState::Cancelled => "cancelled",
@@ -775,7 +809,24 @@ async fn commit_single_album(
         #[cfg(feature = "fail-injection")]
         maybe_fault(CommitFaultPoint::DuringCopy, "during copy")?;
 
-        let actual_blake3 = stream_copy_with_hash(src, &part_path).await?;
+        // P1: pass the cancel token into the stream copy so a mid-copy
+        // cancel stops between read chunks and leaves the operation in
+        // `copying` (recoverable) rather than running the whole file to
+        // completion.
+        let actual_blake3 = match stream_copy_with_hash(src, &part_path, Some(cancelled)).await {
+            Ok(hash) => hash,
+            Err(e) => {
+                // Cancel mid-copy: leave the op in `copying` so Recovery
+                // can resume. Do NOT mark the transaction `failed`.
+                let msg = e.to_string();
+                if msg.contains("cancelled during file copy") {
+                    return Err(e);
+                }
+                // Any other error propagates (caller's match arm handles
+                // it as a recovery_required album result).
+                return Err(e);
+            }
+        };
         let expected = &op_ids[i].2;
         if actual_blake3 != *expected {
             let _ = tokio::fs::remove_file(&part_path).await;
@@ -1262,7 +1313,19 @@ pub(crate) async fn verify_source_snapshot_or_conflict(
 }
 
 /// Stream-copy a file while incrementally computing BLAKE3. Returns the hash.
-pub(crate) async fn stream_copy_with_hash(src: &Path, dst: &Path) -> Result<Vec<u8>, AppError> {
+///
+/// P1: accepts a cancel token and checks it **between read chunks** so a
+/// large file copy responds promptly to cancellation instead of running to
+/// completion. On cancel, the `.part` destination is removed (caller is
+/// responsible for this in the commit path; here we only stop copying and
+/// return `Err`), and the operation is left in `copying`/`planned` state
+/// so Recovery can resume it. The caller must propagate the cancel error
+/// and NOT mark the transaction `failed`.
+pub(crate) async fn stream_copy_with_hash(
+    src: &Path,
+    dst: &Path,
+    cancelled: Option<&Arc<AtomicBool>>,
+) -> Result<Vec<u8>, AppError> {
     let mut src_file = tokio::fs::File::open(src)
         .await
         .map_err(|e| AppError::IoError(format!("cannot open source {}: {e}", src.display())))?;
@@ -1272,6 +1335,19 @@ pub(crate) async fn stream_copy_with_hash(src: &Path, dst: &Path) -> Result<Vec<
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 65536];
     loop {
+        // Check cancellation before each read chunk so a mid-copy cancel
+        // stops promptly rather than draining the whole source file.
+        if let Some(flag) = cancelled {
+            if flag.load(Ordering::Relaxed) {
+                // Best-effort cleanup of the partial destination so the next
+                // attempt starts clean. A failure to remove is not fatal —
+                // the caller also removes `.part` before re-copying.
+                let _ = tokio::fs::remove_file(dst).await;
+                return Err(AppError::Internal(
+                    "commit cancelled during file copy".to_string(),
+                ));
+            }
+        }
         let n = src_file
             .read(&mut buf)
             .await
