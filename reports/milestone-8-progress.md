@@ -415,3 +415,33 @@
 
 - 该测试使用 fail-injection 模拟超时，不是真实 NAS/SMB 超时。
 - 真实挂载共享存储门禁仍需要单独证据。
+
+## 2026-07-04: M8 DoD reconciliation
+
+### 实现内容
+
+- 根据已提交测试证据更新 `checklists/M8_DOD.md`：
+  - 断连恢复已有 library root 消失/恢复、source root 消失/恢复真实 PostgreSQL + 真实文件系统测试；
+  - 空间不足、只读/不可写、超时已有 fail-injection gate，验证 Recovery 暂停、保持 `recovery_required`，清除故障后继续收敛；
+  - 未知目标目录已有真实 PostgreSQL + 真实文件系统测试，验证不覆盖、不合并、不创建图库记录；
+  - 保守发布 marker 前中断已有真实 PostgreSQL + 真实文件系统测试，验证 Recovery 补写 marker 并收敛。
+- 保留 `真实挂载共享存储故障测试通过` 未勾选。
+
+### 本机环境检查
+
+- `Get-SmbMapping` 未返回已映射共享存储。
+- `Get-PSDrive -PSProvider FileSystem` 仅显示本地 `C:` 与 `D:`。
+
+### 执行命令与测试结果
+
+- `Get-SmbMapping | Select-Object LocalPath,RemotePath,Status`
+- `Get-PSDrive -PSProvider FileSystem | Select-Object Name,Root,DisplayRoot,Provider`
+
+### 实际运行结果
+
+- 当前工作机没有可直接使用的已挂载 SMB/NAS 路径，因此不能把真实挂载共享存储故障门禁标为通过。
+- M8 仍停留在当前阶段，不进入 M9。
+
+### 已知限制
+
+- 真实 SMB/NAS 挂载路径测试仍需一个实际挂载共享目录。
