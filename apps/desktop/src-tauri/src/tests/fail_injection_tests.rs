@@ -337,6 +337,88 @@ async fn fail_injection_after_db_write() {
 
 #[tokio::test]
 #[ignore]
+async fn fail_injection_library_root_disconnect_pauses_then_recovers() {
+    let (_tmp, pg, run_id, lib_root, _album) = setup_full_env().await;
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::AfterDbWrite,
+    )
+    .await;
+
+    let tx_id: Uuid = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let id: Uuid = client
+            .query_one(
+                "SELECT id FROM file_transactions ORDER BY started_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        drop(client);
+        handle.abort();
+        id
+    };
+
+    let disconnected_root = lib_root.with_extension("offline");
+    std::fs::rename(&lib_root, &disconnected_root).unwrap();
+
+    let paused = recovery_service::recover_transaction(pg.clone(), tx_id)
+        .await
+        .expect("recovery should pause cleanly while the library root is disconnected");
+    assert_eq!(paused.final_state, "staging");
+    assert!(!paused.recovered);
+    assert!(
+        paused.message.contains("recovery paused"),
+        "expected mounted-root pause message, got {}",
+        paused.message
+    );
+
+    {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let row = client
+            .query_one(
+                "SELECT ft.state, ft.last_error, ir.state
+                 FROM file_transactions ft
+                 JOIN import_runs ir ON ir.id = ft.import_run_id
+                 WHERE ft.id = $1",
+                &[&tx_id],
+            )
+            .await
+            .unwrap();
+        let tx_state: String = row.get(0);
+        let last_error: Option<String> = row.get(1);
+        let run_state: String = row.get(2);
+        assert_eq!(tx_state, "staging");
+        assert_eq!(run_state, "recovery_required");
+        assert!(
+            last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("recovery paused"),
+            "last_error should explain the disconnected mounted root: {last_error:?}"
+        );
+        drop(client);
+        handle.abort();
+    }
+
+    std::fs::rename(&disconnected_root, &lib_root).unwrap();
+    drive_recovery(pg.clone(), run_id).await;
+    assert_recovered(pg.clone(), &lib_root).await;
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
 async fn fail_injection_during_copy() {
     let (_tmp, pg, run_id, lib_root, _album) = setup_full_env().await;
     run_commit_with_fault(pg.clone(), &lib_root, run_id, CommitFaultPoint::DuringCopy).await;
