@@ -1443,6 +1443,64 @@ mod tests {
         assert_ne!(stored.get().database_mode.as_deref(), Some("external"));
     }
 
+    #[tokio::test]
+    async fn cancellable_migration_command_kills_running_child_and_marks_progress() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(ExternalMigrationProgress::running("import")));
+        let cancelled_for_task = cancelled.clone();
+        let progress_for_task = progress.clone();
+
+        let task = tokio::spawn(async move {
+            let mut diagnostics = Vec::new();
+            let command = long_running_command();
+            let result = DatabaseService::run_command_checked_with_cancel(
+                command,
+                "test long-running import",
+                &mut diagnostics,
+                Some(cancelled_for_task),
+                Some(progress_for_task),
+            )
+            .await;
+            (result, diagnostics)
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancelled.store(true, Ordering::Relaxed);
+
+        let (result, diagnostics) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("cancelled child command should finish promptly")
+            .expect("task should not panic");
+
+        let err = result.expect_err("cancelled command should fail");
+        assert!(err
+            .to_string()
+            .contains("external migration cancelled during test long-running import"));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.contains("external migration cancelled during test long-running import")));
+
+        let progress = progress.lock().await;
+        assert_eq!(progress.state, "cancelled");
+        assert_eq!(progress.current_stage, "test long-running import");
+        assert!(progress.cancel_requested);
+        assert!(!progress.switched);
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> Command {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+        command
+    }
+
+    #[cfg(not(windows))]
+    fn long_running_command() -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        command
+    }
+
     #[cfg(feature = "real-db-tests")]
     #[tokio::test]
     #[ignore]
