@@ -57,6 +57,13 @@ pub async fn update_settings(
     state: State<'_, AppState>,
     settings: SettingsDto,
 ) -> Result<SettingsDto, String> {
+    update_settings_for_state(&state, settings).await
+}
+
+pub(crate) async fn update_settings_for_state(
+    state: &AppState,
+    settings: SettingsDto,
+) -> Result<SettingsDto, String> {
     let mut store = state.settings.lock().await;
     let app_settings = AppSettings {
         database_mode: settings.database_mode,

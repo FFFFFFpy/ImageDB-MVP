@@ -17,6 +17,19 @@ pub async fn start_scan<R: Runtime>(
     source_root: String,
     app_handle: tauri::AppHandle<R>,
 ) -> Result<String, String> {
+    let result = start_scan_for_state(&state, source_root).await?;
+    let event_tracker = {
+        let scan_state = state.scan_state.lock().await;
+        scan_state.progress_tracker.clone()
+    };
+    spawn_scan_progress_events(event_tracker, app_handle);
+    Ok(result)
+}
+
+pub(crate) async fn start_scan_for_state(
+    state: &AppState,
+    source_root: String,
+) -> Result<String, String> {
     let mut scan_state = state.scan_state.lock().await;
 
     if scan_state
@@ -49,7 +62,6 @@ pub async fn start_scan<R: Runtime>(
     }));
 
     let cancelled_clone = cancelled.clone();
-    let app_handle_clone = app_handle.clone();
     let source_root_clone = source_root.clone();
     let tracker_clone = progress_tracker.clone();
 
@@ -74,8 +86,16 @@ pub async fn start_scan<R: Runtime>(
         }
     });
 
-    let event_tracker = progress_tracker.clone();
-    let event_handle = app_handle_clone;
+    scan_state.active = Some(crate::state::ScanHandle { cancelled, task });
+    scan_state.progress_tracker = progress_tracker;
+
+    Ok("scan started".to_string())
+}
+
+fn spawn_scan_progress_events<R: Runtime>(
+    event_tracker: std::sync::Arc<tokio::sync::Mutex<ScanProgress>>,
+    app_handle: tauri::AppHandle<R>,
+) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -83,7 +103,7 @@ pub async fn start_scan<R: Runtime>(
                 let progress = event_tracker.lock().await;
                 progress.clone()
             };
-            let _ = event_handle.emit(scan_service::SCAN_PROGRESS_EVENT, snapshot.clone());
+            let _ = app_handle.emit(scan_service::SCAN_PROGRESS_EVENT, snapshot.clone());
             if matches!(
                 snapshot.state.as_str(),
                 "ready_to_commit" | "review_required" | "completed" | "cancelled" | "failed"
@@ -92,11 +112,6 @@ pub async fn start_scan<R: Runtime>(
             }
         }
     });
-
-    scan_state.active = Some(crate::state::ScanHandle { cancelled, task });
-    scan_state.progress_tracker = progress_tracker;
-
-    Ok("scan started".to_string())
 }
 
 #[tauri::command]
@@ -138,6 +153,10 @@ async fn resolve_scan_handle(handle: crate::state::ScanHandle) -> ScanProgress {
 
 #[tauri::command]
 pub async fn get_scan_progress(state: State<'_, AppState>) -> Result<ScanProgress, String> {
+    get_scan_progress_for_state(&state).await
+}
+
+pub(crate) async fn get_scan_progress_for_state(state: &AppState) -> Result<ScanProgress, String> {
     let mut scan_state = state.scan_state.lock().await;
     if scan_state
         .active

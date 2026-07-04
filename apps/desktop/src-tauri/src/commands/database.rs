@@ -56,6 +56,12 @@ pub async fn get_database_status(state: State<'_, AppState>) -> Result<DatabaseS
 pub async fn initialize_managed_database(
     state: State<'_, AppState>,
 ) -> Result<DatabaseState, String> {
+    initialize_managed_database_for_state(&state).await
+}
+
+pub(crate) async fn initialize_managed_database_for_state(
+    state: &AppState,
+) -> Result<DatabaseState, String> {
     let service = &state.database_service;
     service
         .initialize_managed()

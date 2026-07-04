@@ -1,7 +1,7 @@
 # M9 Definition of Done
 
 - [x] Fixed release acceptance dataset with expected results.
-- [ ] Public GUI/IPC main chain verified from first run through completed import.
+- [x] Public GUI/IPC main chain verified from first run through completed import.
 - [ ] Cancellation and crash recovery matrix verified through public paths.
 - [x] Diagnostics export implemented and verified without secrets or image content.
 - [x] Installation, upgrade, reinstall, uninstall, and data retention gates verified.

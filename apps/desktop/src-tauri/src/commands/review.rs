@@ -90,6 +90,13 @@ pub async fn get_review_progress(
     state: State<'_, AppState>,
     import_run_id: String,
 ) -> Result<ReviewProgress, String> {
+    get_review_progress_for_state(&state, import_run_id).await
+}
+
+pub(crate) async fn get_review_progress_for_state(
+    state: &AppState,
+    import_run_id: String,
+) -> Result<ReviewProgress, String> {
     let run_id = parse_uuid(&import_run_id)?;
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
@@ -107,6 +114,13 @@ pub async fn generate_import_plan(
     state: State<'_, AppState>,
     import_run_id: String,
 ) -> Result<ImportPlan, String> {
+    generate_import_plan_for_state(&state, import_run_id).await
+}
+
+pub(crate) async fn generate_import_plan_for_state(
+    state: &AppState,
+    import_run_id: String,
+) -> Result<ImportPlan, String> {
     let run_id = parse_uuid(&import_run_id)?;
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
@@ -122,6 +136,12 @@ pub async fn generate_import_plan(
 #[tauri::command]
 pub async fn get_latest_completed_import_run(
     state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    get_latest_completed_import_run_for_state(&state).await
+}
+
+pub(crate) async fn get_latest_completed_import_run_for_state(
+    state: &AppState,
 ) -> Result<Option<String>, String> {
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
@@ -144,6 +164,12 @@ pub async fn get_latest_completed_import_run(
 #[tauri::command]
 pub async fn get_latest_committable_import_run(
     state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    get_latest_committable_import_run_for_state(&state).await
+}
+
+pub(crate) async fn get_latest_committable_import_run_for_state(
+    state: &AppState,
 ) -> Result<Option<String>, String> {
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;

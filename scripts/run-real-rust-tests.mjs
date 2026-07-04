@@ -23,8 +23,8 @@ const suites = [
   { name: 'file transaction protocol', filter: 'real_protocol_' },
   { name: 'formal commit pipeline', filter: 'real_commit_full_pipeline' },
   {
-    name: 'M9 main chain plan freeze and commit',
-    filter: 'm9_main_chain_exact_duplicate_import_freezes_plan_and_commits',
+    name: 'M9 public command main chain',
+    filter: 'm9_public_command_main_chain_first_run_to_completed_import',
   },
   {
     name: 'M9 diagnostics export',

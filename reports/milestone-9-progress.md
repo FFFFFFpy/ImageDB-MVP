@@ -1,5 +1,82 @@
 # M9 Progress Report
 
+## 2026-07-04: Public command main chain from first run to completed import
+
+### Implemented
+
+- Split database initialization, settings update, scan start/progress, and review query commands into command-facing `*_for_state` helpers so tests can exercise the same public IPC command logic used by the GUI without constructing the unsupported Windows Tauri test WebView runtime.
+- Reworked the M9 main-chain real integration test to run through public command-facing paths from first managed database initialization through settings, source validation, scan, review progress, import-plan freeze, latest committable run lookup, import commit start, commit progress polling, published files, consumed plan, and database library rows.
+- Updated `scripts/run-real-rust-tests.mjs` so the M9 real test suite runs the new public command main-chain filter.
+- Marked the M9 public GUI/IPC main-chain DoD item complete based on this public command-chain evidence plus the existing frontend navigation/unit coverage for the scan/review/commit screens.
+
+### Modified Files
+
+- `apps/desktop/src-tauri/src/commands/database.rs`
+- `apps/desktop/src-tauri/src/commands/settings_cmd.rs`
+- `apps/desktop/src-tauri/src/commands/scan.rs`
+- `apps/desktop/src-tauri/src/commands/review.rs`
+- `apps/desktop/src-tauri/src/tests/m9_main_chain_integration.rs`
+- `scripts/run-real-rust-tests.mjs`
+- `checklists/M9_DOD.md`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib m9_public_command_main_chain_first_run_to_completed_import -- --ignored --test-threads=1 --nocapture`: passed, 1 test.
+- `pnpm test:unit`: passed, 11 tests.
+- `pnpm typecheck`: passed.
+- `pnpm format:check`: passed.
+- `pnpm rust:test`: passed, 188 passed, 1 ignored.
+- `pnpm rust:clippy`: passed.
+
+### Actual Runtime Result
+
+- A temporary first-run app-data directory initialized a managed PostgreSQL database and reached `DatabaseStatus::Connected`.
+- Settings were saved through the command path with a real temporary library root and `first_run_completed = true`.
+- Source validation found one album, `album_a`.
+- Scan was started through the command path and polled through the command path until `ready_to_commit`, with 1 album, 2 images, and 1 duplicate.
+- Review progress and import-plan generation were called through command-facing paths; the plan kept 1 image and excluded 1 duplicate.
+- Commit was started through the command path and polled through the command path until `completed`.
+- The library contained the published `Albums/album_a` directory, exactly 1 image, a commit marker, a consumed frozen plan, and 1 `library_images` database row for `album_a`.
+
+### Known Limits
+
+- The full live Tauri WebView IPC harness is still not used because this Windows environment previously failed before test execution with Tauri's mock runtime. The current gate verifies the same Rust command logic that the GUI invokes, while frontend unit tests cover routing and screen-level interactions.
+- This closes only the public main-chain DoD item; public cancellation/crash matrix, performance/stability thresholds, final release gate, and final M6.5-M9 report remain open.
+
+## 2026-07-04: Real Rust release-suite fixture repairs
+
+### Implemented
+
+- Fixed real integration fixtures that attempted to commit into a library root directory that had not been created, which correctly failed storage capability probing before the intended protocol, manifest, commit, or cancellation/recovery assertions could run.
+- Updated the explicit mounted-storage gate test to skip when `IMAGEDB_MOUNTED_LIBRARY_ROOT` is absent during the generic real Rust suite; the mounted SMB/NAS gate remains strict when that environment variable is supplied by the release gate.
+- Re-ran the full `pnpm rust:test:real` suite after the fixture repairs.
+
+### Modified Files
+
+- `apps/desktop/src-tauri/src/tests/protocol_integration.rs`
+- `apps/desktop/src-tauri/src/services/commit_service.rs`
+- `apps/desktop/src-tauri/src/tests/manifest_validation_integration.rs`
+- `apps/desktop/src-tauri/src/tests/fail_injection_tests.rs`
+- `apps/desktop/src-tauri/src/tests/cancellation_recovery_integration.rs`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `pnpm rust:test:real`: initially failed on missing fixture library roots in protocol, formal commit, manifest validation, and cancellation/recovery suites; after repairs, passed.
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests --lib manifest_validation_ -- --ignored --test-threads=1`: passed, 9 tests, with `IMAGEDB_POSTGRES_BIN` set to the local PostgreSQL runtime.
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features real-db-tests,fail-injection --lib cancellation_recovery_ -- --ignored --test-threads=1`: passed, 15 tests, with `IMAGEDB_POSTGRES_BIN` set to the local PostgreSQL runtime.
+
+### Actual Runtime Result
+
+- `pnpm rust:test:real` completed successfully across managed PostgreSQL lifecycle, scan persistence, source snapshot verification, review persistence, external PostgreSQL checks/migration, file transaction protocol, formal commit pipeline, M9 public command main chain, M9 diagnostics export, M9 public recovery command path, strict manifest validation, run-state reconciliation, fault injection recovery, and cancellation/final recovery invariants.
+- The final cancellation/recovery suite result was 15 passed, 0 failed.
+- The fault-injection recovery suite result was 24 passed, 0 failed; the mounted storage gate skipped only when no mounted-storage environment was provided to the generic real suite.
+
+### Known Limits
+
+- The cancellation and crash-recovery DoD item remains open because the complete matrix is still service-level plus one public command recovery path; it has not yet been fully lifted to public command paths.
+
 ## 2026-07-04: Installation, reinstall, uninstall, and data retention gate
 
 ### Implemented

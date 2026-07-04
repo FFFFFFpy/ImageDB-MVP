@@ -1,17 +1,14 @@
-use crate::domain::import_state::{CommitProgress, ImportRunState};
-use crate::infrastructure::settings::AppSettings;
+use crate::domain::import_state::{CommitProgress, ImportRunState, ScanProgress};
+use crate::domain::DatabaseStatus;
 use crate::repositories::import_repository::ImportRepository;
-use crate::services::{commit_service, review_service, scan_service};
 use crate::state::AppState;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 
 #[tokio::test]
 #[ignore]
-async fn m9_main_chain_exact_duplicate_import_freezes_plan_and_commits() {
+async fn m9_public_command_main_chain_first_run_to_completed_import() {
     if !ensure_postgres_bin() {
         eprintln!("IMAGEDB_POSTGRES_BIN not set and no bundled test PostgreSQL found; skipping");
         return;
@@ -34,42 +31,43 @@ async fn m9_main_chain_exact_duplicate_import_freezes_plan_and_commits() {
     .unwrap();
 
     let app_state = AppState::new(&app_data, fixture_dir).unwrap();
-    app_state
-        .database_service
-        .initialize_managed()
+    let database = crate::commands::initialize_managed_database_for_state(&app_state)
         .await
         .unwrap();
-    {
-        let mut settings = app_state.settings.lock().await;
-        settings
-            .update(AppSettings {
-                database_mode: Some("managed".to_string()),
-                library_root: Some(library_root.display().to_string()),
-                external_host: None,
-                external_port: None,
-                external_database: None,
-                external_username: None,
-                external_tls_mode: None,
-                external_ca_cert_path: None,
-                external_client_cert_path: None,
-                external_client_key_path: None,
-                external_connect_timeout_secs: None,
-                external_query_timeout_secs: None,
-                external_profile_name: None,
-                first_run_completed: true,
-            })
-            .unwrap();
-    }
+    assert_eq!(database.status, DatabaseStatus::Connected);
 
-    let scan = scan_service::run_scan(
-        app_state.postgres_manager.clone(),
-        app_state.settings.clone(),
-        source_root.display().to_string(),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(Mutex::new(crate::domain::import_state::ScanProgress::idle())),
+    crate::commands::update_settings_for_state(
+        &app_state,
+        crate::commands::SettingsDto {
+            database_mode: Some("managed".to_string()),
+            library_root: Some(library_root.display().to_string()),
+            external_host: None,
+            external_port: None,
+            external_database: None,
+            external_username: None,
+            external_tls_mode: None,
+            external_ca_cert_path: None,
+            external_client_cert_path: None,
+            external_client_key_path: None,
+            external_connect_timeout_secs: None,
+            external_query_timeout_secs: None,
+            external_profile_name: None,
+            first_run_completed: true,
+        },
     )
     .await
     .unwrap();
+
+    let source_info = crate::commands::validate_source_directory(source_root.display().to_string())
+        .await
+        .unwrap();
+    assert_eq!(source_info.album_count, 1);
+    assert_eq!(source_info.albums, vec!["album_a".to_string()]);
+
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan = wait_for_scan_terminal(&app_state).await;
     assert_eq!(
         scan.state,
         ImportRunState::ReadyToCommit.to_string(),
@@ -80,44 +78,44 @@ async fn m9_main_chain_exact_duplicate_import_freezes_plan_and_commits() {
     assert_eq!(scan.duplicate_count, 1);
     let import_run_id = uuid::Uuid::parse_str(scan.import_run_id.as_deref().unwrap()).unwrap();
 
-    let (client, handle) = {
-        let mgr = app_state.postgres_manager.lock().await;
-        mgr.connect().await.unwrap()
-    };
-
-    let review_progress = review_service::get_review_progress(&client, import_run_id)
-        .await
-        .unwrap();
+    let review_progress =
+        crate::commands::get_review_progress_for_state(&app_state, import_run_id.to_string())
+            .await
+            .unwrap();
     assert!(review_progress.all_decided);
 
-    let plan = review_service::generate_import_plan(&client, import_run_id)
-        .await
-        .unwrap();
+    let plan =
+        crate::commands::generate_import_plan_for_state(&app_state, import_run_id.to_string())
+            .await
+            .unwrap();
     assert_eq!(plan.total_albums, 1);
     assert_eq!(plan.total_images, 2);
     assert_eq!(plan.excluded_count, 1);
     assert_eq!(plan.kept_images.len(), 1);
 
+    let latest_committable =
+        crate::commands::get_latest_committable_import_run_for_state(&app_state)
+            .await
+            .unwrap();
+    assert_eq!(latest_committable, Some(import_run_id.to_string()));
+
+    let (client, handle) = {
+        let mgr = app_state.postgres_manager.lock().await;
+        mgr.connect().await.unwrap()
+    };
     let frozen = ImportRepository::load_frozen_plan(&client, import_run_id)
         .await
         .unwrap()
         .expect("generate_import_plan must freeze the command-visible plan");
     assert_eq!(frozen.albums.len(), 1);
     assert_eq!(frozen.albums[0].1.len(), 1);
-
     drop(client);
     handle.abort();
 
-    let progress_tracker = Arc::new(Mutex::new(CommitProgress::idle(&import_run_id.to_string())));
-    let commit = commit_service::run_import_commit(
-        app_state.postgres_manager.clone(),
-        library_root.display().to_string(),
-        import_run_id,
-        Arc::new(AtomicBool::new(false)),
-        progress_tracker,
-    )
-    .await
-    .unwrap();
+    crate::commands::start_import_commit_for_state(&app_state, import_run_id.to_string())
+        .await
+        .unwrap();
+    let commit = wait_for_commit_terminal(&app_state).await;
     assert_eq!(commit.state, "completed");
     assert_eq!(commit.albums_total, 1);
     assert_eq!(commit.images_committed, 1);
@@ -157,6 +155,46 @@ async fn m9_main_chain_exact_duplicate_import_freezes_plan_and_commits() {
 
     let mut mgr = app_state.postgres_manager.lock().await;
     mgr.shutdown().await.unwrap();
+}
+
+async fn wait_for_scan_terminal(app_state: &AppState) -> ScanProgress {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let progress = crate::commands::get_scan_progress_for_state(app_state)
+            .await
+            .unwrap();
+        if matches!(
+            progress.state.as_str(),
+            "ready_to_commit" | "review_required" | "completed" | "cancelled" | "failed"
+        ) {
+            return progress;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scan did not reach a terminal state; last progress: {progress:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_commit_terminal(app_state: &AppState) -> CommitProgress {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let progress = crate::commands::get_commit_progress_for_state(app_state)
+            .await
+            .unwrap();
+        if matches!(
+            progress.state.as_str(),
+            "completed" | "failed" | "recovery_required" | "cancelled"
+        ) {
+            return progress;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "commit did not reach a terminal state; last progress: {progress:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn write_test_png(path: &Path) {

@@ -361,6 +361,7 @@ async fn real_protocol_tampered_plan_hash_rejected() {
     let library_root = tmp.path().join("library");
     let album_path = source_root.join("album_a");
     std::fs::create_dir_all(&album_path).unwrap();
+    std::fs::create_dir_all(&library_root).unwrap();
     std::fs::write(album_path.join("photo1.png"), b"photo one data").unwrap();
     let b3 = blake3::hash(b"photo one data").as_bytes().to_vec();
 
@@ -705,6 +706,7 @@ async fn real_protocol_manifest_path_is_published() {
     let library_root = tmp.path().join("library");
     let album_path = source_root.join("album_a");
     std::fs::create_dir_all(&album_path).unwrap();
+    std::fs::create_dir_all(&library_root).unwrap();
     std::fs::write(album_path.join("p.png"), b"payload").unwrap();
     let b3 = blake3::hash(b"payload").as_bytes().to_vec();
 

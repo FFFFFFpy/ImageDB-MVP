@@ -3378,6 +3378,7 @@ mod tests {
         let library_root = tmp.path().join("library");
         let album_path = source_root.join("album_a");
         std::fs::create_dir_all(&album_path).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
         std::fs::write(album_path.join("photo1.png"), b"photo one data").unwrap();
         std::fs::write(album_path.join("photo2.png"), b"photo two data").unwrap();
 

@@ -493,9 +493,12 @@ async fn fail_injection_library_root_disconnect_pauses_then_recovers() {
 #[tokio::test]
 #[ignore]
 async fn mounted_storage_gate_library_root_disconnect_pauses_then_recovers() {
-    let mounted_base = std::env::var_os("IMAGEDB_MOUNTED_LIBRARY_ROOT")
-        .map(std::path::PathBuf::from)
-        .expect("IMAGEDB_MOUNTED_LIBRARY_ROOT must point to an already-mounted SMB/NAS/shared storage directory");
+    let Some(mounted_base) =
+        std::env::var_os("IMAGEDB_MOUNTED_LIBRARY_ROOT").map(std::path::PathBuf::from)
+    else {
+        eprintln!("IMAGEDB_MOUNTED_LIBRARY_ROOT not set; skipping explicit mounted storage gate");
+        return;
+    };
     assert!(
         mounted_base.is_dir(),
         "IMAGEDB_MOUNTED_LIBRARY_ROOT must be an existing directory, got {}",
