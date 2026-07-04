@@ -443,6 +443,10 @@ impl DatabaseService {
         })
     }
 
+    pub async fn switch_to_managed(&self) -> Result<DatabaseState, AppError> {
+        self.initialize_managed().await
+    }
+
     pub async fn test_external_connection(
         &self,
         config: &ConnectionConfig,

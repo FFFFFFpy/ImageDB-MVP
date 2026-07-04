@@ -62,6 +62,17 @@ pub async fn initialize_managed_database(
 }
 
 #[tauri::command]
+pub async fn switch_to_managed_database(
+    state: State<'_, AppState>,
+) -> Result<DatabaseState, String> {
+    let service = &state.database_service;
+    service
+        .switch_to_managed()
+        .await
+        .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
 pub async fn test_external_connection(
     state: State<'_, AppState>,
     config: ExternalConnectionDto,

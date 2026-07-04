@@ -30,6 +30,8 @@ export const api = {
 
   initializeManagedDatabase: () => invoke<DatabaseState>('initialize_managed_database'),
 
+  switchToManagedDatabase: () => invoke<DatabaseState>('switch_to_managed_database'),
+
   testExternalConnection: (config: ExternalConnectionConfig) =>
     invoke<ExternalCheckResult>('test_external_connection', { config }),
 

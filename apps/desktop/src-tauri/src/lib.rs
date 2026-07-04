@@ -47,6 +47,7 @@ pub fn run() {
             commands::run_all_probes,
             commands::get_database_status,
             commands::initialize_managed_database,
+            commands::switch_to_managed_database,
             commands::test_external_connection,
             commands::initialize_external_database,
             commands::migrate_managed_to_external_database,

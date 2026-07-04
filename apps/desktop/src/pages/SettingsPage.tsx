@@ -69,6 +69,11 @@ export function SettingsPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
   });
 
+  const switchManaged = useMutation({
+    mutationFn: api.switchToManagedDatabase,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+  });
+
   return (
     <div className="settings-page">
       <h1>设置</h1>
@@ -134,6 +139,12 @@ export function SettingsPage() {
             <button onClick={() => shutdown.mutate()} disabled={shutdown.isPending}>
               {shutdown.isPending ? '停止中…' : '停止数据库'}
             </button>
+            <button onClick={() => switchManaged.mutate()} disabled={switchManaged.isPending}>
+              {switchManaged.isPending ? '切换中…' : '切回托管库'}
+            </button>
+            {switchManaged.isError && (
+              <pre className="status-err">{String(switchManaged.error)}</pre>
+            )}
           </div>
         )}
       </section>
