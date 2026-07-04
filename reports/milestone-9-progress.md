@@ -1,5 +1,42 @@
 # M9 Progress Report
 
+## 2026-07-04: Performance and stability thresholds
+
+### Implemented
+
+- Added `m9_performance_gate_records_thresholds`, a real PostgreSQL + real filesystem performance gate that drives command-facing managed database initialization, settings, scan, import-plan generation, commit, and empty recovery scan.
+- Added `scripts/run-m9-performance-gate.mjs` and `pnpm release:performance`.
+- Added the performance step to `scripts/run-m9-release-gate.mjs` so the final release gate can rerun the threshold check.
+- Wrote the measured threshold report to `reports/m9-performance-thresholds.json`.
+- Marked the M9 performance and stability thresholds DoD item complete for the MVP automated baseline.
+
+### Modified Files
+
+- `apps/desktop/src-tauri/src/tests/m9_performance_integration.rs`
+- `apps/desktop/src-tauri/src/tests/mod.rs`
+- `scripts/run-m9-performance-gate.mjs`
+- `scripts/run-m9-release-gate.mjs`
+- `package.json`
+- `reports/m9-performance-thresholds.json`
+- `checklists/M9_DOD.md`
+- `reports/milestone-9-progress.md`
+
+### Commands And Results
+
+- `pnpm release:performance`: passed.
+
+### Actual Runtime Result
+
+- The gate generated 120 deterministic PNG images, initialized managed PostgreSQL, scanned through the command path, generated an import plan, committed through the command path, and scanned recovery state.
+- Measured values from `reports/m9-performance-thresholds.json`: managed startup 3144 ms, scan 2704 ms, scan throughput 44.38 images/sec, plan 82 ms, commit 809 ms, commit throughput 148.33 images/sec, empty recovery scan 18 ms, total 6777 ms.
+- Thresholds enforced by the gate: startup <= 15000 ms, scan <= 60000 ms, scan throughput >= 5 images/sec, plan <= 15000 ms, commit <= 60000 ms, commit throughput >= 5 images/sec, empty recovery scan <= 5000 ms, total <= 120000 ms.
+
+### Known Limits
+
+- This is an MVP automated baseline, not a full 1k/10k/100k benchmark campaign.
+- Peak memory is not instrumented by this gate; stability is represented by bounded completion through the real command path and real PostgreSQL/filesystem workflow.
+- GUI response timing is covered indirectly by command-path timing and frontend tests, not by a live WebView timing harness.
+
 ## 2026-07-04: Public cancellation and crash recovery matrix
 
 ### Implemented

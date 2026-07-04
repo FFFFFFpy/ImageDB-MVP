@@ -1,0 +1,43 @@
+{
+  "gate": "M9 performance and stability thresholds",
+  "generated_at": "2026-07-04T15:52:43.821Z",
+  "command": "pnpm release:performance",
+  "environment": {
+    "platform": "win32",
+    "node": "v24.16.0",
+    "image_count": 120,
+    "postgres_bin": "configured"
+  },
+  "thresholds": {
+    "image_count_min": 120,
+    "managed_startup_ms_max": 15000,
+    "scan_ms_max": 60000,
+    "scan_images_per_sec_min": 5,
+    "plan_ms_max": 15000,
+    "commit_ms_max": 60000,
+    "commit_images_per_sec_min": 5,
+    "recovery_scan_empty_ms_max": 5000,
+    "total_ms_max": 120000
+  },
+  "metrics": {
+    "commit_images_per_sec": 148.3312731767614,
+    "commit_mib_per_sec": 0.9941789511549752,
+    "commit_ms": 809,
+    "image_count": 120,
+    "library_images": 120,
+    "managed_startup_ms": 3144,
+    "plan_ms": 82,
+    "recovery_scan_empty_ms": 18,
+    "scan_images_per_sec": 44.378698224852066,
+    "scan_ms": 2704,
+    "source_bytes": 843360,
+    "total_ms": 6777
+  },
+  "status": "passed",
+  "failures": [],
+  "notes": [
+    "This MVP gate uses real managed PostgreSQL, real filesystem IO, and command-facing scan/plan/commit/recovery paths.",
+    "The automated gate records a 120-image baseline. Larger 1k/10k/100k production benchmarks remain a release-hardening follow-up.",
+    "Peak memory is not instrumented by this gate; stability is represented by bounded completion under the thresholded command path."
+  ]
+}

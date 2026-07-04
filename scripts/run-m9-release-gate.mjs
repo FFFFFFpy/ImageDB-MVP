@@ -38,6 +38,12 @@ const steps = [
     args: ['rust:test:real'],
     skip: skipReal,
   },
+  {
+    id: 'performance',
+    label: 'pnpm release:performance',
+    command: 'pnpm',
+    args: ['release:performance'],
+  },
   { id: 'mounted', label: 'mounted SMB storage gate', mounted: true, skip: skipMounted },
   { id: 'build', label: 'pnpm build', command: 'pnpm', args: ['build'], skip: skipBuild },
 ];
@@ -49,7 +55,8 @@ function shouldRun(step) {
 function runStep(step) {
   console.log(`\n[m9-release-gate] ${step.label}`);
   const started = Date.now();
-  const result = spawnSync(step.command, step.args, {
+  const { command, args } = resolveCommand(step.command, step.args);
+  const result = spawnSync(command, args, {
     cwd: repoRoot,
     env,
     stdio: 'inherit',
@@ -65,6 +72,16 @@ function runStep(step) {
     process.exit(result.status ?? 1);
   }
   console.log(`[m9-release-gate] ${step.label} passed in ${seconds}s`);
+}
+
+function resolveCommand(command, args) {
+  if (process.platform === 'win32' && command === 'pnpm') {
+    return {
+      command: process.env.ComSpec ?? 'cmd.exe',
+      args: ['/d', '/s', '/c', ['pnpm', ...args].join(' ')],
+    };
+  }
+  return { command, args };
 }
 
 function runMountedGate() {

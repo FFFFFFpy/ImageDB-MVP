@@ -30,5 +30,9 @@ mod m9_diagnostics_integration;
 mod m9_public_recovery_integration;
 
 #[cfg(test)]
+#[cfg(feature = "real-db-tests")]
+mod m9_performance_integration;
+
+#[cfg(test)]
 #[cfg(all(feature = "real-db-tests", feature = "fail-injection"))]
 mod cancellation_recovery_integration;

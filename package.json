@@ -17,6 +17,7 @@
     "release:runtime": "node scripts/package-postgres-runtime.mjs",
     "release:verify-artifacts": "node scripts/verify-release-artifacts.mjs",
     "release:install-gate": "node scripts/run-m9-installation-gate.mjs",
+    "release:performance": "node scripts/run-m9-performance-gate.mjs",
     "release:dataset": "node scripts/verify-m9-acceptance-dataset.mjs"
   },
   "devDependencies": {
