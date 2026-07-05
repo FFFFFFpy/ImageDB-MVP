@@ -2,7 +2,7 @@
 
 > **当前定性：MVP1 功能完成，进入 Debug / 实战测试阶段。**
 >
-> 这不是“继续扩功能”的阶段。除非实战测试暴露阻断问题，否则主线只接受 bugfix、诊断、文档、测试和发布门禁修正。人类软件项目终于到了可以少造一点轮子的阶段，虽然这通常只是短暂幻觉。
+> 这不是“继续扩功能”的阶段。除非实战测试暴露阻断问题，否则主线只接受 bugfix、诊断、文档、测试和发布门禁修正。
 
 ## 1. 当前版本状态
 
@@ -27,14 +27,14 @@ MVP1 的核心主链已经跑通：
 
 ## 2. Canonical 文档
 
-后续以 `docs/MVP1/` 为唯一主入口。旧的 `reports/`、`tasks/`、`checklists/`、`.codex-plans/` 保留为历史证据和任务过程记录，不再作为当前状态入口。
+后续以 `docs/MVP1/` 为唯一主入口。旧的计划、提示词、任务拆分和历史报告已经归档到 `docs/MVP1/archive/`，不再作为当前状态入口。
 
 | 文档 | 用途 |
 | --- | --- |
 | [`STATUS.md`](./STATUS.md) | MVP1 完成定性、DoD、剩余 Debug 项 |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | 当前 MVP1 产品范围、主链、架构、数据与文件事务 |
 | [`DEBUG_PLAYBOOK.md`](./DEBUG_PLAYBOOK.md) | 实战测试、Debug 记录、验证命令和问题分级 |
-| [`DOCUMENT_MAP.md`](./DOCUMENT_MAP.md) | 旧文档来源、历史报告、任务文档的索引和归档口径 |
+| [`DOCUMENT_MAP.md`](./DOCUMENT_MAP.md) | 文档地图与归档口径 |
 
 ## 3. 当前工作原则
 
@@ -108,10 +108,10 @@ pnpm release:install-gate
 pnpm release:gate
 ```
 
-## 6. 旧文档处理原则
+## 6. 归档处理原则
 
 - `docs/MVP1/` 是当前版本唯一入口。
-- `reports/` 里的 milestone / closure 报告保留为历史证据。
-- `tasks/` 里的任务拆分保留为实现过程记录。
+- `docs/MVP1/archive/` 保存旧计划、旧提示词、旧任务拆分和历史报告。
+- 根目录 `reports/` 仅作为脚本输出目录，用于新生成的环境检查和 gate 报告。
 - `checklists/RELEASE_DOD.md` 保留为 release 级 DoD 证据，但当前状态摘要以 [`STATUS.md`](./STATUS.md) 为准。
-- 不再让 agent 在旧文档里散写新结论。是的，文档到处乱长这种行为终于要被关进笼子。
+- 不再让 agent 在归档文档里散写新结论。
