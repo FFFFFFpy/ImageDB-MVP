@@ -13,6 +13,7 @@ const PORT_FILE: &str = "postgres_port";
 const CREDENTIAL_FILE: &str = "postgres_credentials";
 const DEFAULT_USERNAME: &str = "imagedb";
 const DEFAULT_DATABASE: &str = "imagedb";
+const PG_CTL_START_TIMEOUT_SECS: &str = "45";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PostgresProbeResult {
@@ -621,7 +622,7 @@ impl PostgresManager {
                 &listen_opts,
                 "-w",
                 "-t",
-                "10",
+                PG_CTL_START_TIMEOUT_SECS,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

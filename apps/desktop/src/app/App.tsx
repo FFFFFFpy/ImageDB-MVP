@@ -25,6 +25,14 @@ export function App() {
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
   const handleOnboardingComplete = async () => {
+    const currentSettings = settings.data ?? (await api.getSettings());
+    if (!currentSettings.first_run_completed) {
+      await api.updateSettings({
+        ...currentSettings,
+        first_run_completed: true,
+      });
+    }
+
     // Invalidate settings + database status so first_run_completed and the
     // connected DB state are re-fetched fresh, then navigate without a full
     // page reload (a reload would drop all in-memory React state and force

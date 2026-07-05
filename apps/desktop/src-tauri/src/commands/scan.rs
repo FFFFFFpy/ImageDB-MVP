@@ -30,6 +30,7 @@ pub(crate) async fn start_scan_for_state(
     state: &AppState,
     source_root: String,
 ) -> Result<String, String> {
+    tracing::info!(source_root = %source_root, "start_scan command received");
     let mut scan_state = state.scan_state.lock().await;
 
     if scan_state
@@ -47,10 +48,14 @@ pub(crate) async fn start_scan_for_state(
     }
 
     if scan_state.active.is_some() {
+        tracing::warn!("start_scan rejected because another scan is active");
         return Err("A scan is already running".to_string());
     }
 
-    scan_service::validate_source_directory(&source_root).map_err(|e| format!("{e}"))?;
+    scan_service::validate_source_directory(&source_root).map_err(|e| {
+        tracing::warn!(source_root = %source_root, error = %e, "start_scan validation failed");
+        format!("{e}")
+    })?;
 
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let postgres_manager = state.postgres_manager.clone();
@@ -89,6 +94,7 @@ pub(crate) async fn start_scan_for_state(
     scan_state.active = Some(crate::state::ScanHandle { cancelled, task });
     scan_state.progress_tracker = progress_tracker;
 
+    tracing::info!(source_root = %source_root, "start_scan command accepted");
     Ok("scan started".to_string())
 }
 
@@ -119,8 +125,10 @@ pub async fn cancel_scan(state: State<'_, AppState>) -> Result<String, String> {
     let scan_state = state.scan_state.lock().await;
     if let Some(ref handle) = scan_state.active {
         handle.cancelled.store(true, Ordering::Relaxed);
+        tracing::warn!("cancel_scan command accepted");
         Ok("scan cancellation requested".to_string())
     } else {
+        tracing::warn!("cancel_scan rejected because no scan is active");
         Err("No active scan".to_string())
     }
 }

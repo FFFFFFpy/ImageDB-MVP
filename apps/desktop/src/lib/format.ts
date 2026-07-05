@@ -19,7 +19,7 @@ function snakeCase(input: string): string {
 }
 
 export function taggedStatusCode(status: TaggedStatus | null | undefined): string {
-  if (typeof status === 'string') return status;
+  if (typeof status === 'string') return snakeCase(status);
   if (!status) return 'unknown';
   const [key] = Object.keys(status);
   return key ? snakeCase(key) : 'unknown';

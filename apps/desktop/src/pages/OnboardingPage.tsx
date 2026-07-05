@@ -19,11 +19,11 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
     refetchInterval: 2000,
   });
   const databaseState = connectedState ?? dbStatus.data;
+  const isConnected = databaseState && taggedStatusCode(databaseState.status) === 'connected';
 
   // When the DB becomes connected (either via the initial mutation or the
-  // poll), surface a single, unambiguous "进入应用" button. Never auto-
-  // navigate — the user must click the button so they always see the entry.
-  if (databaseState && taggedStatusCode(databaseState.status) === 'connected') {
+  // poll), surface one explicit entry action.
+  if (isConnected && databaseState) {
     return (
       <div className="onboarding-page">
         <h1>数据库已就绪</h1>

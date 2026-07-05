@@ -12,7 +12,17 @@ pub async fn export_diagnostics(
 pub(crate) async fn export_diagnostics_for_state(
     state: &AppState,
 ) -> Result<DiagnosticsExportResult, String> {
-    diagnostics_service::export_diagnostics(state)
+    tracing::info!("export_diagnostics command received");
+    let result = diagnostics_service::export_diagnostics(state)
         .await
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| {
+            tracing::error!(error = %e, "export_diagnostics failed");
+            format!("{e}")
+        })?;
+    tracing::info!(
+        path = %result.path,
+        byte_size = result.byte_size,
+        "export_diagnostics finished"
+    );
+    Ok(result)
 }

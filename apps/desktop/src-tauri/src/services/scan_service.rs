@@ -19,6 +19,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -434,6 +435,9 @@ pub async fn run_scan(
     cancelled: Arc<AtomicBool>,
     progress_tracker: Arc<Mutex<ScanProgress>>,
 ) -> Result<ScanProgress, AppError> {
+    let started_at = Instant::now();
+    tracing::info!(source_root = %source_root, "scan started");
+
     let mut progress = ScanProgressEvent {
         state: "running".to_string(),
         import_run_id: None,
@@ -468,6 +472,12 @@ pub async fn run_scan(
     let import_run_id =
         ImportRepository::create_import_run(&client, &source_root, library_root_id).await?;
     progress.import_run_id = Some(import_run_id.to_string());
+    tracing::info!(
+        %import_run_id,
+        %library_root_id,
+        source_root = %source_path.display(),
+        "scan import run created"
+    );
 
     emit_progress(&progress, &progress_tracker).await;
 
@@ -481,6 +491,11 @@ pub async fn run_scan(
                 &e.to_string(),
             )
             .await?;
+            tracing::error!(
+                %import_run_id,
+                error = %e,
+                "scan failed while enumerating source albums"
+            );
             handle.abort();
             return Err(e);
         }
@@ -488,6 +503,11 @@ pub async fn run_scan(
 
     progress.total_albums = albums.len() as u32;
     emit_progress(&progress, &progress_tracker).await;
+    tracing::info!(
+        %import_run_id,
+        total_albums = progress.total_albums,
+        "scan source albums enumerated"
+    );
 
     if albums.is_empty() {
         ImportRepository::update_import_run_state(
@@ -499,6 +519,7 @@ pub async fn run_scan(
         progress.state = "completed".to_string();
         progress.current_stage = "completed".to_string();
         emit_progress(&progress, &progress_tracker).await;
+        tracing::info!(%import_run_id, elapsed_ms = started_at.elapsed().as_millis(), "scan completed with no albums");
         handle.abort();
         return Ok(ScanProgress::idle());
     }
@@ -526,6 +547,12 @@ pub async fn run_scan(
         }
         let album_id: Uuid = row.get("id");
         let source_path: String = row.get("source_path");
+        tracing::debug!(
+            %import_run_id,
+            %album_id,
+            source_path = %source_path,
+            "capturing source album snapshot"
+        );
         capture_source_album_snapshot(&client, import_run_id, album_id, Path::new(&source_path))
             .await?;
         let snapshot_errors =
@@ -551,6 +578,7 @@ pub async fn run_scan(
     .await?;
     progress.current_stage = "fingerprinting".to_string();
     emit_progress(&progress, &progress_tracker).await;
+    tracing::info!(%import_run_id, "scan fingerprinting stage started");
 
     struct AlbumImageEntry {
         album_db_id: Uuid,
@@ -585,12 +613,25 @@ pub async fn run_scan(
 
         progress.current_album = Some(album_name.clone());
         emit_progress(&progress, &progress_tracker).await;
+        tracing::info!(
+            %import_run_id,
+            %album_db_id,
+            album = %album_name,
+            "scan album started"
+        );
 
         let album_path = PathBuf::from(&album_source_path);
         let scanned_images = match scan_album_for_images(&album_path, &album_name) {
             Ok(imgs) => imgs,
             Err(e) => {
                 let msg = format!("Failed to scan album '{}': {e}", album_name);
+                tracing::warn!(
+                    %import_run_id,
+                    %album_db_id,
+                    album = %album_name,
+                    error = %e,
+                    "scan album enumeration failed"
+                );
                 errors.push(msg.clone());
                 progress.error_count = errors.len() as u32;
                 progress.errors = errors.clone();
@@ -680,6 +721,14 @@ pub async fn run_scan(
                     .await?;
 
                     let msg = format!("Failed to fingerprint '{}': {e}", img.source_path.display());
+                    tracing::warn!(
+                        %import_run_id,
+                        %album_db_id,
+                        album = %album_name,
+                        source_path = %img.source_path.display(),
+                        error = %e,
+                        "scan image fingerprint failed"
+                    );
                     errors.push(msg.clone());
                     progress.error_count = errors.len() as u32;
                     progress.errors = errors.clone();
@@ -697,6 +746,14 @@ pub async fn run_scan(
             &ImportAlbumState::Completed,
         )
         .await?;
+        tracing::info!(
+            %import_run_id,
+            %album_db_id,
+            album = %album_name,
+            processed_images = progress.processed_images,
+            error_count = progress.error_count,
+            "scan album completed"
+        );
     }
 
     if cancelled.load(Ordering::Relaxed) {
@@ -709,6 +766,13 @@ pub async fn run_scan(
         progress.state = "cancelled".to_string();
         progress.current_stage = "cancelled".to_string();
         emit_progress(&progress, &progress_tracker).await;
+        tracing::warn!(
+            %import_run_id,
+            processed_images = progress.processed_images,
+            total_albums = progress.total_albums,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "scan cancelled"
+        );
         handle.abort();
         return Ok(ScanProgress {
             state: "cancelled".to_string(),
@@ -724,6 +788,11 @@ pub async fn run_scan(
     .await?;
     progress.current_stage = "detecting_duplicates".to_string();
     emit_progress(&progress, &progress_tracker).await;
+    tracing::info!(
+        %import_run_id,
+        total_images,
+        "scan duplicate detection stage started"
+    );
 
     let mut album_groups: std::collections::HashMap<Uuid, Vec<&AlbumImageEntry>> =
         std::collections::HashMap::new();
@@ -1055,6 +1124,12 @@ pub async fn run_scan(
         progress.current_stage = "failed".to_string();
         progress.errors.push(e.to_string());
         emit_progress(&progress, &progress_tracker).await;
+        tracing::error!(
+            %import_run_id,
+            duplicate_count,
+            error = %e,
+            "scan library matching failed"
+        );
         handle.abort();
         return Ok(ScanProgress {
             state: "failed".to_string(),
@@ -1085,6 +1160,16 @@ pub async fn run_scan(
     progress.current_stage = final_run_state.to_string();
     progress.current_album = None;
     emit_progress(&progress, &progress_tracker).await;
+    tracing::info!(
+        %import_run_id,
+        final_state = %final_run_state,
+        total_albums = progress.total_albums,
+        total_images,
+        duplicate_count,
+        error_count = errors.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "scan finished"
+    );
 
     handle.abort();
 

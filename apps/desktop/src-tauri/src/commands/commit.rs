@@ -16,6 +16,7 @@ pub(crate) async fn start_import_commit_for_state(
     state: &AppState,
     import_run_id: String,
 ) -> Result<String, String> {
+    tracing::info!(import_run_id = %import_run_id, "start_import_commit command received");
     let run_id = uuid::Uuid::parse_str(&import_run_id).map_err(|e| format!("invalid UUID: {e}"))?;
 
     let mut commit_state = state.commit_state.lock().await;
@@ -35,6 +36,7 @@ pub(crate) async fn start_import_commit_for_state(
     }
 
     if commit_state.active.is_some() {
+        tracing::warn!("start_import_commit rejected because another commit is active");
         return Err("A commit is already running".to_string());
     }
 
@@ -83,6 +85,7 @@ pub(crate) async fn start_import_commit_for_state(
     commit_state.active = Some(crate::state::CommitHandle { cancelled, task });
     commit_state.progress_tracker = progress_tracker;
 
+    tracing::info!(%run_id, "start_import_commit command accepted");
     Ok("commit started".to_string())
 }
 
@@ -95,8 +98,10 @@ pub(crate) async fn cancel_import_commit_for_state(state: &AppState) -> Result<S
     let commit_state = state.commit_state.lock().await;
     if let Some(ref handle) = commit_state.active {
         handle.cancelled.store(true, Ordering::Relaxed);
+        tracing::warn!("cancel_import_commit command accepted");
         Ok("commit cancellation requested".to_string())
     } else {
+        tracing::warn!("cancel_import_commit rejected because no commit is active");
         Err("No active commit".to_string())
     }
 }

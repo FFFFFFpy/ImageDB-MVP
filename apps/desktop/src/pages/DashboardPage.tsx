@@ -12,7 +12,7 @@ export function DashboardPage({ needsOnboarding, onGoOnboarding, onGoScan }: Das
   const dbStatus = useQuery({
     queryKey: ['database-status'],
     queryFn: api.getDatabaseStatus,
-    refetchInterval: 10000,
+    refetchInterval: 5000,
   });
 
   if (needsOnboarding) {
@@ -20,7 +20,7 @@ export function DashboardPage({ needsOnboarding, onGoOnboarding, onGoScan }: Das
       <div className="dashboard-page">
         <div className="empty-state">
           <h1>欢迎使用 ImageDB</h1>
-          <p>数据库尚未配置。请先完成初始设置。</p>
+          <p>数据库尚未配置。请先完成初始化设置。</p>
           <button className="btn-primary" onClick={onGoOnboarding}>
             开始设置
           </button>
@@ -29,7 +29,21 @@ export function DashboardPage({ needsOnboarding, onGoOnboarding, onGoScan }: Das
     );
   }
 
-  const isConnected = taggedStatusCode(dbStatus.data?.status) === 'connected';
+  const statusCode = taggedStatusCode(dbStatus.data?.status);
+  const statusText = formatTaggedStatus(dbStatus.data?.status);
+  const isConnected = statusCode === 'connected';
+  const isInitialLoading = dbStatus.isLoading && !dbStatus.data;
+  const isManagedStartRetry =
+    statusCode === 'error' &&
+    statusText.includes('Managed PostgreSQL failed to start') &&
+    dbStatus.data?.mode === 'managed_local';
+  const isDatabaseRecovering =
+    isInitialLoading || statusCode === 'initializing' || isManagedStartRetry;
+  const databaseStatusLabel = isDatabaseRecovering
+    ? '托管 PostgreSQL 正在启动 / 恢复中'
+    : isConnected
+      ? '已连接'
+      : statusText;
 
   return (
     <div className="dashboard-page">
@@ -38,9 +52,7 @@ export function DashboardPage({ needsOnboarding, onGoOnboarding, onGoScan }: Das
       <div className="status-cards">
         <div className={`status-card-dashboard ${isConnected ? 'ok' : 'warn'}`}>
           <h3>数据库</h3>
-          <p className={isConnected ? 'status-ok' : 'status-warn'}>
-            {isConnected ? '已连接' : formatTaggedStatus(dbStatus.data?.status)}
-          </p>
+          <p className={isConnected ? 'status-ok' : 'status-warn'}>{databaseStatusLabel}</p>
           {dbStatus.data?.managed_config && (
             <p className="mono">
               {dbStatus.data.managed_config.data_dir} : {dbStatus.data.managed_config.port}

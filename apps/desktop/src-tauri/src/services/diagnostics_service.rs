@@ -31,6 +31,8 @@ struct DiagnosticsBundle {
     recent_tasks: Vec<Value>,
     migration_state: Value,
     recovery: Vec<Value>,
+    live_progress: Value,
+    log_files: Vec<Value>,
     logs: Vec<String>,
     redaction: Value,
 }
@@ -116,6 +118,8 @@ pub async fn export_diagnostics(state: &AppState) -> Result<DiagnosticsExportRes
         sanitize_value(value)
     });
 
+    let live_progress = collect_live_progress(state).await;
+    let log_files = collect_log_file_metadata(&state.app_data_dir);
     let logs = collect_redacted_logs(&state.app_data_dir);
 
     let mut bundle = DiagnosticsBundle {
@@ -127,6 +131,8 @@ pub async fn export_diagnostics(state: &AppState) -> Result<DiagnosticsExportRes
         recent_tasks,
         migration_state,
         recovery,
+        live_progress,
+        log_files,
         logs,
         redaction: json!({
             "secrets": "passwords, tokens, connection strings, and key paths are redacted",
@@ -143,6 +149,8 @@ pub async fn export_diagnostics(state: &AppState) -> Result<DiagnosticsExportRes
         .map(sanitize_value)
         .collect();
     bundle.recovery = bundle.recovery.into_iter().map(sanitize_value).collect();
+    bundle.live_progress = sanitize_value(bundle.live_progress);
+    bundle.log_files = bundle.log_files.into_iter().map(sanitize_value).collect();
 
     let out_dir = state.app_data_dir.join("diagnostics");
     std::fs::create_dir_all(&out_dir)?;
@@ -161,6 +169,41 @@ pub async fn export_diagnostics(state: &AppState) -> Result<DiagnosticsExportRes
         file_count: 1,
         redacted: true,
         byte_size,
+    })
+}
+
+async fn collect_live_progress(state: &AppState) -> Value {
+    let scan = {
+        let scan_state = state.scan_state.lock().await;
+        let active = scan_state
+            .active
+            .as_ref()
+            .map(|handle| !handle.task.is_finished())
+            .unwrap_or(false);
+        let progress = scan_state.progress_tracker.lock().await.clone();
+        json!({
+            "active": active,
+            "progress": progress,
+        })
+    };
+
+    let commit = {
+        let commit_state = state.commit_state.lock().await;
+        let active = commit_state
+            .active
+            .as_ref()
+            .map(|handle| !handle.task.is_finished())
+            .unwrap_or(false);
+        let progress = commit_state.progress_tracker.lock().await.clone();
+        json!({
+            "active": active,
+            "progress": progress,
+        })
+    };
+
+    json!({
+        "scan": scan,
+        "commit": commit,
     })
 }
 
@@ -304,6 +347,40 @@ fn collect_redacted_logs(app_data_dir: &Path) -> Vec<String> {
 
 fn redact_optional_path(value: Option<&str>) -> Option<String> {
     value.map(|_| "<redacted-path>".to_string())
+}
+
+fn collect_log_file_metadata(app_data_dir: &Path) -> Vec<Value> {
+    let log_dir = app_data_dir.join("logs");
+    let mut files = match std::fs::read_dir(&log_dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_string_lossy().to_string();
+                if !name.starts_with("imagedb.log") {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .map(|m| chrono::DateTime::<chrono::Utc>::from(m).to_rfc3339());
+                Some(json!({
+                    "name": name,
+                    "size_bytes": metadata.len(),
+                    "modified_at": modified,
+                }))
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => return Vec::new(),
+    };
+
+    files.sort_by(|a, b| {
+        b.get("modified_at")
+            .and_then(Value::as_str)
+            .cmp(&a.get("modified_at").and_then(Value::as_str))
+    });
+    files
 }
 
 fn sanitize_value(value: Value) -> Value {

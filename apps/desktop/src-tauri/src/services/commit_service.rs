@@ -37,6 +37,7 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_postgres::Client;
@@ -283,6 +284,13 @@ pub async fn run_import_commit(
     cancelled: Arc<AtomicBool>,
     progress_tracker: Arc<Mutex<CommitProgress>>,
 ) -> Result<CommitResult, AppError> {
+    let started_at = Instant::now();
+    tracing::info!(
+        %import_run_id,
+        library_root_path = %library_root_path,
+        "commit started"
+    );
+
     let mut progress = progress_tracker.lock().await;
     progress.state = "running".to_string();
     progress.current_stage = "preparing".to_string();
@@ -313,11 +321,28 @@ pub async fn run_import_commit(
         Ok(r) => {
             progress.state = r.state.clone();
             progress.current_stage = "done".to_string();
+            tracing::info!(
+                %import_run_id,
+                final_state = %r.state,
+                albums_total = r.albums_total,
+                albums_committed = r.albums_committed,
+                albums_skipped = r.albums_skipped,
+                albums_failed = r.albums_failed,
+                images_committed = r.images_committed,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "commit finished"
+            );
         }
         Err(e) => {
             progress.state = "failed".to_string();
             progress.current_stage = "failed".to_string();
             progress.errors.push(e.to_string());
+            tracing::error!(
+                %import_run_id,
+                error = %e,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "commit failed"
+            );
         }
     }
     drop(progress);
@@ -336,6 +361,12 @@ async fn execute_commit_pipeline(
         .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
 
     let library_root_id = import_run.library_root_id;
+    tracing::info!(
+        %import_run_id,
+        import_run_state = %import_run.state,
+        %library_root_id,
+        "commit import run loaded"
+    );
 
     // Rule 5: never overwrite the bound library root with the current settings path.
     // The bound root's path is read from the DB at commit time. If the current
@@ -359,6 +390,13 @@ async fn execute_commit_pipeline(
         .ok_or_else(|| AppError::Internal(format!(
             "no frozen import plan for run {import_run_id}; generate and freeze a plan before committing"
         )))?;
+    tracing::info!(
+        %import_run_id,
+        plan_id = %frozen.plan_id,
+        plan_state = %frozen.plan_state,
+        album_count = frozen.albums.len(),
+        "commit frozen plan loaded"
+    );
 
     if frozen.albums.is_empty() {
         // Phase 3: an empty plan must NOT bypass transaction checks. The
@@ -394,6 +432,13 @@ async fn execute_commit_pipeline(
     // recovery both use this function so a tampered plan fails consistently.
     let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
     let publish_strategy = select_commit_publish_strategy(&library_root)?;
+    tracing::info!(
+        %import_run_id,
+        plan_id = %frozen.plan_id,
+        publish_strategy = ?publish_strategy,
+        album_count = frozen.albums.len(),
+        "commit immutable plan validated"
+    );
 
     {
         let mut p = progress_tracker.lock().await;
@@ -419,6 +464,13 @@ async fn execute_commit_pipeline(
         LIBRARY_ROOT_LEASE_TTL_SECS,
     )
     .await?;
+    tracing::info!(
+        %import_run_id,
+        %library_root_id,
+        %lease_token,
+        lease_owner = %lease_owner,
+        "commit library root lease acquired"
+    );
 
     for (plan_album, images) in &frozen.albums {
         ImportRepository::heartbeat_library_root_lease(
@@ -431,6 +483,7 @@ async fn execute_commit_pipeline(
 
         if cancelled.load(Ordering::Relaxed) {
             all_errors.push("commit cancelled by user".to_string());
+            tracing::warn!(%import_run_id, "commit cancellation observed before next album");
             break;
         }
 
@@ -439,6 +492,12 @@ async fn execute_commit_pipeline(
             p.current_album = Some(plan_album.target_relative_path.clone());
             p.current_stage = "processing_album".to_string();
         }
+        tracing::info!(
+            %import_run_id,
+            album = %plan_album.target_relative_path,
+            image_count = images.len(),
+            "commit album started"
+        );
 
         let commit = PlanAlbumCommit {
             plan_album: plan_album.clone(),
@@ -471,6 +530,13 @@ async fn execute_commit_pipeline(
                         all_errors.push(error.clone());
                     }
                 }
+                tracing::info!(
+                    %import_run_id,
+                    album = %result.album_name,
+                    status = %result.status,
+                    images_committed = result.images_committed,
+                    "commit album finished"
+                );
                 album_results.push(result);
             }
             Err(e) => {
@@ -479,6 +545,12 @@ async fn execute_commit_pipeline(
                         "detected incomplete transaction {transaction_id}; route to recovery"
                     );
                     all_errors.push(msg.clone());
+                    tracing::warn!(
+                        %import_run_id,
+                        album = %plan_album.target_relative_path,
+                        %transaction_id,
+                        "commit album requires recovery"
+                    );
                     album_results.push(CommitAlbumResult {
                         album_name: plan_album.target_relative_path.clone(),
                         status: "recovery_required".to_string(),
@@ -491,6 +563,12 @@ async fn execute_commit_pipeline(
                 }
                 albums_failed += 1;
                 let err_msg = format!("album {}: {e}", plan_album.target_relative_path);
+                tracing::error!(
+                    %import_run_id,
+                    album = %plan_album.target_relative_path,
+                    error = %e,
+                    "commit album failed"
+                );
                 all_errors.push(err_msg.clone());
                 album_results.push(CommitAlbumResult {
                     album_name: plan_album.target_relative_path.clone(),
@@ -522,6 +600,11 @@ async fn execute_commit_pipeline(
     }
 
     ImportRepository::release_library_root_lease(client, library_root_id, lease_token).await?;
+    tracing::info!(
+        %import_run_id,
+        %lease_token,
+        "commit library root lease released"
+    );
 
     // Phase 1: cancellation must NOT manufacture unrecoverable transactions.
     // Previously this block flipped every non-terminal, non-conflict
@@ -599,6 +682,16 @@ async fn execute_commit_pipeline(
             )))
         }
     };
+    tracing::info!(
+        %import_run_id,
+        final_state,
+        albums_committed,
+        albums_skipped,
+        albums_failed,
+        images_committed = total_committed,
+        error_count = all_errors.len(),
+        "commit reconciled final state"
+    );
 
     // Surface non-blocking diagnostics (album failure counts) on the run
     // row WITHOUT mutating the authoritative state. A run with failed
