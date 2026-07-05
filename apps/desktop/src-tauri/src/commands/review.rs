@@ -191,6 +191,69 @@ pub(crate) async fn get_frozen_import_plan_summary_for_state(
 }
 
 #[tauri::command]
+pub async fn set_import_plan_album_included(
+    state: State<'_, AppState>,
+    import_run_id: String,
+    album_id: String,
+    included: bool,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let aid = parse_uuid(&album_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::set_plan_album_included(&client, run_id, aid, included)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn set_import_plan_image_included(
+    state: State<'_, AppState>,
+    import_run_id: String,
+    image_id: String,
+    target_album_id: String,
+    included: bool,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let iid = parse_uuid(&image_id)?;
+    let aid = parse_uuid(&target_album_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::set_plan_image_included(&client, run_id, iid, aid, included)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn move_import_plan_image(
+    state: State<'_, AppState>,
+    import_run_id: String,
+    image_id: String,
+    target_album_id: String,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let iid = parse_uuid(&image_id)?;
+    let aid = parse_uuid(&target_album_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::move_plan_image(&client, run_id, iid, aid)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
 pub async fn get_latest_completed_import_run(
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
@@ -289,6 +352,25 @@ pub async fn get_image_preview(
         mgr.connect().await.map_err(|e| format!("{e}"))?
     };
     let data_url = review_service::load_image_preview_by_candidate(&client, cid, &image_side)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    handle.abort();
+    Ok(ImagePreview { data_url })
+}
+
+#[tauri::command]
+pub async fn get_import_plan_image_preview(
+    state: State<'_, AppState>,
+    import_run_id: String,
+    image_id: String,
+) -> Result<ImagePreview, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let iid = parse_uuid(&image_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let data_url = review_service::load_image_preview_by_import_image(&client, run_id, iid)
         .await
         .map_err(|e| format!("{e}"))?;
     handle.abort();

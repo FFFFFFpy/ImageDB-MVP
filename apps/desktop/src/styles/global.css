@@ -812,6 +812,28 @@ textarea {
   margin-bottom: 24px;
 }
 
+.import-plan-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: -24px -32px 20px;
+  padding: 20px 32px 12px;
+  background: #f4f6f8;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.import-plan-header h1 {
+  margin: 0;
+}
+
+.import-plan-actions {
+  margin: 0;
+}
+
 .import-plan-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -872,8 +894,8 @@ textarea {
 
 .import-plan-album summary {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
   align-items: center;
   padding: 10px 12px;
   cursor: pointer;
@@ -892,6 +914,10 @@ textarea {
   font-weight: 600;
 }
 
+.import-plan-album-title.is-skipped {
+  color: #dc2626;
+}
+
 .import-plan-album-meta {
   color: #4b5563;
   font-size: 13px;
@@ -900,6 +926,154 @@ textarea {
 
 .import-plan-album .import-plan-table {
   border-top: 1px solid #e5e7eb;
+}
+
+.plan-toggle {
+  min-width: 56px;
+  padding: 5px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 999px;
+  background: #f9fafb;
+  color: #374151;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.plan-toggle.is-on {
+  border-color: #86efac;
+  background: #f0fdf4;
+  color: #047857;
+}
+
+.plan-toggle.is-off {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.plan-toggle:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.import-plan-image-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid #e5e7eb;
+}
+
+.import-plan-image-row {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid #eef2f7;
+  background: #ffffff;
+}
+
+.import-plan-image-row:last-child {
+  border-bottom: none;
+}
+
+.import-plan-image-row.skipped {
+  background: #fff7f7;
+}
+
+.import-plan-image-row[draggable='true'] {
+  cursor: grab;
+}
+
+.import-plan-thumb {
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: 1px solid #d8dee6;
+  border-radius: 6px;
+  background: #f8fafc;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.import-plan-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.import-plan-thumb span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 4px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.import-plan-image-info {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.import-plan-image-info span:first-child {
+  min-width: 0;
+}
+
+.import-plan-image-info span:last-child {
+  color: #4b5563;
+  white-space: nowrap;
+}
+
+.image-preview-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgb(15 23 42 / 72%);
+}
+
+.image-preview-dialog {
+  max-width: min(92vw, 1100px);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #f8fafc;
+}
+
+.image-preview-dialog img {
+  max-width: 100%;
+  max-height: calc(88vh - 40px);
+  object-fit: contain;
+  border-radius: 8px;
+  background: #0f172a;
+}
+
+.image-preview-loading {
+  min-width: 280px;
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #475569;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #cbd5e1;
 }
 
 .import-plan-table {
@@ -926,9 +1100,23 @@ textarea {
 }
 
 @media (max-width: 640px) {
+  .import-plan-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .import-plan-album summary {
     grid-template-columns: minmax(0, 1fr);
     gap: 4px;
+  }
+
+  .import-plan-image-row {
+    grid-template-columns: 48px minmax(0, 1fr);
+  }
+
+  .import-plan-image-row > .plan-toggle {
+    grid-column: 2;
+    justify-self: start;
   }
 }
 

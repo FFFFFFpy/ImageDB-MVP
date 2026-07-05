@@ -369,6 +369,19 @@ pub struct ImportPlanImage {
     pub relative_path: String,
     pub file_size: i64,
     pub album_name: String,
+    pub album_id: String,
+    pub source_album_id: String,
+    pub included: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportPlanAlbum {
+    pub album_id: String,
+    pub album_name: String,
+    pub included: bool,
+    pub image_count: u32,
+    pub total_size: i64,
+    pub images: Vec<ImportPlanImage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +392,7 @@ pub struct ImportPlan {
     pub kept_images: Vec<ImportPlanImage>,
     pub excluded_count: u32,
     pub skipped_albums: Vec<String>,
+    pub albums: Vec<ImportPlanAlbum>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

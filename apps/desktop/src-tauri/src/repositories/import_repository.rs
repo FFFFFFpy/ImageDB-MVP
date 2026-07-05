@@ -2,11 +2,11 @@
 
 use crate::domain::import_state::{
     Decision, DecisionSource, DecodeState, DuplicateScope, ImportAlbumState, ImportImageState,
-    ImportPlan, ImportPlanImage, ImportRunState, MatchType, SCAN_POLICY_VERSION,
+    ImportPlan, ImportPlanAlbum, ImportPlanImage, ImportRunState, MatchType, SCAN_POLICY_VERSION,
 };
 use crate::domain::state_machine::{FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -1985,18 +1985,114 @@ impl ImportRepository {
             return Ok(None);
         };
 
+        let all_images = Self::get_all_import_images_with_album(client, import_run_id).await?;
+        let image_source_album: HashMap<Uuid, (Uuid, String)> = all_images
+            .iter()
+            .map(|img| (img.id, (img.album_id, img.album_name.clone())))
+            .collect();
+        let source_albums = Self::get_albums_for_run(client, import_run_id).await?;
+
         let mut kept_images: Vec<ImportPlanImage> = Vec::new();
+        let mut included_image_ids: HashSet<Uuid> = HashSet::new();
+        let mut albums: Vec<ImportPlanAlbum> = Vec::new();
         for (album, images) in &frozen.albums {
+            let mut album_images = Vec::new();
             for img in images {
-                kept_images.push(ImportPlanImage {
+                included_image_ids.insert(img.import_image_id);
+                let source_album_id = image_source_album
+                    .get(&img.import_image_id)
+                    .map(|(album_id, _)| *album_id)
+                    .unwrap_or(album.import_album_id);
+                let plan_image = ImportPlanImage {
                     image_id: img.import_image_id.to_string(),
                     source_path: img.source_path.clone(),
                     relative_path: img.target_relative_path.clone(),
                     file_size: img.expected_file_size,
                     album_name: album.target_relative_path.clone(),
+                    album_id: album.import_album_id.to_string(),
+                    source_album_id: source_album_id.to_string(),
+                    included: true,
+                };
+                kept_images.push(plan_image.clone());
+                album_images.push(plan_image);
+            }
+            album_images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+            albums.push(ImportPlanAlbum {
+                album_id: album.import_album_id.to_string(),
+                album_name: album.target_relative_path.clone(),
+                included: !album_images.is_empty(),
+                image_count: album_images.len() as u32,
+                total_size: album_images.iter().map(|img| img.file_size).sum(),
+                images: album_images,
+            });
+        }
+
+        for source_album in &source_albums {
+            let skipped_images: Vec<ImportPlanImage> = all_images
+                .iter()
+                .filter(|img| img.album_id == source_album.id)
+                .filter(|img| !included_image_ids.contains(&img.id))
+                .map(|img| ImportPlanImage {
+                    image_id: img.id.to_string(),
+                    source_path: img.source_path.clone(),
+                    relative_path: img.relative_path.clone(),
+                    file_size: img.file_size,
+                    album_name: source_album.source_name.clone(),
+                    album_id: source_album.id.to_string(),
+                    source_album_id: img.album_id.to_string(),
+                    included: false,
+                })
+                .collect();
+
+            if skipped_images.is_empty() {
+                if !albums
+                    .iter()
+                    .any(|album| album.album_id == source_album.id.to_string())
+                {
+                    albums.push(ImportPlanAlbum {
+                        album_id: source_album.id.to_string(),
+                        album_name: source_album.source_name.clone(),
+                        included: false,
+                        image_count: 0,
+                        total_size: 0,
+                        images: Vec::new(),
+                    });
+                }
+                continue;
+            }
+
+            if let Some(existing) = albums
+                .iter_mut()
+                .find(|album| album.album_id == source_album.id.to_string())
+            {
+                existing.images.extend(skipped_images);
+                existing
+                    .images
+                    .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+            } else {
+                albums.push(ImportPlanAlbum {
+                    album_id: source_album.id.to_string(),
+                    album_name: source_album.source_name.clone(),
+                    included: false,
+                    image_count: 0,
+                    total_size: 0,
+                    images: skipped_images,
                 });
             }
         }
+
+        for album in &mut albums {
+            album.image_count = album.images.iter().filter(|img| img.included).count() as u32;
+            album.total_size = album
+                .images
+                .iter()
+                .filter(|img| img.included)
+                .map(|img| img.file_size)
+                .sum();
+            album.included = album.image_count > 0;
+        }
+        albums.sort_by(|a, b| a.album_name.cmp(&b.album_name));
+
         // Stable order by target path so the commit-confirm view does not
         // flicker between reads.
         kept_images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -2060,6 +2156,7 @@ impl ImportRepository {
             kept_images,
             excluded_count: (total_images as u64).saturating_sub(kept_count) as u32,
             skipped_albums,
+            albums,
         }))
     }
 

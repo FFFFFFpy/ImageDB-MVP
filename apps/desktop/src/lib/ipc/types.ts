@@ -268,6 +268,18 @@ export interface ImportPlanImage {
   relative_path: string;
   file_size: number;
   album_name: string;
+  album_id: string;
+  source_album_id: string;
+  included: boolean;
+}
+
+export interface ImportPlanAlbum {
+  album_id: string;
+  album_name: string;
+  included: boolean;
+  image_count: number;
+  total_size: number;
+  images: ImportPlanImage[];
 }
 
 export interface ImportPlan {
@@ -277,6 +289,7 @@ export interface ImportPlan {
   kept_images: ImportPlanImage[];
   excluded_count: number;
   skipped_albums: string[];
+  albums: ImportPlanAlbum[];
 }
 
 export interface ImagePreview {

@@ -104,6 +104,25 @@ export const api = {
   getFrozenImportPlanSummary: (importRunId: string) =>
     invoke<ImportPlan | null>('get_frozen_import_plan_summary', { importRunId }),
 
+  setImportPlanAlbumIncluded: (importRunId: string, albumId: string, included: boolean) =>
+    invoke<ImportPlan>('set_import_plan_album_included', { importRunId, albumId, included }),
+
+  setImportPlanImageIncluded: (
+    importRunId: string,
+    imageId: string,
+    targetAlbumId: string,
+    included: boolean,
+  ) =>
+    invoke<ImportPlan>('set_import_plan_image_included', {
+      importRunId,
+      imageId,
+      targetAlbumId,
+      included,
+    }),
+
+  moveImportPlanImage: (importRunId: string, imageId: string, targetAlbumId: string) =>
+    invoke<ImportPlan>('move_import_plan_image', { importRunId, imageId, targetAlbumId }),
+
   getLatestCompletedImportRun: () => invoke<string | null>('get_latest_completed_import_run'),
 
   getLatestReviewableImportRun: () => invoke<string | null>('get_latest_reviewable_import_run'),
@@ -112,6 +131,9 @@ export const api = {
 
   getImagePreview: (candidateId: string, imageSide: string) =>
     invoke<ImagePreview>('get_image_preview', { candidateId, imageSide }),
+
+  getImportPlanImagePreview: (importRunId: string, imageId: string) =>
+    invoke<ImagePreview>('get_import_plan_image_preview', { importRunId, imageId }),
 
   startImportCommit: (importRunId: string) =>
     invoke<string>('start_import_commit', { importRunId }),

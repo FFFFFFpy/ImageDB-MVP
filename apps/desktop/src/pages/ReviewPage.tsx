@@ -7,6 +7,7 @@ import type {
   ReviewCandidateSummary,
   ReviewDecision,
   ImportPlan,
+  ImportPlanAlbum,
   ImportPlanImage,
 } from '../lib/ipc/types';
 
@@ -21,8 +22,11 @@ interface ViewState {
 }
 
 export interface ImportPlanAlbumGroup {
+  albumId: string;
   albumName: string;
+  included: boolean;
   imageCount: number;
+  skippedImageCount: number;
   totalSize: number;
   images: ImportPlanImage[];
 }
@@ -39,24 +43,86 @@ export function groupImportPlanImagesByAlbum(images: ImportPlanImage[]): ImportP
   const groups = new Map<string, ImportPlanAlbumGroup>();
 
   images.forEach((image) => {
+    const albumId = image.album_id || image.album_name || 'unknown';
     const albumName = image.album_name || '未命名图集';
-    const existing = groups.get(albumName);
+    const existing = groups.get(albumId);
     if (existing) {
-      existing.imageCount += 1;
-      existing.totalSize += image.file_size;
+      existing.imageCount += image.included ? 1 : 0;
+      existing.skippedImageCount += image.included ? 0 : 1;
+      existing.totalSize += image.included ? image.file_size : 0;
       existing.images.push(image);
+      existing.included = existing.included || image.included;
       return;
     }
 
-    groups.set(albumName, {
+    groups.set(albumId, {
+      albumId,
       albumName,
-      imageCount: 1,
-      totalSize: image.file_size,
+      included: image.included,
+      imageCount: image.included ? 1 : 0,
+      skippedImageCount: image.included ? 0 : 1,
+      totalSize: image.included ? image.file_size : 0,
       images: [image],
     });
   });
 
   return Array.from(groups.values());
+}
+
+function planAlbumsForDisplay(plan: ImportPlan): ImportPlanAlbumGroup[] {
+  if (plan.albums?.length) {
+    return plan.albums.map((album: ImportPlanAlbum) => ({
+      albumId: album.album_id,
+      albumName: album.album_name,
+      included: album.included,
+      imageCount: album.image_count,
+      skippedImageCount: album.images.filter((image) => !image.included).length,
+      totalSize: album.total_size,
+      images: album.images,
+    }));
+  }
+  return groupImportPlanImagesByAlbum(plan.kept_images);
+}
+
+interface PlanImageThumbnailProps {
+  importRunId: string;
+  image: ImportPlanImage;
+  onOpen: (image: ImportPlanImage, dataUrl: string | null) => void;
+}
+
+function PlanImageThumbnail({ importRunId, image, onOpen }: PlanImageThumbnailProps) {
+  const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getImportPlanImagePreview(importRunId, image.image_id)
+      .then((preview) => {
+        if (!cancelled) setDataUrl(preview.data_url);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [image.image_id, importRunId]);
+
+  return (
+    <button
+      type="button"
+      className="import-plan-thumb"
+      onClick={() => onOpen(image, dataUrl)}
+      aria-label={`预览 ${image.relative_path}`}
+    >
+      {dataUrl ? (
+        <img src={dataUrl} alt="" loading="lazy" />
+      ) : (
+        <span>{failed ? '无预览' : '加载中'}</span>
+      )}
+    </button>
+  );
 }
 
 function formatDistance(val: number | null): string {
@@ -112,6 +178,13 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   const [rightPreview, setRightPreview] = useState<string | null>(null);
   const [importPlan, setImportPlan] = useState<ImportPlan | null>(null);
   const [showPlan, setShowPlan] = useState(false);
+  const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
+  const [planEditError, setPlanEditError] = useState<string | null>(null);
+  const [planEditPending, setPlanEditPending] = useState(false);
+  const [previewModal, setPreviewModal] = useState<{
+    image: ImportPlanImage;
+    dataUrl: string | null;
+  } | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -244,10 +317,86 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
       const plan = await api.freezeImportPlan(importRunId);
       setImportPlan(plan);
       setShowPlan(true);
+      setOpenPlanAlbums(new Set());
+      setPlanEditError(null);
     } catch {
       // ignore
     }
   }, [importRunId]);
+
+  const applyPlanEdit = useCallback(
+    async (edit: () => Promise<ImportPlan>) => {
+      if (planEditPending) return;
+      setPlanEditPending(true);
+      setPlanEditError(null);
+      try {
+        const nextPlan = await edit();
+        setImportPlan(nextPlan);
+      } catch (error) {
+        setPlanEditError(String(error));
+      } finally {
+        setPlanEditPending(false);
+      }
+    },
+    [planEditPending],
+  );
+
+  const togglePlanAlbum = useCallback(
+    (album: ImportPlanAlbumGroup) => {
+      if (!importPlan) return;
+      applyPlanEdit(() =>
+        api.setImportPlanAlbumIncluded(importPlan.import_run_id, album.albumId, !album.included),
+      );
+    },
+    [applyPlanEdit, importPlan],
+  );
+
+  const togglePlanImage = useCallback(
+    (album: ImportPlanAlbumGroup, image: ImportPlanImage) => {
+      if (!importPlan) return;
+      applyPlanEdit(() =>
+        api.setImportPlanImageIncluded(
+          importPlan.import_run_id,
+          image.image_id,
+          album.albumId,
+          !image.included,
+        ),
+      );
+    },
+    [applyPlanEdit, importPlan],
+  );
+
+  const movePlanImage = useCallback(
+    (imageId: string, targetAlbumId: string) => {
+      if (!importPlan) return;
+      applyPlanEdit(() =>
+        api.moveImportPlanImage(importPlan.import_run_id, imageId, targetAlbumId),
+      );
+    },
+    [applyPlanEdit, importPlan],
+  );
+
+  const openPlanImagePreview = useCallback(
+    (image: ImportPlanImage, dataUrl: string | null) => {
+      setPreviewModal({ image, dataUrl });
+      if (dataUrl || !importPlan) return;
+      api
+        .getImportPlanImagePreview(importPlan.import_run_id, image.image_id)
+        .then((preview) => {
+          setPreviewModal((current) =>
+            current?.image.image_id === image.image_id
+              ? { image, dataUrl: preview.data_url }
+              : current,
+          );
+        })
+        .catch(() => {
+          setPreviewModal((current) =>
+            current?.image.image_id === image.image_id ? { image, dataUrl: null } : current,
+          );
+        });
+    },
+    [importPlan],
+  );
 
   const handlePrev = useCallback(() => {
     setCurrentIndex((i) => Math.max(0, i - 1));
@@ -381,11 +530,22 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   }
 
   if (showPlan && importPlan) {
-    const keptAlbumGroups = groupImportPlanImagesByAlbum(importPlan.kept_images);
+    const albumGroups = planAlbumsForDisplay(importPlan);
+    const keptAlbums = albumGroups.filter((album) => album.included).length;
 
     return (
       <div className="review-page">
-        <h1>导入计划</h1>
+        <div className="import-plan-header">
+          <h1>导入计划</h1>
+          <div className="toolbar import-plan-actions">
+            <button className="btn-primary" onClick={() => onNavigate('commit')}>
+              前往提交
+            </button>
+            <button className="btn-secondary" onClick={() => setShowPlan(false)}>
+              返回审核
+            </button>
+          </div>
+        </div>
         <div className="import-plan-summary">
           <div className="import-plan-stats">
             <div className="scan-progress-card">
@@ -405,58 +565,113 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
               <p>{importPlan.excluded_count}</p>
             </div>
           </div>
-          {importPlan.skipped_albums.length > 0 && (
-            <div className="import-plan-skipped">
-              <h3>跳过的图集</h3>
-              <ul>
-                {importPlan.skipped_albums.map((a) => (
-                  <li key={a}>{a}</li>
-                ))}
-              </ul>
-            </div>
-          )}
+          {planEditError && <div className="commit-error-msg">{planEditError}</div>}
           <div className="import-plan-kept">
             <h3>
-              保留图集 ({keptAlbumGroups.length}) / 保留图片 ({importPlan.kept_images.length})
+              导入图集 ({keptAlbums}) / 导入图片 ({importPlan.kept_images.length})
             </h3>
             <div className="import-plan-albums">
-              {keptAlbumGroups.map((album) => (
-                <details className="import-plan-album" key={album.albumName}>
-                  <summary>
-                    <span className="import-plan-album-title">{album.albumName}</span>
-                    <span className="import-plan-album-meta">
-                      {album.imageCount} 张 · {formatFileSize(album.totalSize)}
-                    </span>
-                  </summary>
-                  <table className="import-plan-table">
-                    <thead>
-                      <tr>
-                        <th>文件</th>
-                        <th>大小</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {album.images.map((img) => (
-                        <tr key={img.image_id}>
-                          <td className="mono">{img.relative_path}</td>
-                          <td>{formatFileSize(img.file_size)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </details>
-              ))}
+              {albumGroups.map((album) => {
+                const isOpen = openPlanAlbums.has(album.albumId);
+                return (
+                  <details
+                    className={`import-plan-album ${album.included ? 'included' : 'skipped'}`}
+                    key={album.albumId}
+                    open={isOpen}
+                    onToggle={(event) => {
+                      const nextOpen = event.currentTarget.open;
+                      setOpenPlanAlbums((current) => {
+                        const next = new Set(current);
+                        if (nextOpen) next.add(album.albumId);
+                        else next.delete(album.albumId);
+                        return next;
+                      });
+                    }}
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const imageId = event.dataTransfer.getData('text/plain');
+                      if (imageId) movePlanImage(imageId, album.albumId);
+                    }}
+                  >
+                    <summary>
+                      <span
+                        className={`import-plan-album-title ${album.included ? '' : 'is-skipped'}`}
+                      >
+                        {album.albumName}
+                      </span>
+                      <span className="import-plan-album-meta">
+                        导入 {album.imageCount} 张 / 跳过 {album.skippedImageCount} 张 ·{' '}
+                        {formatFileSize(album.totalSize)}
+                      </span>
+                      <button
+                        type="button"
+                        className={`plan-toggle ${album.included ? 'is-on' : 'is-off'}`}
+                        disabled={planEditPending}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          togglePlanAlbum(album);
+                        }}
+                      >
+                        {album.included ? '导入' : '跳过'}
+                      </button>
+                    </summary>
+                    {isOpen && (
+                      <div className="import-plan-image-list">
+                        {album.images.map((img) => (
+                          <div
+                            className={`import-plan-image-row ${img.included ? 'included' : 'skipped'}`}
+                            key={img.image_id}
+                            draggable
+                            onDragStart={(event) => {
+                              event.dataTransfer.setData('text/plain', img.image_id);
+                              event.dataTransfer.effectAllowed = 'move';
+                            }}
+                          >
+                            <PlanImageThumbnail
+                              importRunId={importPlan.import_run_id}
+                              image={img}
+                              onOpen={openPlanImagePreview}
+                            />
+                            <button
+                              type="button"
+                              className="import-plan-image-info"
+                              onClick={() => openPlanImagePreview(img, null)}
+                            >
+                              <span className="mono">{img.relative_path}</span>
+                              <span>{formatFileSize(img.file_size)}</span>
+                            </button>
+                            <button
+                              type="button"
+                              className={`plan-toggle ${img.included ? 'is-on' : 'is-off'}`}
+                              disabled={planEditPending}
+                              onClick={() => togglePlanImage(album, img)}
+                            >
+                              {img.included ? '导入' : '跳过'}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </details>
+                );
+              })}
             </div>
           </div>
         </div>
-        <div className="toolbar">
-          <button className="btn-primary" onClick={() => onNavigate('commit')}>
-            前往提交
-          </button>
-          <button className="btn-secondary" onClick={() => setShowPlan(false)}>
-            返回审核
-          </button>
-        </div>
+        {previewModal && (
+          <div className="image-preview-modal" onClick={() => setPreviewModal(null)}>
+            <div className="image-preview-dialog" onClick={(event) => event.stopPropagation()}>
+              {previewModal.dataUrl ? (
+                <img src={previewModal.dataUrl} alt={previewModal.image.relative_path} />
+              ) : (
+                <div className="image-preview-loading">正在加载预览...</div>
+              )}
+              <div className="mono">{previewModal.image.relative_path}</div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
