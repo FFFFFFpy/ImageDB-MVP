@@ -10,7 +10,7 @@ MVP1 已定性为：
 
 当前 canonical 文档入口已经收敛到：[`docs/MVP1/`](docs/MVP1/README.md)
 
-后续判断当前版本状态、Debug 任务、验收边界、架构说明时，优先看 `docs/MVP1/`，不要再从散落的 `reports/`、`tasks/`、`checklists/`、`.codex-plans/` 中拼状态。拼文档这种活儿，通常只会把人类逼成考古学家。
+后续判断当前版本状态、Debug 任务、验收边界、架构说明时，优先看 `docs/MVP1/`，不要再从历史归档或脚本输出中拼状态。
 
 ## MVP1 主链
 
@@ -64,18 +64,19 @@ MVP1 覆盖：
 | [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、完成标准、剩余 Debug 项 |
 | [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | 架构、主链、数据库、文件事务 |
 | [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
-| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 旧文档索引与归档口径 |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 文档地图与归档口径 |
 
-## 历史文档
+## 历史归档
 
-旧报告和任务文件仍保留：
+旧计划、提示词、任务拆分和历史报告已经归档到：
 
-- `reports/`
-- `tasks/`
-- `checklists/`
-- `.codex-plans/`
+```text
+docs/MVP1/archive/
+```
 
-这些文件用于追溯实现过程和验收证据，不再作为当前状态入口。
+根目录 `reports/` 仅保留为脚本输出目录，例如环境检查报告和性能 gate 新输出。
+
+这些历史文件用于追溯实现过程和验收证据，不再作为当前状态入口。
 
 ## 后续开发原则
 
