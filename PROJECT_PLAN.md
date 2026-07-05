@@ -1,251 +1,107 @@
 # ImageDB MVP 项目计划
 
-## 1. 产品范围
+## 当前口径
 
-应用接受一个源目录。源目录下每个一级子目录视为一个图集。
-
-每个图集依次完成：
-
-1. 扫描图片文件。
-2. 建立文件快照。
-3. 计算文件与图像指纹。
-4. 检测图集内部重复与相似图片。
-5. 与历史图库中的图片比较。
-6. 自动处理证据明确的重复项。
-7. 将不确定候选交给用户审核。
-8. 生成不可变入库计划。
-9. 将保留文件复制到目标图库 staging 目录。
-10. 逐文件校验。
-11. 发布正式图集目录及 manifest。
-12. 在 PostgreSQL 中确认正式入库。
-13. 归档源图集。
-14. 中断后恢复未完成事务。
-
-目标图库根目录由用户选择，可以位于本地磁盘、外接磁盘或操作系统已经挂载的共享目录。
-
-## 2. 应用架构
+MVP1 已定性为：
 
 ```text
-React Components
-      ↓
-Hooks + TanStack Query
-      ↓
-Typed Tauri IPC / Channel
-      ↓
-Rust Commands
-      ↓
-Application Services
-      ↓
-Domain Rules
-      ↓
-Repositories / Infrastructure
-      ↓
-PostgreSQL + Filesystem
+功能完成，进入 Debug / 实战测试阶段。
 ```
 
-### 前端职责
+当前 canonical 文档入口已经收敛到：[`docs/MVP1/`](docs/MVP1/README.md)
 
-- 页面与交互
-- 表单校验
-- 查询缓存
-- 进度展示
-- 审核操作
+后续判断当前版本状态、Debug 任务、验收边界、架构说明时，优先看 `docs/MVP1/`，不要再从历史归档或脚本输出中拼状态。
 
-### Rust 职责
+## MVP1 主链
 
-- 数据库生命周期
-- 目录扫描
-- 图片解码与指纹
-- 候选匹配
-- 审核状态
-- 入库计划
-- 文件事务
-- 中断恢复
-
-## 3. 数据库模式
-
-### 应用托管模式
-
-应用管理独立 PostgreSQL 实例，负责：
-
-- 初始化数据目录
-- 生成凭据
-- 选择本地端口
-- 启动与停止进程
-- 启用 pgvector
-- 执行迁移
-- 健康检查
-- 备份与恢复
-
-实例只监听本机地址，数据目录位于系统应用数据目录。
-
-### 外部连接模式
-
-用户提供连接参数。应用负责：
-
-- 测试连接
-- 检查 PostgreSQL 版本
-- 检查 pgvector
-- 检查权限
-- 执行应用 Schema 迁移
-
-两种模式共用相同 Repository 和业务代码。
-
-## 4. 图像匹配流程
-
-### 文件级
-
-- 文件大小
-- BLAKE3
-
-### 像素级
-
-解码后执行固定标准化：
-
-- 应用方向信息
-- 固定颜色与通道规则
-- 固定 Alpha 处理
-- 固定像素排列
-- 计算标准像素 Hash
-
-### 感知级
-
-固定并版本化：
-
-- Gradient Hash
-- Block Hash
-- Median Hash
-- 缩放尺寸
-- 缩放滤镜
-- 灰度规则
-- Hash 位数
-- Bit 顺序
-
-支持原图、旋转和镜像变换的候选比较。
-
-### 决策
-
-- 明确重复：自动排除新图片中的重复版本。
-- 不确定候选：进入审核队列。
-- 历史图库只参与比较，不在导入流程中被修改。
-
-## 5. 文件事务
+MVP1 的核心流程已经完成并通过本地人工验收：
 
 ```text
-READY
-→ STAGING
-→ VERIFYING
-→ VERIFIED
-→ PUBLISHING
-→ PUBLISHED
-→ DB_COMMITTING
-→ COMMITTED
-→ SOURCE_ARCHIVING
-→ SOURCE_ARCHIVED
+全新开始
+→ 初始化托管本地 PostgreSQL
+→ 选择源目录
+→ 导入 / 分析
+→ 审核
+→ 生成 / 冻结导入计划
+→ 提交入库
+→ 本地目录正式入库
 ```
 
-规则：
+## MVP1 功能范围
 
-1. 分析期间源文件保持不变。
-2. 提交前重新验证源文件快照。
-3. 文件复制到目标根目录内的 staging。
-4. staging 文件逐个重新计算 BLAKE3。
-5. 全部校验通过后发布正式目录。
-6. 写入 manifest。
-7. PostgreSQL 事务写入正式图库记录。
-8. 数据库成功后归档完整源图集。
-9. 每个状态都可通过持久化证据恢复。
+MVP1 覆盖：
 
-## 6. GUI 页面
+- 托管本地 PostgreSQL + pgvector。
+- 外部 PostgreSQL 连接、TLS、预检和迁移。
+- 源目录扫描，一级子目录作为图集。
+- 文件快照。
+- BLAKE3 / 像素 hash / 感知 hash。
+- 图集内部重复与相似检测。
+- 与历史图库比较。
+- 人工审核 GUI。
+- frozen import plan。
+- staging / 校验 / 发布 / DB 确认 / 源图集归档。
+- Recovery / Reverify。
+- 挂载共享目录能力探测和保守发布策略。
+- Windows release runtime packaging 和 install gate。
 
-### 首次启动
+## 当前未完成但不阻断 MVP1 定性的事项
 
-- 初始化托管数据库
-- 展示数据库健康状态
-- 选择目标图库目录
+以下属于 Debug / 发布硬化 / 正式 release sign-off：
 
-### 新建导入
+- clean Windows 完整 `pnpm release:gate`。
+- 1k / 10k / 100k 大图库性能验证。
+- 24 小时稳定性 / soak。
+- 备份、恢复、升级、卸载完整验收。
+- 诊断包脱敏确认。
+- 更多 NAS / SMB / 外接盘实战矩阵。
 
-- 选择源目录
-- 展示识别图集数量
-- 启动分析
+## 文档入口
 
-### 分析进度
+| 文档 | 用途 |
+| --- | --- |
+| [`docs/MVP1/README.md`](docs/MVP1/README.md) | MVP1 文档总入口 |
+| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、完成标准、剩余 Debug 项 |
+| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | 架构、主链、数据库、文件事务 |
+| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 文档地图与归档口径 |
 
-- 当前阶段
-- 当前图集
-- 已处理图片
-- 重复与疑似数量
-- 错误数量
-- 取消
+## 历史归档
 
-### 审核
+旧计划、提示词、任务拆分和历史报告已经归档到：
 
-- 双图并排
-- 同步缩放与拖动
-- 叠加对比
-- 图片尺寸与文件大小
-- 指纹距离与变换关系
-- 保留左图、保留右图、全部保留、跳过图集
+```text
+docs/MVP1/archive/
+```
 
-### 提交确认
+根目录 `reports/` 仅保留为脚本输出目录，例如环境检查报告和性能 gate 新输出。
 
-- 图集数量
-- 保留图片数量
-- 排除重复数量
-- 目标路径
-- 预计空间
+这些历史文件用于追溯实现过程和验收证据，不再作为当前状态入口。
 
-### 提交进度与结果
+## 后续开发原则
 
-- 复制、校验、发布、入库状态
-- 成功、跳过和失败图集
-- 完整性验证结果
+MVP1 Debug 阶段默认只做：
 
-### 设置
+- bugfix；
+- 诊断增强；
+- 测试补充；
+- 文档修正；
+- release gate 修正；
+- 性能和稳定性硬化。
 
-- 数据库模式与健康状态
-- 目标图库目录
-- 匹配策略预设
-- 备份与恢复
-- 日志和诊断
+默认不做：
 
-## 7. 里程碑
+- 新功能；
+- 新算法方向；
+- 大 UI 改版；
+- 非必要数据库 schema 大改；
+- 主链重构；
+- 没有真实问题支撑的“顺手优化”。
 
-| 阶段 | 目标                                                 |
-| ---- | ---------------------------------------------------- |
-| 0    | 验证 Tauri、私有 PostgreSQL、图像指纹和本地文件事务  |
-| 1    | 完成应用骨架、数据库生命周期和初始 Schema            |
-| 2    | 完成扫描、快照和精确重复检测                         |
-| 3    | 完成感知相似检测和候选生成                           |
-| 4    | 完成人工审核 GUI                                     |
-| 5    | 完成正式文件入库闭环                                 |
-| 6    | 完成中断恢复和幂等验证                               |
-| 6.5  | 托管 PostgreSQL 运行时与 Windows 安装包发布复验      |
-| 7    | 完成外部 PostgreSQL 模式与托管库迁移                 |
-| 8    | 完成已挂载共享目录兼容验证                           |
-| 9    | 完成端到端发布收口、安装升级、诊断、性能和稳定性验收 |
+## 版本结论
 
-详细任务位于 `tasks/`。
-
-### 当前状态
-
-截至 2026-07-05，M6.5–M9 主链本地人工验收通过（见 `.codex-plans/M6.5-M9-closure/` 与 `reports/m6_5_m9_closure.md`）：全新开始 → 初始化托管本地 PostgreSQL → 导入 / 分析 → 审核 → 生成 / 冻结导入计划 → 提交入库 → 本地目录正式入库。托管 PostgreSQL runtime 打包为 Windows release 资源；真实测试缺 runtime 时 fail-fast；外部 PostgreSQL 使用统一 TLS connector；冻结计划主链（Review → freeze → Commit 读取 frozen summary）一致；Scan 的 `ready_to_commit` 入口回到 Review 生成 / 冻结计划；可提交 run 查询优先 `ready_to_commit`；挂载目录能力门禁覆盖读写/rename/大小写/Unicode/长路径，断连不误报成功。
-
-当前状态不是最终发布完成。发布级签字仍需 clean Windows `pnpm release:gate`，其中 `verify-artifacts` 只检查构建产物和 runtime 文件存在，`install-gate` 才验证安装、覆盖安装、启动 smoke、卸载和数据保留。当前任务为 `tasks/09-release-closure.md`。
-
-## 8. MVP 完成标准
-
-- GUI 可以完成完整导入流程。
-- 默认数据库无需用户手动安装和配置。
-- 支持外部 PostgreSQL 连接。
-- 支持托管数据库安全迁移到受信任的外部 PostgreSQL。
-- 支持操作系统已经挂载的共享目录作为图库路径，并按能力选择发布策略。
-- 图集内部与历史图库比较均可工作。
-- 不确定候选可以完成审核。
-- 目标文件逐个校验。
-- 数据库只记录实际发布成功的文件。
-- 应用在关键阶段退出后可以恢复。
-- 重复执行不产生重复入库。
-- 成功确认前源图集保持完整。
-- Release 安装包可在干净 Windows 环境独立运行。
+```text
+MVP1 功能完成。
+当前阶段：Debug / 实战测试。
+正式发布：等待 clean Windows release gate 签字。
+```
