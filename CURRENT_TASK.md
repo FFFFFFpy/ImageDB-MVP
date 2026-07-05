@@ -1,79 +1,61 @@
 # Current Task
 
-Executing: `.codex-plans/M6.5-M9-closure/tasks/06_5_09_closure.md`
+## 当前阶段
 
-Branch: `core_fix_m5_m6_refactor`
+MVP1 已定性为：
 
-## Closure status (M6.5–M9)
+```text
+功能完成，进入 Debug / 实战测试阶段。
+```
 
-This round closes the M6.5–M9 framework into a verifiable main chain. It
-does NOT add new features. Each item was verified against real PostgreSQL
-18.4 + pgvector 0.8.3 and the real filesystem — claims are backed by tests
-that fail (not skip) when the runtime is missing.
+主线分支：`main`
 
-Manual acceptance note (2026-07-05): the local MVP main chain has also been
-run by hand from a fresh start through managed local PostgreSQL initialization,
-source selection, import / analysis, review, import-plan generation / freeze,
-commit, and final library directory admission. This is local main-chain
-acceptance, not final release publication.
+当前 canonical 文档入口：[`docs/MVP1/README.md`](docs/MVP1/README.md)
 
-- M6.5 managed PostgreSQL runtime: the Windows release bundles its own
-  PostgreSQL + pgvector runtime via Tauri resources; `lib.rs` exposes it to
-  the `PostgresManager` locator via `IMAGEDB_POSTGRES_RUNTIME_DIR`. Missing
-  runtime now reports "安装包不完整" (incomplete installer) and tells the
-  user to reinstall, not to install PostgreSQL. Real test
-  `real_packaged_runtime_clean_bootstrap` runs the full lifecycle using
-  only the packaged runtime.
-- Real test fail-fast: every real-DB test that previously skipped when
-  `IMAGEDB_POSTGRES_BIN` was unset now panics with the expected path.
-  `run-real-rust-tests.mjs` pre-flights the runtime and aborts before
-  cargo if it is missing.
-- M7 external PostgreSQL: the external connection path routes through
-  `connect_external` for all four TLS modes (disable / require / verify-ca /
-  verify-full); preflight checks PG version, pgvector, CREATE EXTENSION,
-  schema, and migration permissions; UI surfaces TLS + diagnostics. Managed
-  local mode is unaffected.
-- M8 mounted storage: capability probe covers read/write, rename variants,
-  case sensitivity, Unicode normalization, long paths, file sync, and free
-  space; `classify_publish_strategy` rejects any storage missing a required
-  capability. The disconnect-then-recover path is exercised by the real
-  `mounted_storage_gate_library_root_disconnect_pauses_then_recovers` test
-  and the Windows loopback SMB gate.
-- M9 frozen plan: `freeze_import_plan` writes the three plan tables +
-  plan_hash + plan state=frozen + run state=ready_to_commit in a single
-  database transaction; `get_frozen_import_plan_summary` reads the
-  persisted view. The commit page reads the frozen summary; the review page
-  calls freeze (idempotent). Re-freeze returns the same summary; post-freeze
-  candidate/review edits cannot change the commit set.
-- Scan completion entry: both `review_required` and `ready_to_commit` route
-  into Review / import review. Commit remains reserved for runs with an
-  already frozen plan.
-- Latest committable run: the query now prefers `ready_to_commit`, then
-  resubmittable `cancelled` (no active transaction); `completed` no longer
-  enters the default commit page; `recovery_required` routes to recovery.
-- Release gate status: `verify-artifacts` checks only release artifact and
-  packaged runtime presence. `install-gate` verifies NSIS install,
-  overwrite install, launch smoke, uninstall, and data retention. A clean
-  Windows release gate / install gate run is still required for release
-  sign-off.
+## 状态摘要
 
-See `reports/m6_5_m9_closure.md` for the final closure report and the
-acceptance checklist in `.codex-plans/M6.5-M9-closure/checklists/`.
+MVP1 本地主链已人工验收通过：
 
-## Non-goals (this round)
+```text
+全新开始
+→ 初始化托管本地 PostgreSQL
+→ 选择源目录
+→ 导入 / 分析
+→ 审核
+→ 生成 / 冻结导入计划
+→ 提交入库
+→ 本地目录正式入库
+```
 
-- No new algorithms, no SMB protocol, no cross-platform runtime.
-- No rewrite of the transaction system.
-- Remote branch exists for this task branch; no PR, release publication, or
-  artifact upload is recorded here.
+当前不是继续扩功能阶段。默认只接受：
 
-## Prior milestones
+- 实战测试暴露的 bugfix。
+- Debug / 诊断 / 日志增强。
+- 测试补充。
+- 文档收敛。
+- release gate / install gate 修正。
+- clean Windows 发布验收补强。
 
-> Milestone 0 technical probe prototype is complete. Report: reports/milestone-0.md.
-> Milestone 1 app skeleton and database foundation is complete. Report: reports/milestone-1.md.
-> Milestone 2 scan and exact duplicate detection is complete. Report: reports/milestone-2.md.
-> Milestone 3 perceptual similarity detection is complete. Report: reports/milestone-3.md.
-> Milestone 4 human review GUI is complete. Report: reports/milestone-4.md.
-> Milestone 5 formal import loop is complete (re-verified during the core fix). Report: reports/milestone-5.md.
-> Milestone 7 external PostgreSQL mode is complete (re-verified during M6.5–M9 closure). Report: reports/milestone-7-progress.md.
-> Milestone 8 mounted shared storage compatibility is complete (re-verified during M6.5–M9 closure). Report: reports/milestone-8-progress.md.
+## 发布签字状态
+
+- MVP1 功能完成：已定性完成。
+- 本地主链人工验收：已通过。
+- 单项测试、Clippy、Release 构建与本地 install-gate：已记录通过。
+- 完整 clean Windows `pnpm release:gate`：未签字。
+- 正式 release publication：未发生。
+
+## 文档入口
+
+| 文档 | 用途 |
+| --- | --- |
+| [`docs/MVP1/README.md`](docs/MVP1/README.md) | MVP1 文档总入口 |
+| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、DoD、剩余 Debug 项 |
+| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | MVP1 架构、主链、数据与文件事务 |
+| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 旧文档索引与归档口径 |
+
+## 历史记录
+
+旧的里程碑报告、M5/M6 修复报告、M6.5–M9 closure 报告、任务拆分和 Codex 执行计划都保留为历史证据。当前状态不要再从散落文档推断，以 `docs/MVP1/` 为准。
+
+是的，终于给文档找了个家。软件项目最像家政灾难片的部分通常就是文档。
