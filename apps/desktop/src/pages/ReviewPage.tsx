@@ -7,6 +7,7 @@ import type {
   ReviewCandidateSummary,
   ReviewDecision,
   ImportPlan,
+  ImportPlanImage,
 } from '../lib/ipc/types';
 
 interface ReviewPageProps {
@@ -19,12 +20,43 @@ interface ViewState {
   offsetY: number;
 }
 
+export interface ImportPlanAlbumGroup {
+  albumName: string;
+  imageCount: number;
+  totalSize: number;
+  images: ImportPlanImage[];
+}
+
 const DEFAULT_VIEW: ViewState = { scale: 1, offsetX: 0, offsetY: 0 };
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function groupImportPlanImagesByAlbum(images: ImportPlanImage[]): ImportPlanAlbumGroup[] {
+  const groups = new Map<string, ImportPlanAlbumGroup>();
+
+  images.forEach((image) => {
+    const albumName = image.album_name || '未命名图集';
+    const existing = groups.get(albumName);
+    if (existing) {
+      existing.imageCount += 1;
+      existing.totalSize += image.file_size;
+      existing.images.push(image);
+      return;
+    }
+
+    groups.set(albumName, {
+      albumName,
+      imageCount: 1,
+      totalSize: image.file_size,
+      images: [image],
+    });
+  });
+
+  return Array.from(groups.values());
 }
 
 function formatDistance(val: number | null): string {
@@ -349,6 +381,8 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
   }
 
   if (showPlan && importPlan) {
+    const keptAlbumGroups = groupImportPlanImagesByAlbum(importPlan.kept_images);
+
     return (
       <div className="review-page">
         <h1>导入计划</h1>
@@ -382,25 +416,37 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
             </div>
           )}
           <div className="import-plan-kept">
-            <h3>保留图片 ({importPlan.kept_images.length})</h3>
-            <table className="import-plan-table">
-              <thead>
-                <tr>
-                  <th>图集</th>
-                  <th>文件</th>
-                  <th>大小</th>
-                </tr>
-              </thead>
-              <tbody>
-                {importPlan.kept_images.map((img) => (
-                  <tr key={img.image_id}>
-                    <td>{img.album_name}</td>
-                    <td className="mono">{img.relative_path}</td>
-                    <td>{formatFileSize(img.file_size)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <h3>
+              保留图集 ({keptAlbumGroups.length}) / 保留图片 ({importPlan.kept_images.length})
+            </h3>
+            <div className="import-plan-albums">
+              {keptAlbumGroups.map((album) => (
+                <details className="import-plan-album" key={album.albumName}>
+                  <summary>
+                    <span className="import-plan-album-title">{album.albumName}</span>
+                    <span className="import-plan-album-meta">
+                      {album.imageCount} 张 · {formatFileSize(album.totalSize)}
+                    </span>
+                  </summary>
+                  <table className="import-plan-table">
+                    <thead>
+                      <tr>
+                        <th>文件</th>
+                        <th>大小</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {album.images.map((img) => (
+                        <tr key={img.image_id}>
+                          <td className="mono">{img.relative_path}</td>
+                          <td>{formatFileSize(img.file_size)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </details>
+              ))}
+            </div>
           </div>
         </div>
         <div className="toolbar">

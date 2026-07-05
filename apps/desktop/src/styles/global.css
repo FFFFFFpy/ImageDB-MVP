@@ -820,11 +820,13 @@ textarea {
 }
 
 .import-plan-stats .scan-progress-card.ok {
-  border-left: 4px solid #059669;
+  border-color: #a7f3d0;
+  background: #f0fdf4;
 }
 
 .import-plan-stats .scan-progress-card.warn {
-  border-left: 4px solid #d97706;
+  border-color: #fed7aa;
+  background: #fff7ed;
 }
 
 .import-plan-skipped {
@@ -855,6 +857,51 @@ textarea {
   margin: 0 0 12px;
 }
 
+.import-plan-albums {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.import-plan-album {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.import-plan-album summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.import-plan-album summary:hover {
+  background: #f9fafb;
+}
+
+.import-plan-album-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.import-plan-album-meta {
+  color: #4b5563;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.import-plan-album .import-plan-table {
+  border-top: 1px solid #e5e7eb;
+}
+
 .import-plan-table {
   width: 100%;
   border-collapse: collapse;
@@ -876,6 +923,13 @@ textarea {
 
 .import-plan-table tr:hover {
   background: #f9fafb;
+}
+
+@media (max-width: 640px) {
+  .import-plan-album summary {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
 }
 
 .commit-page {
