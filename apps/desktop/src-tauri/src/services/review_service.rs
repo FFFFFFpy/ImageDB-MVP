@@ -385,7 +385,9 @@ pub fn build_import_plan(
     albums: &[AlbumRow],
 ) -> ImportPlan {
     let mut excluded_image_ids: HashSet<Uuid> = HashSet::new();
-    let mut skipped_album_ids: HashSet<Uuid> = HashSet::new();
+    let duplicate_album_resolution =
+        detect_covered_import_albums(all_images, all_candidates, albums);
+    let mut skipped_album_ids: HashSet<Uuid> = duplicate_album_resolution.skipped_album_ids.clone();
 
     let album_name_map: HashMap<Uuid, String> = albums
         .iter()
@@ -396,6 +398,7 @@ pub fn build_import_plan(
     let auto_edges: Vec<DuplicateEdge> = all_candidates
         .iter()
         .filter(|c| c.candidate_decision.as_deref() == Some("auto_duplicate"))
+        .filter(|c| !duplicate_album_resolution.should_ignore_auto_edge(c))
         .filter_map(|c| {
             let candidate_id = c
                 .candidate_source_image_id
@@ -458,10 +461,11 @@ pub fn build_import_plan(
         .collect();
 
     let total_images = all_images.len() as u32;
-    let skipped_album_names: Vec<String> = skipped_album_ids
+    let mut skipped_album_names: Vec<String> = skipped_album_ids
         .iter()
         .filter_map(|id| album_name_map.get(id).cloned())
         .collect();
+    skipped_album_names.sort();
 
     ImportPlan {
         import_run_id,
@@ -470,6 +474,217 @@ pub fn build_import_plan(
         excluded_count: total_images.saturating_sub(kept_images.len() as u32),
         kept_images,
         skipped_albums: skipped_album_names,
+    }
+}
+
+struct DuplicateAlbumResolution {
+    skipped_album_ids: HashSet<Uuid>,
+    skipped_image_ids: HashSet<Uuid>,
+}
+
+impl DuplicateAlbumResolution {
+    fn empty() -> Self {
+        Self {
+            skipped_album_ids: HashSet::new(),
+            skipped_image_ids: HashSet::new(),
+        }
+    }
+
+    fn should_ignore_auto_edge(&self, candidate: &ImportPlanCandidateRow) -> bool {
+        if self.skipped_image_ids.contains(&candidate.source_image_id) {
+            return true;
+        }
+        let Some(candidate_source_image_id) = candidate.candidate_source_image_id else {
+            return false;
+        };
+        self.skipped_image_ids.contains(&candidate_source_image_id)
+    }
+}
+
+fn detect_covered_import_albums(
+    all_images: &[ImportPlanImageRow],
+    all_candidates: &[ImportPlanCandidateRow],
+    albums: &[AlbumRow],
+) -> DuplicateAlbumResolution {
+    if albums.len() < 2 || all_images.is_empty() {
+        return DuplicateAlbumResolution::empty();
+    }
+
+    let album_name_by_id: HashMap<Uuid, &str> = albums
+        .iter()
+        .map(|album| (album.id, album.source_name.as_str()))
+        .collect();
+    let mut image_album_by_id: HashMap<Uuid, Uuid> = HashMap::new();
+    let mut image_ids_by_album: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+
+    for img in all_images {
+        image_album_by_id.insert(img.id, img.album_id);
+        image_ids_by_album
+            .entry(img.album_id)
+            .or_default()
+            .push(img.id);
+    }
+
+    let mut exact_cross_pairs: HashSet<(Uuid, Uuid)> = HashSet::new();
+    for candidate in all_candidates {
+        if candidate.candidate_decision.as_deref() != Some("auto_duplicate")
+            || candidate.scope != "cross_album"
+            || !candidate.blake3_equal
+        {
+            continue;
+        }
+        let Some(candidate_source_image_id) = candidate.candidate_source_image_id else {
+            continue;
+        };
+        let Some(source_album_id) = image_album_by_id.get(&candidate.source_image_id) else {
+            continue;
+        };
+        let Some(candidate_album_id) = image_album_by_id.get(&candidate_source_image_id) else {
+            continue;
+        };
+        if source_album_id == candidate_album_id {
+            continue;
+        }
+        exact_cross_pairs.insert(ordered_uuid_pair(
+            candidate.source_image_id,
+            candidate_source_image_id,
+        ));
+    }
+
+    if exact_cross_pairs.is_empty() {
+        return DuplicateAlbumResolution::empty();
+    }
+
+    for ids in image_ids_by_album.values_mut() {
+        ids.sort();
+    }
+
+    let mut skipped_album_ids = HashSet::new();
+    for i in 0..albums.len() {
+        for j in (i + 1)..albums.len() {
+            let album_a = albums[i].id;
+            let album_b = albums[j].id;
+            let Some(images_a) = image_ids_by_album.get(&album_a) else {
+                continue;
+            };
+            let Some(images_b) = image_ids_by_album.get(&album_b) else {
+                continue;
+            };
+            if images_a.is_empty() || images_b.is_empty() {
+                continue;
+            }
+
+            let exact_match_count =
+                exact_match_count_between_albums(images_a, images_b, &exact_cross_pairs);
+            let a_covers_b =
+                exact_match_count == images_b.len() && images_a.len() >= images_b.len();
+            let b_covers_a =
+                exact_match_count == images_a.len() && images_b.len() >= images_a.len();
+
+            if a_covers_b && b_covers_a {
+                let winner = preferred_album_for_equal_content(album_a, album_b, &album_name_by_id);
+                let loser = if winner == album_a { album_b } else { album_a };
+                skipped_album_ids.insert(loser);
+            } else if a_covers_b {
+                skipped_album_ids.insert(album_b);
+            } else if b_covers_a {
+                skipped_album_ids.insert(album_a);
+            }
+        }
+    }
+
+    if skipped_album_ids.is_empty() {
+        return DuplicateAlbumResolution::empty();
+    }
+
+    let skipped_image_ids: HashSet<Uuid> = all_images
+        .iter()
+        .filter(|img| skipped_album_ids.contains(&img.album_id))
+        .map(|img| img.id)
+        .collect();
+
+    DuplicateAlbumResolution {
+        skipped_album_ids,
+        skipped_image_ids,
+    }
+}
+
+fn exact_match_count_between_albums(
+    images_a: &[Uuid],
+    images_b: &[Uuid],
+    exact_cross_pairs: &HashSet<(Uuid, Uuid)>,
+) -> usize {
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); images_a.len()];
+    for (left_idx, image_a) in images_a.iter().enumerate() {
+        for (right_idx, image_b) in images_b.iter().enumerate() {
+            if exact_cross_pairs.contains(&ordered_uuid_pair(*image_a, *image_b)) {
+                adjacency[left_idx].push(right_idx);
+            }
+        }
+    }
+    maximum_bipartite_matches(&adjacency, images_b.len())
+}
+
+fn maximum_bipartite_matches(adjacency: &[Vec<usize>], right_len: usize) -> usize {
+    fn try_match(
+        left_idx: usize,
+        adjacency: &[Vec<usize>],
+        seen_right: &mut [bool],
+        matched_left_by_right: &mut [Option<usize>],
+    ) -> bool {
+        for &right_idx in &adjacency[left_idx] {
+            if seen_right[right_idx] {
+                continue;
+            }
+            seen_right[right_idx] = true;
+            if matched_left_by_right[right_idx]
+                .map(|other_left| {
+                    try_match(other_left, adjacency, seen_right, matched_left_by_right)
+                })
+                .unwrap_or(true)
+            {
+                matched_left_by_right[right_idx] = Some(left_idx);
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut matched_left_by_right = vec![None; right_len];
+    let mut count = 0;
+    for left_idx in 0..adjacency.len() {
+        let mut seen_right = vec![false; right_len];
+        if try_match(
+            left_idx,
+            adjacency,
+            &mut seen_right,
+            &mut matched_left_by_right,
+        ) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn preferred_album_for_equal_content(
+    album_a: Uuid,
+    album_b: Uuid,
+    album_name_by_id: &HashMap<Uuid, &str>,
+) -> Uuid {
+    let name_a = album_name_by_id.get(&album_a).copied().unwrap_or("");
+    let name_b = album_name_by_id.get(&album_b).copied().unwrap_or("");
+    if (name_a, album_a) <= (name_b, album_b) {
+        album_a
+    } else {
+        album_b
+    }
+}
+
+fn ordered_uuid_pair(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -791,13 +1006,22 @@ mod tests {
     }
 
     fn make_image(id: Uuid, album_id: Uuid, name: &str) -> ImportPlanImageRow {
+        make_image_in_album(id, album_id, "album_a", name)
+    }
+
+    fn make_image_in_album(
+        id: Uuid,
+        album_id: Uuid,
+        album_name: &str,
+        relative_name: &str,
+    ) -> ImportPlanImageRow {
         ImportPlanImageRow {
             id,
-            source_path: format!("/src/{name}"),
-            relative_path: name.to_string(),
+            source_path: format!("/src/{album_name}/{relative_name}"),
+            relative_path: format!("{album_name}/{relative_name}"),
             file_size: 1000,
             album_id,
-            album_name: "album_a".to_string(),
+            album_name: album_name.to_string(),
         }
     }
 
@@ -839,6 +1063,133 @@ mod tests {
         assert_eq!(plan.kept_images.len(), 1);
         assert_eq!(plan.kept_images[0].image_id, img_a.to_string());
         assert_eq!(plan.excluded_count, 1);
+    }
+
+    #[test]
+    fn plan_keeps_one_complete_album_for_exact_duplicate_album_copies() {
+        let album_a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let album_b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let a_001 = Uuid::parse_str("00000000-0000-0000-0000-000000000020").unwrap();
+        let b_001 = Uuid::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let a_002 = Uuid::parse_str("00000000-0000-0000-0000-000000000030").unwrap();
+        let b_002 = Uuid::parse_str("00000000-0000-0000-0000-000000000040").unwrap();
+
+        let images = vec![
+            make_image_in_album(a_001, album_a, "album_a", "001.jpg"),
+            make_image_in_album(a_002, album_a, "album_a", "002.jpg"),
+            make_image_in_album(b_001, album_b, "album_b_copy", "001.jpg"),
+            make_image_in_album(b_002, album_b, "album_b_copy", "002.jpg"),
+        ];
+        let candidates = vec![
+            ImportPlanCandidateRow {
+                candidate_id: Uuid::parse_str("00000000-0000-0000-0000-000000000100").unwrap(),
+                source_image_id: a_001,
+                candidate_source_image_id: Some(b_001),
+                candidate_library_image_id: None,
+                scope: "cross_album".to_string(),
+                candidate_decision: Some("auto_duplicate".to_string()),
+                review_decision: None,
+                source_album_id: album_a,
+                blake3_equal: true,
+                pixel_hash_equal: true,
+                confidence: Some(1.0),
+            },
+            ImportPlanCandidateRow {
+                candidate_id: Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap(),
+                source_image_id: a_002,
+                candidate_source_image_id: Some(b_002),
+                candidate_library_image_id: None,
+                scope: "cross_album".to_string(),
+                candidate_decision: Some("auto_duplicate".to_string()),
+                review_decision: None,
+                source_album_id: album_a,
+                blake3_equal: true,
+                pixel_hash_equal: true,
+                confidence: Some(1.0),
+            },
+        ];
+        let albums = vec![
+            make_album(album_a, "album_a"),
+            make_album(album_b, "album_b_copy"),
+        ];
+
+        let plan = build_import_plan("run-1".to_string(), &images, &candidates, &albums);
+
+        let kept_ids: HashSet<&str> = plan
+            .kept_images
+            .iter()
+            .map(|img| img.image_id.as_str())
+            .collect();
+        assert_eq!(kept_ids.len(), 2);
+        assert!(kept_ids.contains(a_001.to_string().as_str()));
+        assert!(kept_ids.contains(a_002.to_string().as_str()));
+        assert_eq!(plan.skipped_albums, vec!["album_b_copy".to_string()]);
+        assert_eq!(plan.excluded_count, 2);
+    }
+
+    #[test]
+    fn plan_keeps_superset_album_when_one_album_contains_another() {
+        let album_a = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let album_b = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let a_extra = Uuid::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let a_copy_001 = Uuid::parse_str("00000000-0000-0000-0000-000000000030").unwrap();
+        let a_copy_002 = Uuid::parse_str("00000000-0000-0000-0000-000000000040").unwrap();
+        let b_001 = Uuid::parse_str("00000000-0000-0000-0000-000000000020").unwrap();
+        let b_002 = Uuid::parse_str("00000000-0000-0000-0000-000000000050").unwrap();
+
+        let images = vec![
+            make_image_in_album(a_extra, album_a, "album_a", "cover.jpg"),
+            make_image_in_album(a_copy_001, album_a, "album_a", "copied_b/001.jpg"),
+            make_image_in_album(a_copy_002, album_a, "album_a", "copied_b/002.jpg"),
+            make_image_in_album(b_001, album_b, "album_b", "001.jpg"),
+            make_image_in_album(b_002, album_b, "album_b", "002.jpg"),
+        ];
+        let candidates = vec![
+            ImportPlanCandidateRow {
+                candidate_id: Uuid::parse_str("00000000-0000-0000-0000-000000000110").unwrap(),
+                source_image_id: a_copy_001,
+                candidate_source_image_id: Some(b_001),
+                candidate_library_image_id: None,
+                scope: "cross_album".to_string(),
+                candidate_decision: Some("auto_duplicate".to_string()),
+                review_decision: None,
+                source_album_id: album_a,
+                blake3_equal: true,
+                pixel_hash_equal: true,
+                confidence: Some(1.0),
+            },
+            ImportPlanCandidateRow {
+                candidate_id: Uuid::parse_str("00000000-0000-0000-0000-000000000111").unwrap(),
+                source_image_id: a_copy_002,
+                candidate_source_image_id: Some(b_002),
+                candidate_library_image_id: None,
+                scope: "cross_album".to_string(),
+                candidate_decision: Some("auto_duplicate".to_string()),
+                review_decision: None,
+                source_album_id: album_a,
+                blake3_equal: true,
+                pixel_hash_equal: true,
+                confidence: Some(1.0),
+            },
+        ];
+        let albums = vec![
+            make_album(album_a, "album_a"),
+            make_album(album_b, "album_b"),
+        ];
+
+        let plan = build_import_plan("run-1".to_string(), &images, &candidates, &albums);
+
+        let kept_ids: HashSet<&str> = plan
+            .kept_images
+            .iter()
+            .map(|img| img.image_id.as_str())
+            .collect();
+        assert_eq!(kept_ids.len(), 3);
+        assert!(kept_ids.contains(a_extra.to_string().as_str()));
+        assert!(kept_ids.contains(a_copy_001.to_string().as_str()));
+        assert!(kept_ids.contains(a_copy_002.to_string().as_str()));
+        assert_eq!(plan.skipped_albums, vec!["album_b".to_string()]);
+        assert_eq!(plan.excluded_count, 2);
     }
 
     #[test]
