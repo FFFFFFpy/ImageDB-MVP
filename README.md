@@ -2,18 +2,48 @@
 
 ImageDB 是一个本地优先的桌面图集整理应用。
 
-核心流程：
+> **MVP1 当前定性：功能完成，进入 Debug / 实战测试阶段。**
+>
+> 当前版本状态、Debug 边界和文档入口以 [`docs/MVP1/`](docs/MVP1/README.md) 为准。
+
+## 当前状态
 
 ```text
-选择源目录
-→ 扫描图集
-→ 图集内部重复与相似检测
-→ 与历史图库比较
-→ 人工审核不确定候选
-→ 写入目标图库
-→ 完整性校验
-→ 数据库确认入库
+MVP1 功能完成。
+当前阶段：Debug / 实战测试。
+正式发布：等待 clean Windows release gate 签字。
 ```
+
+MVP1 本地主链已经人工验收通过：
+
+```text
+全新开始
+→ 初始化托管本地 PostgreSQL
+→ 选择源目录
+→ 导入 / 分析
+→ 审核
+→ 生成 / 冻结导入计划
+→ 提交入库
+→ 本地目录正式入库
+```
+
+## 文档入口
+
+| 文档 | 用途 |
+| --- | --- |
+| [`docs/MVP1/README.md`](docs/MVP1/README.md) | MVP1 文档总入口 |
+| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、DoD、剩余 Debug 项 |
+| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | MVP1 架构、主链、数据与文件事务 |
+| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 文档地图与归档说明 |
+
+历史计划、提示词、任务和报告已经归档到：
+
+```text
+docs/MVP1/archive/
+```
+
+根目录 `reports/` 仅保留为脚本生成报告的输出目录。
 
 ## 技术栈
 
@@ -30,33 +60,42 @@ pnpm install
 pnpm dev
 ```
 
-常用命令：
+常用验证：
 
 ```bash
+pnpm format:check
 pnpm typecheck
 pnpm test:unit
 pnpm rust:test
 pnpm rust:clippy
-pnpm build
 ```
 
-Codex 开始工作前依次阅读：
-
-1. `AGENTS.md`
-2. `CURRENT_TASK.md`
-3. `PROJECT_PLAN.md`
-4. 当前任务引用的文档
-
-## 环境检查
-
-Windows：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check-env.ps1
-```
-
-macOS：
+真实 PostgreSQL 验证：
 
 ```bash
-bash ./scripts/check-env.sh
+pnpm rust:test:real
 ```
+
+Windows release 验证：
+
+```bash
+pnpm build
+pnpm release:verify-artifacts
+pnpm release:install-gate
+```
+
+完整发布签字：
+
+```bash
+pnpm release:gate
+```
+
+## Agent / Codex 阅读顺序
+
+1. `AGENTS.md`
+2. `docs/MVP1/README.md`
+3. `docs/MVP1/STATUS.md`
+4. `CURRENT_TASK.md`
+5. `docs/MVP1/DEBUG_PLAYBOOK.md`
+
+不要再从 `docs/MVP1/archive/`、历史 `reports` 或旧任务文件推断当前状态。
