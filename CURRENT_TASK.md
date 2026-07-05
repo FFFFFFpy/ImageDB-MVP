@@ -52,10 +52,14 @@ MVP1 本地主链已人工验收通过：
 | [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、DoD、剩余 Debug 项 |
 | [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | MVP1 架构、主链、数据与文件事务 |
 | [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
-| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 旧文档索引与归档口径 |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 文档地图与归档口径 |
 
 ## 历史记录
 
-旧的里程碑报告、M5/M6 修复报告、M6.5–M9 closure 报告、任务拆分和 Codex 执行计划都保留为历史证据。当前状态不要再从散落文档推断，以 `docs/MVP1/` 为准。
+旧的里程碑报告、M5/M6 修复报告、M6.5–M9 closure 报告、任务拆分和 Codex 执行计划已经归档到：
 
-是的，终于给文档找了个家。软件项目最像家政灾难片的部分通常就是文档。
+```text
+docs/MVP1/archive/
+```
+
+当前状态不要再从归档文档推断，以 `docs/MVP1/` 为准。
