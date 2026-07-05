@@ -2,7 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { Route } from '../hooks/use-router';
-import type { CommitProgress, ImportPlan } from '../lib/ipc/types';
+import type {
+  CommitProgress,
+  ImportPlan,
+  ImportPlanAlbum,
+  ImportPlanImage,
+} from '../lib/ipc/types';
 
 interface CommitPageProps {
   onNavigate: (route: Route) => void;
@@ -14,6 +19,93 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+interface CommitPlanAlbumGroup {
+  albumId: string;
+  albumName: string;
+  included: boolean;
+  imageCount: number;
+  skippedImageCount: number;
+  totalSize: number;
+  images: ImportPlanImage[];
+}
+
+function planAlbumsForDisplay(plan: ImportPlan): CommitPlanAlbumGroup[] {
+  if (plan.albums?.length) {
+    return plan.albums.map((album: ImportPlanAlbum) => ({
+      albumId: album.album_id,
+      albumName: album.album_name,
+      included: album.included,
+      imageCount: album.image_count,
+      skippedImageCount: album.images.filter((image) => !image.included).length,
+      totalSize: album.total_size,
+      images: album.images,
+    }));
+  }
+
+  const groups = new Map<string, CommitPlanAlbumGroup>();
+  plan.kept_images.forEach((image) => {
+    const albumId = image.album_id || image.album_name || 'unknown';
+    const existing = groups.get(albumId);
+    if (existing) {
+      existing.imageCount += 1;
+      existing.totalSize += image.file_size;
+      existing.images.push(image);
+      return;
+    }
+    groups.set(albumId, {
+      albumId,
+      albumName: image.album_name || '未命名图集',
+      included: true,
+      imageCount: 1,
+      skippedImageCount: 0,
+      totalSize: image.file_size,
+      images: [image],
+    });
+  });
+  return Array.from(groups.values());
+}
+
+interface CommitImageThumbnailProps {
+  importRunId: string;
+  image: ImportPlanImage;
+  onOpen: (image: ImportPlanImage, dataUrl: string | null) => void;
+}
+
+function CommitImageThumbnail({ importRunId, image, onOpen }: CommitImageThumbnailProps) {
+  const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getImportPlanImagePreview(importRunId, image.image_id)
+      .then((preview) => {
+        if (!cancelled) setDataUrl(preview.data_url);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [image.image_id, importRunId]);
+
+  return (
+    <button
+      type="button"
+      className="import-plan-thumb"
+      onClick={() => onOpen(image, dataUrl)}
+      aria-label={`预览 ${image.relative_path}`}
+    >
+      {dataUrl ? (
+        <img src={dataUrl} alt="" loading="lazy" />
+      ) : (
+        <span>{failed ? '无预览' : '加载中'}</span>
+      )}
+    </button>
+  );
 }
 
 function isTerminalProgress(progress: CommitProgress): boolean {
@@ -55,6 +147,11 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   const [progress, setProgress] = useState<CommitProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [importRunId, setImportRunId] = useState<string | null>(null);
+  const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
+  const [previewModal, setPreviewModal] = useState<{
+    image: ImportPlanImage;
+    dataUrl: string | null;
+  } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Keep this aligned with ImportRepository::get_latest_committable_run:
@@ -125,14 +222,57 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
     }
   }, []);
 
+  const openPlanImagePreview = useCallback(
+    (image: ImportPlanImage, dataUrl: string | null) => {
+      setPreviewModal({ image, dataUrl });
+      if (dataUrl || !importRunId) return;
+      api
+        .getImportPlanImagePreview(importRunId, image.image_id)
+        .then((preview) => {
+          setPreviewModal((current) =>
+            current?.image.image_id === image.image_id
+              ? { image, dataUrl: preview.data_url }
+              : current,
+          );
+        })
+        .catch(() => {
+          setPreviewModal((current) =>
+            current?.image.image_id === image.image_id ? { image, dataUrl: null } : current,
+          );
+        });
+    },
+    [importRunId],
+  );
+
   const totalFileSize = plan
     ? plan.kept_images.reduce((sum, image) => sum + image.file_size, 0)
     : 0;
 
   if (phase === 'confirm') {
+    const albumGroups = plan ? planAlbumsForDisplay(plan) : [];
+    const keptAlbums = albumGroups.filter((album) => album.included).length;
+
     return (
       <div className="commit-page">
-        <h1>提交确认</h1>
+        {plan ? (
+          <div className="import-plan-header">
+            <h1>提交确认</h1>
+            <div className="toolbar import-plan-actions">
+              <button
+                className="btn-primary"
+                onClick={handleStartCommit}
+                disabled={commitMutation.isPending || plan.kept_images.length === 0}
+              >
+                {commitMutation.isPending ? '提交中…' : '提交导入'}
+              </button>
+              <button className="btn-secondary" onClick={() => onNavigate('review')}>
+                退回至导入计划
+              </button>
+            </div>
+          </div>
+        ) : (
+          <h1>提交确认</h1>
+        )}
 
         {latestRun.isLoading && <p>正在加载可提交的导入任务…</p>}
         {!latestRun.data && !latestRun.isLoading && (
@@ -170,69 +310,120 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
 
         {plan && (
           <div className="commit-confirm">
-            <div className="commit-stats">
-              <div className="stat-card">
-                <div className="stat-value">{plan.total_albums}</div>
-                <div className="stat-label">图集数</div>
+            <div className="import-plan-summary">
+              <div className="import-plan-stats">
+                <div className="scan-progress-card">
+                  <h3>图集数</h3>
+                  <p>{plan.total_albums}</p>
+                </div>
+                <div className="scan-progress-card">
+                  <h3>图片总数</h3>
+                  <p>{plan.total_images}</p>
+                </div>
+                <div className="scan-progress-card ok">
+                  <h3>导入</h3>
+                  <p>{plan.kept_images.length}</p>
+                </div>
+                <div className="scan-progress-card warn">
+                  <h3>排除</h3>
+                  <p>{plan.excluded_count}</p>
+                </div>
+                <div className="scan-progress-card">
+                  <h3>预计大小</h3>
+                  <p>{formatFileSize(totalFileSize)}</p>
+                </div>
               </div>
-              <div className="stat-card">
-                <div className="stat-value">{plan.kept_images.length}</div>
-                <div className="stat-label">保留图片</div>
-              </div>
-              <div className="stat-card">
-                <div className="stat-value">{plan.excluded_count}</div>
-                <div className="stat-label">排除</div>
-              </div>
-              <div className="stat-card">
-                <div className="stat-value">{formatFileSize(totalFileSize)}</div>
-                <div className="stat-label">预计大小</div>
+
+              <div className="import-plan-kept">
+                <h3>
+                  导入图集 ({keptAlbums}) / 导入图片 ({plan.kept_images.length})
+                </h3>
+                <div className="import-plan-albums">
+                  {albumGroups.map((album) => {
+                    const isOpen = openPlanAlbums.has(album.albumId);
+                    return (
+                      <details
+                        className={`import-plan-album ${album.included ? 'included' : 'skipped'}`}
+                        key={album.albumId}
+                        open={isOpen}
+                        onToggle={(event) => {
+                          const nextOpen = event.currentTarget.open;
+                          setOpenPlanAlbums((current) => {
+                            const next = new Set(current);
+                            if (nextOpen) next.add(album.albumId);
+                            else next.delete(album.albumId);
+                            return next;
+                          });
+                        }}
+                      >
+                        <summary>
+                          <span
+                            className={`import-plan-album-title ${
+                              album.included ? '' : 'is-skipped'
+                            }`}
+                          >
+                            {album.albumName}
+                          </span>
+                          <span className="import-plan-album-meta">
+                            导入 {album.imageCount} 张 / 跳过 {album.skippedImageCount} 张 ·{' '}
+                            {formatFileSize(album.totalSize)}
+                          </span>
+                          <span className={`plan-toggle ${album.included ? 'is-on' : 'is-off'}`}>
+                            {album.included ? '导入' : '跳过'}
+                          </span>
+                        </summary>
+                        {isOpen && (
+                          <div className="import-plan-image-list">
+                            {album.images.map((image) => (
+                              <div
+                                className={`import-plan-image-row ${
+                                  image.included ? 'included' : 'skipped'
+                                }`}
+                                key={image.image_id}
+                              >
+                                <CommitImageThumbnail
+                                  importRunId={plan.import_run_id}
+                                  image={image}
+                                  onOpen={openPlanImagePreview}
+                                />
+                                <button
+                                  type="button"
+                                  className="import-plan-image-info"
+                                  onClick={() => openPlanImagePreview(image, null)}
+                                >
+                                  <span className="mono">{image.relative_path}</span>
+                                  <span>{formatFileSize(image.file_size)}</span>
+                                </button>
+                                <span
+                                  className={`plan-toggle ${image.included ? 'is-on' : 'is-off'}`}
+                                >
+                                  {image.included ? '导入' : '跳过'}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </details>
+                    );
+                  })}
+                </div>
               </div>
             </div>
 
-            {plan.skipped_albums.length > 0 && (
-              <div className="commit-section">
-                <h3>跳过的图集</h3>
-                <ul>
-                  {plan.skipped_albums.map((album) => (
-                    <li key={album}>{album}</li>
-                  ))}
-                </ul>
+            {previewModal && (
+              <div className="image-preview-modal" onClick={() => setPreviewModal(null)}>
+                <div className="image-preview-dialog" onClick={(event) => event.stopPropagation()}>
+                  {previewModal.dataUrl ? (
+                    <img src={previewModal.dataUrl} alt={previewModal.image.relative_path} />
+                  ) : (
+                    <div className="image-preview-loading">正在加载预览...</div>
+                  )}
+                  <div className="mono">{previewModal.image.relative_path}</div>
+                </div>
               </div>
             )}
 
-            <div className="commit-section">
-              <h3>待提交文件</h3>
-              <table className="commit-table">
-                <thead>
-                  <tr>
-                    <th>图集</th>
-                    <th>文件</th>
-                    <th>大小</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {plan.kept_images.map((image) => (
-                    <tr key={image.image_id}>
-                      <td>{image.album_name}</td>
-                      <td className="mono">{image.relative_path}</td>
-                      <td>{formatFileSize(image.file_size)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
             {error && <div className="commit-error-msg">{error}</div>}
-
-            <div className="commit-actions">
-              <button
-                className="btn-primary"
-                onClick={handleStartCommit}
-                disabled={commitMutation.isPending || plan.kept_images.length === 0}
-              >
-                {commitMutation.isPending ? '提交中…' : '提交导入'}
-              </button>
-            </div>
           </div>
         )}
       </div>

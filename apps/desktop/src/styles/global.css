@@ -1121,7 +1121,11 @@ textarea {
 }
 
 .commit-page {
-  max-width: 1200px;
+  max-width: 1400px;
+}
+
+.commit-page .plan-toggle {
+  cursor: default;
 }
 
 .commit-page h1 {

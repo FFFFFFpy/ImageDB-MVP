@@ -214,6 +214,21 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
     refetchInterval: 5000,
   });
 
+  const frozenPlanQuery = useQuery({
+    queryKey: ['reviewFrozenImportPlanSummary', importRunId],
+    queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
+    enabled: !!importRunId && !showPlan && !importPlan,
+  });
+
+  useEffect(() => {
+    if (frozenPlanQuery.data && !showPlan && !importPlan) {
+      setImportPlan(frozenPlanQuery.data);
+      setShowPlan(true);
+      setOpenPlanAlbums(new Set());
+      setPlanEditError(null);
+    }
+  }, [frozenPlanQuery.data, importPlan, showPlan]);
+
   const queue = queueQuery.data ?? [];
   const undecidedQueue = useMemo(() => queue.filter((c) => !c.has_decision), [queue]);
 
