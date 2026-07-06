@@ -29,7 +29,10 @@ pub async fn connect_external(
         TlsMode::Disable => {
             pg.ssl_mode(SslMode::Disable);
             let (client, conn) = pg.connect(NoTls).await.map_err(|e| {
-                AppError::PostgresUnavailable(format!("external connection failed: {e}"))
+                AppError::PostgresUnavailable(format_external_connect_error(
+                    "external connection failed",
+                    &e,
+                ))
             })?;
             Ok(spawn_connection(client, conn))
         }
@@ -39,11 +42,25 @@ pub async fn connect_external(
             let connector = MakeTlsConnector::new(build_tls_connector(config)?);
 
             let (client, conn) = pg.connect(connector).await.map_err(|e| {
-                AppError::PostgresUnavailable(format!("external TLS connection failed: {e}"))
+                AppError::PostgresUnavailable(format_external_connect_error(
+                    "external TLS connection failed",
+                    &e,
+                ))
             })?;
             Ok(spawn_connection(client, conn))
         }
     }
+}
+
+fn format_external_connect_error(context: &str, error: &tokio_postgres::Error) -> String {
+    if let Some(db_error) = error.as_db_error() {
+        return format!(
+            "{context}: {}: {}",
+            db_error.code().code(),
+            db_error.message()
+        );
+    }
+    format!("{context}: {error}")
 }
 
 fn build_tls_connector(config: &ConnectionConfig) -> Result<TlsConnector, AppError> {

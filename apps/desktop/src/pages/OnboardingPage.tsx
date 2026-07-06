@@ -41,21 +41,33 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
   return (
     <div className="onboarding-page">
       <h1>欢迎使用 ImageDB</h1>
-      <p>请选择数据库模式以完成初始设置。</p>
+      <p>
+        {mode === 'external'
+          ? '正在配置外部 PostgreSQL。修正连接、权限或 TLS 参数后，可以在这里重新连接并初始化。'
+          : mode === 'managed'
+            ? '正在初始化托管 PostgreSQL。数据库就绪后即可进入应用。'
+            : '请选择数据库模式以完成初始设置。'}
+      </p>
 
       {databaseState && <DbStateSummary state={databaseState} />}
 
       <div className="mode-cards">
         <div
           className={`mode-card ${mode === 'managed' ? 'selected' : ''}`}
-          onClick={() => setMode('managed')}
+          onClick={() => {
+            setMode('managed');
+            setConnectedState(null);
+          }}
         >
           <h3>托管模式（推荐）</h3>
           <p>应用自动管理本地 PostgreSQL 实例。无需手动安装和配置。</p>
         </div>
         <div
           className={`mode-card ${mode === 'external' ? 'selected' : ''}`}
-          onClick={() => setMode('external')}
+          onClick={() => {
+            setMode('external');
+            setConnectedState(null);
+          }}
         >
           <h3>外部连接</h3>
           <p>连接已有的 PostgreSQL 数据库。需要提供连接参数。</p>
@@ -64,7 +76,7 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
 
       {mode === 'managed' && (
         <ManagedSetup
-          onConnected={(state) => {
+          onInitialized={(state) => {
             setConnectedState(state);
             queryClient.invalidateQueries({ queryKey: ['database-status'] });
           }}
@@ -72,7 +84,7 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
       )}
       {mode === 'external' && (
         <ExternalSetup
-          onConnected={(state) => {
+          onInitialized={(state) => {
             setConnectedState(state);
             queryClient.invalidateQueries({ queryKey: ['database-status'] });
           }}
@@ -127,13 +139,11 @@ function DbStateSummary({ state }: { state: DatabaseState }) {
   );
 }
 
-function ManagedSetup({ onConnected }: { onConnected: (state: DatabaseState) => void }) {
+function ManagedSetup({ onInitialized }: { onInitialized: (state: DatabaseState) => void }) {
   const init = useMutation({
     mutationFn: api.initializeManagedDatabase,
     onSuccess: (state) => {
-      if (taggedStatusCode(state.status) === 'connected') {
-        onConnected(state);
-      }
+      onInitialized(state);
     },
   });
 
@@ -153,7 +163,7 @@ function ManagedSetup({ onConnected }: { onConnected: (state: DatabaseState) => 
   );
 }
 
-function ExternalSetup({ onConnected }: { onConnected: (state: DatabaseState) => void }) {
+function ExternalSetup({ onInitialized }: { onInitialized: (state: DatabaseState) => void }) {
   const [host, setHost] = useState('127.0.0.1');
   const [port, setPort] = useState('5432');
   const [database, setDatabase] = useState('imagedb');
@@ -185,9 +195,7 @@ function ExternalSetup({ onConnected }: { onConnected: (state: DatabaseState) =>
   const initExt = useMutation({
     mutationFn: () => api.initializeExternalDatabase(buildConfig()),
     onSuccess: (state) => {
-      if (taggedStatusCode(state.status) === 'connected') {
-        onConnected(state);
-      }
+      onInitialized(state);
     },
   });
 
@@ -302,6 +310,9 @@ function ExternalSetup({ onConnected }: { onConnected: (state: DatabaseState) =>
             </details>
           )}
         </div>
+      )}
+      {initExt.data && taggedStatusCode(initExt.data.status) !== 'connected' && (
+        <p className="status-err">外部库尚未就绪。请按诊断信息修正后重新连接并初始化。</p>
       )}
       {initExt.data && <DbStateSummary state={initExt.data} />}
       {(testConn.isError || initExt.isError) && (

@@ -25,7 +25,7 @@ export function App() {
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
   const handleOnboardingComplete = async () => {
-    const currentSettings = settings.data ?? (await api.getSettings());
+    const currentSettings = await api.getSettings();
     if (!currentSettings.first_run_completed) {
       await api.updateSettings({
         ...currentSettings,
@@ -54,7 +54,7 @@ export function App() {
           {route === 'dashboard' && (
             <DashboardPage
               needsOnboarding={needsOnboarding}
-              onGoOnboarding={() => navigate('onboarding')}
+              onConfigureDatabase={() => navigate('settings')}
               onGoScan={() => navigate('scan')}
             />
           )}

@@ -10,6 +10,7 @@ vi.mock('../lib/ipc/api', () => ({
     getDatabaseStatus: vi.fn(),
     getExternalMigrationProgress: vi.fn(),
     testExternalConnection: vi.fn(),
+    initializeExternalDatabase: vi.fn(),
     startManagedToExternalMigration: vi.fn(),
     cancelExternalMigration: vi.fn(),
     shutdownDatabase: vi.fn(),
@@ -66,6 +67,27 @@ beforeEach(() => {
     diagnostics: [],
     errors: [],
     cancel_requested: false,
+  });
+  mockedApi.initializeExternalDatabase.mockResolvedValue({
+    mode: 'external',
+    status: 'connected',
+    managed_config: null,
+    external_config: {
+      host: '192.168.31.25',
+      port: 35973,
+      database: 'image_db',
+      username: 'helw',
+      tls_mode: 'disable',
+      ca_cert_path: null,
+      client_cert_path: null,
+      client_key_path: null,
+      connect_timeout_secs: 10,
+      query_timeout_secs: 15,
+      profile_name: 'default',
+    },
+    pgvector_available: true,
+    migration_version: '0010_library_root_leases',
+    diagnostics: ['external database initialized'],
   });
   mockedApi.probeStorageCapabilities.mockResolvedValue({
     root: 'C:/ImageLibrary',
@@ -143,6 +165,59 @@ function renderSettingsPage() {
 }
 
 describe('SettingsPage external PostgreSQL GUI', () => {
+  test('labels the local managed data directory as reserved before a database mode is selected', async () => {
+    mockedApi.getDatabaseStatus.mockResolvedValue({
+      mode: null,
+      status: 'not_initialized',
+      managed_config: {
+        data_dir: 'C:/Users/Helw/AppData/Local/ImageDB/postgres_data',
+        port: 0,
+        username: 'imagedb',
+        database: 'imagedb',
+      },
+      external_config: null,
+      pgvector_available: false,
+      migration_version: null,
+      diagnostics: [],
+    });
+
+    renderSettingsPage();
+
+    expect(await screen.findByText(/数据库模式尚未选择/)).toBeInTheDocument();
+    expect(await screen.findByText('托管库预留目录')).toBeInTheDocument();
+    expect(screen.getByText(/尚未使用本地托管库/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '初始化托管库' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '连接并初始化外部库' })).toBeInTheDocument();
+    expect(screen.queryByText('数据目录')).not.toBeInTheDocument();
+  });
+
+  test('initializes an external database directly from settings', async () => {
+    renderSettingsPage();
+
+    fireEvent.change(await screen.findByLabelText('主机'), {
+      target: { value: '192.168.31.25' },
+    });
+    fireEvent.change(screen.getByLabelText('端口'), { target: { value: '35973' } });
+    fireEvent.change(screen.getByLabelText('数据库名'), { target: { value: 'image_db' } });
+    fireEvent.change(screen.getByLabelText('用户名'), { target: { value: 'helw' } });
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'secret' } });
+
+    fireEvent.click(screen.getByRole('button', { name: '连接并初始化外部库' }));
+
+    expect(await screen.findByText('外部数据库已连接并初始化。')).toBeInTheDocument();
+    expect(mockedApi.initializeExternalDatabase).toHaveBeenCalledWith(
+      expect.objectContaining({
+        host: '192.168.31.25',
+        port: 35973,
+        database: 'image_db',
+        username: 'helw',
+        password: 'secret',
+      }),
+    );
+    await waitFor(() => expect(mockedApi.getSettings.mock.calls.length).toBeGreaterThan(1));
+    await waitFor(() => expect(mockedApi.getDatabaseStatus.mock.calls.length).toBeGreaterThan(1));
+  });
+
   test('renders structured external preflight diagnostics after testing a connection', async () => {
     mockedApi.testExternalConnection.mockResolvedValue({
       connection_ok: true,

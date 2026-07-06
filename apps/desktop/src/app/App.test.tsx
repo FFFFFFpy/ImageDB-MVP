@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { App } from './App';
 
@@ -88,6 +88,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 beforeEach(() => {
+  window.location.hash = '';
   mockState.settings = {
     database_mode: 'managed_local',
     library_root: null,
@@ -158,6 +159,53 @@ test('renders status cards section', async () => {
   expect(screen.getByText('迁移')).toBeInTheDocument();
 });
 
+test('does not present a local managed path as active before database mode is selected', async () => {
+  mockState.databaseStatus = {
+    ...mockState.databaseStatus,
+    mode: null,
+    status: 'not_initialized',
+    managed_config: {
+      data_dir: 'C:/Users/Helw/AppData/Local/ImageDB/postgres_data',
+      port: 0,
+      username: 'imagedb',
+      database: 'imagedb',
+    },
+    pgvector_available: false,
+    migration_version: null,
+  };
+
+  renderApp();
+
+  expect(await screen.findByText('未初始化')).toBeInTheDocument();
+  expect(screen.getByText('尚未选择数据库模式')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '选择数据库模式' })).toBeInTheDocument();
+  expect(screen.queryByText(/postgres_data : 0/)).not.toBeInTheDocument();
+});
+
+test('routes unresolved database mode from dashboard to settings instead of onboarding loop', async () => {
+  mockState.databaseStatus = {
+    ...mockState.databaseStatus,
+    mode: null,
+    status: 'not_initialized',
+    managed_config: {
+      data_dir: 'C:/Users/Helw/AppData/Local/ImageDB/postgres_data',
+      port: 0,
+      username: 'imagedb',
+      database: 'imagedb',
+    },
+    pgvector_available: false,
+    migration_version: null,
+  };
+
+  renderApp();
+
+  fireEvent.click(await screen.findByRole('button', { name: '选择数据库模式' }));
+
+  expect(await screen.findByRole('heading', { name: '设置' })).toBeInTheDocument();
+  expect(screen.getByText('外部数据库连接')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '初始化托管库' })).toBeInTheDocument();
+});
+
 test('renders tagged database status objects without crashing', async () => {
   renderApp();
   expect(await screen.findByText(/缺少 PostgreSQL 运行文件/)).toBeInTheDocument();
@@ -191,4 +239,53 @@ test('shows enter app button when onboarding sees uppercase Connected status', a
   renderApp();
 
   expect(await screen.findByRole('button', { name: '进入应用' })).toBeInTheDocument();
+});
+
+test('entering the app after external initialization does not overwrite freshly stored settings', async () => {
+  mockState.settings = {
+    ...mockState.settings,
+    database_mode: null,
+    first_run_completed: false,
+  };
+  mockState.databaseStatus = {
+    ...mockState.databaseStatus,
+    mode: 'external',
+    status: 'Connected',
+    managed_config: null,
+    external_config: {
+      host: '192.168.31.25',
+      port: 35973,
+      database: 'image_db',
+      username: 'helw',
+      tls_mode: 'disable',
+      ca_cert_path: null,
+      client_cert_path: null,
+      client_key_path: null,
+      connect_timeout_secs: 10,
+      query_timeout_secs: 15,
+      profile_name: 'default',
+    },
+    pgvector_available: true,
+    migration_version: '0010_library_root_leases',
+  };
+
+  renderApp();
+
+  const enterButton = await screen.findByRole('button', { name: '进入应用' });
+  mockState.settings = {
+    ...mockState.settings,
+    database_mode: 'external',
+    external_host: '192.168.31.25',
+    external_port: 35973,
+    external_database: 'image_db',
+    external_username: 'helw',
+    external_tls_mode: 'disable',
+    first_run_completed: true,
+  };
+
+  fireEvent.click(enterButton);
+
+  expect(await screen.findByRole('heading', { name: '工作台' })).toBeInTheDocument();
+  expect(mockState.settings.database_mode).toBe('external');
+  expect(mockState.settings.external_database).toBe('image_db');
 });

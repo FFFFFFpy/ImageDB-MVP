@@ -4,6 +4,7 @@ import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/f
 import { useState } from 'react';
 import type {
   CapabilityProbe,
+  DatabaseState,
   ExternalConnectionConfig,
   StorageCapabilities,
 } from '../lib/ipc/types';
@@ -52,6 +53,50 @@ function formatMigrationStage(stage: string): string {
   return map[stage] ?? stage;
 }
 
+function DbActivationResult({
+  state,
+  successText,
+}: {
+  state: DatabaseState;
+  successText: string | null;
+}) {
+  return (
+    <div className="check-result">
+      {successText && <p className="status-ok">{successText}</p>}
+      <table>
+        <tbody>
+          <tr>
+            <td>状态</td>
+            <td>{formatTaggedStatus(state.status)}</td>
+          </tr>
+          <tr>
+            <td>模式</td>
+            <td>{state.mode ? (state.mode === 'managed_local' ? '托管' : '外部') : '未设置'}</td>
+          </tr>
+          <tr>
+            <td>pgvector</td>
+            <td>{state.pgvector_available ? '可用' : '不可用'}</td>
+          </tr>
+          <tr>
+            <td>迁移版本</td>
+            <td className="mono">{state.migration_version ?? '未执行'}</td>
+          </tr>
+        </tbody>
+      </table>
+      {state.diagnostics.length > 0 && (
+        <details className="diagnostics">
+          <summary>诊断信息 ({state.diagnostics.length})</summary>
+          <ul>
+            {state.diagnostics.map((d, i) => (
+              <li key={i}>{formatDiagnostic(d)}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
 
@@ -90,6 +135,20 @@ export function SettingsPage() {
     mutationFn: () => api.testExternalConnection(buildExternalConfig()),
   });
 
+  const initExternal = useMutation({
+    mutationFn: () => api.initializeExternalDatabase(buildExternalConfig()),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['settings'] }),
+        queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+      ]);
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ['settings'], type: 'active' }),
+        queryClient.refetchQueries({ queryKey: ['database-status'], type: 'active' }),
+      ]);
+    },
+  });
+
   const migrationProgress = useQuery({
     queryKey: ['external-migration-progress'],
     queryFn: api.getExternalMigrationProgress,
@@ -98,9 +157,12 @@ export function SettingsPage() {
 
   const startMigration = useMutation({
     mutationFn: () => api.startManagedToExternalMigration(buildExternalConfig()),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] });
-      queryClient.invalidateQueries({ queryKey: ['database-status'] });
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] }),
+        queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['settings'] }),
+      ]);
     },
   });
 
@@ -137,7 +199,16 @@ export function SettingsPage() {
 
   const switchManaged = useMutation({
     mutationFn: api.switchToManagedDatabase,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['settings'] }),
+        queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+      ]);
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ['settings'], type: 'active' }),
+        queryClient.refetchQueries({ queryKey: ['database-status'], type: 'active' }),
+      ]);
+    },
   });
 
   const exportDiagnostics = useMutation({
@@ -147,6 +218,9 @@ export function SettingsPage() {
   const migration = migrationProgress.data;
   const migrationRunning = migration?.state === 'running' || startMigration.isPending;
   const effectiveLibraryRoot = libRoot || settings.data?.library_root || '';
+  const currentDbMode = dbStatus.data?.mode;
+  const externalConfig = dbStatus.data?.external_config;
+  const managedConfig = dbStatus.data?.managed_config;
 
   return (
     <div className="settings-page">
@@ -156,6 +230,11 @@ export function SettingsPage() {
         <h2>数据库状态</h2>
         {dbStatus.data && (
           <div className="db-status-card">
+            {!dbStatus.data.mode && (
+              <p className="settings-help">
+                数据库模式尚未选择。可以初始化托管库，或在下方填写外部 PostgreSQL 后连接并初始化。
+              </p>
+            )}
             <table>
               <tbody>
                 <tr>
@@ -186,15 +265,41 @@ export function SettingsPage() {
                   <td>迁移版本</td>
                   <td className="mono">{dbStatus.data.migration_version ?? '未执行'}</td>
                 </tr>
-                {dbStatus.data.managed_config && (
+                {currentDbMode === 'external' && externalConfig && (
                   <>
                     <tr>
-                      <td>数据目录</td>
-                      <td className="mono">{dbStatus.data.managed_config.data_dir}</td>
+                      <td>外部数据库</td>
+                      <td className="mono">
+                        {externalConfig.host}:{externalConfig.port}/{externalConfig.database}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>连接用户</td>
+                      <td>{externalConfig.username}</td>
+                    </tr>
+                  </>
+                )}
+                {currentDbMode === 'managed_local' && managedConfig && (
+                  <>
+                    <tr>
+                      <td>托管库数据目录</td>
+                      <td className="mono">{managedConfig.data_dir}</td>
                     </tr>
                     <tr>
                       <td>端口</td>
-                      <td>{dbStatus.data.managed_config.port}</td>
+                      <td>{managedConfig.port}</td>
+                    </tr>
+                  </>
+                )}
+                {!currentDbMode && managedConfig && (
+                  <>
+                    <tr>
+                      <td>托管库预留目录</td>
+                      <td className="mono">{managedConfig.data_dir}</td>
+                    </tr>
+                    <tr>
+                      <td>说明</td>
+                      <td>尚未使用本地托管库；连接外部库成功后会显示外部数据库。</td>
                     </tr>
                   </>
                 )}
@@ -214,7 +319,11 @@ export function SettingsPage() {
               {shutdown.isPending ? '停止中…' : '停止数据库'}
             </button>
             <button onClick={() => switchManaged.mutate()} disabled={switchManaged.isPending}>
-              {switchManaged.isPending ? '切换中…' : '切回托管库'}
+              {switchManaged.isPending
+                ? '初始化中…'
+                : currentDbMode
+                  ? '切回托管库'
+                  : '初始化托管库'}
             </button>
             <button
               onClick={() => exportDiagnostics.mutate()}
@@ -224,6 +333,16 @@ export function SettingsPage() {
             </button>
             {switchManaged.isError && (
               <pre className="status-err">{String(switchManaged.error)}</pre>
+            )}
+            {switchManaged.data && (
+              <DbActivationResult
+                state={switchManaged.data}
+                successText={
+                  taggedStatusCode(switchManaged.data.status) === 'connected'
+                    ? '托管库已初始化并激活。'
+                    : null
+                }
+              />
             )}
             {exportDiagnostics.data && (
               <div className="check-result">
@@ -323,6 +442,13 @@ export function SettingsPage() {
         </button>
         <button
           className="btn-primary"
+          onClick={() => initExternal.mutate()}
+          disabled={initExternal.isPending}
+        >
+          {initExternal.isPending ? '连接中…' : '连接并初始化外部库'}
+        </button>
+        <button
+          className="btn-primary"
           onClick={() => startMigration.mutate()}
           disabled={migrationRunning}
         >
@@ -394,6 +520,17 @@ export function SettingsPage() {
           </div>
         )}
         {testExt.isError && <pre className="status-err">{String(testExt.error)}</pre>}
+        {initExternal.data && (
+          <DbActivationResult
+            state={initExternal.data}
+            successText={
+              taggedStatusCode(initExternal.data.status) === 'connected'
+                ? '外部数据库已连接并初始化。'
+                : null
+            }
+          />
+        )}
+        {initExternal.isError && <pre className="status-err">{String(initExternal.error)}</pre>}
         {migration && migration.state !== 'idle' && (
           <div className="check-result">
             <table>

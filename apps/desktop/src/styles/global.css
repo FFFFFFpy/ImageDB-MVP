@@ -315,6 +315,13 @@ textarea {
   margin-bottom: 20px;
 }
 
+.settings-help {
+  margin: 0 0 12px;
+  color: #4b5563;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
 .db-status-card {
   padding: 16px;
   border: 1px solid #e5e7eb;
@@ -356,6 +363,15 @@ textarea {
   margin: 0;
   font-size: 16px;
   font-weight: 600;
+}
+
+.status-card-dashboard .status-card-detail {
+  margin-top: 6px;
+  color: #4b5563;
+  font-size: 12px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .coming-soon {

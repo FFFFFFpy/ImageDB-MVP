@@ -222,6 +222,95 @@ impl DatabaseService {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
 
+    fn create_database_sql(database: &str, owner: &str) -> String {
+        format!(
+            "CREATE DATABASE {} OWNER {} ENCODING 'UTF8' TEMPLATE template0",
+            Self::quote_ident(database),
+            Self::quote_ident(owner)
+        )
+    }
+
+    async fn ensure_external_database_exists(
+        config: &ConnectionConfig,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<bool, AppError> {
+        if let Ok((_, handle)) = connect_external(config).await {
+            handle.abort();
+            diagnostics.push(format!(
+                "External database '{}' already exists and is reachable",
+                config.database
+            ));
+            return Ok(false);
+        }
+
+        diagnostics.push(format!(
+            "External database '{}' is not reachable yet; checking maintenance database for creation",
+            config.database
+        ));
+
+        let maintenance_databases = ["postgres", "template1"];
+        let mut last_error = None;
+        for database in maintenance_databases {
+            if database == config.database {
+                continue;
+            }
+
+            let mut maintenance_config = config.clone();
+            maintenance_config.database = database.to_string();
+            let (client, handle) = match connect_external(&maintenance_config).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    last_error = Some(format!("{database}: {e}"));
+                    continue;
+                }
+            };
+
+            let exists = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+                    &[&config.database],
+                )
+                .await
+                .map_err(|e| {
+                    handle.abort();
+                    AppError::Internal(format!(
+                        "failed to inspect external database '{}': {e}",
+                        config.database
+                    ))
+                })?
+                .get::<_, bool>(0);
+
+            if exists {
+                diagnostics.push(format!(
+                    "External database '{}' already exists but the target connection still failed",
+                    config.database
+                ));
+                handle.abort();
+                return Ok(false);
+            }
+
+            let sql = Self::create_database_sql(&config.database, &config.username);
+            client.batch_execute(&sql).await.map_err(|e| {
+                handle.abort();
+                AppError::Internal(format!(
+                    "failed to create external database '{}': {e}",
+                    config.database
+                ))
+            })?;
+            diagnostics.push(format!(
+                "Created external database '{}' through maintenance database '{}'",
+                config.database, database
+            ));
+            handle.abort();
+            return Ok(true);
+        }
+
+        Err(AppError::PostgresUnavailable(format!(
+            "external target database is not reachable and maintenance database connection failed: {}",
+            last_error.unwrap_or_else(|| "no maintenance database candidate was usable".to_string())
+        )))
+    }
+
     fn pg_verify_error(context: &str, error: tokio_postgres::Error) -> AppError {
         AppError::Internal(format!("{context}: {error}"))
     }
@@ -1190,7 +1279,10 @@ impl DatabaseService {
         config: &ConnectionConfig,
     ) -> Result<DatabaseState, AppError> {
         let effective_config = self.with_stored_password(config)?;
+        let mut diagnostics = Vec::new();
+        Self::ensure_external_database_exists(&effective_config, &mut diagnostics).await?;
         let check = self.test_external_connection(&effective_config).await?;
+        diagnostics.extend(check.diagnostics.clone());
 
         if !check.connection_ok
             || !check.version_ok
@@ -1211,7 +1303,7 @@ impl DatabaseService {
                 external_config: Some(Self::redacted_config(&effective_config)),
                 pgvector_available: false,
                 migration_version: None,
-                diagnostics: check.diagnostics,
+                diagnostics,
             });
         }
 
@@ -1240,7 +1332,7 @@ impl DatabaseService {
             pgvector_available: check.pgvector_available,
             migration_version: version,
             diagnostics: {
-                let mut d = check.diagnostics;
+                let mut d = diagnostics;
                 if !applied.is_empty() {
                     d.push(format!("Applied migrations: {}", applied.join(", ")));
                 }
@@ -1284,6 +1376,8 @@ impl DatabaseService {
             &diagnostics,
         )
         .await?;
+        Self::ensure_external_database_exists(&effective_config, &mut diagnostics).await?;
+        Self::set_external_migration_stage(&progress_tracker, "preflight", &diagnostics).await;
         let check = self.test_external_connection(&effective_config).await?;
         diagnostics.extend(check.diagnostics.clone());
         if !check.connection_ok
@@ -1782,6 +1876,15 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn create_database_sql_quotes_database_and_owner_identifiers() {
+        let sql = DatabaseService::create_database_sql("image db", "helw\"admin");
+        assert_eq!(
+            sql,
+            "CREATE DATABASE \"image db\" OWNER \"helw\"\"admin\" ENCODING 'UTF8' TEMPLATE template0"
+        );
+    }
+
     #[cfg(windows)]
     fn long_running_command() -> Command {
         let mut command = Command::new("powershell");
@@ -1917,6 +2020,117 @@ mod tests {
         assert!(
             stored.get().external_host.is_some(),
             "external settings should retain non-secret profile metadata"
+        );
+        drop(stored);
+
+        target_manager.shutdown().await.expect("target shutdown");
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    #[tokio::test]
+    #[ignore]
+    async fn real_external_missing_database_is_created_during_initialize() {
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_none()
+        {
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real external PostgreSQL test.                  Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run                  `node scripts/package-postgres-runtime.mjs` to populate the packaged runtime                  at .local/db-tools/postgresql-18.4/pgsql/bin."
+            );
+        }
+
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::infrastructure::secrets::CredentialStore;
+        use crate::infrastructure::settings::SettingsStore;
+        use tempfile::TempDir;
+
+        let service_tmp = TempDir::new().unwrap();
+        let target_tmp = TempDir::new().unwrap();
+        let settings_tmp = TempDir::new().unwrap();
+
+        let service_manager = Arc::new(Mutex::new(PostgresManager::new(service_tmp.path())));
+        let settings = Arc::new(Mutex::new(SettingsStore::new(settings_tmp.path()).unwrap()));
+        let credentials =
+            Arc::new(CredentialStore::new_file_for_tests(settings_tmp.path()).unwrap());
+        let service = DatabaseService::new(service_manager, settings.clone(), credentials);
+
+        let mut target_manager = PostgresManager::new(target_tmp.path());
+        let target_probe = target_manager.initialize().await.expect("target init");
+        assert!(
+            target_probe.connection_ok,
+            "target init failed: {:?}",
+            target_probe.diagnostics
+        );
+
+        let missing_database = format!("imagedb_missing_{}", uuid::Uuid::new_v4().simple());
+        let target_config = ConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: target_manager.port(),
+            database: missing_database.clone(),
+            username: target_manager.username().to_string(),
+            password: target_manager.password().map(ToOwned::to_owned),
+            tls_mode: TlsMode::Disable,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 10,
+            query_timeout_secs: 15,
+            profile_name: Some("real-missing-external-test".to_string()),
+        };
+
+        let preflight = service
+            .test_external_connection(&target_config)
+            .await
+            .expect("preflight missing external target");
+        assert!(!preflight.connection_ok, "{:?}", preflight.diagnostics);
+
+        let state = service
+            .initialize_external(&target_config)
+            .await
+            .expect("initialize missing external database");
+        assert_eq!(state.mode, Some(DatabaseMode::External));
+        assert_eq!(state.status, DatabaseStatus::Connected);
+        assert!(state.pgvector_available);
+        assert_eq!(
+            state.migration_version.as_deref(),
+            Some(MigrationRunner::latest_version())
+        );
+        assert!(
+            state
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("Created external database")),
+            "state diagnostics: {:?}",
+            state.diagnostics
+        );
+
+        let (target_client, target_handle) = connect_external(&target_config)
+            .await
+            .expect("connect newly created external database");
+        let vector_installed = target_client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')",
+                &[],
+            )
+            .await
+            .expect("inspect vector extension")
+            .get::<_, bool>(0);
+        assert!(vector_installed);
+        let schema_version = MigrationRunner::current_version(&target_client)
+            .await
+            .expect("current version");
+        assert_eq!(
+            schema_version.as_deref(),
+            Some(MigrationRunner::latest_version())
+        );
+        target_handle.abort();
+
+        let stored = settings.lock().await;
+        assert_eq!(stored.get().database_mode.as_deref(), Some("external"));
+        assert_eq!(
+            stored.get().external_database.as_deref(),
+            Some(missing_database.as_str())
         );
         drop(stored);
 
