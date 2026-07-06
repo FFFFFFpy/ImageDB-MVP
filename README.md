@@ -5,6 +5,8 @@ ImageDB 是一个本地优先的桌面图集整理应用。
 > **MVP1 当前定性：功能完成，进入 Debug / 实战测试阶段。**
 >
 > 当前版本状态、Debug 边界和文档入口以 [`docs/MVP1/`](docs/MVP1/README.md) 为准。
+>
+> 当前分支开始显式落地 MVP2 图集级流程基础，入口见 [`docs/MVP2/`](docs/MVP2/README.md)。
 
 ## 当前状态
 
@@ -12,6 +14,7 @@ ImageDB 是一个本地优先的桌面图集整理应用。
 MVP1 功能完成。
 当前阶段：Debug / 实战测试。
 正式发布：等待 clean Windows release gate 签字。
+MVP2 基础：图集级断点续跑 + 异步审核入口 + 数据状态可见。
 ```
 
 MVP1 本地主链已经人工验收通过：
@@ -29,13 +32,14 @@ MVP1 本地主链已经人工验收通过：
 
 ## 文档入口
 
-| 文档 | 用途 |
-| --- | --- |
-| [`docs/MVP1/README.md`](docs/MVP1/README.md) | MVP1 文档总入口 |
-| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、DoD、剩余 Debug 项 |
-| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | MVP1 架构、主链、数据与文件事务 |
-| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
-| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 文档地图与归档说明 |
+| 文档                                                         | 用途                            |
+| ------------------------------------------------------------ | ------------------------------- |
+| [`docs/MVP1/README.md`](docs/MVP1/README.md)                 | MVP1 文档总入口                 |
+| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md)                 | 当前状态、DoD、剩余 Debug 项    |
+| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md)     | MVP1 架构、主链、数据与文件事务 |
+| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册           |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md)     | 文档地图与归档说明              |
+| [`docs/MVP2/README.md`](docs/MVP2/README.md)                 | MVP2 图集流程文档入口           |
 
 历史计划、提示词、任务和报告已经归档到：
 

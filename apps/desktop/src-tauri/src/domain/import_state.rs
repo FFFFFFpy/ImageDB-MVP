@@ -62,6 +62,12 @@ pub enum ImportAlbumState {
     Pending,
     Scanning,
     Fingerprinting,
+    Analyzing,
+    Analyzed,
+    ReviewRequired,
+    Reviewed,
+    ReadyToCommit,
+    Committing,
     Completed,
     Failed,
 }
@@ -72,6 +78,12 @@ impl fmt::Display for ImportAlbumState {
             Self::Pending => write!(f, "pending"),
             Self::Scanning => write!(f, "scanning"),
             Self::Fingerprinting => write!(f, "fingerprinting"),
+            Self::Analyzing => write!(f, "analyzing"),
+            Self::Analyzed => write!(f, "analyzed"),
+            Self::ReviewRequired => write!(f, "review_required"),
+            Self::Reviewed => write!(f, "reviewed"),
+            Self::ReadyToCommit => write!(f, "ready_to_commit"),
+            Self::Committing => write!(f, "committing"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
         }
@@ -85,6 +97,12 @@ impl ImportAlbumState {
             "pending" => Some(Self::Pending),
             "scanning" => Some(Self::Scanning),
             "fingerprinting" => Some(Self::Fingerprinting),
+            "analyzing" => Some(Self::Analyzing),
+            "analyzed" => Some(Self::Analyzed),
+            "review_required" => Some(Self::ReviewRequired),
+            "reviewed" => Some(Self::Reviewed),
+            "ready_to_commit" => Some(Self::ReadyToCommit),
+            "committing" => Some(Self::Committing),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             _ => None,
@@ -567,10 +585,24 @@ mod tests {
 
     #[test]
     fn import_album_state_round_trip() {
-        assert_eq!(
-            ImportAlbumState::from_str_opt(&ImportAlbumState::Fingerprinting.to_string()),
-            Some(ImportAlbumState::Fingerprinting)
-        );
+        for state in [
+            ImportAlbumState::Pending,
+            ImportAlbumState::Scanning,
+            ImportAlbumState::Fingerprinting,
+            ImportAlbumState::Analyzing,
+            ImportAlbumState::Analyzed,
+            ImportAlbumState::ReviewRequired,
+            ImportAlbumState::Reviewed,
+            ImportAlbumState::ReadyToCommit,
+            ImportAlbumState::Committing,
+            ImportAlbumState::Completed,
+            ImportAlbumState::Failed,
+        ] {
+            assert_eq!(
+                ImportAlbumState::from_str_opt(&state.to_string()),
+                Some(state)
+            );
+        }
         assert_eq!(ImportAlbumState::from_str_opt("unknown"), None);
     }
 

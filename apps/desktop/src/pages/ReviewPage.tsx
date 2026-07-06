@@ -231,6 +231,10 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
 
   const queue = queueQuery.data ?? [];
   const undecidedQueue = useMemo(() => queue.filter((c) => !c.has_decision), [queue]);
+  const reviewAlbumCount = useMemo(
+    () => new Set(undecidedQueue.map((candidate) => candidate.album_name)).size,
+    [undecidedQueue],
+  );
 
   const currentCandidate: ReviewCandidateSummary | undefined = undecidedQueue[currentIndex];
 
@@ -726,6 +730,9 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
             {progress && `（总计 ${progress.decided_count}/${progress.total_review_candidates}）`}
           </span>
         </h1>
+        <p className="status-card-detail">
+          当前有 {reviewAlbumCount} 个图集包含待审核候选，可在整批分析结束前先处理。
+        </p>
         <div className="review-header-actions">
           <button
             className={`btn-secondary ${overlayMode ? 'active' : ''}`}

@@ -9,6 +9,8 @@ import type {
   PostgresProbeResult,
   ImageFingerprintProbeResult,
   FileTransactionProbeResult,
+  ImportAlbumStatus,
+  ImportRunDashboard,
   ScanProgress,
   ScanSourceInfo,
   ReviewCandidateSummary,
@@ -79,6 +81,16 @@ export const api = {
   cancelScan: () => invoke<string>('cancel_scan'),
 
   getScanProgress: () => invoke<ScanProgress>('get_scan_progress'),
+
+  getImportRunsDashboard: () => invoke<ImportRunDashboard[]>('get_import_runs_dashboard'),
+
+  getImportRunAlbums: (importRunId: string) =>
+    invoke<ImportAlbumStatus[]>('get_import_run_albums', { importRunId }),
+
+  resumeImportRun: (importRunId: string) => invoke<string>('resume_import_run', { importRunId }),
+
+  retryImportAlbum: (albumId: string) =>
+    invoke<ImportAlbumStatus>('retry_import_album', { albumId }),
 
   getReviewQueue: (importRunId: string) =>
     invoke<ReviewCandidateSummary[]>('get_review_queue', { importRunId }),

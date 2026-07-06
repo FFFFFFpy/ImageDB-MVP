@@ -12,6 +12,8 @@ MVP1 已定性为：
 
 后续判断当前版本状态、Debug 任务、验收边界、架构说明时，优先看 `docs/MVP1/`，不要再从历史归档或脚本输出中拼状态。
 
+用户明确启动的 MVP2 图集流程工作以 [`docs/MVP2/`](docs/MVP2/README.md) 为入口，不改变 MVP1 release sign-off 仍未完成的事实。
+
 ## MVP1 主链
 
 MVP1 的核心流程已经完成并通过本地人工验收：
@@ -58,13 +60,14 @@ MVP1 覆盖：
 
 ## 文档入口
 
-| 文档 | 用途 |
-| --- | --- |
-| [`docs/MVP1/README.md`](docs/MVP1/README.md) | MVP1 文档总入口 |
-| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、完成标准、剩余 Debug 项 |
-| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | 架构、主链、数据库、文件事务 |
-| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
-| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 文档地图与归档口径 |
+| 文档                                                         | 用途                              |
+| ------------------------------------------------------------ | --------------------------------- |
+| [`docs/MVP1/README.md`](docs/MVP1/README.md)                 | MVP1 文档总入口                   |
+| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md)                 | 当前状态、完成标准、剩余 Debug 项 |
+| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md)     | 架构、主链、数据库、文件事务      |
+| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册             |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md)     | 文档地图与归档口径                |
+| [`docs/MVP2/README.md`](docs/MVP2/README.md)                 | MVP2 图集级断点续跑与异步审核入口 |
 
 ## 历史归档
 

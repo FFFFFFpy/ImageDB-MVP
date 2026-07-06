@@ -1270,7 +1270,7 @@ mod tests {
                 .await
                 .expect("current_version #1");
             // Migration 0010 is the current head of the embedded migration chain.
-            assert_eq!(version.as_deref(), Some("0010_library_root_leases"));
+            assert_eq!(version.as_deref(), Some(MigrationRunner::latest_version()));
 
             drop(client);
             handle.abort();
@@ -1295,7 +1295,7 @@ mod tests {
                 .await
                 .expect("current_version #2");
             // Migration 0010 is the current head of the embedded migration chain.
-            assert_eq!(version2.as_deref(), Some("0010_library_root_leases"));
+            assert_eq!(version2.as_deref(), Some(MigrationRunner::latest_version()));
 
             drop(client2);
             handle2.abort();
@@ -1388,7 +1388,7 @@ mod tests {
                 .expect("current_version");
             assert_eq!(
                 version.as_deref(),
-                Some("0010_library_root_leases"),
+                Some(MigrationRunner::latest_version()),
                 "migration head must be reached on a clean bootstrap"
             );
 

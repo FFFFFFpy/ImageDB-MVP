@@ -56,6 +56,8 @@ export function App() {
               needsOnboarding={needsOnboarding}
               onConfigureDatabase={() => navigate('settings')}
               onGoScan={() => navigate('scan')}
+              onGoReview={() => navigate('review')}
+              onGoRecovery={() => navigate('recovery')}
             />
           )}
           {route === 'scan' && <ScanPage onNavigate={navigate} />}

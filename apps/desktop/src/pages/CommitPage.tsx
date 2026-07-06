@@ -441,7 +441,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
         <h1>提交进行中</h1>
         <div className="commit-progress">
           <div className="progress-bar-container">
-            <div className="progress-bar" style={{ width: `${pct}%` }} />
+            <div className="progress-bar" style={{ transform: `scaleX(${pct / 100})` }} />
           </div>
           <div className="progress-text">{pct}%</div>
 

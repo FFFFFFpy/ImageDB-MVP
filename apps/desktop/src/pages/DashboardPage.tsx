@@ -6,17 +6,27 @@ interface DashboardPageProps {
   needsOnboarding: boolean;
   onConfigureDatabase: () => void;
   onGoScan: () => void;
+  onGoReview: () => void;
+  onGoRecovery: () => void;
 }
 
 export function DashboardPage({
   needsOnboarding,
   onConfigureDatabase,
   onGoScan,
+  onGoReview,
+  onGoRecovery,
 }: DashboardPageProps) {
   const dbStatus = useQuery({
     queryKey: ['database-status'],
     queryFn: api.getDatabaseStatus,
     refetchInterval: 5000,
+  });
+  const importRuns = useQuery({
+    queryKey: ['import-runs-dashboard'],
+    queryFn: api.getImportRunsDashboard,
+    refetchInterval: 3000,
+    enabled: !needsOnboarding,
   });
 
   if (needsOnboarding) {
@@ -56,6 +66,19 @@ export function DashboardPage({
         : dbStatus.data?.mode === null
           ? '尚未选择数据库模式'
           : null;
+  const latestRun = importRuns.data?.[0] ?? null;
+  const totalAlbums = latestRun?.total_albums ?? 0;
+  const totalImages = latestRun?.total_images ?? 0;
+  const pendingReviews = latestRun?.pending_reviews ?? 0;
+  const failedAlbums = latestRun?.failed_albums ?? 0;
+  const hasRecoveryTask = latestRun?.state === 'recovery_required';
+  const nextAction = hasRecoveryTask
+    ? { label: '前往恢复', onClick: onGoRecovery }
+    : pendingReviews > 0
+      ? { label: '继续审核', onClick: onGoReview }
+      : (latestRun?.pending_albums ?? 0) > 0 || (latestRun?.analyzing_albums ?? 0) > 0
+        ? { label: '继续分析', onClick: onGoScan }
+        : { label: '开始导入', onClick: onGoScan };
 
   return (
     <div className="dashboard-page">
@@ -82,6 +105,46 @@ export function DashboardPage({
           <p className="mono">{dbStatus.data?.migration_version ?? '未执行'}</p>
         </div>
       </div>
+
+      <section className="scan-progress-section">
+        <h2>数据状态</h2>
+        <div className="scan-progress-grid">
+          <div className="scan-progress-card">
+            <h3>数据安全</h3>
+            <p className={hasRecoveryTask ? 'status-error' : 'status-ok'}>
+              {hasRecoveryTask ? '需要恢复' : '未发现未完成事务'}
+            </p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>图集</h3>
+            <p>{totalAlbums}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>图片</h3>
+            <p>{totalImages}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>待审核</h3>
+            <p className={pendingReviews > 0 ? 'status-warn' : ''}>{pendingReviews}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>失败图集</h3>
+            <p className={failedAlbums > 0 ? 'status-error' : ''}>{failedAlbums}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>下一步</h3>
+            <button className="btn-primary" onClick={nextAction.onClick} disabled={!isConnected}>
+              {nextAction.label}
+            </button>
+          </div>
+        </div>
+        {latestRun && (
+          <p className="status-card-detail">
+            最近任务：{latestRun.total_albums} 个图集，已分析 {latestRun.analyzed_albums}， 待审核{' '}
+            {latestRun.review_required_albums}，失败 {latestRun.failed_albums}
+          </p>
+        )}
+      </section>
 
       <section className="scan-action-section">
         {isConnected ? (

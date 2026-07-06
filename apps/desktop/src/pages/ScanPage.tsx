@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
-import type { ScanProgress, ScanSourceInfo } from '../lib/ipc/types';
+import type { ImportAlbumStatus, ScanProgress, ScanSourceInfo } from '../lib/ipc/types';
 import type { Route } from '../hooks/use-router';
 
 interface ScanPageProps {
@@ -36,6 +37,21 @@ const STAGE_LABELS: Record<string, string> = {
   completing: '完成中',
   completed: '已完成',
   cancelled: '已取消',
+  failed: '失败',
+  analyzing: '分析中',
+  analyzed: '已分析',
+  review_required: '待审核',
+  ready_to_commit: '可生成入库计划',
+};
+
+const ALBUM_STATE_LABELS: Record<string, string> = {
+  pending: '待分析',
+  scanning: '扫描中',
+  fingerprinting: '计算指纹',
+  analyzing: '分析中',
+  analyzed: '已分析',
+  review_required: '待审核',
+  completed: '已入库',
   failed: '失败',
 };
 
@@ -95,6 +111,7 @@ export function nextActionLabelForScanState(state: string | null | undefined): s
 }
 
 export function ScanPage({ onNavigate }: ScanPageProps) {
+  const queryClient = useQueryClient();
   const [sourcePath, setSourcePath] = useState(() => loadScanDraft().sourcePath);
   const [sourceInfo, setSourceInfo] = useState<ScanSourceInfo | null>(
     () => loadScanDraft().sourceInfo,
@@ -106,6 +123,27 @@ export function ScanPage({ onNavigate }: ScanPageProps) {
   const [isScanning, setIsScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const eventListenerRef = useRef<(() => void) | null>(null);
+  const runsQuery = useQuery({
+    queryKey: ['import-runs-dashboard'],
+    queryFn: api.getImportRunsDashboard,
+    refetchInterval: isScanning ? 1500 : 5000,
+  });
+  const latestRun = runsQuery.data?.[0] ?? null;
+  const albumsQuery = useQuery({
+    queryKey: ['import-run-albums', latestRun?.import_run_id],
+    queryFn: () => api.getImportRunAlbums(latestRun!.import_run_id),
+    enabled: Boolean(latestRun?.import_run_id),
+    refetchInterval: isScanning ? 1500 : 5000,
+  });
+  const retryAlbum = useMutation({
+    mutationFn: api.retryImportAlbum,
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
+        queryClient.invalidateQueries({ queryKey: ['import-run-albums'] }),
+      ]);
+    },
+  });
 
   useEffect(() => {
     return () => {
@@ -212,6 +250,17 @@ export function ScanPage({ onNavigate }: ScanPageProps) {
   const isFinished = isTerminalScanState(displayProgress?.state);
   const nextRoute = nextRouteForScanState(displayProgress?.state);
   const nextActionLabel = nextActionLabelForScanState(displayProgress?.state);
+  const albumRows = albumsQuery.data ?? [];
+  const albumCounts = latestRun
+    ? {
+        total: latestRun.total_albums,
+        analyzed: latestRun.analyzed_albums + latestRun.review_required_albums,
+        analyzing: latestRun.analyzing_albums,
+        pending: latestRun.pending_albums,
+        review: latestRun.review_required_albums,
+        failed: latestRun.failed_albums,
+      }
+    : null;
 
   return (
     <div className="scan-page">
@@ -260,6 +309,91 @@ export function ScanPage({ onNavigate }: ScanPageProps) {
       )}
 
       {scanError && <p className="status-error">{scanError}</p>}
+
+      {latestRun && (
+        <section className="scan-progress-section">
+          <h2>图集流程</h2>
+          <div className="scan-progress-grid">
+            <div className="scan-progress-card">
+              <h3>总图集</h3>
+              <p>{albumCounts?.total ?? 0}</p>
+            </div>
+            <div className="scan-progress-card">
+              <h3>已分析</h3>
+              <p>{albumCounts?.analyzed ?? 0}</p>
+            </div>
+            <div className="scan-progress-card">
+              <h3>分析中</h3>
+              <p>{albumCounts?.analyzing ?? 0}</p>
+            </div>
+            <div className="scan-progress-card">
+              <h3>待分析</h3>
+              <p>{albumCounts?.pending ?? 0}</p>
+            </div>
+            <div className="scan-progress-card">
+              <h3>待审核</h3>
+              <p className={(albumCounts?.review ?? 0) > 0 ? 'status-warn' : ''}>
+                {albumCounts?.review ?? 0}
+              </p>
+            </div>
+            <div className="scan-progress-card">
+              <h3>失败</h3>
+              <p className={(albumCounts?.failed ?? 0) > 0 ? 'status-error' : ''}>
+                {albumCounts?.failed ?? 0}
+              </p>
+            </div>
+          </div>
+
+          <div className="table-wrapper">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>图集</th>
+                  <th>图片</th>
+                  <th>状态</th>
+                  <th>重复候选</th>
+                  <th>待审核</th>
+                  <th>错误</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {albumRows.map((album: ImportAlbumStatus) => (
+                  <tr key={album.id}>
+                    <td>{album.source_name}</td>
+                    <td>{album.image_count}</td>
+                    <td>{ALBUM_STATE_LABELS[album.state] ?? album.state}</td>
+                    <td>{album.duplicate_candidate_count}</td>
+                    <td>{album.review_candidate_count}</td>
+                    <td className="status-error">{album.last_error_message ?? ''}</td>
+                    <td>
+                      {album.state === 'failed' && (
+                        <button
+                          className="btn-secondary"
+                          onClick={() => retryAlbum.mutate(album.id)}
+                          disabled={retryAlbum.isPending}
+                        >
+                          重试
+                        </button>
+                      )}
+                      {album.review_candidate_count > 0 && (
+                        <button className="btn-primary" onClick={() => onNavigate('review')}>
+                          审核
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {albumRows.length === 0 && (
+                  <tr>
+                    <td colSpan={7}>暂无图集状态。验证源目录后开始分析。</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       {(isScanning || isFinished) && displayProgress && (
         <section className="scan-progress-section">

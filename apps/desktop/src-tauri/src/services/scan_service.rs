@@ -1,7 +1,6 @@
 use crate::domain::import_state::{
-    Decision, DecisionSource, DecodeState, DuplicateScope, ImportAlbumState, ImportImageState,
-    ImportRunState, MatchType, MatchingStrategy, ScanProgress, TransformType,
-    SUPPORTED_IMAGE_EXTENSIONS,
+    Decision, DecisionSource, DecodeState, DuplicateScope, ImportImageState, ImportRunState,
+    MatchType, MatchingStrategy, ScanProgress, TransformType, SUPPORTED_IMAGE_EXTENSIONS,
 };
 use crate::error::AppError;
 use crate::infrastructure::image_fingerprint::{
@@ -21,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use tokio_postgres::Client;
 use uuid::Uuid;
 
 pub const SCAN_PROGRESS_EVENT: &str = "scan-progress";
@@ -64,6 +64,20 @@ struct FingerprintedData {
     blake3_hex: String,
     pixel_hash_hex: String,
     transform_variants: Vec<TransformVariant>,
+}
+
+struct AlbumImageEntry {
+    album_db_id: Uuid,
+    image_db_id: Uuid,
+    fp: FingerprintedData,
+}
+
+struct AlbumDetectionContext<'a> {
+    client: &'a Client,
+    import_run_id: Uuid,
+    album_id: Uuid,
+    progress_tracker: &'a Mutex<ScanProgress>,
+    cancelled: &'a AtomicBool,
 }
 
 struct PerceptualHex {
@@ -428,12 +442,339 @@ pub fn validate_source_directory(path: &str) -> Result<ScanProgress, AppError> {
     Ok(ScanProgress::idle())
 }
 
+async fn insert_candidate_and_count(
+    client: &Client,
+    candidate: NewDuplicateCandidate,
+    duplicate_count: &mut u32,
+    progress: &mut ScanProgressEvent,
+    progress_tracker: &Mutex<ScanProgress>,
+) -> Result<(), AppError> {
+    ImportRepository::insert_duplicate_candidate(client, candidate).await?;
+    *duplicate_count += 1;
+    progress.duplicate_count = *duplicate_count;
+    emit_progress(progress, progress_tracker).await;
+    Ok(())
+}
+
+async fn detect_album_duplicates(
+    ctx: &AlbumDetectionContext<'_>,
+    images: &[&AlbumImageEntry],
+    duplicate_count: &mut u32,
+    progress: &mut ScanProgressEvent,
+) -> Result<(), AppError> {
+    let strategy = MatchingStrategy::Balanced;
+    let thresholds = strategy.perceptual_thresholds();
+
+    for i in 0..images.len() {
+        if ctx.cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        for j in (i + 1)..images.len() {
+            let a = images[i];
+            let b = images[j];
+            let file_exact = a.fp.file_size == b.fp.file_size && a.fp.blake3_hex == b.fp.blake3_hex;
+            let pixel_exact = a.fp.pixel_hash_hex == b.fp.pixel_hash_hex;
+
+            if file_exact {
+                insert_candidate_and_count(
+                    ctx.client,
+                    NewDuplicateCandidate {
+                        import_run_id: ctx.import_run_id,
+                        source_image_id: a.image_db_id,
+                        candidate_source_image_id: Some(b.image_db_id),
+                        candidate_library_image_id: None,
+                        scope: DuplicateScope::IntraAlbum,
+                        match_type: MatchType::FileExact,
+                        blake3_equal: true,
+                        pixel_hash_equal: pixel_exact,
+                        gradient_distance: None,
+                        block_distance: None,
+                        median_distance: None,
+                        transform_type: None,
+                        confidence: Some(1.0),
+                        decision: Some(Decision::AutoDuplicate),
+                        decision_source: Some(DecisionSource::ExactRule),
+                    },
+                    duplicate_count,
+                    progress,
+                    ctx.progress_tracker,
+                )
+                .await?;
+            } else if pixel_exact {
+                insert_candidate_and_count(
+                    ctx.client,
+                    NewDuplicateCandidate {
+                        import_run_id: ctx.import_run_id,
+                        source_image_id: a.image_db_id,
+                        candidate_source_image_id: Some(b.image_db_id),
+                        candidate_library_image_id: None,
+                        scope: DuplicateScope::IntraAlbum,
+                        match_type: MatchType::PixelExact,
+                        blake3_equal: false,
+                        pixel_hash_equal: true,
+                        gradient_distance: None,
+                        block_distance: None,
+                        median_distance: None,
+                        transform_type: None,
+                        confidence: Some(1.0),
+                        decision: Some(Decision::AutoDuplicate),
+                        decision_source: Some(DecisionSource::ExactRule),
+                    },
+                    duplicate_count,
+                    progress,
+                    ctx.progress_tracker,
+                )
+                .await?;
+            } else if let Some(evidence) = compare_perceptual_intra(&a.fp, &b.fp, thresholds) {
+                let (match_type, decision, source) = classify_perceptual(&evidence, thresholds);
+                insert_candidate_and_count(
+                    ctx.client,
+                    NewDuplicateCandidate {
+                        import_run_id: ctx.import_run_id,
+                        source_image_id: a.image_db_id,
+                        candidate_source_image_id: Some(b.image_db_id),
+                        candidate_library_image_id: None,
+                        scope: DuplicateScope::IntraAlbum,
+                        match_type,
+                        blake3_equal: false,
+                        pixel_hash_equal: false,
+                        gradient_distance: Some(evidence.gradient_distance),
+                        block_distance: Some(evidence.block_distance),
+                        median_distance: Some(evidence.median_distance),
+                        transform_type: Some(evidence.transform_type.to_string()),
+                        confidence: Some(evidence.confidence),
+                        decision,
+                        decision_source: source,
+                    },
+                    duplicate_count,
+                    progress,
+                    ctx.progress_tracker,
+                )
+                .await?;
+            }
+        }
+    }
+
+    let album_blake3: Vec<Vec<u8>> = images
+        .iter()
+        .filter_map(|e| {
+            if e.fp.blake3_bytes.is_empty() {
+                None
+            } else {
+                Some(e.fp.blake3_bytes.clone())
+            }
+        })
+        .collect();
+    if !album_blake3.is_empty() {
+        let siblings = ImportRepository::find_sibling_images_by_blake3(
+            ctx.client,
+            ctx.import_run_id,
+            &album_blake3,
+        )
+        .await?;
+        let mut by_hash: std::collections::HashMap<Vec<u8>, Vec<(Uuid, Uuid)>> =
+            std::collections::HashMap::new();
+        for (id, sibling_album_id, _file_size, b3) in siblings {
+            by_hash.entry(b3).or_default().push((id, sibling_album_id));
+        }
+        for group in by_hash.values() {
+            for i in 0..group.len() {
+                for j in (i + 1)..group.len() {
+                    let (a_id, a_album) = group[i];
+                    let (b_id, b_album) = group[j];
+                    if a_album == b_album {
+                        continue;
+                    }
+                    if !((a_album == ctx.album_id) ^ (b_album == ctx.album_id)) {
+                        continue;
+                    }
+                    insert_candidate_and_count(
+                        ctx.client,
+                        NewDuplicateCandidate {
+                            import_run_id: ctx.import_run_id,
+                            source_image_id: a_id,
+                            candidate_source_image_id: Some(b_id),
+                            candidate_library_image_id: None,
+                            scope: DuplicateScope::CrossAlbum,
+                            match_type: MatchType::FileExact,
+                            blake3_equal: true,
+                            pixel_hash_equal: false,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
+                        },
+                        duplicate_count,
+                        progress,
+                        ctx.progress_tracker,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        let matched_library =
+            ImportRepository::find_library_images_by_blake3(ctx.client, &album_blake3).await?;
+        let mut blake3_to_lib: std::collections::HashMap<Vec<u8>, Vec<LibraryImageRow>> =
+            std::collections::HashMap::new();
+        for lib in &matched_library {
+            blake3_to_lib
+                .entry(lib.blake3.clone())
+                .or_default()
+                .push(lib.clone());
+        }
+        for entry in images {
+            if let Some(libs) = blake3_to_lib.get(&entry.fp.blake3_bytes) {
+                for lib in libs {
+                    let pixel_exact = lib
+                        .pixel_hash
+                        .as_ref()
+                        .map(|ph| *ph == entry.fp.pixel_hash_bytes)
+                        .unwrap_or(false);
+                    insert_candidate_and_count(
+                        ctx.client,
+                        NewDuplicateCandidate {
+                            import_run_id: ctx.import_run_id,
+                            source_image_id: entry.image_db_id,
+                            candidate_source_image_id: None,
+                            candidate_library_image_id: Some(lib.id),
+                            scope: DuplicateScope::Library,
+                            match_type: MatchType::FileExact,
+                            blake3_equal: true,
+                            pixel_hash_equal: pixel_exact,
+                            gradient_distance: None,
+                            block_distance: None,
+                            median_distance: None,
+                            transform_type: None,
+                            confidence: Some(1.0),
+                            decision: Some(Decision::AutoDuplicate),
+                            decision_source: Some(DecisionSource::ExactRule),
+                        },
+                        duplicate_count,
+                        progress,
+                        ctx.progress_tracker,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    let max_perceptual_candidates: usize = 50;
+    for entry in images {
+        if ctx.cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let bands = compute_perceptual_bands(&entry.fp);
+        let mut recalled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+
+        for (band_idx, band_val) in bands.iter().enumerate() {
+            if band_val.is_empty() {
+                continue;
+            }
+            let candidates = ImportRepository::find_library_images_by_perceptual_band(
+                ctx.client,
+                band_idx as u8,
+                band_val,
+                max_perceptual_candidates,
+            )
+            .await?;
+            for lib in candidates {
+                if recalled.contains(&lib.id) {
+                    continue;
+                }
+                recalled.insert(lib.id);
+
+                let Some(lib_hex) = PerceptualHex::from_bytes(
+                    &lib.gradient_hash,
+                    &lib.block_hash,
+                    &lib.median_hash,
+                ) else {
+                    continue;
+                };
+                let Some(evidence) = compare_perceptual_library(&entry.fp, &lib_hex, thresholds)
+                else {
+                    continue;
+                };
+                let (match_type, decision, source) = classify_perceptual(&evidence, thresholds);
+                insert_candidate_and_count(
+                    ctx.client,
+                    NewDuplicateCandidate {
+                        import_run_id: ctx.import_run_id,
+                        source_image_id: entry.image_db_id,
+                        candidate_source_image_id: None,
+                        candidate_library_image_id: Some(lib.id),
+                        scope: DuplicateScope::Library,
+                        match_type,
+                        blake3_equal: false,
+                        pixel_hash_equal: false,
+                        gradient_distance: Some(evidence.gradient_distance),
+                        block_distance: Some(evidence.block_distance),
+                        median_distance: Some(evidence.median_distance),
+                        transform_type: Some(evidence.transform_type.to_string()),
+                        confidence: Some(evidence.confidence),
+                        decision,
+                        decision_source: source,
+                    },
+                    duplicate_count,
+                    progress,
+                    ctx.progress_tracker,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn run_scan(
     postgres_manager: Arc<Mutex<PostgresManager>>,
     settings: Arc<Mutex<SettingsStore>>,
     source_root: String,
     cancelled: Arc<AtomicBool>,
     progress_tracker: Arc<Mutex<ScanProgress>>,
+) -> Result<ScanProgress, AppError> {
+    run_scan_inner(
+        postgres_manager,
+        settings,
+        source_root,
+        cancelled,
+        progress_tracker,
+        None,
+    )
+    .await
+}
+
+pub async fn run_scan_for_import_run(
+    postgres_manager: Arc<Mutex<PostgresManager>>,
+    settings: Arc<Mutex<SettingsStore>>,
+    source_root: String,
+    import_run_id: Uuid,
+    cancelled: Arc<AtomicBool>,
+    progress_tracker: Arc<Mutex<ScanProgress>>,
+) -> Result<ScanProgress, AppError> {
+    run_scan_inner(
+        postgres_manager,
+        settings,
+        source_root,
+        cancelled,
+        progress_tracker,
+        Some(import_run_id),
+    )
+    .await
+}
+
+async fn run_scan_inner(
+    postgres_manager: Arc<Mutex<PostgresManager>>,
+    settings: Arc<Mutex<SettingsStore>>,
+    source_root: String,
+    cancelled: Arc<AtomicBool>,
+    progress_tracker: Arc<Mutex<ScanProgress>>,
+    resume_import_run_id: Option<Uuid>,
 ) -> Result<ScanProgress, AppError> {
     let started_at = Instant::now();
     tracing::info!(source_root = %source_root, "scan started");
@@ -469,8 +810,49 @@ pub async fn run_scan(
         ImportRepository::update_library_root_path(&client, library_root_id, &library_root).await?;
     }
 
-    let import_run_id =
-        ImportRepository::create_import_run(&client, &source_root, library_root_id).await?;
+    let existing_run = if let Some(id) = resume_import_run_id {
+        let row = client
+            .query_opt(
+                "SELECT id FROM import_runs
+                 WHERE id = $1
+                   AND source_root = $2
+                   AND state IN ('analyzing', 'scanning', 'fingerprinting', 'cancelled', 'failed')
+                 LIMIT 1",
+                &[&id, &source_root],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "failed to query requested resumable import run: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "import run {id} is not resumable for source root {source_root}"
+                ))
+            })?;
+        Some(row)
+    } else {
+        client
+            .query_opt(
+                "SELECT id FROM import_runs
+                 WHERE source_root = $1
+                   AND state IN ('analyzing', 'scanning', 'fingerprinting', 'cancelled', 'failed')
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+                &[&source_root],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query resumable import run: {e}")))?
+    };
+    let import_run_id = if let Some(row) = existing_run {
+        let id: Uuid = row.get("id");
+        ImportRepository::mark_stale_analyzing_albums(&client, id).await?;
+        ImportRepository::update_import_run_state(&client, id, &ImportRunState::Analyzing).await?;
+        id
+    } else {
+        ImportRepository::create_import_run(&client, &source_root, library_root_id).await?
+    };
     progress.import_run_id = Some(import_run_id.to_string());
     tracing::info!(
         %import_run_id,
@@ -534,62 +916,22 @@ pub async fn run_scan(
         .await?;
     }
 
-    let snapshot_rows = client
-        .query(
-            "SELECT id, source_path FROM import_albums WHERE import_run_id = $1",
-            &[&import_run_id],
-        )
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to query albums for snapshot: {e}")))?;
-    for row in &snapshot_rows {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        let album_id: Uuid = row.get("id");
-        let source_path: String = row.get("source_path");
-        tracing::debug!(
-            %import_run_id,
-            %album_id,
-            source_path = %source_path,
-            "capturing source album snapshot"
-        );
-        capture_source_album_snapshot(&client, import_run_id, album_id, Path::new(&source_path))
-            .await?;
-        let snapshot_errors =
-            verify_source_album_snapshot(&client, album_id, Path::new(&source_path)).await?;
-        if !snapshot_errors.is_empty() {
-            return Err(AppError::Internal(format!(
-                "source snapshot verification failed for {}: {}",
-                source_path,
-                snapshot_errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            )));
-        }
-    }
-
-    ImportRepository::update_import_run_state(
-        &client,
-        import_run_id,
-        &ImportRunState::Fingerprinting,
-    )
-    .await?;
-    progress.current_stage = "fingerprinting".to_string();
+    ImportRepository::mark_stale_analyzing_albums(&client, import_run_id).await?;
+    ImportRepository::update_import_run_state(&client, import_run_id, &ImportRunState::Analyzing)
+        .await?;
+    progress.current_stage = "analyzing".to_string();
     emit_progress(&progress, &progress_tracker).await;
-    tracing::info!(%import_run_id, "scan fingerprinting stage started");
+    tracing::info!(%import_run_id, "album workflow analysis stage started");
 
-    struct AlbumImageEntry {
-        album_db_id: Uuid,
-        image_db_id: Uuid,
-        fp: FingerprintedData,
-    }
     let mut all_album_images: Vec<AlbumImageEntry> = Vec::new();
 
     let album_rows = client
         .query(
-            "SELECT id, source_path, source_name, state FROM import_albums WHERE import_run_id = $1 ORDER BY source_name",
+            "SELECT id, source_path, source_name, state
+             FROM import_albums
+             WHERE import_run_id = $1
+               AND state IN ('pending', 'analyzing', 'scanning', 'fingerprinting')
+             ORDER BY source_name",
             &[&import_run_id],
         )
         .await
@@ -604,14 +946,10 @@ pub async fn run_scan(
         let album_source_path: String = album_row.get("source_path");
         let album_name: String = album_row.get("source_name");
 
-        ImportRepository::update_import_album_state(
-            &client,
-            album_db_id,
-            &ImportAlbumState::Scanning,
-        )
-        .await?;
+        ImportRepository::mark_import_album_analyzing(&client, album_db_id).await?;
 
         progress.current_album = Some(album_name.clone());
+        progress.current_stage = "analyzing".to_string();
         emit_progress(&progress, &progress_tracker).await;
         tracing::info!(
             %import_run_id,
@@ -621,6 +959,67 @@ pub async fn run_scan(
         );
 
         let album_path = PathBuf::from(&album_source_path);
+        if let Err(e) =
+            capture_source_album_snapshot(&client, import_run_id, album_db_id, &album_path).await
+        {
+            let msg = format!("Failed to snapshot album '{}': {e}", album_name);
+            errors.push(msg.clone());
+            progress.error_count = errors.len() as u32;
+            progress.errors = errors.clone();
+            ImportRepository::mark_import_album_failed(
+                &client,
+                album_db_id,
+                "SNAPSHOT_FAILED",
+                &msg,
+            )
+            .await?;
+            emit_progress(&progress, &progress_tracker).await;
+            continue;
+        }
+        match verify_source_album_snapshot(&client, album_db_id, &album_path).await {
+            Ok(snapshot_errors) if snapshot_errors.is_empty() => {}
+            Ok(snapshot_errors) => {
+                let msg = format!(
+                    "Source snapshot verification failed for '{}': {}",
+                    album_name,
+                    snapshot_errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                errors.push(msg.clone());
+                progress.error_count = errors.len() as u32;
+                progress.errors = errors.clone();
+                ImportRepository::mark_import_album_failed(
+                    &client,
+                    album_db_id,
+                    "SNAPSHOT_VERIFY_FAILED",
+                    &msg,
+                )
+                .await?;
+                emit_progress(&progress, &progress_tracker).await;
+                continue;
+            }
+            Err(e) => {
+                let msg = format!("Failed to verify snapshot for '{}': {e}", album_name);
+                errors.push(msg.clone());
+                progress.error_count = errors.len() as u32;
+                progress.errors = errors.clone();
+                ImportRepository::mark_import_album_failed(
+                    &client,
+                    album_db_id,
+                    "SNAPSHOT_VERIFY_FAILED",
+                    &msg,
+                )
+                .await?;
+                emit_progress(&progress, &progress_tracker).await;
+                continue;
+            }
+        }
+
+        progress.current_stage = "fingerprinting".to_string();
+        emit_progress(&progress, &progress_tracker).await;
         let scanned_images = match scan_album_for_images(&album_path, &album_name) {
             Ok(imgs) => imgs,
             Err(e) => {
@@ -635,23 +1034,17 @@ pub async fn run_scan(
                 errors.push(msg.clone());
                 progress.error_count = errors.len() as u32;
                 progress.errors = errors.clone();
-                ImportRepository::update_import_album_state(
+                ImportRepository::mark_import_album_failed(
                     &client,
                     album_db_id,
-                    &ImportAlbumState::Failed,
+                    "SCAN_ALBUM_FAILED",
+                    &msg,
                 )
                 .await?;
                 emit_progress(&progress, &progress_tracker).await;
                 continue;
             }
         };
-
-        ImportRepository::update_import_album_state(
-            &client,
-            album_db_id,
-            &ImportAlbumState::Fingerprinting,
-        )
-        .await?;
 
         for img in scanned_images {
             if cancelled.load(Ordering::Relaxed) {
@@ -740,19 +1133,60 @@ pub async fn run_scan(
             }
         }
 
-        ImportRepository::update_import_album_state(
-            &client,
-            album_db_id,
-            &ImportAlbumState::Completed,
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        progress.current_stage = "detecting_duplicates".to_string();
+        emit_progress(&progress, &progress_tracker).await;
+        let album_images: Vec<&AlbumImageEntry> = all_album_images
+            .iter()
+            .filter(|entry| entry.album_db_id == album_db_id)
+            .collect();
+        let detection_ctx = AlbumDetectionContext {
+            client: &client,
+            import_run_id,
+            album_id: album_db_id,
+            progress_tracker: &progress_tracker,
+            cancelled: &cancelled,
+        };
+        if let Err(e) = detect_album_duplicates(
+            &detection_ctx,
+            &album_images,
+            &mut duplicate_count,
+            &mut progress,
         )
-        .await?;
+        .await
+        {
+            let msg = format!(
+                "Failed to detect duplicates for album '{}': {e}",
+                album_name
+            );
+            errors.push(msg.clone());
+            progress.error_count = errors.len() as u32;
+            progress.errors = errors.clone();
+            ImportRepository::mark_import_album_failed(
+                &client,
+                album_db_id,
+                "DUPLICATE_DETECTION_FAILED",
+                &msg,
+            )
+            .await?;
+            emit_progress(&progress, &progress_tracker).await;
+            continue;
+        }
+
+        let album_status =
+            ImportRepository::refresh_album_workflow_summary(&client, album_db_id).await?;
         tracing::info!(
             %import_run_id,
             %album_db_id,
             album = %album_name,
             processed_images = progress.processed_images,
+            album_state = %album_status.state,
+            review_candidates = album_status.review_candidate_count,
             error_count = progress.error_count,
-            "scan album completed"
+            "scan album analysis checkpoint persisted"
         );
     }
 
@@ -780,363 +1214,6 @@ pub async fn run_scan(
         });
     }
 
-    ImportRepository::update_import_run_state(
-        &client,
-        import_run_id,
-        &ImportRunState::DetectingDuplicates,
-    )
-    .await?;
-    progress.current_stage = "detecting_duplicates".to_string();
-    emit_progress(&progress, &progress_tracker).await;
-    tracing::info!(
-        %import_run_id,
-        total_images,
-        "scan duplicate detection stage started"
-    );
-
-    let mut album_groups: std::collections::HashMap<Uuid, Vec<&AlbumImageEntry>> =
-        std::collections::HashMap::new();
-    for entry in &all_album_images {
-        album_groups
-            .entry(entry.album_db_id)
-            .or_default()
-            .push(entry);
-    }
-
-    let strategy = MatchingStrategy::Balanced;
-    let thresholds = strategy.perceptual_thresholds();
-
-    for images in album_groups.values() {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        for i in 0..images.len() {
-            for j in (i + 1)..images.len() {
-                let a = images[i];
-                let b = images[j];
-
-                let file_exact =
-                    a.fp.file_size == b.fp.file_size && a.fp.blake3_hex == b.fp.blake3_hex;
-                let pixel_exact = a.fp.pixel_hash_hex == b.fp.pixel_hash_hex;
-
-                if file_exact {
-                    ImportRepository::insert_duplicate_candidate(
-                        &client,
-                        NewDuplicateCandidate {
-                            import_run_id,
-                            source_image_id: a.image_db_id,
-                            candidate_source_image_id: Some(b.image_db_id),
-                            candidate_library_image_id: None,
-                            scope: DuplicateScope::IntraAlbum,
-                            match_type: MatchType::FileExact,
-                            blake3_equal: true,
-                            pixel_hash_equal: a.fp.pixel_hash_hex == b.fp.pixel_hash_hex,
-                            gradient_distance: None,
-                            block_distance: None,
-                            median_distance: None,
-                            transform_type: None,
-                            confidence: Some(1.0),
-                            decision: Some(Decision::AutoDuplicate),
-                            decision_source: Some(DecisionSource::ExactRule),
-                        },
-                    )
-                    .await?;
-                    duplicate_count += 1;
-                    progress.duplicate_count = duplicate_count;
-                    emit_progress(&progress, &progress_tracker).await;
-                } else if pixel_exact {
-                    ImportRepository::insert_duplicate_candidate(
-                        &client,
-                        NewDuplicateCandidate {
-                            import_run_id,
-                            source_image_id: a.image_db_id,
-                            candidate_source_image_id: Some(b.image_db_id),
-                            candidate_library_image_id: None,
-                            scope: DuplicateScope::IntraAlbum,
-                            match_type: MatchType::PixelExact,
-                            blake3_equal: false,
-                            pixel_hash_equal: true,
-                            gradient_distance: None,
-                            block_distance: None,
-                            median_distance: None,
-                            transform_type: None,
-                            confidence: Some(1.0),
-                            decision: Some(Decision::AutoDuplicate),
-                            decision_source: Some(DecisionSource::ExactRule),
-                        },
-                    )
-                    .await?;
-                    duplicate_count += 1;
-                    progress.duplicate_count = duplicate_count;
-                    emit_progress(&progress, &progress_tracker).await;
-                } else {
-                    if let Some(evidence) = compare_perceptual_intra(&a.fp, &b.fp, thresholds) {
-                        let (match_type, decision, source) =
-                            classify_perceptual(&evidence, thresholds);
-                        ImportRepository::insert_duplicate_candidate(
-                            &client,
-                            NewDuplicateCandidate {
-                                import_run_id,
-                                source_image_id: a.image_db_id,
-                                candidate_source_image_id: Some(b.image_db_id),
-                                candidate_library_image_id: None,
-                                scope: DuplicateScope::IntraAlbum,
-                                match_type,
-                                blake3_equal: false,
-                                pixel_hash_equal: false,
-                                gradient_distance: Some(evidence.gradient_distance),
-                                block_distance: Some(evidence.block_distance),
-                                median_distance: Some(evidence.median_distance),
-                                transform_type: Some(evidence.transform_type.to_string()),
-                                confidence: Some(evidence.confidence),
-                                decision,
-                                decision_source: source,
-                            },
-                        )
-                        .await?;
-                        duplicate_count += 1;
-                        progress.duplicate_count = duplicate_count;
-                        emit_progress(&progress, &progress_tracker).await;
-                    }
-                }
-            }
-        }
-    }
-
-    // Phase 2b: Cross-album exact duplicate detection within this run.
-    //
-    // Two images in different albums of the same run can be exact duplicates.
-    // We batch-query all import images in this run sharing any BLAKE3 hash,
-    // then form duplicate candidate edges between images whose albums differ.
-    // The result is order-independent (candidates are deduplicated by the
-    // normalized-pair unique index from migration 0006).
-    let all_blake3: Vec<Vec<u8>> = all_album_images
-        .iter()
-        .filter_map(|e| {
-            if e.fp.blake3_bytes.is_empty() {
-                None
-            } else {
-                Some(e.fp.blake3_bytes.clone())
-            }
-        })
-        .collect();
-    if !all_blake3.is_empty() {
-        let siblings =
-            ImportRepository::find_sibling_images_by_blake3(&client, import_run_id, &all_blake3)
-                .await?;
-        if !siblings.is_empty() {
-            // Map blake3 -> list of (image_id, album_id, file_size) so we can
-            // pair every two distinct images that share a hash.
-            let mut by_hash: std::collections::HashMap<Vec<u8>, Vec<(Uuid, Uuid, i64)>> =
-                std::collections::HashMap::new();
-            for (id, album_id, file_size, b3) in &siblings {
-                by_hash
-                    .entry(b3.clone())
-                    .or_default()
-                    .push((*id, *album_id, *file_size));
-            }
-            for (_hash, group) in by_hash.iter() {
-                for i in 0..group.len() {
-                    for j in (i + 1)..group.len() {
-                        let (a_id, a_album, _) = group[i];
-                        let (b_id, b_album, _) = group[j];
-                        if a_album == b_album {
-                            continue; // intra-album already handled above
-                        }
-                        ImportRepository::insert_duplicate_candidate(
-                            &client,
-                            NewDuplicateCandidate {
-                                import_run_id,
-                                source_image_id: a_id,
-                                candidate_source_image_id: Some(b_id),
-                                candidate_library_image_id: None,
-                                scope: DuplicateScope::CrossAlbum,
-                                match_type: MatchType::FileExact,
-                                blake3_equal: true,
-                                pixel_hash_equal: false,
-                                gradient_distance: None,
-                                block_distance: None,
-                                median_distance: None,
-                                transform_type: None,
-                                confidence: Some(1.0),
-                                decision: Some(Decision::AutoDuplicate),
-                                decision_source: Some(DecisionSource::ExactRule),
-                            },
-                        )
-                        .await?;
-                        duplicate_count += 1;
-                        progress.duplicate_count = duplicate_count;
-                        emit_progress(&progress, &progress_tracker).await;
-                    }
-                }
-            }
-        }
-    }
-
-    // Phase 3: Indexed historical library matching (no N×M full scan).
-    //
-    // Instead of loading ALL library images and comparing each import image
-    // against each library image (N×M), we:
-    // 1. Batch query library images by BLAKE3 (indexed exact match).
-    // 2. Batch query library images by pixel_hash (indexed exact match).
-    // 3. For perceptual matching, query by perceptual band (bucketed recall).
-
-    // 1. Batch BLAKE3 exact match against library.
-    //
-    // Rule: a library query failure must fail the run, NOT silently behave
-    // as an empty library. We wrap the library-matching phase so any DB error
-    // marks the run FAILED with a real error code before propagating.
-    let library_match: Result<(), AppError> = async {
-        if !all_blake3.is_empty() {
-            let matched_library =
-                ImportRepository::find_library_images_by_blake3(&client, &all_blake3).await?;
-
-            let mut blake3_to_lib: std::collections::HashMap<Vec<u8>, Vec<LibraryImageRow>> =
-                std::collections::HashMap::new();
-            for lib in &matched_library {
-                blake3_to_lib
-                    .entry(lib.blake3.clone())
-                    .or_default()
-                    .push(lib.clone());
-            }
-
-            for entry in &all_album_images {
-                if cancelled.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Some(libs) = blake3_to_lib.get(&entry.fp.blake3_bytes) {
-                    for lib in libs {
-                        let pixel_exact = lib
-                            .pixel_hash
-                            .as_ref()
-                            .map(|ph| *ph == entry.fp.pixel_hash_bytes)
-                            .unwrap_or(false);
-
-                        ImportRepository::insert_duplicate_candidate(
-                            &client,
-                            NewDuplicateCandidate {
-                                import_run_id,
-                                source_image_id: entry.image_db_id,
-                                candidate_source_image_id: None,
-                                candidate_library_image_id: Some(lib.id),
-                                scope: DuplicateScope::Library,
-                                match_type: MatchType::FileExact,
-                                blake3_equal: true,
-                                pixel_hash_equal: pixel_exact,
-                                gradient_distance: None,
-                                block_distance: None,
-                                median_distance: None,
-                                transform_type: None,
-                                confidence: Some(1.0),
-                                decision: Some(Decision::AutoDuplicate),
-                                decision_source: Some(DecisionSource::ExactRule),
-                            },
-                        )
-                        .await?;
-                        duplicate_count += 1;
-                        progress.duplicate_count = duplicate_count;
-                        emit_progress(&progress, &progress_tracker).await;
-                    }
-                }
-            }
-        }
-
-        // 2. Perceptual matching via band-based recall (bounded candidates).
-        let max_perceptual_candidates: usize = 50;
-        for entry in &all_album_images {
-            if cancelled.load(Ordering::Relaxed) {
-                break;
-            }
-            let bands = compute_perceptual_bands(&entry.fp);
-            let mut recalled: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-
-            for (band_idx, band_val) in bands.iter().enumerate() {
-                if band_val.is_empty() {
-                    continue;
-                }
-                let candidates = ImportRepository::find_library_images_by_perceptual_band(
-                    &client,
-                    band_idx as u8,
-                    band_val,
-                    max_perceptual_candidates,
-                )
-                .await?;
-                for lib in candidates {
-                    if recalled.contains(&lib.id) {
-                        continue;
-                    }
-                    recalled.insert(lib.id);
-
-                    let lib_hex = PerceptualHex::from_bytes(
-                        &lib.gradient_hash,
-                        &lib.block_hash,
-                        &lib.median_hash,
-                    );
-                    if let Some(lib_hex) = lib_hex {
-                        if let Some(evidence) =
-                            compare_perceptual_library(&entry.fp, &lib_hex, thresholds)
-                        {
-                            let (match_type, decision, source) =
-                                classify_perceptual(&evidence, thresholds);
-                            ImportRepository::insert_duplicate_candidate(
-                                &client,
-                                NewDuplicateCandidate {
-                                    import_run_id,
-                                    source_image_id: entry.image_db_id,
-                                    candidate_source_image_id: None,
-                                    candidate_library_image_id: Some(lib.id),
-                                    scope: DuplicateScope::Library,
-                                    match_type,
-                                    blake3_equal: false,
-                                    pixel_hash_equal: false,
-                                    gradient_distance: Some(evidence.gradient_distance),
-                                    block_distance: Some(evidence.block_distance),
-                                    median_distance: Some(evidence.median_distance),
-                                    transform_type: Some(evidence.transform_type.to_string()),
-                                    confidence: Some(evidence.confidence),
-                                    decision,
-                                    decision_source: source,
-                                },
-                            )
-                            .await?;
-                            duplicate_count += 1;
-                            progress.duplicate_count = duplicate_count;
-                            emit_progress(&progress, &progress_tracker).await;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    .await;
-
-    if let Err(e) = library_match {
-        // Fail-stop: a library read failure must never look like "no matches".
-        ImportRepository::update_import_run_error(
-            &client,
-            import_run_id,
-            "LIBRARY_MATCH_FAILED",
-            &e.to_string(),
-        )
-        .await?;
-        progress.state = "failed".to_string();
-        progress.current_stage = "failed".to_string();
-        progress.errors.push(e.to_string());
-        emit_progress(&progress, &progress_tracker).await;
-        tracing::error!(
-            %import_run_id,
-            duplicate_count,
-            error = %e,
-            "scan library matching failed"
-        );
-        handle.abort();
-        return Ok(ScanProgress {
-            state: "failed".to_string(),
-            ..ScanProgress::idle()
-        });
-    }
-
     let statistics = serde_json::json!({
         "total_albums": progress.total_albums,
         "total_images": total_images,
@@ -1149,8 +1226,18 @@ pub async fn run_scan(
     // the run needs review; otherwise it is ready to commit. The run is NOT
     // marked Completed here — completion happens after commit + archive.
     let review_progress = ImportRepository::get_review_progress(&client, import_run_id).await?;
+    let run_summary = ImportRepository::list_import_runs_summary(&client)
+        .await?
+        .into_iter()
+        .find(|summary| summary.import_run_id == import_run_id.to_string());
+    let has_failed_albums = run_summary
+        .as_ref()
+        .map(|summary| summary.failed_albums > 0)
+        .unwrap_or(false);
     let final_run_state = if review_progress.total > review_progress.decided {
         ImportRunState::ReviewRequired
+    } else if has_failed_albums {
+        ImportRunState::Failed
     } else {
         ImportRunState::ReadyToCommit
     };
@@ -1214,6 +1301,7 @@ pub async fn scan_source_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::import_state::ImportAlbumState;
     use crate::repositories::import_repository::NewSnapshotFile;
     #[cfg(feature = "real-db-tests")]
     use crate::services::source_snapshot_service::SnapshotVerifyError;
@@ -1863,6 +1951,307 @@ mod tests {
             std::fs::read(&metadata_variant).unwrap(),
             metadata_bytes_before
         );
+    }
+
+    /// Real PostgreSQL album-workflow checkpoint test.
+    ///
+    /// Covers stale resume cleanup, failed-album retry isolation, dashboard
+    /// counters, and review entry from already-persisted candidates.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_scan_album_workflow_resume_cleanup_and_retry() {
+        use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            panic!(
+                "IMAGEDB_POSTGRES_BIN is not set; cannot run the real album workflow test. \
+                 Set IMAGEDB_POSTGRES_BIN to a PostgreSQL 18.x bin directory, or run \
+                 `node scripts/package-postgres-runtime.mjs`."
+            );
+        }
+
+        async fn insert_test_image(
+            client: &tokio_postgres::Client,
+            album_id: Uuid,
+            path: &Path,
+            relative_path: &str,
+        ) -> Uuid {
+            let fp = fingerprint_image_sync(path).unwrap();
+            ImportRepository::insert_import_image(
+                client,
+                NewImportImage {
+                    album_id,
+                    source_path: path.display().to_string(),
+                    relative_path: relative_path.to_string(),
+                    file_size: fp.file_size as i64,
+                    modified_at: None,
+                    width: Some(fp.width as i32),
+                    height: Some(fp.height as i32),
+                    format: Some(fp.format.clone()),
+                    decode_state: DecodeState::Decoded,
+                    blake3: Some(fp.blake3_bytes),
+                    pixel_hash: Some(fp.pixel_hash_bytes),
+                    gradient_hash: Some(fp.gradient_hash_bytes),
+                    block_hash: Some(fp.block_hash_bytes),
+                    median_hash: Some(fp.median_hash_bytes),
+                    fingerprint_version: Some("1".to_string()),
+                    state: ImportImageState::Fingerprinted,
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let app_data = tmp.path().join("app_data");
+        let source_root = tmp.path().join("source");
+        let done_album_dir = create_test_album(&source_root, "done_album");
+        let stale_album_dir = create_test_album(&source_root, "stale_album");
+        let failed_album_dir = create_test_album(&source_root, "failed_album");
+        let done_a = create_test_image(&done_album_dir, "a.png");
+        let done_b = create_test_image(&done_album_dir, "b.png");
+        let stale_img = create_test_image(&stale_album_dir, "partial.png");
+        let failed_img = create_test_image(&failed_album_dir, "failed.png");
+
+        std::fs::create_dir_all(&app_data).unwrap();
+        let mut manager = PostgresManager::new(&app_data);
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+
+        let (mut client, db_handle) = manager.connect().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            &source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let done_album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &done_album_dir.display().to_string(),
+            "done_album",
+        )
+        .await
+        .unwrap();
+        let stale_album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &stale_album_dir.display().to_string(),
+            "stale_album",
+        )
+        .await
+        .unwrap();
+        let failed_album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &failed_album_dir.display().to_string(),
+            "failed_album",
+        )
+        .await
+        .unwrap();
+
+        let done_image_a =
+            insert_test_image(&client, done_album_id, &done_a, "done_album/a.png").await;
+        let done_image_b =
+            insert_test_image(&client, done_album_id, &done_b, "done_album/b.png").await;
+        let stale_image = insert_test_image(
+            &client,
+            stale_album_id,
+            &stale_img,
+            "stale_album/partial.png",
+        )
+        .await;
+        let failed_image = insert_test_image(
+            &client,
+            failed_album_id,
+            &failed_img,
+            "failed_album/failed.png",
+        )
+        .await;
+
+        ImportRepository::insert_duplicate_candidate(
+            &client,
+            NewDuplicateCandidate {
+                import_run_id,
+                source_image_id: done_image_a,
+                candidate_source_image_id: Some(done_image_b),
+                candidate_library_image_id: None,
+                scope: DuplicateScope::IntraAlbum,
+                match_type: MatchType::PerceptualSimilar,
+                blake3_equal: false,
+                pixel_hash_equal: false,
+                gradient_distance: Some(8),
+                block_distance: Some(8),
+                median_distance: Some(8),
+                transform_type: None,
+                confidence: Some(0.8),
+                decision: None,
+                decision_source: None,
+            },
+        )
+        .await
+        .unwrap();
+        ImportRepository::insert_duplicate_candidate(
+            &client,
+            NewDuplicateCandidate {
+                import_run_id,
+                source_image_id: stale_image,
+                candidate_source_image_id: Some(done_image_a),
+                candidate_library_image_id: None,
+                scope: DuplicateScope::CrossAlbum,
+                match_type: MatchType::FileExact,
+                blake3_equal: true,
+                pixel_hash_equal: false,
+                gradient_distance: None,
+                block_distance: None,
+                median_distance: None,
+                transform_type: None,
+                confidence: Some(1.0),
+                decision: Some(Decision::AutoDuplicate),
+                decision_source: Some(DecisionSource::ExactRule),
+            },
+        )
+        .await
+        .unwrap();
+        ImportRepository::insert_duplicate_candidate(
+            &client,
+            NewDuplicateCandidate {
+                import_run_id,
+                source_image_id: failed_image,
+                candidate_source_image_id: Some(done_image_b),
+                candidate_library_image_id: None,
+                scope: DuplicateScope::CrossAlbum,
+                match_type: MatchType::FileExact,
+                blake3_equal: true,
+                pixel_hash_equal: false,
+                gradient_distance: None,
+                block_distance: None,
+                median_distance: None,
+                transform_type: None,
+                confidence: Some(1.0),
+                decision: Some(Decision::AutoDuplicate),
+                decision_source: Some(DecisionSource::ExactRule),
+            },
+        )
+        .await
+        .unwrap();
+
+        let done_status = ImportRepository::refresh_album_workflow_summary(&client, done_album_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            done_status.state,
+            ImportAlbumState::ReviewRequired.to_string()
+        );
+        assert_eq!(done_status.image_count, 2);
+        assert_eq!(done_status.review_candidate_count, 1);
+
+        ImportRepository::mark_import_album_analyzing(&client, stale_album_id)
+            .await
+            .unwrap();
+        ImportRepository::mark_import_album_failed(
+            &client,
+            failed_album_id,
+            "TEST_FAILURE",
+            "simulated album failure",
+        )
+        .await
+        .unwrap();
+
+        let cleaned = ImportRepository::mark_stale_analyzing_albums(&client, import_run_id)
+            .await
+            .unwrap();
+        assert_eq!(cleaned, 1);
+
+        let stale_status = ImportRepository::get_import_album_status_by_id(&client, stale_album_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_status.state, ImportAlbumState::Pending.to_string());
+        assert_eq!(stale_status.image_count, 0);
+        assert_eq!(stale_status.duplicate_candidate_count, 0);
+        let stale_image_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_images WHERE import_album_id = $1",
+                &[&stale_album_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(stale_image_count, 0);
+
+        let done_image_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_images WHERE import_album_id = $1",
+                &[&done_album_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(done_image_count, 2);
+        let remaining_review_candidates: i64 = client
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM duplicate_candidates
+                 WHERE import_run_id = $1 AND decision IS NULL",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(remaining_review_candidates, 1);
+
+        ImportRepository::reset_failed_album_for_retry(&client, failed_album_id)
+            .await
+            .unwrap();
+        let failed_status =
+            ImportRepository::get_import_album_status_by_id(&client, failed_album_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(failed_status.state, ImportAlbumState::Pending.to_string());
+        assert!(failed_status.last_error_message.is_none());
+        let failed_image_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_images WHERE import_album_id = $1",
+                &[&failed_album_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(failed_image_count, 0);
+
+        let summary = ImportRepository::list_import_runs_summary(&client)
+            .await
+            .unwrap();
+        let run_summary = summary
+            .iter()
+            .find(|item| item.import_run_id == import_run_id.to_string())
+            .unwrap();
+        assert_eq!(run_summary.total_albums, 3);
+        assert_eq!(run_summary.pending_albums, 2);
+        assert_eq!(run_summary.review_required_albums, 1);
+        assert_eq!(run_summary.pending_reviews, 1);
+
+        let latest_reviewable = ImportRepository::get_latest_reviewable_run(&client)
+            .await
+            .unwrap();
+        assert_eq!(latest_reviewable, Some(import_run_id));
+
+        drop(client);
+        db_handle.abort();
+        manager.shutdown().await.unwrap();
     }
 
     fn make_snapshot_file(path: &str, ft: &str, size: i64, hash: u8) -> NewSnapshotFile {

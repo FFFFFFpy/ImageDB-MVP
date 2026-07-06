@@ -12,6 +12,8 @@ MVP1 已定性为：
 
 当前 canonical 文档入口：[`docs/MVP1/README.md`](docs/MVP1/README.md)
 
+当前显式任务包：MVP2 图集级断点续跑 + 异步审核入口 + 数据状态可见，文档入口为 [`docs/MVP2/README.md`](docs/MVP2/README.md)。
+
 ## 状态摘要
 
 MVP1 本地主链已人工验收通过：
@@ -36,6 +38,8 @@ MVP1 本地主链已人工验收通过：
 - release gate / install gate 修正。
 - clean Windows 发布验收补强。
 
+例外：用户明确要求的 MVP2 任务在独立 feature 分支上执行，仍必须保持 frozen plan / commit / recovery 文件事务安全边界。
+
 ## 发布签字状态
 
 - MVP1 功能完成：已定性完成。
@@ -46,13 +50,13 @@ MVP1 本地主链已人工验收通过：
 
 ## 文档入口
 
-| 文档 | 用途 |
-| --- | --- |
-| [`docs/MVP1/README.md`](docs/MVP1/README.md) | MVP1 文档总入口 |
-| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md) | 当前状态、DoD、剩余 Debug 项 |
-| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md) | MVP1 架构、主链、数据与文件事务 |
-| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册 |
-| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md) | 文档地图与归档口径 |
+| 文档                                                         | 用途                            |
+| ------------------------------------------------------------ | ------------------------------- |
+| [`docs/MVP1/README.md`](docs/MVP1/README.md)                 | MVP1 文档总入口                 |
+| [`docs/MVP1/STATUS.md`](docs/MVP1/STATUS.md)                 | 当前状态、DoD、剩余 Debug 项    |
+| [`docs/MVP1/ARCHITECTURE.md`](docs/MVP1/ARCHITECTURE.md)     | MVP1 架构、主链、数据与文件事务 |
+| [`docs/MVP1/DEBUG_PLAYBOOK.md`](docs/MVP1/DEBUG_PLAYBOOK.md) | 实战测试和 Debug 手册           |
+| [`docs/MVP1/DOCUMENT_MAP.md`](docs/MVP1/DOCUMENT_MAP.md)     | 文档地图与归档口径              |
 
 ## 历史记录
 

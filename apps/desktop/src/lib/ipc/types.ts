@@ -210,6 +210,46 @@ export interface ScanSourceInfo {
   album_count: number;
 }
 
+export type AlbumWorkflowState =
+  | 'pending'
+  | 'analyzing'
+  | 'analyzed'
+  | 'review_required'
+  | 'failed'
+  | 'completed'
+  | 'scanning'
+  | 'fingerprinting';
+
+export interface ImportAlbumStatus {
+  id: string;
+  import_run_id: string;
+  source_name: string;
+  source_path: string;
+  state: AlbumWorkflowState;
+  image_count: number;
+  fingerprinted_count: number;
+  duplicate_candidate_count: number;
+  review_candidate_count: number;
+  last_error_message: string | null;
+  analysis_started_at: string | null;
+  analysis_completed_at: string | null;
+}
+
+export interface ImportRunDashboard {
+  import_run_id: string;
+  source_root: string;
+  state: string;
+  total_albums: number;
+  pending_albums: number;
+  analyzing_albums: number;
+  analyzed_albums: number;
+  review_required_albums: number;
+  failed_albums: number;
+  total_images: number;
+  pending_reviews: number;
+  duplicate_candidates: number;
+}
+
 export interface ReviewCandidateSummary {
   candidate_id: string;
   source_image_id: string;

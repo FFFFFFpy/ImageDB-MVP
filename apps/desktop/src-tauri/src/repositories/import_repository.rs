@@ -6,6 +6,7 @@ use crate::domain::import_state::{
 };
 use crate::domain::state_machine::{FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 use uuid::Uuid;
@@ -45,6 +46,38 @@ pub struct ImportAlbumRecord {
     pub source_path: String,
     pub source_name: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportAlbumStatus {
+    pub id: String,
+    pub import_run_id: String,
+    pub source_name: String,
+    pub source_path: String,
+    pub state: String,
+    pub image_count: i32,
+    pub fingerprinted_count: i32,
+    pub duplicate_candidate_count: i32,
+    pub review_candidate_count: i32,
+    pub last_error_message: Option<String>,
+    pub analysis_started_at: Option<String>,
+    pub analysis_completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportRunDashboard {
+    pub import_run_id: String,
+    pub source_root: String,
+    pub state: String,
+    pub total_albums: i32,
+    pub pending_albums: i32,
+    pub analyzing_albums: i32,
+    pub analyzed_albums: i32,
+    pub review_required_albums: i32,
+    pub failed_albums: i32,
+    pub total_images: i32,
+    pub pending_reviews: i32,
+    pub duplicate_candidates: i32,
 }
 
 pub struct ImportImageRecord {
@@ -650,15 +683,19 @@ impl ImportRepository {
     ) -> Result<Uuid, AppError> {
         let id = Uuid::new_v4();
         let state = ImportAlbumState::Pending.to_string();
-        client
-            .execute(
+        let row = client
+            .query_one(
                 "INSERT INTO import_albums (id, import_run_id, source_path, source_name, state)
-                 VALUES ($1, $2, $3, $4, $5)",
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (import_run_id, source_path) DO UPDATE
+                 SET source_name = EXCLUDED.source_name,
+                     updated_at = now()
+                 RETURNING id",
                 &[&id, &import_run_id, &source_path, &source_name, &state],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to insert import album: {e}")))?;
-        Ok(id)
+        Ok(row.get("id"))
     }
 
     pub async fn update_import_album_state(
@@ -667,13 +704,193 @@ impl ImportRepository {
         state: &ImportAlbumState,
     ) -> Result<(), AppError> {
         let state_str = state.to_string();
+        let started_at = if matches!(state, ImportAlbumState::Analyzing) {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+        let completed_at = if matches!(
+            state,
+            ImportAlbumState::Analyzed
+                | ImportAlbumState::ReviewRequired
+                | ImportAlbumState::Completed
+                | ImportAlbumState::Failed
+        ) {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
         client
             .execute(
-                "UPDATE import_albums SET state = $1 WHERE id = $2",
-                &[&state_str, &id],
+                "UPDATE import_albums
+                 SET state = $1,
+                     analysis_started_at = COALESCE(analysis_started_at, $2),
+                     analysis_completed_at = COALESCE($3, analysis_completed_at),
+                     updated_at = now()
+                 WHERE id = $4",
+                &[&state_str, &started_at, &completed_at, &id],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to update album state: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn mark_import_album_analyzing(client: &Client, id: Uuid) -> Result<(), AppError> {
+        let state = ImportAlbumState::Analyzing.to_string();
+        client
+            .execute(
+                "UPDATE import_albums
+                 SET state = $1,
+                     analysis_started_at = COALESCE(analysis_started_at, now()),
+                     analysis_completed_at = NULL,
+                     last_error_code = NULL,
+                     last_error_message = NULL,
+                     analysis_attempts = analysis_attempts + 1,
+                     updated_at = now()
+                 WHERE id = $2",
+                &[&state, &id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to mark album analyzing: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn mark_import_album_failed(
+        client: &Client,
+        id: Uuid,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<(), AppError> {
+        let state = ImportAlbumState::Failed.to_string();
+        client
+            .execute(
+                "UPDATE import_albums
+                 SET state = $1,
+                     analysis_completed_at = now(),
+                     last_error_code = $2,
+                     last_error_message = $3,
+                     updated_at = now()
+                 WHERE id = $4",
+                &[&state, &error_code, &error_message, &id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to mark album failed: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn refresh_album_workflow_summary(
+        client: &Client,
+        album_id: Uuid,
+    ) -> Result<ImportAlbumStatus, AppError> {
+        let row = client
+            .query_one(
+                "WITH counts AS (
+                    SELECT
+                        COUNT(ii.id)::INTEGER AS image_count,
+                        COUNT(ii.id) FILTER (WHERE ii.state = 'fingerprinted')::INTEGER AS fingerprinted_count
+                    FROM import_images ii
+                    WHERE ii.import_album_id = $1
+                 ),
+                 candidate_counts AS (
+                    SELECT
+                        COUNT(dc.id)::INTEGER AS duplicate_candidate_count,
+                        COUNT(dc.id) FILTER (
+                            WHERE dc.decision IS NULL AND rd.id IS NULL
+                        )::INTEGER AS review_candidate_count
+                    FROM duplicate_candidates dc
+                    JOIN import_images si ON dc.source_image_id = si.id
+                    LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                    WHERE si.import_album_id = $1
+                 )
+                 UPDATE import_albums ia
+                 SET image_count = counts.image_count,
+                     fingerprinted_count = counts.fingerprinted_count,
+                     duplicate_candidate_count = candidate_counts.duplicate_candidate_count,
+                     review_candidate_count = candidate_counts.review_candidate_count,
+                     state = CASE
+                         WHEN candidate_counts.review_candidate_count > 0 THEN 'review_required'
+                         WHEN ia.state NOT IN ('completed', 'committing', 'ready_to_commit', 'reviewed') THEN 'analyzed'
+                         ELSE ia.state
+                     END,
+                     analysis_completed_at = COALESCE(ia.analysis_completed_at, now()),
+                     updated_at = now()
+                 FROM counts, candidate_counts
+                 WHERE ia.id = $1
+                 RETURNING ia.id, ia.import_run_id, ia.source_name, ia.source_path, ia.state,
+                           ia.image_count, ia.fingerprinted_count,
+                           ia.duplicate_candidate_count, ia.review_candidate_count,
+                           ia.last_error_message, ia.analysis_started_at, ia.analysis_completed_at",
+                &[&album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to refresh album summary: {e}")))?;
+        Ok(Self::album_status_from_row(&row))
+    }
+
+    pub async fn reset_failed_album_for_retry(
+        client: &Client,
+        album_id: Uuid,
+    ) -> Result<(), AppError> {
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to begin album retry reset: {e}")))?;
+
+        let result: Result<(), AppError> = async {
+            client
+                .execute(
+                    "DELETE FROM duplicate_candidates dc
+                 WHERE dc.source_image_id IN (
+                     SELECT id FROM import_images WHERE import_album_id = $1
+                 )
+                 OR dc.candidate_source_image_id IN (
+                     SELECT id FROM import_images WHERE import_album_id = $1
+                 )",
+                    &[&album_id],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to delete album candidates: {e}"))
+                })?;
+            client
+                .execute(
+                    "DELETE FROM import_images WHERE import_album_id = $1",
+                    &[&album_id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to delete album images: {e}")))?;
+            let state = ImportAlbumState::Pending.to_string();
+            client
+                .execute(
+                    "UPDATE import_albums
+                 SET state = $1,
+                     analysis_started_at = NULL,
+                     analysis_completed_at = NULL,
+                     last_error_code = NULL,
+                     last_error_message = NULL,
+                     image_count = 0,
+                     fingerprinted_count = 0,
+                     duplicate_candidate_count = 0,
+                     review_candidate_count = 0,
+                     updated_at = now()
+                 WHERE id = $2",
+                    &[&state, &album_id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to reset album: {e}")))?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(e);
+        }
+
+        client
+            .batch_execute("COMMIT")
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to commit album retry reset: {e}")))?;
         Ok(())
     }
 
@@ -1259,6 +1476,220 @@ impl ImportRepository {
             .collect())
     }
 
+    fn album_status_from_row(row: &tokio_postgres::Row) -> ImportAlbumStatus {
+        let started_at: Option<chrono::DateTime<chrono::Utc>> = row.get("analysis_started_at");
+        let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("analysis_completed_at");
+        ImportAlbumStatus {
+            id: row.get::<_, Uuid>("id").to_string(),
+            import_run_id: row.get::<_, Uuid>("import_run_id").to_string(),
+            source_name: row.get("source_name"),
+            source_path: row.get("source_path"),
+            state: row.get("state"),
+            image_count: row.get("image_count"),
+            fingerprinted_count: row.get("fingerprinted_count"),
+            duplicate_candidate_count: row.get("duplicate_candidate_count"),
+            review_candidate_count: row.get("review_candidate_count"),
+            last_error_message: row.get("last_error_message"),
+            analysis_started_at: started_at.map(|ts| ts.to_rfc3339()),
+            analysis_completed_at: completed_at.map(|ts| ts.to_rfc3339()),
+        }
+    }
+
+    pub async fn get_import_run_album_status(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<ImportAlbumStatus>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, import_run_id, source_name, source_path, state,
+                        image_count, fingerprinted_count,
+                        duplicate_candidate_count, review_candidate_count,
+                        last_error_message, analysis_started_at, analysis_completed_at
+                 FROM import_albums
+                 WHERE import_run_id = $1
+                 ORDER BY source_name",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query album status: {e}")))?;
+        Ok(rows.iter().map(Self::album_status_from_row).collect())
+    }
+
+    pub async fn get_import_album_status_by_id(
+        client: &Client,
+        album_id: Uuid,
+    ) -> Result<Option<ImportAlbumStatus>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT id, import_run_id, source_name, source_path, state,
+                        image_count, fingerprinted_count,
+                        duplicate_candidate_count, review_candidate_count,
+                        last_error_message, analysis_started_at, analysis_completed_at
+                 FROM import_albums
+                 WHERE id = $1",
+                &[&album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query album status: {e}")))?;
+        Ok(row.map(|row| Self::album_status_from_row(&row)))
+    }
+
+    pub async fn list_resume_candidates(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<ImportAlbumStatus>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, import_run_id, source_name, source_path, state,
+                        image_count, fingerprinted_count,
+                        duplicate_candidate_count, review_candidate_count,
+                        last_error_message, analysis_started_at, analysis_completed_at
+                 FROM import_albums
+                 WHERE import_run_id = $1
+                   AND state IN ('pending', 'analyzing', 'scanning', 'fingerprinting', 'failed')
+                 ORDER BY source_name",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query resume candidates: {e}")))?;
+        Ok(rows.iter().map(Self::album_status_from_row).collect())
+    }
+
+    pub async fn mark_stale_analyzing_albums(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<u64, AppError> {
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to begin stale album cleanup: {e}")))?;
+
+        let result: Result<u64, AppError> = async {
+            let stale_rows = client
+                .query(
+                    "SELECT id
+                     FROM import_albums
+                     WHERE import_run_id = $1
+                       AND state IN ('analyzing', 'scanning', 'fingerprinting')",
+                    &[&import_run_id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to query stale albums: {e}")))?;
+            let stale_album_ids: Vec<Uuid> = stale_rows.iter().map(|row| row.get("id")).collect();
+            if stale_album_ids.is_empty() {
+                return Ok(0);
+            }
+
+            client
+                .execute(
+                    "DELETE FROM duplicate_candidates dc
+                     WHERE dc.source_image_id IN (
+                         SELECT id FROM import_images WHERE import_album_id = ANY($1)
+                     )
+                     OR dc.candidate_source_image_id IN (
+                         SELECT id FROM import_images WHERE import_album_id = ANY($1)
+                     )",
+                    &[&stale_album_ids],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to delete stale album candidates: {e}"))
+                })?;
+            client
+                .execute(
+                    "DELETE FROM import_images WHERE import_album_id = ANY($1)",
+                    &[&stale_album_ids],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to delete stale album images: {e}"))
+                })?;
+
+            let pending = ImportAlbumState::Pending.to_string();
+            let updated = client
+                .execute(
+                    "UPDATE import_albums
+                     SET state = $1,
+                         analysis_started_at = NULL,
+                         analysis_completed_at = NULL,
+                         last_error_code = NULL,
+                         last_error_message = NULL,
+                         image_count = 0,
+                         fingerprinted_count = 0,
+                         duplicate_candidate_count = 0,
+                         review_candidate_count = 0,
+                         updated_at = now()
+                     WHERE id = ANY($2)",
+                    &[&pending, &stale_album_ids],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to mark stale albums: {e}")))?;
+            Ok(updated)
+        }
+        .await;
+
+        match result {
+            Ok(updated) => {
+                client.batch_execute("COMMIT").await.map_err(|e| {
+                    AppError::Internal(format!("failed to commit stale album cleanup: {e}"))
+                })?;
+                Ok(updated)
+            }
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn list_import_runs_summary(
+        client: &Client,
+    ) -> Result<Vec<ImportRunDashboard>, AppError> {
+        let rows = client
+            .query(
+                "SELECT r.id AS import_run_id,
+                        r.source_root,
+                        r.state,
+                        COUNT(a.id)::INTEGER AS total_albums,
+                        COUNT(a.id) FILTER (WHERE a.state = 'pending')::INTEGER AS pending_albums,
+                        COUNT(a.id) FILTER (
+                            WHERE a.state IN ('analyzing', 'scanning', 'fingerprinting')
+                        )::INTEGER AS analyzing_albums,
+                        COUNT(a.id) FILTER (WHERE a.state = 'analyzed')::INTEGER AS analyzed_albums,
+                        COUNT(a.id) FILTER (WHERE a.state = 'review_required')::INTEGER AS review_required_albums,
+                        COUNT(a.id) FILTER (WHERE a.state = 'failed')::INTEGER AS failed_albums,
+                        COALESCE(SUM(a.image_count), 0)::INTEGER AS total_images,
+                        COALESCE(SUM(a.review_candidate_count), 0)::INTEGER AS pending_reviews,
+                        COALESCE(SUM(a.duplicate_candidate_count), 0)::INTEGER AS duplicate_candidates
+                 FROM import_runs r
+                 LEFT JOIN import_albums a ON a.import_run_id = r.id
+                 GROUP BY r.id, r.source_root, r.state, r.started_at
+                 ORDER BY r.started_at DESC
+                 LIMIT 20",
+                &[],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query run dashboard: {e}")))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ImportRunDashboard {
+                import_run_id: r.get::<_, Uuid>("import_run_id").to_string(),
+                source_root: r.get("source_root"),
+                state: r.get("state"),
+                total_albums: r.get("total_albums"),
+                pending_albums: r.get("pending_albums"),
+                analyzing_albums: r.get("analyzing_albums"),
+                analyzed_albums: r.get("analyzed_albums"),
+                review_required_albums: r.get("review_required_albums"),
+                failed_albums: r.get("failed_albums"),
+                total_images: r.get("total_images"),
+                pending_reviews: r.get("pending_reviews"),
+                duplicate_candidates: r.get("duplicate_candidates"),
+            })
+            .collect())
+    }
+
     pub async fn get_latest_completed_run(client: &Client) -> Result<Option<Uuid>, AppError> {
         let row = client
             .query_opt(
@@ -1285,6 +1716,16 @@ impl ImportRepository {
             .query_opt(
                 "SELECT id FROM import_runs
                  WHERE state IN ('review_required', 'ready_to_commit')
+                    OR EXISTS (
+                        SELECT 1
+                        FROM duplicate_candidates dc
+                        JOIN import_images ii ON ii.id = dc.source_image_id
+                        JOIN import_albums ia ON ia.id = ii.import_album_id
+                        LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                        WHERE ia.import_run_id = import_runs.id
+                          AND dc.decision IS NULL
+                          AND rd.id IS NULL
+                    )
                  ORDER BY started_at DESC
                  LIMIT 1",
                 &[],

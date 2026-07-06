@@ -1,8 +1,12 @@
-use crate::domain::import_state::{ScanProgress, ScanSourceInfo};
+use crate::domain::import_state::{ImportRunState, ScanProgress, ScanSourceInfo};
+use crate::repositories::import_repository::{
+    ImportAlbumStatus, ImportRepository, ImportRunDashboard,
+};
 use crate::services::scan_service;
 use crate::state::AppState;
 use std::sync::atomic::Ordering;
 use tauri::{Emitter, Runtime, State};
+use uuid::Uuid;
 
 #[tauri::command]
 pub async fn validate_source_directory(source_root: String) -> Result<ScanSourceInfo, String> {
@@ -29,6 +33,14 @@ pub async fn start_scan<R: Runtime>(
 pub(crate) async fn start_scan_for_state(
     state: &AppState,
     source_root: String,
+) -> Result<String, String> {
+    start_scan_for_state_inner(state, source_root, None).await
+}
+
+async fn start_scan_for_state_inner(
+    state: &AppState,
+    source_root: String,
+    import_run_id: Option<Uuid>,
 ) -> Result<String, String> {
     tracing::info!(source_root = %source_root, "start_scan command received");
     let mut scan_state = state.scan_state.lock().await;
@@ -71,14 +83,26 @@ pub(crate) async fn start_scan_for_state(
     let tracker_clone = progress_tracker.clone();
 
     let task = tokio::spawn(async move {
-        let result = scan_service::run_scan(
-            postgres_manager,
-            settings,
-            source_root_clone,
-            cancelled_clone,
-            tracker_clone,
-        )
-        .await;
+        let result = if let Some(import_run_id) = import_run_id {
+            scan_service::run_scan_for_import_run(
+                postgres_manager,
+                settings,
+                source_root_clone,
+                import_run_id,
+                cancelled_clone,
+                tracker_clone,
+            )
+            .await
+        } else {
+            scan_service::run_scan(
+                postgres_manager,
+                settings,
+                source_root_clone,
+                cancelled_clone,
+                tracker_clone,
+            )
+            .await
+        };
 
         match result {
             Ok(progress) => progress,
@@ -181,4 +205,94 @@ pub(crate) async fn get_scan_progress_for_state(state: &AppState) -> Result<Scan
     }
     let tracker = scan_state.progress_tracker.lock().await;
     Ok(tracker.clone())
+}
+
+fn parse_uuid(s: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(s).map_err(|e| format!("invalid uuid '{s}': {e}"))
+}
+
+#[tauri::command]
+pub async fn get_import_runs_dashboard(
+    state: State<'_, AppState>,
+) -> Result<Vec<ImportRunDashboard>, String> {
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = ImportRepository::list_import_runs_summary(&client)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn get_import_run_albums(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<Vec<ImportAlbumStatus>, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = ImportRepository::get_import_run_album_status(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn retry_import_album(
+    state: State<'_, AppState>,
+    album_id: String,
+) -> Result<ImportAlbumStatus, String> {
+    let album_id = parse_uuid(&album_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = async {
+        ImportRepository::reset_failed_album_for_retry(&client, album_id).await?;
+        ImportRepository::get_import_album_status_by_id(&client, album_id)
+            .await?
+            .ok_or_else(|| {
+                crate::error::AppError::Internal(format!(
+                    "album {album_id} was not found after retry reset"
+                ))
+            })
+    }
+    .await
+    .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn resume_import_run(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<String, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = async {
+        let run = ImportRepository::get_import_run_by_id(&client, run_id)
+            .await?
+            .ok_or_else(|| {
+                crate::error::AppError::Internal(format!("import run {run_id} was not found"))
+            })?;
+        ImportRepository::mark_stale_analyzing_albums(&client, run_id).await?;
+        ImportRepository::update_import_run_state(&client, run_id, &ImportRunState::Analyzing)
+            .await?;
+        Ok::<String, crate::error::AppError>(run.source_root)
+    }
+    .await
+    .map_err(|e| format!("{e}"));
+    handle.abort();
+    let source_root = result?;
+    start_scan_for_state_inner(&state, source_root, Some(run_id)).await
 }
