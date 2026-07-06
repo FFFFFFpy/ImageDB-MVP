@@ -75,6 +75,7 @@ const mockState = vi.hoisted(() => ({
 const mockApi = vi.hoisted(() => ({
   getImportRunsDashboard: vi.fn(() => Promise.resolve(mockState.dashboard)),
   getImportRunAlbums: vi.fn(() => Promise.resolve(mockState.albums)),
+  resumeImportRun: vi.fn(() => Promise.resolve('scan started')),
   retryImportAlbum: vi.fn((albumId: string) =>
     Promise.resolve({
       ...mockState.albums.find((album) => album.id === albumId)!,
@@ -109,7 +110,7 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn(() => Promise.resolve(() => undefined)),
 }));
 
-function renderScanPage(onNavigate = vi.fn()) {
+function renderScanPage(onNavigate = vi.fn(), initialImportRunId: string | null = 'run-1') {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -117,7 +118,7 @@ function renderScanPage(onNavigate = vi.fn()) {
     onNavigate,
     ...render(
       <QueryClientProvider client={client}>
-        <ScanPage onNavigate={onNavigate} />
+        <ScanPage initialImportRunId={initialImportRunId} onNavigate={onNavigate} />
       </QueryClientProvider>,
     ),
   };
@@ -161,6 +162,14 @@ describe('ScanPage state routing', () => {
 });
 
 describe('ScanPage album workflow', () => {
+  test('does not show stale latest-run albums until a run is active', async () => {
+    renderScanPage(vi.fn(), null);
+
+    expect(await screen.findByText('暂无图集状态。验证源目录后开始分析。')).toBeInTheDocument();
+    expect(screen.queryByText('review-album')).not.toBeInTheDocument();
+    expect(mockApi.getImportRunAlbums).not.toHaveBeenCalled();
+  });
+
   test('loads album status from IPC and renders the workflow table', async () => {
     renderScanPage();
 
@@ -169,6 +178,24 @@ describe('ScanPage album workflow', () => {
     expect(screen.getByText('done-album')).toBeInTheDocument();
     expect(screen.getByText('simulated failure')).toBeInTheDocument();
     expect(mockApi.getImportRunAlbums).toHaveBeenCalledWith('run-1');
+  });
+
+  test('clears the active run when the source path is edited', async () => {
+    renderScanPage();
+
+    expect(await screen.findByText('review-album')).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'D:/Other' } });
+
+    expect(screen.queryByText('review-album')).not.toBeInTheDocument();
+    expect(screen.getByText('暂无图集状态。验证源目录后开始分析。')).toBeInTheDocument();
+  });
+
+  test('continues the active run through resumeImportRun', async () => {
+    renderScanPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '继续分析' }));
+    await waitFor(() => expect(mockApi.resumeImportRun).toHaveBeenCalledWith('run-1'));
+    expect(mockApi.startScan).not.toHaveBeenCalled();
   });
 
   test('shows retry for failed albums and review only for albums with candidates', async () => {

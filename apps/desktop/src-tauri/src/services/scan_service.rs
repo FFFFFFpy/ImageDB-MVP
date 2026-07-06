@@ -873,6 +873,7 @@ async fn run_scan_inner(
                 &e.to_string(),
             )
             .await?;
+            ImportRepository::refresh_import_run_statistics(&client, import_run_id).await?;
             tracing::error!(
                 %import_run_id,
                 error = %e,
@@ -1207,6 +1208,7 @@ async fn run_scan_inner(
             elapsed_ms = started_at.elapsed().as_millis(),
             "scan cancelled"
         );
+        ImportRepository::refresh_import_run_statistics(&client, import_run_id).await?;
         handle.abort();
         return Ok(ScanProgress {
             state: "cancelled".to_string(),
@@ -1214,13 +1216,7 @@ async fn run_scan_inner(
         });
     }
 
-    let statistics = serde_json::json!({
-        "total_albums": progress.total_albums,
-        "total_images": total_images,
-        "duplicate_count": duplicate_count,
-        "error_count": errors.len(),
-    });
-    ImportRepository::update_import_run_statistics(&client, import_run_id, &statistics).await?;
+    ImportRepository::refresh_import_run_statistics(&client, import_run_id).await?;
 
     // Determine post-scan state: if any undecided duplicate candidates remain,
     // the run needs review; otherwise it is ready to commit. The run is NOT
@@ -1301,6 +1297,7 @@ pub async fn scan_source_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "real-db-tests")]
     use crate::domain::import_state::ImportAlbumState;
     use crate::repositories::import_repository::NewSnapshotFile;
     #[cfg(feature = "real-db-tests")]
@@ -1763,6 +1760,21 @@ mod tests {
         let (mut client, db_handle) = manager.connect().await.unwrap();
         MigrationRunner::run_pending(&mut client).await.unwrap();
 
+        let empty_db_info = ImportRepository::get_database_info_dashboard(
+            &client,
+            crate::repositories::import_repository::DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: Some("0011_album_workflow_state".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty_db_info.library.library_root_count, 0);
+        assert_eq!(empty_db_info.imports.import_run_count, 0);
+        assert!(empty_db_info.latest_run.is_none());
+
         let library_root_id = ImportRepository::upsert_default_library_root(&client)
             .await
             .unwrap();
@@ -1961,6 +1973,7 @@ mod tests {
     #[ignore]
     #[cfg(feature = "real-db-tests")]
     async fn real_scan_album_workflow_resume_cleanup_and_retry() {
+        use crate::domain::import_state::ReviewDecisionAction;
         use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 
         if std::env::var("IMAGEDB_POSTGRES_BIN")
@@ -2080,7 +2093,7 @@ mod tests {
         )
         .await;
 
-        ImportRepository::insert_duplicate_candidate(
+        let review_candidate_id = ImportRepository::insert_duplicate_candidate(
             &client,
             NewDuplicateCandidate {
                 import_run_id,
@@ -2248,6 +2261,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(latest_reviewable, Some(import_run_id));
+
+        let stale_statistics = serde_json::json!({
+            "total_albums": 999,
+            "total_images": 999,
+            "duplicate_count": 999,
+            "error_count": 999,
+        });
+        ImportRepository::update_import_run_statistics(&client, import_run_id, &stale_statistics)
+            .await
+            .unwrap();
+        let refreshed_statistics =
+            ImportRepository::refresh_import_run_statistics(&client, import_run_id)
+                .await
+                .unwrap();
+        assert_eq!(refreshed_statistics["total_albums"], 3);
+        assert_eq!(refreshed_statistics["total_images"], 2);
+        assert_eq!(refreshed_statistics["duplicate_count"], 1);
+        assert_eq!(refreshed_statistics["pending_review_count"], 1);
+
+        let db_info = ImportRepository::get_database_info_dashboard(
+            &client,
+            crate::repositories::import_repository::DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: Some("0011_album_workflow_state".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(db_info.library.library_root_count, 1);
+        assert_eq!(db_info.imports.import_run_count, 1);
+        assert_eq!(db_info.imports.import_album_count, 3);
+        assert_eq!(db_info.imports.import_image_count, 2);
+        assert_eq!(db_info.imports.pending_review_count, 1);
+        assert_eq!(db_info.imports.failed_album_count, 0);
+        assert_eq!(
+            db_info.latest_run.unwrap().import_run_id,
+            import_run_id.to_string()
+        );
+
+        crate::services::review_service::submit_decision(
+            &client,
+            review_candidate_id,
+            ReviewDecisionAction::KeepSource,
+        )
+        .await
+        .unwrap();
+        let done_status = ImportRepository::get_import_album_status_by_id(&client, done_album_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done_status.review_candidate_count, 0);
+        assert_eq!(done_status.state, ImportAlbumState::Analyzed.to_string());
+        let summary = ImportRepository::list_import_runs_summary(&client)
+            .await
+            .unwrap();
+        let run_summary = summary
+            .iter()
+            .find(|item| item.import_run_id == import_run_id.to_string())
+            .unwrap();
+        assert_eq!(run_summary.pending_reviews, 0);
 
         drop(client);
         db_handle.abort();

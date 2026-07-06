@@ -5,9 +5,15 @@ import { formatTaggedStatus, taggedStatusCode } from '../lib/format';
 interface DashboardPageProps {
   needsOnboarding: boolean;
   onConfigureDatabase: () => void;
-  onGoScan: () => void;
+  onGoScan: (importRunId?: string | null) => void;
   onGoReview: () => void;
   onGoRecovery: () => void;
+}
+
+function formatDatabaseMode(mode: 'managed_local' | 'external' | null | undefined): string {
+  if (mode === 'managed_local') return '托管本地 PostgreSQL';
+  if (mode === 'external') return '外部 PostgreSQL';
+  return '未配置';
 }
 
 export function DashboardPage({
@@ -22,9 +28,9 @@ export function DashboardPage({
     queryFn: api.getDatabaseStatus,
     refetchInterval: 5000,
   });
-  const importRuns = useQuery({
-    queryKey: ['import-runs-dashboard'],
-    queryFn: api.getImportRunsDashboard,
+  const databaseInfo = useQuery({
+    queryKey: ['database-info-dashboard'],
+    queryFn: api.getDatabaseInfoDashboard,
     refetchInterval: 3000,
     enabled: !needsOnboarding,
   });
@@ -45,6 +51,7 @@ export function DashboardPage({
 
   const statusCode = taggedStatusCode(dbStatus.data?.status);
   const statusText = formatTaggedStatus(dbStatus.data?.status);
+  const info = databaseInfo.data;
   const isConnected = statusCode === 'connected';
   const isInitialLoading = dbStatus.isLoading && !dbStatus.data;
   const isManagedStartRetry =
@@ -66,19 +73,23 @@ export function DashboardPage({
         : dbStatus.data?.mode === null
           ? '尚未选择数据库模式'
           : null;
-  const latestRun = importRuns.data?.[0] ?? null;
-  const totalAlbums = latestRun?.total_albums ?? 0;
-  const totalImages = latestRun?.total_images ?? 0;
-  const pendingReviews = latestRun?.pending_reviews ?? 0;
-  const failedAlbums = latestRun?.failed_albums ?? 0;
-  const hasRecoveryTask = latestRun?.state === 'recovery_required';
+  const latestRun = info?.latest_run ?? null;
+  const pendingReviews = info?.imports.pending_review_count ?? latestRun?.pending_reviews ?? 0;
+  const failedAlbums = info?.imports.failed_album_count ?? latestRun?.failed_albums ?? 0;
+  const recoveryRequiredRuns = info?.imports.recovery_required_run_count ?? 0;
+  const hasRecoveryTask = recoveryRequiredRuns > 0 || latestRun?.state === 'recovery_required';
+  const hasResumableRun =
+    !!latestRun && (latestRun.pending_albums > 0 || latestRun.analyzing_albums > 0);
+  const hasFailedRun = !!latestRun && failedAlbums > 0;
   const nextAction = hasRecoveryTask
     ? { label: '前往恢复', onClick: onGoRecovery }
     : pendingReviews > 0
       ? { label: '继续审核', onClick: onGoReview }
-      : (latestRun?.pending_albums ?? 0) > 0 || (latestRun?.analyzing_albums ?? 0) > 0
-        ? { label: '继续分析', onClick: onGoScan }
-        : { label: '开始导入', onClick: onGoScan };
+      : hasResumableRun
+        ? { label: '继续分析', onClick: () => onGoScan(latestRun.import_run_id) }
+        : hasFailedRun
+          ? { label: '查看失败图集', onClick: () => onGoScan(latestRun.import_run_id) }
+          : { label: '开始导入', onClick: () => onGoScan(null) };
 
   return (
     <div className="dashboard-page">
@@ -107,21 +118,35 @@ export function DashboardPage({
       </div>
 
       <section className="scan-progress-section">
-        <h2>数据状态</h2>
-        <div className="scan-progress-grid">
+        <h2>数据库概览</h2>
+        <div className="database-info-grid">
           <div className="scan-progress-card">
-            <h3>数据安全</h3>
-            <p className={hasRecoveryTask ? 'status-error' : 'status-ok'}>
-              {hasRecoveryTask ? '需要恢复' : '未发现未完成事务'}
-            </p>
+            <h3>数据库模式</h3>
+            <p>{formatDatabaseMode(info?.database.mode ?? dbStatus.data?.mode)}</p>
           </div>
           <div className="scan-progress-card">
-            <h3>图集</h3>
-            <p>{totalAlbums}</p>
+            <h3>图库根目录</h3>
+            <p>{info?.library.library_root_count ?? 0}</p>
           </div>
           <div className="scan-progress-card">
-            <h3>图片</h3>
-            <p>{totalImages}</p>
+            <h3>已入库图集</h3>
+            <p>{info?.library.library_album_count ?? 0}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>已入库图片</h3>
+            <p>{info?.library.library_image_count ?? 0}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>导入任务</h3>
+            <p>{info?.imports.import_run_count ?? 0}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>导入图集</h3>
+            <p>{info?.imports.import_album_count ?? 0}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>导入图片</h3>
+            <p>{info?.imports.import_image_count ?? 0}</p>
           </div>
           <div className="scan-progress-card">
             <h3>待审核</h3>
@@ -132,15 +157,23 @@ export function DashboardPage({
             <p className={failedAlbums > 0 ? 'status-error' : ''}>{failedAlbums}</p>
           </div>
           <div className="scan-progress-card">
-            <h3>下一步</h3>
-            <button className="btn-primary" onClick={nextAction.onClick} disabled={!isConnected}>
-              {nextAction.label}
-            </button>
+            <h3>需要恢复</h3>
+            <p className={hasRecoveryTask ? 'status-error' : 'status-ok'}>{recoveryRequiredRuns}</p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>失败任务</h3>
+            <p className={(info?.imports.failed_run_count ?? 0) > 0 ? 'status-error' : ''}>
+              {info?.imports.failed_run_count ?? 0}
+            </p>
+          </div>
+          <div className="scan-progress-card">
+            <h3>冻结计划</h3>
+            <p>{info?.imports.frozen_plan_count ?? 0}</p>
           </div>
         </div>
         {latestRun && (
           <p className="status-card-detail">
-            最近任务：{latestRun.total_albums} 个图集，已分析 {latestRun.analyzed_albums}， 待审核{' '}
+            最近任务：{latestRun.total_albums} 个图集，已分析 {latestRun.analyzed_albums}，待审核{' '}
             {latestRun.review_required_albums}，失败 {latestRun.failed_albums}
           </p>
         )}
@@ -149,11 +182,16 @@ export function DashboardPage({
       <section className="scan-action-section">
         {isConnected ? (
           <>
-            <h2>新建导入</h2>
-            <p>选择源目录，扫描图集并检测精确重复。</p>
-            <button className="btn-primary" onClick={onGoScan}>
-              开始导入
-            </button>
+            <h2>下一步</h2>
+            <p>从当前数据库状态继续处理，或开始一次新的源目录导入。</p>
+            <div className="toolbar">
+              <button className="btn-primary" onClick={nextAction.onClick}>
+                {nextAction.label}
+              </button>
+              <button className="btn-secondary" onClick={() => onGoScan(null)}>
+                新建导入
+              </button>
+            </div>
           </>
         ) : (
           <>

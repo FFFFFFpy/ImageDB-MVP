@@ -102,7 +102,9 @@ pub async fn submit_decision(
         selected_image_id,
         None,
     )
-    .await
+    .await?;
+    ImportRepository::refresh_review_album_and_run(client, row.album_id).await?;
+    Ok(())
 }
 
 pub async fn skip_album_candidates(
@@ -133,6 +135,7 @@ pub async fn skip_album_candidates(
         }
     }
 
+    ImportRepository::refresh_review_album_and_run(client, album_id).await?;
     Ok(count)
 }
 
@@ -1848,9 +1851,13 @@ mod tests {
         let app_data = tmp.path().join("app_data");
         let source_root = tmp.path().join("source");
         let album_path = source_root.join("album_a");
+        let album_b_path = source_root.join("album_b");
         std::fs::create_dir_all(&album_path).unwrap();
+        std::fs::create_dir_all(&album_b_path).unwrap();
         std::fs::write(album_path.join("source.png"), b"source").unwrap();
         std::fs::write(album_path.join("candidate.png"), b"candidate").unwrap();
+        std::fs::write(album_b_path.join("source.png"), b"source-b").unwrap();
+        std::fs::write(album_b_path.join("candidate.png"), b"candidate-b").unwrap();
 
         let mut manager = PostgresManager::new(&app_data);
         assert!(manager.binaries_available());
@@ -1880,6 +1887,14 @@ mod tests {
             import_run_id,
             &album_path.display().to_string(),
             "album_a",
+        )
+        .await
+        .unwrap();
+        let album_b_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &album_b_path.display().to_string(),
+            "album_b",
         )
         .await
         .unwrap();
@@ -1953,6 +1968,80 @@ mod tests {
         )
         .await
         .unwrap();
+        let source_b_id = ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id: album_b_id,
+                source_path: album_b_path.join("source.png").display().to_string(),
+                relative_path: "album_b/source.png".to_string(),
+                file_size: 8,
+                modified_at: None,
+                width: Some(10),
+                height: Some(10),
+                format: Some("png".to_string()),
+                decode_state: DecodeState::Decoded,
+                blake3: Some(vec![3; 32]),
+                pixel_hash: Some(vec![3; 8]),
+                gradient_hash: Some(vec![3; 8]),
+                block_hash: Some(vec![3; 8]),
+                median_hash: Some(vec![3; 8]),
+                fingerprint_version: Some("test".to_string()),
+                state: ImportImageState::Fingerprinted,
+            },
+        )
+        .await
+        .unwrap();
+        let candidate_b_id = ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id: album_b_id,
+                source_path: album_b_path.join("candidate.png").display().to_string(),
+                relative_path: "album_b/candidate.png".to_string(),
+                file_size: 11,
+                modified_at: None,
+                width: Some(10),
+                height: Some(10),
+                format: Some("png".to_string()),
+                decode_state: DecodeState::Decoded,
+                blake3: Some(vec![4; 32]),
+                pixel_hash: Some(vec![4; 8]),
+                gradient_hash: Some(vec![4; 8]),
+                block_hash: Some(vec![4; 8]),
+                median_hash: Some(vec![4; 8]),
+                fingerprint_version: Some("test".to_string()),
+                state: ImportImageState::Fingerprinted,
+            },
+        )
+        .await
+        .unwrap();
+        ImportRepository::insert_duplicate_candidate(
+            &client,
+            NewDuplicateCandidate {
+                import_run_id,
+                source_image_id: source_b_id,
+                candidate_source_image_id: Some(candidate_b_id),
+                candidate_library_image_id: None,
+                scope: DuplicateScope::IntraAlbum,
+                match_type: MatchType::PerceptualSimilar,
+                blake3_equal: false,
+                pixel_hash_equal: false,
+                gradient_distance: Some(9),
+                block_distance: Some(9),
+                median_distance: Some(9),
+                transform_type: Some("identity".to_string()),
+                confidence: Some(0.7),
+                decision: None,
+                decision_source: None,
+            },
+        )
+        .await
+        .unwrap();
+        ImportRepository::refresh_album_workflow_summary(&client, album_id)
+            .await
+            .unwrap();
+        ImportRepository::refresh_album_workflow_summary(&client, album_b_id)
+            .await
+            .unwrap();
 
         ImportRepository::update_import_run_state(
             &client,
@@ -1963,7 +2052,7 @@ mod tests {
         .unwrap();
 
         let queue = get_review_queue(&client, import_run_id).await.unwrap();
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.len(), 2);
         assert!(!queue[0].has_decision);
 
         let blocked_plan = generate_import_plan(&client, import_run_id).await;
@@ -1976,6 +2065,12 @@ mod tests {
         )
         .await
         .unwrap();
+        let album_a_status = ImportRepository::get_import_album_status_by_id(&client, album_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(album_a_status.review_candidate_count, 0);
+        assert_eq!(album_a_status.state, "analyzed");
         submit_decision(
             &client,
             review_candidate_id,
@@ -1991,19 +2086,30 @@ mod tests {
         .await;
         assert!(conflicting.is_err());
 
+        let skipped = skip_album_candidates(&client, import_run_id, album_b_id)
+            .await
+            .unwrap();
+        assert_eq!(skipped, 1);
+        let album_b_status = ImportRepository::get_import_album_status_by_id(&client, album_b_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(album_b_status.review_candidate_count, 0);
+        assert_eq!(album_b_status.state, "analyzed");
+
         let progress = get_review_progress(&client, import_run_id).await.unwrap();
-        assert_eq!(progress.total_review_candidates, 1);
-        assert_eq!(progress.decided_count, 1);
+        assert_eq!(progress.total_review_candidates, 2);
+        assert_eq!(progress.decided_count, 2);
         assert!(progress.all_decided);
 
         let queue = get_review_queue(&client, import_run_id).await.unwrap();
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.len(), 2);
         assert!(queue[0].has_decision);
 
         let plan = generate_import_plan(&client, import_run_id).await.unwrap();
         assert_eq!(plan.kept_images.len(), 1);
         assert_eq!(plan.kept_images[0].image_id, source_id.to_string());
-        assert_eq!(plan.excluded_count, 1);
+        assert_eq!(plan.excluded_count, 3);
 
         drop(client);
         db_handle.abort();

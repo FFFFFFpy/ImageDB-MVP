@@ -2,6 +2,9 @@ use crate::domain::{
     ConnectionConfig, DatabaseState, ExternalCheckResult, ExternalMigrationProgress,
     ExternalMigrationResult, TlsMode,
 };
+use crate::repositories::import_repository::{
+    DatabaseInfoDashboard, DatabaseInfoDatabaseSection, ImportRepository,
+};
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
@@ -50,6 +53,35 @@ impl From<ExternalConnectionDto> for ConnectionConfig {
 pub async fn get_database_status(state: State<'_, AppState>) -> Result<DatabaseState, String> {
     let service = &state.database_service;
     Ok(service.get_state().await)
+}
+
+#[tauri::command]
+pub async fn get_database_info_dashboard(
+    state: State<'_, AppState>,
+) -> Result<DatabaseInfoDashboard, String> {
+    let database_state = state.database_service.get_state().await;
+    let database = DatabaseInfoDatabaseSection {
+        mode: database_state.mode.as_ref().map(ToString::to_string),
+        status: database_state.status.to_string(),
+        pgvector_available: database_state.pgvector_available,
+        migration_version: database_state.migration_version.clone(),
+    };
+
+    let connect_result = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await
+    };
+
+    let (client, handle) = match connect_result {
+        Ok(pair) => pair,
+        Err(_) => return Ok(ImportRepository::empty_database_info_dashboard(database)),
+    };
+
+    let result = ImportRepository::get_database_info_dashboard(&client, database)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
 }
 
 #[tauri::command]

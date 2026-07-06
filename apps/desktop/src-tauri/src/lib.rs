@@ -61,6 +61,7 @@ pub fn run() {
             commands::probe_file_transaction,
             commands::run_all_probes,
             commands::get_database_status,
+            commands::get_database_info_dashboard,
             commands::initialize_managed_database,
             commands::switch_to_managed_database,
             commands::test_external_connection,

@@ -17,18 +17,21 @@ ADD COLUMN IF NOT EXISTS analysis_attempts INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 ALTER TABLE import_albums DROP CONSTRAINT IF EXISTS chk_import_album_state;
+
+UPDATE import_albums
+SET state = 'pending'
+WHERE state IN ('scanning', 'fingerprinting');
+
+UPDATE import_albums
+SET state = 'analyzed'
+WHERE state IN ('reviewed', 'ready_to_commit', 'committing', 'completed');
+
 ALTER TABLE import_albums ADD CONSTRAINT chk_import_album_state
     CHECK (state IN (
         'pending',
-        'scanning',
-        'fingerprinting',
         'analyzing',
         'analyzed',
         'review_required',
-        'reviewed',
-        'ready_to_commit',
-        'committing',
-        'completed',
         'failed'
     ));
 

@@ -80,6 +80,41 @@ pub struct ImportRunDashboard {
     pub duplicate_candidates: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseInfoDatabaseSection {
+    pub mode: Option<String>,
+    pub status: String,
+    pub pgvector_available: bool,
+    pub migration_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseInfoLibrarySection {
+    pub library_root_count: i64,
+    pub library_album_count: i64,
+    pub library_image_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseInfoImportsSection {
+    pub import_run_count: i64,
+    pub import_album_count: i64,
+    pub import_image_count: i64,
+    pub pending_review_count: i64,
+    pub failed_album_count: i64,
+    pub recovery_required_run_count: i64,
+    pub failed_run_count: i64,
+    pub frozen_plan_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseInfoDashboard {
+    pub database: DatabaseInfoDatabaseSection,
+    pub library: DatabaseInfoLibrarySection,
+    pub imports: DatabaseInfoImportsSection,
+    pub latest_run: Option<ImportRunDashboard>,
+}
+
 pub struct ImportImageRecord {
     pub id: Uuid,
     pub source_path: String,
@@ -675,6 +710,54 @@ impl ImportRepository {
         Ok(())
     }
 
+    pub async fn refresh_import_run_statistics(
+        client: &Client,
+        id: Uuid,
+    ) -> Result<serde_json::Value, AppError> {
+        let row = client
+            .query_one(
+                "SELECT
+                    (SELECT COUNT(*) FROM import_albums WHERE import_run_id = $1)::BIGINT AS total_albums,
+                    (
+                        SELECT COUNT(*)
+                        FROM import_images ii
+                        JOIN import_albums ia ON ia.id = ii.import_album_id
+                        WHERE ia.import_run_id = $1
+                    )::BIGINT AS total_images,
+                    (SELECT COUNT(*) FROM duplicate_candidates WHERE import_run_id = $1)::BIGINT AS duplicate_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM import_albums
+                        WHERE import_run_id = $1 AND state = 'failed'
+                    )::BIGINT AS failed_album_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM duplicate_candidates dc
+                        LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                        WHERE dc.import_run_id = $1
+                          AND dc.decision IS NULL
+                          AND rd.id IS NULL
+                    )::BIGINT AS pending_review_count",
+                &[&id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to aggregate import run statistics: {e}"))
+            })?;
+
+        let failed_album_count: i64 = row.get("failed_album_count");
+        let statistics = serde_json::json!({
+            "total_albums": row.get::<_, i64>("total_albums"),
+            "total_images": row.get::<_, i64>("total_images"),
+            "duplicate_count": row.get::<_, i64>("duplicate_count"),
+            "error_count": failed_album_count,
+            "failed_album_count": failed_album_count,
+            "pending_review_count": row.get::<_, i64>("pending_review_count"),
+        });
+        Self::update_import_run_statistics(client, id, &statistics).await?;
+        Ok(statistics)
+    }
+
     pub async fn insert_import_album(
         client: &Client,
         import_run_id: Uuid,
@@ -713,7 +796,6 @@ impl ImportRepository {
             state,
             ImportAlbumState::Analyzed
                 | ImportAlbumState::ReviewRequired
-                | ImportAlbumState::Completed
                 | ImportAlbumState::Failed
         ) {
             Some(chrono::Utc::now())
@@ -809,8 +891,7 @@ impl ImportRepository {
                      review_candidate_count = candidate_counts.review_candidate_count,
                      state = CASE
                          WHEN candidate_counts.review_candidate_count > 0 THEN 'review_required'
-                         WHEN ia.state NOT IN ('completed', 'committing', 'ready_to_commit', 'reviewed') THEN 'analyzed'
-                         ELSE ia.state
+                         ELSE 'analyzed'
                      END,
                      analysis_completed_at = COALESCE(ia.analysis_completed_at, now()),
                      updated_at = now()
@@ -825,6 +906,21 @@ impl ImportRepository {
             .await
             .map_err(|e| AppError::Internal(format!("failed to refresh album summary: {e}")))?;
         Ok(Self::album_status_from_row(&row))
+    }
+
+    pub async fn refresh_review_album_and_run(
+        client: &Client,
+        album_id: Uuid,
+    ) -> Result<ImportAlbumStatus, AppError> {
+        let status = Self::refresh_album_workflow_summary(client, album_id).await?;
+        let import_run_id = Uuid::parse_str(&status.import_run_id).map_err(|e| {
+            AppError::Internal(format!(
+                "failed to parse refreshed album import_run_id '{}': {e}",
+                status.import_run_id
+            ))
+        })?;
+        Self::refresh_import_run_statistics(client, import_run_id).await?;
+        Ok(status)
     }
 
     pub async fn reset_failed_album_for_retry(
@@ -1688,6 +1784,92 @@ impl ImportRepository {
                 duplicate_candidates: r.get("duplicate_candidates"),
             })
             .collect())
+    }
+
+    pub async fn get_database_info_dashboard(
+        client: &Client,
+        database: DatabaseInfoDatabaseSection,
+    ) -> Result<DatabaseInfoDashboard, AppError> {
+        let library_row = client
+            .query_one(
+                "SELECT
+                    (SELECT COUNT(*) FROM library_roots)::BIGINT AS library_root_count,
+                    (SELECT COUNT(*) FROM library_albums)::BIGINT AS library_album_count,
+                    (SELECT COUNT(*) FROM library_images)::BIGINT AS library_image_count",
+                &[],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query library summary: {e}")))?;
+
+        let imports_row = client
+            .query_one(
+                "SELECT
+                    (SELECT COUNT(*) FROM import_runs)::BIGINT AS import_run_count,
+                    (SELECT COUNT(*) FROM import_albums)::BIGINT AS import_album_count,
+                    (SELECT COUNT(*) FROM import_images)::BIGINT AS import_image_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM duplicate_candidates dc
+                        LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                        WHERE dc.decision IS NULL AND rd.id IS NULL
+                    )::BIGINT AS pending_review_count,
+                    (SELECT COUNT(*) FROM import_albums WHERE state = 'failed')::BIGINT AS failed_album_count,
+                    (SELECT COUNT(*) FROM import_runs WHERE state = 'recovery_required')::BIGINT AS recovery_required_run_count,
+                    (SELECT COUNT(*) FROM import_runs WHERE state = 'failed')::BIGINT AS failed_run_count,
+                    (SELECT COUNT(*) FROM import_plans WHERE state = 'frozen')::BIGINT AS frozen_plan_count",
+                &[],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query import summary: {e}")))?;
+
+        let latest_run = Self::list_import_runs_summary(client)
+            .await?
+            .into_iter()
+            .next();
+
+        Ok(DatabaseInfoDashboard {
+            database,
+            library: DatabaseInfoLibrarySection {
+                library_root_count: library_row.get("library_root_count"),
+                library_album_count: library_row.get("library_album_count"),
+                library_image_count: library_row.get("library_image_count"),
+            },
+            imports: DatabaseInfoImportsSection {
+                import_run_count: imports_row.get("import_run_count"),
+                import_album_count: imports_row.get("import_album_count"),
+                import_image_count: imports_row.get("import_image_count"),
+                pending_review_count: imports_row.get("pending_review_count"),
+                failed_album_count: imports_row.get("failed_album_count"),
+                recovery_required_run_count: imports_row.get("recovery_required_run_count"),
+                failed_run_count: imports_row.get("failed_run_count"),
+                frozen_plan_count: imports_row.get("frozen_plan_count"),
+            },
+            latest_run,
+        })
+    }
+
+    pub fn empty_database_info_dashboard(
+        database: DatabaseInfoDatabaseSection,
+    ) -> DatabaseInfoDashboard {
+        DatabaseInfoDashboard {
+            database,
+            library: DatabaseInfoLibrarySection {
+                library_root_count: 0,
+                library_album_count: 0,
+                library_image_count: 0,
+            },
+            imports: DatabaseInfoImportsSection {
+                import_run_count: 0,
+                import_album_count: 0,
+                import_image_count: 0,
+                pending_review_count: 0,
+                failed_album_count: 0,
+                recovery_required_run_count: 0,
+                failed_run_count: 0,
+                frozen_plan_count: 0,
+            },
+            latest_run: None,
+        }
     }
 
     pub async fn get_latest_completed_run(client: &Client) -> Result<Option<Uuid>, AppError> {

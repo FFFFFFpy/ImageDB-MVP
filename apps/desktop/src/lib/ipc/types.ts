@@ -211,14 +211,7 @@ export interface ScanSourceInfo {
 }
 
 export type AlbumWorkflowState =
-  | 'pending'
-  | 'analyzing'
-  | 'analyzed'
-  | 'review_required'
-  | 'failed'
-  | 'completed'
-  | 'scanning'
-  | 'fingerprinting';
+  'pending' | 'analyzing' | 'analyzed' | 'review_required' | 'failed';
 
 export interface ImportAlbumStatus {
   id: string;
@@ -248,6 +241,31 @@ export interface ImportRunDashboard {
   total_images: number;
   pending_reviews: number;
   duplicate_candidates: number;
+}
+
+export interface DatabaseInfoDashboard {
+  database: {
+    mode: 'managed_local' | 'external' | null;
+    status: string;
+    pgvector_available: boolean;
+    migration_version: string | null;
+  };
+  library: {
+    library_root_count: number;
+    library_album_count: number;
+    library_image_count: number;
+  };
+  imports: {
+    import_run_count: number;
+    import_album_count: number;
+    import_image_count: number;
+    pending_review_count: number;
+    failed_album_count: number;
+    recovery_required_run_count: number;
+    failed_run_count: number;
+    frozen_plan_count: number;
+  };
+  latest_run: ImportRunDashboard | null;
 }
 
 export interface ReviewCandidateSummary {

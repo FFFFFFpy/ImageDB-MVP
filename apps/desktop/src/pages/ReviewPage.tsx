@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import type { QueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { Route } from '../hooks/use-router';
 import type {
@@ -32,6 +33,16 @@ export interface ImportPlanAlbumGroup {
 }
 
 const DEFAULT_VIEW: ViewState = { scale: 1, offsetX: 0, offsetY: 0 };
+
+type ReviewInvalidationClient = Pick<QueryClient, 'invalidateQueries'>;
+
+export function invalidateReviewWorkflowQueries(queryClient: ReviewInvalidationClient) {
+  queryClient.invalidateQueries({ queryKey: ['reviewQueue'] });
+  queryClient.invalidateQueries({ queryKey: ['reviewProgress'] });
+  queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] });
+  queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] });
+  queryClient.invalidateQueries({ queryKey: ['import-run-albums'] });
+}
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -286,8 +297,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
     mutationFn: ({ candidateId, decision }: { candidateId: string; decision: ReviewDecision }) =>
       api.submitReviewDecision(candidateId, decision),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['reviewQueue'] });
-      queryClient.invalidateQueries({ queryKey: ['reviewProgress'] });
+      invalidateReviewWorkflowQueries(queryClient);
       setSubmitting(false);
     },
     onError: () => {
@@ -319,8 +329,7 @@ export function ReviewPage({ onNavigate }: ReviewPageProps) {
     setSubmitting(true);
     try {
       await api.skipReviewAlbum(importRunId, detail.album_id);
-      queryClient.invalidateQueries({ queryKey: ['reviewQueue'] });
-      queryClient.invalidateQueries({ queryKey: ['reviewProgress'] });
+      invalidateReviewWorkflowQueries(queryClient);
       setCurrentIndex(0);
     } catch {
       // ignore

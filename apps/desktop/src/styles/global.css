@@ -590,6 +590,13 @@ textarea {
   margin: 12px 0;
 }
 
+.database-info-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
 .scan-progress-card {
   padding: 14px;
   border: 1px solid #e5e7eb;

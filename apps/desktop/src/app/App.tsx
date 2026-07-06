@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useState } from 'react';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { Layout } from '../components/Layout';
 import { useRouter } from '../hooks/use-router';
@@ -15,6 +16,7 @@ import { SettingsPage } from '../pages/SettingsPage';
 export function App() {
   const { route, navigate } = useRouter();
   const queryClient = useQueryClient();
+  const [scanImportRunId, setScanImportRunId] = useState<string | null>(null);
 
   const settings = useQuery({
     queryKey: ['settings'],
@@ -55,12 +57,17 @@ export function App() {
             <DashboardPage
               needsOnboarding={needsOnboarding}
               onConfigureDatabase={() => navigate('settings')}
-              onGoScan={() => navigate('scan')}
+              onGoScan={(importRunId) => {
+                setScanImportRunId(importRunId ?? null);
+                navigate('scan');
+              }}
               onGoReview={() => navigate('review')}
               onGoRecovery={() => navigate('recovery')}
             />
           )}
-          {route === 'scan' && <ScanPage onNavigate={navigate} />}
+          {route === 'scan' && (
+            <ScanPage initialImportRunId={scanImportRunId} onNavigate={navigate} />
+          )}
           {route === 'review' && <ReviewPage onNavigate={navigate} />}
           {route === 'commit' && <CommitPage onNavigate={navigate} />}
           {route === 'recovery' && <RecoveryPage onNavigate={navigate} />}

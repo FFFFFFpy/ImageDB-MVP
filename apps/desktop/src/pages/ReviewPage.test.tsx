@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import type { ImportPlanImage } from '../lib/ipc/types';
-import { groupImportPlanImagesByAlbum } from './ReviewPage';
+import { groupImportPlanImagesByAlbum, invalidateReviewWorkflowQueries } from './ReviewPage';
 
 function image(overrides: Partial<ImportPlanImage>): ImportPlanImage {
   return {
@@ -49,5 +49,25 @@ describe('groupImportPlanImagesByAlbum', () => {
       skippedImageCount: 0,
       totalSize: 300,
     });
+  });
+});
+
+describe('invalidateReviewWorkflowQueries', () => {
+  test('refreshes review, dashboard, and album-status queries after decisions', () => {
+    const queryClient = {
+      invalidateQueries: vi.fn(),
+    };
+
+    invalidateReviewWorkflowQueries(queryClient);
+
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['reviewQueue'] });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['reviewProgress'] });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['import-runs-dashboard'],
+    });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['database-info-dashboard'],
+    });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['import-run-albums'] });
   });
 });

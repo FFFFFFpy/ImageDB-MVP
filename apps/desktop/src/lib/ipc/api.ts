@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AppSettings,
   DatabaseState,
+  DatabaseInfoDashboard,
   DiagnosticsExportResult,
   ExternalCheckResult,
   ExternalConnectionConfig,
@@ -32,6 +33,8 @@ export const api = {
   getAppStatus: () => invoke<string>('get_app_status'),
 
   getDatabaseStatus: () => invoke<DatabaseState>('get_database_status'),
+
+  getDatabaseInfoDashboard: () => invoke<DatabaseInfoDashboard>('get_database_info_dashboard'),
 
   initializeManagedDatabase: () => invoke<DatabaseState>('initialize_managed_database'),
 
