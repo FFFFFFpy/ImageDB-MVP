@@ -34,7 +34,7 @@ pub async fn connect_external(
                     &e,
                 ))
             })?;
-            Ok(spawn_connection(client, conn))
+            configure_external_session(spawn_connection(client, conn), config).await
         }
         TlsMode::Require | TlsMode::VerifyCa | TlsMode::VerifyFull => {
             pg.ssl_mode(SslMode::Require);
@@ -47,9 +47,32 @@ pub async fn connect_external(
                     &e,
                 ))
             })?;
-            Ok(spawn_connection(client, conn))
+            configure_external_session(spawn_connection(client, conn), config).await
         }
     }
+}
+
+async fn configure_external_session(
+    connection: (Client, tokio::task::JoinHandle<()>),
+    config: &ConnectionConfig,
+) -> Result<(Client, tokio::task::JoinHandle<()>), AppError> {
+    let (client, handle) = connection;
+    let timeout_ms = config.query_timeout_secs.saturating_mul(1_000);
+    let timeout_value = format!("{timeout_ms}ms");
+    let configured = client
+        .query_one(
+            "SELECT set_config('statement_timeout', $1, false),
+                    set_config('lock_timeout', $1, false)",
+            &[&timeout_value],
+        )
+        .await;
+    if let Err(error) = configured {
+        handle.abort();
+        return Err(AppError::PostgresUnavailable(
+            format_external_connect_error("failed to configure external query timeout", &error),
+        ));
+    }
+    Ok((client, handle))
 }
 
 fn format_external_connect_error(context: &str, error: &tokio_postgres::Error) -> String {
@@ -328,5 +351,57 @@ svMuf5iOfkujHO2necKFjw==
             .connect("127.0.0.1", stream)
             .expect("verify_ca should validate CA while allowing hostname mismatch");
         server.join().expect("verify_ca TLS server thread");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_external_query_timeout_is_applied() {
+        use crate::infrastructure::postgres::PostgresManager;
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            panic!("IMAGEDB_POSTGRES_BIN is required for external timeout test");
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut manager = PostgresManager::new(temp.path());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+
+        let config = ConnectionConfig {
+            host: "127.0.0.1".to_string(),
+            port: manager.port(),
+            database: manager.database().to_string(),
+            username: manager.username().to_string(),
+            password: manager.password().map(ToString::to_string),
+            tls_mode: TlsMode::Disable,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 5,
+            query_timeout_secs: 1,
+            profile_name: None,
+        };
+        let (client, handle) = connect_external(&config).await.unwrap();
+        let started = std::time::Instant::now();
+        let error = client
+            .query_one("SELECT pg_sleep(3)", &[])
+            .await
+            .expect_err("statement_timeout must cancel a slow external query");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "external query timeout was not enforced promptly"
+        );
+        assert_eq!(
+            error.as_db_error().map(|db_error| db_error.code().code()),
+            Some("57014")
+        );
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
     }
 }

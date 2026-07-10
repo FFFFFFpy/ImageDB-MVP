@@ -12,7 +12,7 @@ use crate::repositories::import_repository::{
     ImportRepository, LibraryImageRow, NewDuplicateCandidate, NewImportImage,
 };
 use crate::services::source_snapshot_service::{
-    capture_source_album_snapshot, verify_source_album_snapshot,
+    capture_source_album_snapshot_with_cancel, verify_source_album_snapshot_with_cancel,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -848,7 +848,7 @@ async fn run_scan_inner(
     let import_run_id = if let Some(row) = existing_run {
         let id: Uuid = row.get("id");
         ImportRepository::mark_stale_analyzing_albums(&client, id).await?;
-        ImportRepository::update_import_run_state(&client, id, &ImportRunState::Analyzing).await?;
+        ImportRepository::reopen_import_run_for_analysis(&client, id).await?;
         id
     } else {
         ImportRepository::create_import_run(&client, &source_root, library_root_id).await?
@@ -892,7 +892,15 @@ async fn run_scan_inner(
         "scan source albums enumerated"
     );
 
-    if albums.is_empty() {
+    let stored_album_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM import_albums WHERE import_run_id = $1",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to count stored albums: {e}")))?
+        .get(0);
+    if albums.is_empty() && stored_album_count == 0 {
         ImportRepository::update_import_run_state(
             &client,
             import_run_id,
@@ -960,9 +968,18 @@ async fn run_scan_inner(
         );
 
         let album_path = PathBuf::from(&album_source_path);
-        if let Err(e) =
-            capture_source_album_snapshot(&client, import_run_id, album_db_id, &album_path).await
+        if let Err(e) = capture_source_album_snapshot_with_cancel(
+            &client,
+            import_run_id,
+            album_db_id,
+            &album_path,
+            Some(cancelled.clone()),
+        )
+        .await
         {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
             let msg = format!("Failed to snapshot album '{}': {e}", album_name);
             errors.push(msg.clone());
             progress.error_count = errors.len() as u32;
@@ -977,7 +994,14 @@ async fn run_scan_inner(
             emit_progress(&progress, &progress_tracker).await;
             continue;
         }
-        match verify_source_album_snapshot(&client, album_db_id, &album_path).await {
+        match verify_source_album_snapshot_with_cancel(
+            &client,
+            album_db_id,
+            &album_path,
+            Some(cancelled.clone()),
+        )
+        .await
+        {
             Ok(snapshot_errors) if snapshot_errors.is_empty() => {}
             Ok(snapshot_errors) => {
                 let msg = format!(
@@ -1003,6 +1027,9 @@ async fn run_scan_inner(
                 continue;
             }
             Err(e) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
                 let msg = format!("Failed to verify snapshot for '{}': {e}", album_name);
                 errors.push(msg.clone());
                 progress.error_count = errors.len() as u32;
@@ -1177,8 +1204,16 @@ async fn run_scan_inner(
             continue;
         }
 
+        if cancelled.load(Ordering::Relaxed) {
+            // detect_album_duplicates stops cooperatively and returns Ok so
+            // cancellation is not reported as an analysis failure. Do not
+            // turn that partial candidate set into a completed checkpoint;
+            // keep the album analyzing so resume can clean and rerun it.
+            break;
+        }
+
         let album_status =
-            ImportRepository::refresh_album_workflow_summary(&client, album_db_id).await?;
+            ImportRepository::finalize_import_album_analysis(&client, album_db_id).await?;
         tracing::info!(
             %import_run_id,
             %album_db_id,
@@ -1230,10 +1265,14 @@ async fn run_scan_inner(
         .as_ref()
         .map(|summary| summary.failed_albums > 0)
         .unwrap_or(false);
-    let final_run_state = if review_progress.total > review_progress.decided {
-        ImportRunState::ReviewRequired
-    } else if has_failed_albums {
+    let has_unfinished_albums = run_summary
+        .as_ref()
+        .map(|summary| summary.pending_albums > 0 || summary.analyzing_albums > 0)
+        .unwrap_or(false);
+    let final_run_state = if has_failed_albums || has_unfinished_albums {
         ImportRunState::Failed
+    } else if review_progress.total > review_progress.decided {
+        ImportRunState::ReviewRequired
     } else {
         ImportRunState::ReadyToCommit
     };
@@ -1302,6 +1341,10 @@ mod tests {
     use crate::repositories::import_repository::NewSnapshotFile;
     #[cfg(feature = "real-db-tests")]
     use crate::services::source_snapshot_service::SnapshotVerifyError;
+    #[cfg(feature = "real-db-tests")]
+    use crate::services::source_snapshot_service::{
+        capture_source_album_snapshot, verify_source_album_snapshot,
+    };
     use crate::services::source_snapshot_service::{collect_album_files, compute_snapshot_hash};
     use tempfile::TempDir;
 
@@ -1766,7 +1809,7 @@ mod tests {
                 mode: Some("managed_local".to_string()),
                 status: "connected".to_string(),
                 pgvector_available: true,
-                migration_version: Some("0011_album_workflow_state".to_string()),
+                migration_version: Some("0012_album_workflow_repair".to_string()),
             },
         )
         .await
@@ -2160,7 +2203,10 @@ mod tests {
         .await
         .unwrap();
 
-        let done_status = ImportRepository::refresh_album_workflow_summary(&client, done_album_id)
+        ImportRepository::mark_import_album_analyzing(&client, done_album_id)
+            .await
+            .unwrap();
+        let done_status = ImportRepository::finalize_import_album_analysis(&client, done_album_id)
             .await
             .unwrap();
         assert_eq!(
@@ -2173,6 +2219,15 @@ mod tests {
         ImportRepository::mark_import_album_analyzing(&client, stale_album_id)
             .await
             .unwrap();
+        let (stale_snapshot_id, stale_snapshot_hash) =
+            crate::services::source_snapshot_service::capture_source_album_snapshot(
+                &client,
+                import_run_id,
+                stale_album_id,
+                &stale_album_dir,
+            )
+            .await
+            .unwrap();
         ImportRepository::mark_import_album_failed(
             &client,
             failed_album_id,
@@ -2181,6 +2236,25 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let analyzing_after_review_refresh =
+            ImportRepository::refresh_review_album_and_run(&client, stale_album_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            analyzing_after_review_refresh.state,
+            ImportAlbumState::Analyzing.to_string(),
+            "async review must not finalize an in-flight album"
+        );
+        let failed_after_review_refresh =
+            ImportRepository::refresh_review_album_and_run(&client, failed_album_id)
+                .await
+                .unwrap();
+        assert_eq!(
+            failed_after_review_refresh.state,
+            ImportAlbumState::Failed.to_string(),
+            "review counter refresh must preserve a failed checkpoint"
+        );
 
         let cleaned = ImportRepository::mark_stale_analyzing_albums(&client, import_run_id)
             .await
@@ -2203,6 +2277,33 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(stale_image_count, 0);
+        let preserved_snapshot =
+            ImportRepository::get_source_album_snapshot(&client, stale_album_id)
+                .await
+                .unwrap()
+                .expect("stale cleanup must preserve the immutable source snapshot");
+        assert_eq!(preserved_snapshot.snapshot_id, stale_snapshot_id);
+        let (reused_snapshot_id, reused_snapshot_hash) =
+            crate::services::source_snapshot_service::capture_source_album_snapshot(
+                &client,
+                import_run_id,
+                stale_album_id,
+                &stale_album_dir,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reused_snapshot_id, stale_snapshot_id);
+        assert_eq!(reused_snapshot_hash, stale_snapshot_hash);
+        assert!(
+            crate::services::source_snapshot_service::verify_source_album_snapshot(
+                &client,
+                stale_album_id,
+                &stale_album_dir,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
 
         let done_image_count: i64 = client
             .query_one(
@@ -2224,6 +2325,19 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(remaining_review_candidates, 1);
+
+        let non_failed_retry =
+            ImportRepository::reset_failed_album_for_retry(&client, done_album_id).await;
+        assert!(non_failed_retry.is_err());
+        let done_image_count_after_rejected_retry: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_images WHERE import_album_id = $1",
+                &[&done_album_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(done_image_count_after_rejected_retry, 2);
 
         ImportRepository::reset_failed_album_for_retry(&client, failed_album_id)
             .await
@@ -2286,7 +2400,7 @@ mod tests {
                 mode: Some("managed_local".to_string()),
                 status: "connected".to_string(),
                 pgvector_available: true,
-                migration_version: Some("0011_album_workflow_state".to_string()),
+                migration_version: Some("0012_album_workflow_repair".to_string()),
             },
         )
         .await

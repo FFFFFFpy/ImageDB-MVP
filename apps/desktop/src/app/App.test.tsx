@@ -34,6 +34,11 @@ const mockState = vi.hoisted(() => ({
     migration_version: '0002_indexes',
     diagnostics: [],
   } as Record<string, unknown>,
+  databaseInfo: null as Record<string, unknown> | null,
+}));
+
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(() => Promise.resolve(() => undefined)),
 }));
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -52,6 +57,29 @@ vi.mock('@tauri-apps/api/core', () => ({
       }
       if (cmd === 'get_database_status') {
         return Promise.resolve(mockState.databaseStatus);
+      }
+      if (cmd === 'get_database_info_dashboard') {
+        return Promise.resolve(mockState.databaseInfo);
+      }
+      if (cmd === 'get_import_runs_dashboard') {
+        return Promise.resolve(mockState.databaseInfo ? [mockState.databaseInfo.latest_run] : []);
+      }
+      if (cmd === 'get_import_run_albums') {
+        return Promise.resolve([]);
+      }
+      if (cmd === 'get_scan_progress') {
+        return Promise.resolve({
+          state: 'idle',
+          import_run_id: null,
+          current_stage: 'idle',
+          current_album: null,
+          processed_images: 0,
+          total_albums: 0,
+          total_images: 0,
+          duplicate_count: 0,
+          error_count: 0,
+          errors: [],
+        });
       }
       if (cmd === 'probe_postgres') {
         return Promise.resolve({
@@ -89,6 +117,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 beforeEach(() => {
   window.location.hash = '';
+  window.localStorage.clear();
   mockState.settings = {
     database_mode: 'managed_local',
     library_root: null,
@@ -119,6 +148,7 @@ beforeEach(() => {
     migration_version: '0002_indexes',
     diagnostics: [],
   };
+  mockState.databaseInfo = null;
 });
 
 afterEach(() => cleanup());
@@ -145,6 +175,61 @@ test('renders sidebar navigation', async () => {
   expect(screen.getByRole('button', { name: '新建导入' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '设置' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '技术探针' })).toBeInTheDocument();
+});
+
+test('sidebar new import clears a run selected from the dashboard', async () => {
+  mockState.databaseStatus = {
+    ...mockState.databaseStatus,
+    status: 'Connected',
+  };
+  mockState.databaseInfo = {
+    database: {
+      mode: 'managed_local',
+      status: 'Connected',
+      pgvector_available: true,
+      migration_version: '0012_album_workflow_repair',
+    },
+    library: {
+      library_root_count: 1,
+      library_album_count: 0,
+      library_image_count: 0,
+    },
+    imports: {
+      import_run_count: 1,
+      import_album_count: 1,
+      import_image_count: 1,
+      pending_review_count: 0,
+      failed_album_count: 0,
+      recovery_required_run_count: 0,
+      failed_run_count: 0,
+      frozen_plan_count: 0,
+    },
+    latest_run: {
+      import_run_id: 'run-selected',
+      source_root: 'D:/Selected',
+      state: 'analyzing',
+      total_albums: 1,
+      pending_albums: 1,
+      analyzing_albums: 0,
+      analyzed_albums: 0,
+      review_required_albums: 0,
+      failed_albums: 0,
+      total_images: 1,
+      pending_reviews: 0,
+      duplicate_candidates: 0,
+    },
+  };
+
+  renderApp();
+
+  fireEvent.click(await screen.findByRole('button', { name: '继续分析' }));
+  expect(await screen.findByRole('heading', { name: '新建导入' })).toBeInTheDocument();
+  expect(await screen.findByDisplayValue('D:/Selected')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: '新建导入' }));
+
+  expect(screen.queryByRole('button', { name: '继续分析' })).not.toBeInTheDocument();
+  expect(await screen.findByText('暂无图集状态。验证源目录后开始分析。')).toBeInTheDocument();
 });
 
 test('renders ImageDB brand in sidebar', async () => {

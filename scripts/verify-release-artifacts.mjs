@@ -1,5 +1,5 @@
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -8,6 +8,8 @@ const releaseExe = join(tauriDir, 'target', 'release', 'imagedb-desktop.exe');
 const bundleDir = join(tauriDir, 'target', 'release', 'bundle');
 const nsisDir = join(bundleDir, 'nsis');
 const runtimeDir = join(tauriDir, 'binaries', 'windows-x86_64', 'postgres-runtime');
+const tauriConfig = JSON.parse(readFileSync(join(tauriDir, 'tauri.conf.json'), 'utf8'));
+const expectedInstallerName = `${tauriConfig.productName}_${tauriConfig.version}_x64-setup.exe`;
 
 const requiredRuntime = [
   ['runtime-manifest.json'],
@@ -40,8 +42,15 @@ const installers = readdirSync(nsisDir)
   .map((name) => join(nsisDir, name))
   .filter((path) => statSync(path).size > 1024 * 1024);
 
-if (installers.length === 0) {
-  throw new Error(`No non-empty NSIS installer found in ${nsisDir}`);
+if (installers.length !== 1 || basename(installers[0]) !== expectedInstallerName) {
+  throw new Error(
+    `Expected exactly one current NSIS installer '${expectedInstallerName}', found: ${
+      installers.map((path) => basename(path)).join(', ') || '<none>'
+    }. Remove stale bundles and rebuild.`,
+  );
+}
+if (statSync(installers[0]).mtimeMs + 5_000 < statSync(releaseExe).mtimeMs) {
+  throw new Error(`NSIS installer is older than the release executable: ${installers[0]}`);
 }
 
 console.log('[release-artifacts] release executable:', releaseExe);

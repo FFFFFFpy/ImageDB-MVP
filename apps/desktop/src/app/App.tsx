@@ -26,6 +26,11 @@ export function App() {
   const needsOnboarding = settings.data ? !settings.data.first_run_completed : false;
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
+  const handleLayoutNavigate = (nextRoute: Parameters<typeof navigate>[0]) => {
+    if (nextRoute === 'scan') setScanImportRunId(null);
+    navigate(nextRoute);
+  };
+
   const handleOnboardingComplete = async () => {
     const currentSettings = await api.getSettings();
     if (!currentSettings.first_run_completed) {
@@ -52,7 +57,7 @@ export function App() {
       {showOnboarding ? (
         <OnboardingPage onComplete={handleOnboardingComplete} />
       ) : (
-        <Layout currentRoute={route} onNavigate={navigate}>
+        <Layout currentRoute={route} onNavigate={handleLayoutNavigate}>
           {route === 'dashboard' && (
             <DashboardPage
               needsOnboarding={needsOnboarding}

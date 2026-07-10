@@ -155,12 +155,19 @@ fn file_type_from_path(path: &Path) -> String {
     }
 }
 
-fn hash_file_sync(path: &Path) -> Result<Vec<u8>, AppError> {
+fn hash_file_sync_with_cancel(
+    path: &Path,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<u8>, AppError> {
+    use std::sync::atomic::Ordering;
     let mut f = std::fs::File::open(path)
         .map_err(|e| AppError::IoError(format!("cannot open {}: {e}", path.display())))?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = [0u8; 65536];
     loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(AppError::Internal("snapshot walk cancelled".to_string()));
+        }
         let n = f
             .read(&mut buf)
             .map_err(|e| AppError::IoError(format!("read error on {}: {e}", path.display())))?;
@@ -202,6 +209,7 @@ fn classify_special_entry(ft: &std::fs::FileType) -> Option<&'static str> {
 /// symlinks, directory junctions, Windows reparse points, FIFOs, sockets,
 /// and devices surface as an `AppError` rather than being silently hashed
 /// or skipped. Only regular files + directories are walked.
+#[cfg(test)]
 pub fn collect_album_files(album_path: &Path) -> Result<Vec<NewSnapshotFile>, AppError> {
     collect_album_files_with_cancel(album_path, None)
 }
@@ -271,7 +279,7 @@ pub fn collect_album_files_with_cancel(
             } else if ft.is_file() {
                 let relative_path = normalize_snapshot_relative_path(album_path, &path)?;
                 let metadata = std::fs::metadata(&path)?;
-                let blake3 = hash_file_sync(&path)?;
+                let blake3 = hash_file_sync_with_cancel(&path, cancelled)?;
                 out.push(NewSnapshotFile {
                     relative_path,
                     file_type: file_type_from_path(&path),
@@ -330,6 +338,7 @@ pub fn compute_snapshot_hash(files: &[NewSnapshotFile]) -> Vec<u8> {
 /// P2: a global semaphore (`SNAPSHOT_CONCURRENCY`) bounds the number of
 /// concurrent snapshot tasks so a burst of albums cannot exhaust the
 /// blocking thread pool or saturate disk I/O.
+#[cfg(all(test, feature = "real-db-tests"))]
 pub async fn capture_source_album_snapshot(
     client: &tokio_postgres::Client,
     import_run_id: Uuid,
@@ -356,6 +365,28 @@ pub async fn capture_source_album_snapshot_with_cancel(
     source_album_path: &Path,
     cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<(Uuid, Vec<u8>), AppError> {
+    // A snapshot is an immutable checkpoint, not a per-attempt cache.  A
+    // cancelled scan can already have persisted it before fingerprinting;
+    // re-inserting on resume would violate UNIQUE(import_album_id), while
+    // replacing it would silently accept source changes made during the
+    // interruption.  Reuse the original evidence and let the caller verify
+    // the current directory against it.
+    if let Some(existing) =
+        ImportRepository::get_source_album_snapshot(client, import_album_id).await?
+    {
+        let requested_path = source_album_path.display().to_string();
+        if existing.import_run_id != import_run_id || existing.source_album_path != requested_path {
+            return Err(AppError::Internal(format!(
+                "snapshot identity mismatch for album {import_album_id}: stored run/path is {}/{}, requested {}/{}",
+                existing.import_run_id,
+                existing.source_album_path,
+                import_run_id,
+                requested_path
+            )));
+        }
+        return Ok((existing.snapshot_id, existing.snapshot_hash));
+    }
+
     let album_path = source_album_path.to_path_buf();
     // Acquire a concurrency permit before offloading. This bounds the
     // number of simultaneous snapshot walks so the blocking thread pool
@@ -373,12 +404,13 @@ pub async fn capture_source_album_snapshot_with_cancel(
     .map_err(|e| AppError::Internal(format!("source album snapshot task failed: {e}")))??;
     let snapshot_hash = compute_snapshot_hash(&files);
     let snapshot_id = Uuid::new_v4();
+    let source_album_path = source_album_path.display().to_string();
     ImportRepository::insert_source_album_snapshot(
         client,
         snapshot_id,
         import_run_id,
         import_album_id,
-        &source_album_path.display().to_string(),
+        &source_album_path,
         &snapshot_hash,
         &files,
     )
@@ -419,10 +451,20 @@ pub async fn load_source_album_snapshot(
 ///
 /// P2: acquires the same `SNAPSHOT_CONCURRENCY` permit as capture so the
 /// combined snapshot load is bounded.
+#[cfg(all(test, feature = "real-db-tests"))]
 pub async fn verify_source_album_snapshot(
     client: &tokio_postgres::Client,
     import_album_id: Uuid,
     source_album_path: &Path,
+) -> Result<Vec<SnapshotVerifyError>, AppError> {
+    verify_source_album_snapshot_with_cancel(client, import_album_id, source_album_path, None).await
+}
+
+pub async fn verify_source_album_snapshot_with_cancel(
+    client: &tokio_postgres::Client,
+    import_album_id: Uuid,
+    source_album_path: &Path,
+    cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<Vec<SnapshotVerifyError>, AppError> {
     let snapshot =
         match ImportRepository::get_source_album_snapshot(client, import_album_id).await? {
@@ -444,8 +486,14 @@ pub async fn verify_source_album_snapshot(
     let album_path = source_album_path.to_path_buf();
     let snapshot_hash = snapshot.snapshot_hash.clone();
     let stored_files_owned: Vec<SnapshotFileRecord> = stored_files;
+    let cancel_for_task = cancelled.clone();
     tokio::task::spawn_blocking(move || {
-        verify_source_snapshot_files(&album_path, &snapshot_hash, &stored_files_owned)
+        verify_source_snapshot_files_with_cancel(
+            &album_path,
+            &snapshot_hash,
+            &stored_files_owned,
+            cancel_for_task.as_deref(),
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("snapshot verify task failed: {e}")))?
@@ -483,7 +531,16 @@ pub fn verify_source_snapshot_files(
     snapshot_hash: &[u8],
     stored_files: &[SnapshotFileRecord],
 ) -> Result<Vec<SnapshotVerifyError>, AppError> {
-    let actual_files = collect_album_files(source_album_path)?;
+    verify_source_snapshot_files_with_cancel(source_album_path, snapshot_hash, stored_files, None)
+}
+
+fn verify_source_snapshot_files_with_cancel(
+    source_album_path: &Path,
+    snapshot_hash: &[u8],
+    stored_files: &[SnapshotFileRecord],
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<SnapshotVerifyError>, AppError> {
+    let actual_files = collect_album_files_with_cancel(source_album_path, cancelled)?;
 
     let mut errors = Vec::new();
 
@@ -596,6 +653,19 @@ mod tests {
         let hb = compute_snapshot_hash(&b);
         assert_eq!(ha, hb);
         assert_eq!(ha.len(), 32);
+    }
+
+    #[test]
+    fn verify_observes_cancellation_before_hashing() {
+        let tmp = TempDir::new().unwrap();
+        let album = tmp.path().join("cancelled_verify");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("large.bin"), vec![0xAB; 1024 * 1024]).unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let error = verify_source_snapshot_files_with_cancel(&album, &[], &[], Some(&cancelled))
+            .expect_err("cancelled verification must stop before hashing the album");
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]

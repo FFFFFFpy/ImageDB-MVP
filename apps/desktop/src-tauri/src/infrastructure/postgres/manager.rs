@@ -11,9 +11,39 @@ use tokio::time::{timeout, Duration};
 
 const PORT_FILE: &str = "postgres_port";
 const CREDENTIAL_FILE: &str = "postgres_credentials";
+const INITDB_COMPLETE_FILE: &str = "imagedb_initdb_complete";
 const DEFAULT_USERNAME: &str = "imagedb";
 const DEFAULT_DATABASE: &str = "imagedb";
 const PG_CTL_START_TIMEOUT_SECS: &str = "45";
+const PG_CTL_STATUS_TIMEOUT_SECS: u64 = 10;
+const PG_CTL_NOT_RUNNING_EXIT_CODE: i32 = 3;
+
+fn validate_shutdown_status_after_failed_stop(
+    status_code: Option<i32>,
+    stop_stderr: &str,
+    status_stdout: &str,
+    status_stderr: &str,
+) -> Result<(), String> {
+    match status_code {
+        Some(PG_CTL_NOT_RUNNING_EXIT_CODE) => Ok(()),
+        Some(0) => Err(format!(
+            "pg_ctl stop returned non-zero and pg_ctl status reports the server is still running; stop stderr: {stop_stderr}; status stdout: {status_stdout}; status stderr: {status_stderr}"
+        )),
+        Some(code) => Err(format!(
+            "pg_ctl stop returned non-zero and pg_ctl status returned unexpected exit code {code}; stop stderr: {stop_stderr}; status stdout: {status_stdout}; status stderr: {status_stderr}"
+        )),
+        None => Err(format!(
+            "pg_ctl stop returned non-zero and pg_ctl status terminated without an exit code; stop stderr: {stop_stderr}; status stdout: {status_stdout}; status stderr: {status_stderr}"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeLookup {
+    Found,
+    ContinueSearch,
+    RequiredRuntimeMissing,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PostgresProbeResult {
@@ -75,21 +105,18 @@ impl PostgresManager {
             ""
         };
 
-        if let Ok(runtime_dir) = std::env::var("IMAGEDB_POSTGRES_RUNTIME_DIR") {
-            let runtime = PathBuf::from(&runtime_dir);
-            let bin_dir = runtime.join("bin");
-            if self.try_use_bin_dir(&bin_dir, exe_suffix) {
-                self.diagnostics.push(format!(
-                    "Found bundled PostgreSQL runtime via IMAGEDB_POSTGRES_RUNTIME_DIR: {}",
-                    runtime.display()
-                ));
-                return;
-            }
-            self.diagnostics.push(format!(
-                "IMAGEDB_POSTGRES_RUNTIME_DIR='{}' is set but missing bin/pg_ctl/initdb/psql; \
-                 falling back to default search",
-                runtime.display()
-            ));
+        let runtime_required = std::env::var("IMAGEDB_POSTGRES_RUNTIME_REQUIRED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                )
+            })
+            .unwrap_or(false);
+        let runtime_dir = std::env::var_os("IMAGEDB_POSTGRES_RUNTIME_DIR").map(PathBuf::from);
+        match self.locate_configured_runtime(runtime_dir.as_deref(), runtime_required, exe_suffix) {
+            RuntimeLookup::Found | RuntimeLookup::RequiredRuntimeMissing => return,
+            RuntimeLookup::ContinueSearch => {}
         }
 
         if let Ok(env_bin) = std::env::var("IMAGEDB_POSTGRES_BIN") {
@@ -194,6 +221,67 @@ impl PostgresManager {
                     .unwrap_or_else(|| "<unknown exe dir>".to_string())
             ));
         }
+    }
+
+    fn locate_configured_runtime(
+        &mut self,
+        runtime_dir: Option<&std::path::Path>,
+        required: bool,
+        exe_suffix: &str,
+    ) -> RuntimeLookup {
+        let Some(runtime) = runtime_dir else {
+            if required {
+                self.diagnostics.push(
+                    "The bundled PostgreSQL runtime path is unavailable. The ImageDB install is \
+                     incomplete; reinstall ImageDB. System PostgreSQL fallback is disabled for \
+                     release builds."
+                        .to_string(),
+                );
+                return RuntimeLookup::RequiredRuntimeMissing;
+            }
+            return RuntimeLookup::ContinueSearch;
+        };
+
+        let bin_dir = runtime.join("bin");
+        let found = if required {
+            self.try_use_complete_packaged_runtime(&bin_dir, exe_suffix)
+        } else {
+            self.try_use_bin_dir(&bin_dir, exe_suffix)
+        };
+        if found {
+            self.diagnostics.push(format!(
+                "Found bundled PostgreSQL runtime via IMAGEDB_POSTGRES_RUNTIME_DIR: {}",
+                runtime.display()
+            ));
+            return RuntimeLookup::Found;
+        }
+
+        if required {
+            self.diagnostics.push(format!(
+                "Bundled PostgreSQL runtime '{}' is incomplete (expected postgres, pg_ctl, \
+                 initdb, psql, and pg_dump in bin). Reinstall ImageDB; system PostgreSQL \
+                 fallback is disabled for release builds.",
+                runtime.display()
+            ));
+            RuntimeLookup::RequiredRuntimeMissing
+        } else {
+            self.diagnostics.push(format!(
+                "IMAGEDB_POSTGRES_RUNTIME_DIR='{}' is set but missing bin/pg_ctl/initdb/psql; \
+                 falling back to default search",
+                runtime.display()
+            ));
+            RuntimeLookup::ContinueSearch
+        }
+    }
+
+    fn try_use_complete_packaged_runtime(
+        &mut self,
+        base: &std::path::Path,
+        exe_suffix: &str,
+    ) -> bool {
+        let postgres = strip_verbatim_prefix(&base.join(format!("postgres{exe_suffix}")));
+        let pg_dump = strip_verbatim_prefix(&base.join(format!("pg_dump{exe_suffix}")));
+        postgres.exists() && pg_dump.exists() && self.try_use_bin_dir(base, exe_suffix)
     }
 
     pub(crate) fn try_use_bin_dir(&mut self, base: &std::path::Path, exe_suffix: &str) -> bool {
@@ -361,7 +449,10 @@ impl PostgresManager {
         self.data_dir.join("PG_VERSION").is_file()
             && self.data_dir.join("base").is_dir()
             && self.data_dir.join("global").is_dir()
+            && self.data_dir.join("global").join("pg_control").is_file()
             && self.data_dir.join("pg_wal").is_dir()
+            && self.data_dir.join("postgresql.conf").is_file()
+            && self.data_dir.join("pg_hba.conf").is_file()
     }
 
     pub async fn initialize(&mut self) -> Result<PostgresProbeResult, AppError> {
@@ -378,14 +469,128 @@ impl PostgresManager {
             });
         }
 
-        if !self.data_dir.exists() {
-            let parent_dir = self.data_dir.parent().ok_or_else(|| {
+        let parent_dir = self
+            .data_dir
+            .parent()
+            .ok_or_else(|| {
                 AppError::Internal(format!(
                     "data directory {} has no parent",
                     self.data_dir.display()
                 ))
+            })?
+            .to_path_buf();
+        let staging_dir = parent_dir.join("postgres_staging");
+        let has_initialization_marker =
+            staging_dir.join(PORT_FILE).is_file() && staging_dir.join(CREDENTIAL_FILE).is_file();
+        let initdb_completed = staging_dir.join(INITDB_COMPLETE_FILE).is_file();
+        let has_published_metadata = self.data_dir.join(PORT_FILE).is_file()
+            || self.data_dir.join(CREDENTIAL_FILE).is_file();
+
+        if self.data_dir.exists()
+            && has_initialization_marker
+            && !initdb_completed
+            && !has_published_metadata
+        {
+            // Both staged metadata files are written before initdb starts
+            // and the completion marker is written only after initdb exits
+            // successfully and the cluster structure is verified. Without
+            // that post-init marker, even a directory that superficially
+            // resembles a cluster is safe to discard and retry.
+            std::fs::remove_dir_all(&self.data_dir).map_err(|e| {
+                AppError::Internal(format!(
+                    "cannot clean interrupted PostgreSQL cluster {}: {e}",
+                    self.data_dir.display()
+                ))
             })?;
-            std::fs::create_dir_all(parent_dir).map_err(|e| {
+            std::fs::remove_dir_all(&staging_dir).map_err(|e| {
+                AppError::Internal(format!(
+                    "cannot clean interrupted PostgreSQL staging directory {}: {e}",
+                    staging_dir.display()
+                ))
+            })?;
+            self.diagnostics.push(
+                "Recovered an interrupted managed PostgreSQL initialization; retrying initdb"
+                    .to_string(),
+            );
+        }
+
+        if self.data_dir.exists() && !self.cluster_files_exist() {
+            self.diagnostics.push(format!(
+                    "Refusing to reuse or delete incomplete PostgreSQL data directory {} because no safely recoverable ImageDB initialization is present",
+                    self.data_dir.display()
+                ));
+            return Ok(PostgresProbeResult {
+                available: true,
+                managed: false,
+                pgvector_available: false,
+                port: None,
+                data_dir: Some(self.data_dir.display().to_string()),
+                database_created: false,
+                connection_ok: false,
+                diagnostics: self.diagnostics.clone(),
+            });
+        }
+
+        if self.cluster_files_exist() && staging_dir.exists() {
+            if !initdb_completed {
+                self.diagnostics.push(format!(
+                    "Refusing to publish PostgreSQL metadata from unrecognized staging directory {} because the post-initdb completion marker is missing",
+                    staging_dir.display()
+                ));
+                return Ok(PostgresProbeResult {
+                    available: true,
+                    managed: false,
+                    pgvector_available: false,
+                    port: None,
+                    data_dir: Some(self.data_dir.display().to_string()),
+                    database_created: false,
+                    connection_ok: false,
+                    diagnostics: self.diagnostics.clone(),
+                });
+            }
+            // initdb completed, but the process died before publishing its
+            // generated connection metadata. Finish that small atomic handoff
+            // instead of generating credentials that no longer match the DB.
+            for file_name in [PORT_FILE, CREDENTIAL_FILE] {
+                let staged = staging_dir.join(file_name);
+                let published = self.data_dir.join(file_name);
+                if !published.is_file() {
+                    if !staged.is_file() {
+                        self.diagnostics.push(format!(
+                            "Managed PostgreSQL initialization metadata is incomplete: neither {} nor {} exists",
+                            published.display(),
+                            staged.display()
+                        ));
+                        return Ok(PostgresProbeResult {
+                            available: true,
+                            managed: false,
+                            pgvector_available: false,
+                            port: None,
+                            data_dir: Some(self.data_dir.display().to_string()),
+                            database_created: false,
+                            connection_ok: false,
+                            diagnostics: self.diagnostics.clone(),
+                        });
+                    }
+                    std::fs::rename(&staged, &published).map_err(|e| {
+                        AppError::Internal(format!(
+                            "cannot finish managed PostgreSQL metadata publish {} -> {}: {e}",
+                            staged.display(),
+                            published.display()
+                        ))
+                    })?;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            self.load_saved_config();
+            self.diagnostics.push(
+                "Recovered managed PostgreSQL metadata after interrupted initialization"
+                    .to_string(),
+            );
+        }
+
+        if !self.data_dir.exists() {
+            std::fs::create_dir_all(&parent_dir).map_err(|e| {
                 AppError::Internal(format!(
                     "cannot create parent directory {}: {e}",
                     parent_dir.display()
@@ -398,7 +603,6 @@ impl PostgresManager {
             // initdb requires its target data directory to be empty. Our port
             // and credential files must therefore live in a sibling staging
             // directory until initdb finishes.
-            let staging_dir = parent_dir.join("postgres_staging");
             if staging_dir.exists() {
                 std::fs::remove_dir_all(&staging_dir).map_err(|e| {
                     AppError::Internal(format!(
@@ -539,6 +743,15 @@ impl PostgresManager {
                     diagnostics: self.diagnostics.clone(),
                 });
             }
+
+            std::fs::write(staging_dir.join(INITDB_COMPLETE_FILE), b"initdb-complete\n").map_err(
+                |e| {
+                    AppError::Internal(format!(
+                        "cannot persist initdb completion marker in {}: {e}",
+                        staging_dir.display()
+                    ))
+                },
+            )?;
 
             let final_port = self.data_dir.join(PORT_FILE);
             let final_credentials = self.data_dir.join(CREDENTIAL_FILE);
@@ -875,19 +1088,65 @@ impl PostgresManager {
             let has_postmaster = self.data_dir.join("postmaster.pid").exists();
             if self.data_dir.exists() && (self.server_running || has_postmaster) {
                 let data_dir_str = Self::path_to_str(&self.data_dir)?;
-                let output = Command::new(pg_ctl)
+                let mut stop_command = Command::new(pg_ctl);
+                stop_command
                     .args(["stop", "-D", &data_dir_str, "-m", "fast", "-w"])
                     .stdin(Stdio::null())
-                    .output()
-                    .await?;
+                    .kill_on_drop(true);
+                let output = stop_command.output().await?;
 
                 if output.status.success() {
                     self.diagnostics.push("PostgreSQL stopped".to_string());
                     self.server_running = false;
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    self.diagnostics
-                        .push(format!("pg_ctl stop warning: {stderr}"));
+                    let stop_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let mut status_command = Command::new(pg_ctl);
+                    status_command
+                        .args(["status", "-D", &data_dir_str])
+                        .stdin(Stdio::null())
+                        .kill_on_drop(true);
+                    let status_output = match timeout(
+                        Duration::from_secs(PG_CTL_STATUS_TIMEOUT_SECS),
+                        status_command.output(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(output)) => output,
+                        Ok(Err(error)) => {
+                            let message = format!(
+                                "pg_ctl stop returned non-zero and the follow-up status command failed: {error}; stop stderr: {stop_stderr}"
+                            );
+                            self.diagnostics.push(message.clone());
+                            return Err(AppError::PostgresUnavailable(message));
+                        }
+                        Err(_) => {
+                            let message = format!(
+                                "pg_ctl stop returned non-zero and follow-up status timed out after {PG_CTL_STATUS_TIMEOUT_SECS}s; stop stderr: {stop_stderr}"
+                            );
+                            self.diagnostics.push(message.clone());
+                            return Err(AppError::PostgresUnavailable(message));
+                        }
+                    };
+                    let status_stdout = String::from_utf8_lossy(&status_output.stdout)
+                        .trim()
+                        .to_string();
+                    let status_stderr = String::from_utf8_lossy(&status_output.stderr)
+                        .trim()
+                        .to_string();
+                    if let Err(message) = validate_shutdown_status_after_failed_stop(
+                        status_output.status.code(),
+                        &stop_stderr,
+                        &status_stdout,
+                        &status_stderr,
+                    ) {
+                        self.diagnostics.push(message.clone());
+                        return Err(AppError::PostgresUnavailable(message));
+                    }
+
+                    self.diagnostics.push(format!(
+                        "pg_ctl stop returned non-zero, but follow-up status confirmed PostgreSQL is stopped: {stop_stderr}"
+                    ));
+                    self.server_running = false;
                 }
             }
         }
@@ -927,6 +1186,50 @@ fn strip_verbatim_prefix(path: &std::path::Path) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn shutdown_failed_stop_accepts_status_not_running() {
+        assert!(validate_shutdown_status_after_failed_stop(
+            Some(PG_CTL_NOT_RUNNING_EXIT_CODE),
+            "stop command reported an error",
+            "no server running",
+            "",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn shutdown_failed_stop_rejects_status_still_running() {
+        let error = validate_shutdown_status_after_failed_stop(
+            Some(0),
+            "stop command reported an error",
+            "server is running",
+            "",
+        )
+        .expect_err("status exit code 0 must keep graceful shutdown from exiting");
+        assert!(error.contains("still running"));
+    }
+
+    #[test]
+    fn shutdown_failed_stop_rejects_abnormal_status() {
+        let unexpected = validate_shutdown_status_after_failed_stop(
+            Some(4),
+            "stop command reported an error",
+            "",
+            "invalid data directory",
+        )
+        .expect_err("an abnormal status code must fail shutdown");
+        assert!(unexpected.contains("unexpected exit code 4"));
+
+        let terminated = validate_shutdown_status_after_failed_stop(
+            None,
+            "stop command reported an error",
+            "",
+            "terminated",
+        )
+        .expect_err("status without an exit code must fail shutdown");
+        assert!(terminated.contains("without an exit code"));
+    }
 
     #[test]
     fn test_missing_binaries_diagnostic() {
@@ -969,7 +1272,7 @@ mod tests {
         std::fs::create_dir_all(&isolated).unwrap();
 
         // Simulate the release resource dir:
-        // <resources>/postgres-runtime/bin/{pg_ctl,initdb,psql,pg_dump}
+        // <resources>/postgres-runtime/bin/{postgres,pg_ctl,initdb,psql,pg_dump}
         let bin_dir = tmp.path().join("postgres-runtime").join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let exe_suffix = if cfg!(target_os = "windows") {
@@ -977,7 +1280,7 @@ mod tests {
         } else {
             ""
         };
-        for name in ["pg_ctl", "initdb", "psql", "pg_dump"] {
+        for name in ["postgres", "pg_ctl", "initdb", "psql", "pg_dump"] {
             std::fs::write(bin_dir.join(format!("{name}{exe_suffix}")), b"").unwrap();
         }
 
@@ -995,6 +1298,84 @@ mod tests {
             mgr.pg_dump.is_some(),
             "pg_dump should be discovered alongside the others"
         );
+    }
+
+    #[test]
+    fn test_release_runtime_policy_rejects_incomplete_bundle_without_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let isolated = tmp.path().join("isolated_app_data");
+        std::fs::create_dir_all(&isolated).unwrap();
+        let runtime_dir = tmp.path().join("postgres-runtime");
+        let bin_dir = runtime_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe_suffix = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        for name in ["pg_ctl", "initdb", "psql"] {
+            std::fs::write(bin_dir.join(format!("{name}{exe_suffix}")), b"").unwrap();
+        }
+
+        let mut mgr = PostgresManager::new(&isolated);
+        mgr.pg_ctl = None;
+        mgr.initdb = None;
+        mgr.psql = None;
+        mgr.pg_dump = None;
+        mgr.diagnostics.clear();
+
+        assert_eq!(
+            mgr.locate_configured_runtime(Some(&runtime_dir), true, exe_suffix),
+            RuntimeLookup::RequiredRuntimeMissing
+        );
+        assert!(!mgr.binaries_available());
+        assert!(mgr.diagnostics.iter().any(
+            |message| message.contains("fallback is disabled") && message.contains("Reinstall")
+        ));
+    }
+
+    #[test]
+    fn test_release_runtime_policy_accepts_only_complete_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let isolated = tmp.path().join("isolated_app_data");
+        std::fs::create_dir_all(&isolated).unwrap();
+        let runtime_dir = tmp.path().join("postgres-runtime");
+        let bin_dir = runtime_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe_suffix = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        for name in ["postgres", "pg_ctl", "initdb", "psql", "pg_dump"] {
+            std::fs::write(bin_dir.join(format!("{name}{exe_suffix}")), b"").unwrap();
+        }
+
+        let mut mgr = PostgresManager::new(&isolated);
+        mgr.pg_ctl = None;
+        mgr.initdb = None;
+        mgr.psql = None;
+        mgr.pg_dump = None;
+        mgr.diagnostics.clear();
+
+        assert_eq!(
+            mgr.locate_configured_runtime(Some(&runtime_dir), true, exe_suffix),
+            RuntimeLookup::Found
+        );
+        assert!(mgr.binaries_available());
+        for path in mgr
+            .pg_ctl
+            .iter()
+            .chain(mgr.initdb.iter())
+            .chain(mgr.psql.iter())
+            .chain(mgr.pg_dump.iter())
+        {
+            assert!(
+                path.starts_with(&bin_dir),
+                "unexpected runtime path: {}",
+                path.display()
+            );
+        }
     }
 
     /// Tauri's `resource_dir()` returns a `\\?\`-prefixed verbatim path on
@@ -1306,6 +1687,87 @@ mod tests {
             Ok(()) => {}
             Err(_) => panic!("real_pgvector_full_lifecycle timed out after 120s"),
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn real_pgvector_partial_initialization_recovers_safely() {
+        let _bin_dir = match std::env::var("IMAGEDB_POSTGRES_BIN") {
+            Ok(value) if !value.is_empty() => value,
+            _ => panic!("IMAGEDB_POSTGRES_BIN is required for partial-init recovery test"),
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let app_data = tmp.path().join("app_data");
+        let partial_data = app_data.join("postgres_data");
+        let staging = app_data.join("postgres_staging");
+        std::fs::create_dir_all(&partial_data).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(partial_data.join("PG_VERSION"), b"18").unwrap();
+        std::fs::create_dir_all(partial_data.join("base")).unwrap();
+        std::fs::create_dir_all(partial_data.join("global")).unwrap();
+        std::fs::create_dir_all(partial_data.join("pg_wal")).unwrap();
+        std::fs::write(staging.join(PORT_FILE), b"54321").unwrap();
+        std::fs::write(staging.join(CREDENTIAL_FILE), b"imagedb:interrupted").unwrap();
+
+        let mut manager = PostgresManager::new(&app_data);
+        let result = manager.initialize().await.unwrap();
+        assert!(result.managed, "diagnostics: {:?}", result.diagnostics);
+        assert!(
+            result.connection_ok,
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert!(manager.cluster_files_exist());
+        assert!(!staging.exists());
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("interrupted managed PostgreSQL initialization")));
+        manager.shutdown().await.unwrap();
+
+        // A valid, already-published cluster plus a suspicious unmarked
+        // staging directory is not an interrupted first initialization.
+        // Preserve the database and fail closed instead of treating the two
+        // staged metadata files as authority to delete an established cluster.
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(PORT_FILE), b"54322").unwrap();
+        std::fs::write(staging.join(CREDENTIAL_FILE), b"imagedb:suspicious").unwrap();
+        let established_sentinel = partial_data.join("established-data-sentinel.txt");
+        std::fs::write(&established_sentinel, b"must survive").unwrap();
+        let mut established_manager = PostgresManager::new(&app_data);
+        let refused_staging = established_manager.initialize().await.unwrap();
+        assert!(!refused_staging.connection_ok);
+        assert!(
+            established_sentinel.is_file(),
+            "published cluster data must survive an unmarked staging conflict"
+        );
+        assert!(refused_staging
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("completion marker is missing")));
+
+        let unknown_app_data = tmp.path().join("unknown_app_data");
+        let unknown_data = unknown_app_data.join("postgres_data");
+        let unknown_staging = unknown_app_data.join("postgres_staging");
+        std::fs::create_dir_all(&unknown_data).unwrap();
+        std::fs::create_dir_all(&unknown_staging).unwrap();
+        let sentinel = unknown_data.join("do-not-delete.txt");
+        let staging_sentinel = unknown_staging.join("do-not-delete.txt");
+        std::fs::write(&sentinel, b"unknown user data").unwrap();
+        std::fs::write(&staging_sentinel, b"unknown staging data").unwrap();
+        let mut unknown_manager = PostgresManager::new(&unknown_app_data);
+        let refused = unknown_manager.initialize().await.unwrap();
+        assert!(!refused.connection_ok);
+        assert!(sentinel.is_file(), "unknown partial data must be preserved");
+        assert!(
+            staging_sentinel.is_file(),
+            "an unmarked staging directory must be preserved"
+        );
+        assert!(refused
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("Refusing to reuse or delete incomplete")));
     }
 
     /// Clean Windows bootstrap: simulate a fresh install that has NO system

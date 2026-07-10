@@ -15,7 +15,7 @@
 //!       manifest_validation_ -- --ignored --test-threads=1
 #![cfg(test)]
 #![cfg(feature = "real-db-tests")]
-use crate::domain::import_state::{DecodeState, ImportImageState};
+use crate::domain::import_state::{DecodeState, ImportImageState, ImportRunState};
 use crate::domain::state_machine::PlanState;
 use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 use crate::repositories::import_repository::{ImportRepository, NewImportImage};
@@ -203,6 +203,9 @@ async fn seed_and_freeze(
         .await
         .unwrap();
     ImportRepository::update_import_plan_state(&client, plan_id, &PlanState::Frozen)
+        .await
+        .unwrap();
+    ImportRepository::update_import_run_state(&client, run_id, &ImportRunState::ReadyToCommit)
         .await
         .unwrap();
     drop(client);

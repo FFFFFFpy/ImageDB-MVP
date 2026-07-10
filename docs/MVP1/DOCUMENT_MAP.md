@@ -13,30 +13,30 @@
 
 ## 2. 根部文件
 
-| 文件 | 当前用途 |
-| --- | --- |
-| `README.md` | 项目门面，指向 `docs/MVP1/`。 |
-| `AGENTS.md` | Agent / Codex 当前阶段工作规则。 |
-| `CURRENT_TASK.md` | 当前 Debug 阶段摘要。 |
+| 文件              | 当前用途                              |
+| ----------------- | ------------------------------------- |
+| `README.md`       | 项目门面，指向 `docs/MVP1/`。         |
+| `AGENTS.md`       | Agent / Codex 当前阶段工作规则。      |
+| `CURRENT_TASK.md` | 当前 Debug 阶段摘要。                 |
 | `PROJECT_PLAN.md` | 顶层项目计划入口，指向 `docs/MVP1/`。 |
-| `ENVIRONMENT.md` | 开发环境与验证命令。 |
+| `ENVIRONMENT.md`  | 开发环境与验证命令。                  |
 
 ## 3. 当前保留的根目录输出 / 证据目录
 
-| 路径 | 当前用途 |
-| --- | --- |
-| `reports/` | 脚本输出目录。环境检查和 release performance 会继续写入这里。历史报告已搬到 `docs/MVP1/archive/reports/`。 |
-| `checklists/` | Release / milestone DoD 证据目录。`RELEASE_DOD.md` 仍保留为 release 级证据。 |
+| 路径          | 当前用途                                                                                                   |
+| ------------- | ---------------------------------------------------------------------------------------------------------- |
+| `reports/`    | 脚本输出目录。环境检查和 release performance 会继续写入这里。历史报告已搬到 `docs/MVP1/archive/reports/`。 |
+| `checklists/` | Release / milestone DoD 证据目录。`RELEASE_DOD.md` 仍保留为 release 级证据。                               |
 
 ## 4. 归档位置
 
-| 原路径 | 归档位置 |
-| --- | --- |
-| `.codex-plans/` | `docs/MVP1/archive/codex-plans/` |
-| `prompts/` | `docs/MVP1/archive/prompts/` |
-| `tasks/` | `docs/MVP1/archive/tasks/` |
-| `PROJECT_PLAN_PATCH.md` | `docs/MVP1/archive/PROJECT_PLAN_PATCH.md` |
-| 历史 `reports/*.md` / `reports/*.json` | `docs/MVP1/archive/reports/` |
+| 原路径                                 | 归档位置                                  |
+| -------------------------------------- | ----------------------------------------- |
+| `.codex-plans/`                        | `docs/MVP1/archive/codex-plans/`          |
+| `prompts/`                             | `docs/MVP1/archive/prompts/`              |
+| `tasks/`                               | `docs/MVP1/archive/tasks/`                |
+| `PROJECT_PLAN_PATCH.md`                | `docs/MVP1/archive/PROJECT_PLAN_PATCH.md` |
+| 历史 `reports/*.md` / `reports/*.json` | `docs/MVP1/archive/reports/`              |
 
 ## 5. Reports 口径
 

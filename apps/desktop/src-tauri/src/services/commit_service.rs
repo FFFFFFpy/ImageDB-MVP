@@ -23,7 +23,8 @@ use crate::infrastructure::storage_capabilities::{
     probe_storage_capabilities, PublishStrategy as StoragePublishStrategy,
 };
 use crate::repositories::import_repository::{
-    FrozenPlanRow, ImportRepository, PlanAlbumRow, PlanImageRow, SnapshotFileRecord,
+    FrozenPlanRow, ImportRepository, NewFileOperation, PlanAlbumRow, PlanImageRow,
+    SnapshotFileRecord,
 };
 use crate::services::recovery_service::reconcile_import_run_state;
 use crate::services::source_snapshot_service::{
@@ -384,12 +385,75 @@ async fn execute_commit_pipeline(
     }
     let library_root = bound;
 
-    // Rule 3: the frozen plan is the sole commit source of truth.
-    let frozen = ImportRepository::load_frozen_plan(client, import_run_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(format!(
-            "no frozen import plan for run {import_run_id}; generate and freeze a plan before committing"
-        )))?;
+    // Capture and hash the frozen plan under the same per-run row lock used
+    // by every plan edit. The guarded transition to `committing` is committed
+    // before releasing that lock, so an editor either finishes first (and we
+    // read its new plan) or wakes after us and rejects the committing state.
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin commit plan capture: {e}")))?;
+    let capture_result = async {
+        let locked_run = client
+            .query_opt(
+                "SELECT state FROM import_runs WHERE id = $1 FOR UPDATE",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to lock import run for commit: {e}")))?
+            .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+        let locked_run_state: String = locked_run.get("state");
+        if !matches!(
+            locked_run_state.as_str(),
+            "ready_to_commit"
+                | "cancelled"
+                | "committing"
+                | "recovery_required"
+                | "failed"
+                | "completed"
+        ) {
+            return Err(AppError::Internal(format!(
+                "cannot commit import run {import_run_id} from state '{locked_run_state}'"
+            )));
+        }
+
+        // Rule 3: the frozen plan is the sole commit source of truth.
+        let frozen = ImportRepository::load_frozen_plan(client, import_run_id)
+            .await?
+            .ok_or_else(|| AppError::Internal(format!(
+                "no frozen import plan for run {import_run_id}; generate and freeze a plan before committing"
+            )))?;
+
+        // Rule 4: validate and hash the immutable plan while the edit lock is
+        // held. Commit and Recovery share this canonical hash validation.
+        let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
+        let publish_strategy = if frozen.albums.is_empty() {
+            None
+        } else {
+            Some(select_commit_publish_strategy(&library_root)?)
+        };
+        ImportRepository::update_import_run_state(
+            client,
+            import_run_id,
+            &ImportRunState::Committing,
+        )
+        .await?;
+        Ok::<_, AppError>((frozen, validated_plan_hash, publish_strategy))
+    }
+    .await;
+    let (frozen, validated_plan_hash, publish_strategy) = match capture_result {
+        Ok(captured) => {
+            client
+                .batch_execute("COMMIT")
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to commit plan capture: {e}")))?;
+            captured
+        }
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(error);
+        }
+    };
     tracing::info!(
         %import_run_id,
         plan_id = %frozen.plan_id,
@@ -428,10 +492,9 @@ async fn execute_commit_pipeline(
         });
     }
 
-    // Rule 4: validate and hash the immutable plan up front. Commit and
-    // recovery both use this function so a tampered plan fails consistently.
-    let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
-    let publish_strategy = select_commit_publish_strategy(&library_root)?;
+    let publish_strategy = publish_strategy.ok_or_else(|| {
+        AppError::Internal("non-empty frozen plan has no publish strategy".to_string())
+    })?;
     tracing::info!(
         %import_run_id,
         plan_id = %frozen.plan_id,
@@ -445,9 +508,6 @@ async fn execute_commit_pipeline(
         p.current_stage = "committing".to_string();
         p.albums_total = frozen.albums.len() as u32;
     }
-    ImportRepository::update_import_run_state(client, import_run_id, &ImportRunState::Committing)
-        .await?;
-
     let mut album_results = Vec::new();
     let mut total_committed = 0u32;
     let mut albums_committed = 0u32;
@@ -1009,48 +1069,46 @@ async fn commit_single_album(
         .join("staging")
         .join(tx_id.to_string());
     let staging_dir = staging_base.join(&album_relative_path);
+    ensure_no_symlink_or_reparse_escape(library_root, &staging_dir)?;
 
     let initial = state_machine::transition_transaction(TransactionState::Planned, "stage")?;
-    ImportRepository::insert_file_transaction(
+    let mut operations = Vec::with_capacity(images.len());
+    for img in &images {
+        let target_rel = normalize_relative_path(&img.target_relative_path)?;
+        let staged_path = staging_dir.join(&target_rel);
+        let target_path = publish_dir.join(&target_rel);
+        operations.push(NewFileOperation {
+            source_path: img.source_path.clone(),
+            staging_path: staged_path.display().to_string(),
+            target_path: target_path.display().to_string(),
+            expected_size: img.expected_file_size,
+            expected_blake3: img.expected_blake3.clone(),
+        });
+    }
+
+    let operation_ids = ImportRepository::prewrite_file_transaction(
         client,
         tx_id,
         import_run_id,
         plan_album.import_album_id,
         &initial,
-        Some(&staging_dir.display().to_string()),
-        Some(&publish_dir.display().to_string()),
-        None,
+        &staging_dir.display().to_string(),
+        &publish_dir.display().to_string(),
+        plan_hash,
+        &operations,
     )
     .await?;
-
-    ImportRepository::set_transaction_hashes(client, tx_id, Some(plan_hash), None).await?;
-
-    // Build manifest metadata common to all operations.
-    let mut op_ids: Vec<(Uuid, PathBuf, Vec<u8>)> = Vec::with_capacity(images.len());
-    for img in &images {
-        let target_rel = normalize_relative_path(&img.target_relative_path)?;
-        let staged_path = staging_dir.join(&target_rel);
-        let target_path = publish_dir.join(&target_rel);
-        let op_id = ImportRepository::insert_file_operation(
-            client,
-            tx_id,
-            &img.source_path,
-            &staged_path.display().to_string(),
-            &target_path.display().to_string(),
-            img.expected_file_size,
-            &img.expected_blake3,
-        )
-        .await?;
-        op_ids.push((op_id, staged_path, img.expected_blake3.clone()));
-    }
-
-    ImportRepository::update_file_transaction_state(
-        client,
-        tx_id,
-        &TransactionState::Staging,
-        None,
-    )
-    .await?;
+    let op_ids: Vec<(Uuid, PathBuf, Vec<u8>)> = operation_ids
+        .into_iter()
+        .zip(operations.iter())
+        .map(|(operation_id, operation)| {
+            (
+                operation_id,
+                PathBuf::from(&operation.staging_path),
+                operation.expected_blake3.clone(),
+            )
+        })
+        .collect();
 
     #[cfg(feature = "fail-injection")]
     maybe_fault(CommitFaultPoint::AfterDbWrite, "after DB write")?;
@@ -3699,6 +3757,12 @@ mod tests {
         let hash = compute_plan_hash(&frozen)?;
         ImportRepository::set_plan_hash(client, plan_id, &hash).await?;
         ImportRepository::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
+        ImportRepository::update_import_run_state(
+            client,
+            import_run_id,
+            &ImportRunState::ReadyToCommit,
+        )
+        .await?;
         Ok(())
     }
 

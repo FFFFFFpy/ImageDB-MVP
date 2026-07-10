@@ -35,6 +35,12 @@ const steps = [
   { id: 'typecheck', label: 'pnpm typecheck', command: 'pnpm', args: ['typecheck'] },
   { id: 'unit', label: 'pnpm test:unit', command: 'pnpm', args: ['test:unit'] },
   {
+    id: 'dataset',
+    label: 'pnpm release:dataset',
+    command: 'pnpm',
+    args: ['release:dataset'],
+  },
+  {
     id: 'rust',
     label: 'pnpm rust:test',
     command: 'pnpm',
@@ -192,6 +198,10 @@ try {
   $env:IMAGEDB_MOUNTED_LOCAL_PATH = $drive
   $env:IMAGEDB_MOUNTED_REMOTE_PATH = $remote
   cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --features fail-injection,real-db-tests --lib mounted_storage_gate_library_root_disconnect_pauses_then_recovers -- --ignored --test-threads=1
+  $cargoExitCode = $LASTEXITCODE
+  if ($cargoExitCode -ne 0) {
+    throw "mounted storage cargo test failed with exit code $cargoExitCode"
+  }
 }
 finally {
   if ($mappingCreated) {

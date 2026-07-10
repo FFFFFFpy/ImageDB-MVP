@@ -29,12 +29,12 @@ MVP1 的核心主链已经跑通：
 
 后续以 `docs/MVP1/` 为唯一主入口。旧的计划、提示词、任务拆分和历史报告已经归档到 `docs/MVP1/archive/`，不再作为当前状态入口。
 
-| 文档 | 用途 |
-| --- | --- |
-| [`STATUS.md`](./STATUS.md) | MVP1 完成定性、DoD、剩余 Debug 项 |
-| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | 当前 MVP1 产品范围、主链、架构、数据与文件事务 |
-| [`DEBUG_PLAYBOOK.md`](./DEBUG_PLAYBOOK.md) | 实战测试、Debug 记录、验证命令和问题分级 |
-| [`DOCUMENT_MAP.md`](./DOCUMENT_MAP.md) | 文档地图与归档口径 |
+| 文档                                       | 用途                                           |
+| ------------------------------------------ | ---------------------------------------------- |
+| [`STATUS.md`](./STATUS.md)                 | MVP1 完成定性、DoD、剩余 Debug 项              |
+| [`ARCHITECTURE.md`](./ARCHITECTURE.md)     | 当前 MVP1 产品范围、主链、架构、数据与文件事务 |
+| [`DEBUG_PLAYBOOK.md`](./DEBUG_PLAYBOOK.md) | 实战测试、Debug 记录、验证命令和问题分级       |
+| [`DOCUMENT_MAP.md`](./DOCUMENT_MAP.md)     | 文档地图与归档口径                             |
 
 ## 3. 当前工作原则
 

@@ -1,12 +1,13 @@
 use crate::domain::duplicate_group::{build_duplicate_groups, compute_excluded_ids, DuplicateEdge};
 use crate::domain::import_state::{
-    ImportPlan, ImportPlanAlbum, ImportPlanImage, ReviewCandidateDetail, ReviewCandidateSummary,
-    ReviewDecisionAction, ReviewProgress,
+    ImportAlbumState, ImportPlan, ImportPlanAlbum, ImportPlanImage, ImportRunState,
+    ReviewCandidateDetail, ReviewCandidateSummary, ReviewDecisionAction, ReviewProgress,
 };
 use crate::domain::state_machine::PlanState;
 use crate::error::AppError;
 use crate::repositories::import_repository::{
     AlbumRow, ImportImageFullRow, ImportPlanCandidateRow, ImportPlanImageRow, ImportRepository,
+    ImportRunRecord,
 };
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
@@ -159,33 +160,11 @@ pub async fn generate_import_plan(
     client: &Client,
     import_run_id: Uuid,
 ) -> Result<ImportPlan, AppError> {
-    let progress = ImportRepository::get_review_progress(client, import_run_id).await?;
-    let remaining = progress.total.saturating_sub(progress.decided);
-    if remaining > 0 {
-        return Err(AppError::Internal(format!(
-            "cannot generate import plan while {remaining} review candidates remain undecided"
-        )));
-    }
-
-    let all_images =
-        ImportRepository::get_all_import_images_with_album(client, import_run_id).await?;
-    let all_candidates =
-        ImportRepository::get_all_candidates_for_import_plan(client, import_run_id).await?;
-    let albums = ImportRepository::get_albums_for_run(client, import_run_id).await?;
-
-    let plan = build_import_plan(
-        import_run_id.to_string(),
-        &all_images,
-        &all_candidates,
-        &albums,
-    );
-
-    // Freezing is a separate, idempotent, transactional step — but the
-    // review page still wants the in-memory plan to preview, so we freeze
-    // here as a side effect (idempotent on re-call) and return the plan.
-    freeze_import_plan(client, import_run_id).await?;
-
-    Ok(plan)
+    // `freeze_import_plan` owns both the undecided-review guard and the
+    // idempotent frozen-plan fast path. Keeping a single gate matters after
+    // Commit advances the run: a second Generate request must return the
+    // persisted projection instead of re-evaluating mutable review rows.
+    freeze_import_plan(client, import_run_id).await
 }
 
 /// Freeze the import plan for a run in a single database transaction. Reads
@@ -198,87 +177,155 @@ pub async fn freeze_import_plan(
     client: &Client,
     import_run_id: Uuid,
 ) -> Result<ImportPlan, AppError> {
-    // Reuse an already-frozen plan: idempotent. The returned summary is the
-    // frozen view — it is NOT rebuilt from candidates/reviews, so post-freeze
-    // review edits cannot mutate what the commit page will show.
-    if let Some(existing) =
-        ImportRepository::load_frozen_plan_summary(client, import_run_id).await?
-    {
-        return Ok(existing);
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin plan freeze: {e}")))?;
+
+    let result = async {
+        // The run row is the serialization point shared by Freeze, plan
+        // editors, summary readers, and Commit. Re-check the idempotent path
+        // only after taking it so a concurrent freeze/edit cannot interleave
+        // the summary's multiple reads.
+        lock_import_run_for_plan_access(client, import_run_id).await?;
+        if let Some(existing) =
+            ImportRepository::load_frozen_plan_summary(client, import_run_id).await?
+        {
+            return Ok(existing);
+        }
+
+        // Async review may expose candidates while the rest of the run is
+        // still being analyzed. Never let that transiently-empty review queue
+        // create a partial commit set.
+        let import_run = require_freezable_import_run(client, import_run_id).await?;
+        let progress = ImportRepository::get_review_progress(client, import_run_id).await?;
+        let remaining = progress.total.saturating_sub(progress.decided);
+        if remaining > 0 {
+            return Err(AppError::Internal(format!(
+                "cannot freeze import plan while {remaining} review candidates remain undecided"
+            )));
+        }
+
+        let all_images =
+            ImportRepository::get_all_import_images_with_album(client, import_run_id).await?;
+        let all_candidates =
+            ImportRepository::get_all_candidates_for_import_plan(client, import_run_id).await?;
+        let albums = ImportRepository::get_albums_for_run(client, import_run_id).await?;
+        let plan = build_import_plan(
+            import_run_id.to_string(),
+            &all_images,
+            &all_candidates,
+            &albums,
+        );
+
+        let kept_ids = parse_kept_image_ids(&plan)?;
+        let full_images = ImportRepository::get_import_images_by_ids(client, &kept_ids).await?;
+        let image_by_id: HashMap<Uuid, ImportImageFullRow> =
+            full_images.into_iter().map(|img| (img.id, img)).collect();
+        let mut kept_images_by_album: HashMap<Uuid, Vec<ImportImageFullRow>> = HashMap::new();
+        for album in &albums {
+            let album_images: Vec<ImportImageFullRow> = kept_ids
+                .iter()
+                .filter_map(|id| image_by_id.get(id).cloned())
+                .filter(|img| img.import_album_id == album.id)
+                .collect();
+            if !album_images.is_empty() {
+                kept_images_by_album.insert(album.id, album_images);
+            }
+        }
+
+        // Compute the hash from the same draft shape Commit validates, then
+        // write and re-read the frozen projection before releasing the lock.
+        let draft =
+            synthesize_draft_for_hash(import_run_id, &import_run, &albums, &kept_images_by_album);
+        let plan_hash = crate::services::commit_service::compute_plan_hash(&draft)?;
+        ImportRepository::write_frozen_import_plan_in_transaction(
+            client,
+            import_run_id,
+            &albums,
+            &kept_images_by_album,
+            &import_run.policy_version,
+            import_run.library_root_id,
+            &plan_hash,
+        )
+        .await?;
+
+        ImportRepository::load_frozen_plan_summary(client, import_run_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "freeze did not produce a frozen plan for run {import_run_id}"
+                ))
+            })
     }
+    .await;
 
-    let progress = ImportRepository::get_review_progress(client, import_run_id).await?;
-    let remaining = progress.total.saturating_sub(progress.decided);
-    if remaining > 0 {
-        return Err(AppError::Internal(format!(
-            "cannot freeze import plan while {remaining} review candidates remain undecided"
-        )));
-    }
+    finish_plan_transaction(client, result, "plan freeze").await
+}
 
-    let all_images =
-        ImportRepository::get_all_import_images_with_album(client, import_run_id).await?;
-    let all_candidates =
-        ImportRepository::get_all_candidates_for_import_plan(client, import_run_id).await?;
-    let albums = ImportRepository::get_albums_for_run(client, import_run_id).await?;
+async fn lock_import_run_for_plan_access(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<(), AppError> {
+    client
+        .query_opt(
+            "SELECT id FROM import_runs WHERE id = $1 FOR UPDATE",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to lock import run: {e}")))?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    Ok(())
+}
 
-    let plan = build_import_plan(
-        import_run_id.to_string(),
-        &all_images,
-        &all_candidates,
-        &albums,
-    );
-
+async fn require_freezable_import_run(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<ImportRunRecord, AppError> {
     let import_run = ImportRepository::get_import_run_by_id(client, import_run_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
 
-    let kept_ids = parse_kept_image_ids(&plan)?;
-    let full_images = ImportRepository::get_import_images_by_ids(client, &kept_ids).await?;
-    let image_by_id: HashMap<Uuid, ImportImageFullRow> =
-        full_images.into_iter().map(|img| (img.id, img)).collect();
-
-    let mut kept_images_by_album: HashMap<Uuid, Vec<ImportImageFullRow>> = HashMap::new();
-    for album in &albums {
-        let album_images: Vec<ImportImageFullRow> = kept_ids
-            .iter()
-            .filter_map(|id| image_by_id.get(id).cloned())
-            .filter(|img| img.import_album_id == album.id)
-            .collect();
-        if !album_images.is_empty() {
-            kept_images_by_album.insert(album.id, album_images);
-        }
+    let review_required = ImportRunState::ReviewRequired.to_string();
+    let ready_to_commit = ImportRunState::ReadyToCommit.to_string();
+    if import_run.state != review_required && import_run.state != ready_to_commit {
+        return Err(AppError::Internal(format!(
+            "cannot freeze import plan for run {import_run_id} in state '{}'; expected {review_required} or {ready_to_commit}",
+            import_run.state,
+        )));
     }
 
-    // Compute the hash from the same draft shape the commit pipeline will
-    // validate against. We build a transient draft via load_draft_plan after
-    // the transactional insert sets state=frozen; but the hash must be
-    // computed BEFORE the insert to match commit's validate_and_hash. So we
-    // compute it from the in-memory kept set the same way build_import_plan
-    // would, via commit_service::compute_plan_hash on a synthesized draft.
-    let draft =
-        synthesize_draft_for_hash(import_run_id, &import_run, &albums, &kept_images_by_album);
-    let plan_hash = crate::services::commit_service::compute_plan_hash(&draft)?;
-
-    ImportRepository::freeze_import_plan_transactionally(
-        client,
-        import_run_id,
-        &albums,
-        &kept_images_by_album,
-        &import_run.policy_version,
-        import_run.library_root_id,
-        &plan_hash,
-    )
-    .await?;
-
-    // Return the frozen summary (re-read from the persisted tables) so the
-    // caller sees exactly what the commit page will see.
-    ImportRepository::load_frozen_plan_summary(client, import_run_id)
-        .await?
-        .ok_or_else(|| {
+    let allowed_album_states = vec![
+        ImportAlbumState::Analyzed.to_string(),
+        ImportAlbumState::ReviewRequired.to_string(),
+    ];
+    let invalid_album = client
+        .query_opt(
+            "SELECT source_name, state
+             FROM import_albums
+             WHERE import_run_id = $1
+               AND NOT (state = ANY($2))
+             ORDER BY source_name
+             LIMIT 1",
+            &[&import_run_id, &allowed_album_states],
+        )
+        .await
+        .map_err(|e| {
             AppError::Internal(format!(
-                "freeze did not produce a frozen plan for run {import_run_id}"
+                "failed to validate album states before freezing import plan: {e}"
             ))
-        })
+        })?;
+
+    if let Some(row) = invalid_album {
+        let source_name: String = row.get("source_name");
+        let state: String = row.get("state");
+        return Err(AppError::Internal(format!(
+            "cannot freeze import plan while album '{source_name}' is in state '{state}'; expected {} or {}",
+            allowed_album_states[0], allowed_album_states[1],
+        )));
+    }
+
+    Ok(import_run)
 }
 
 /// Read the frozen plan summary for the commit-confirm page. Returns None
@@ -288,7 +335,16 @@ pub async fn get_frozen_plan_summary(
     client: &Client,
     import_run_id: Uuid,
 ) -> Result<Option<ImportPlan>, AppError> {
-    ImportRepository::load_frozen_plan_summary(client, import_run_id).await
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin frozen plan read: {e}")))?;
+    let result = async {
+        lock_import_run_for_plan_access(client, import_run_id).await?;
+        ImportRepository::load_frozen_plan_summary(client, import_run_id).await
+    }
+    .await;
+    finish_plan_transaction(client, result, "frozen plan read").await
 }
 
 pub async fn set_plan_album_included(
@@ -297,13 +353,13 @@ pub async fn set_plan_album_included(
     album_id: Uuid,
     included: bool,
 ) -> Result<ImportPlan, AppError> {
-    ensure_plan_editable(client, import_run_id).await?;
     client
         .batch_execute("BEGIN")
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin plan edit: {e}")))?;
 
     let result = async {
+        ensure_plan_editable(client, import_run_id).await?;
         let frozen = require_frozen_plan(client, import_run_id).await?;
         if included {
             include_album_images(client, frozen.plan_id, album_id).await?;
@@ -321,7 +377,7 @@ pub async fn set_plan_album_included(
     .await;
 
     finish_plan_edit_transaction(client, result).await?;
-    ImportRepository::load_frozen_plan_summary(client, import_run_id)
+    get_frozen_plan_summary(client, import_run_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
 }
@@ -333,13 +389,13 @@ pub async fn set_plan_image_included(
     target_album_id: Uuid,
     included: bool,
 ) -> Result<ImportPlan, AppError> {
-    ensure_plan_editable(client, import_run_id).await?;
     client
         .batch_execute("BEGIN")
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin plan edit: {e}")))?;
 
     let result = async {
+        ensure_plan_editable(client, import_run_id).await?;
         let frozen = require_frozen_plan(client, import_run_id).await?;
         if included {
             include_image_in_album(client, frozen.plan_id, image_id, target_album_id).await?;
@@ -360,7 +416,7 @@ pub async fn set_plan_image_included(
     .await;
 
     finish_plan_edit_transaction(client, result).await?;
-    ImportRepository::load_frozen_plan_summary(client, import_run_id)
+    get_frozen_plan_summary(client, import_run_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
 }
@@ -371,7 +427,6 @@ pub async fn move_plan_image(
     image_id: Uuid,
     target_album_id: Uuid,
 ) -> Result<ImportPlan, AppError> {
-    ensure_plan_editable(client, import_run_id).await?;
     let image = ImportRepository::get_import_images_by_ids(client, &[image_id])
         .await?
         .into_iter()
@@ -387,6 +442,24 @@ pub async fn move_plan_image(
 }
 
 async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<(), AppError> {
+    // Every plan editor calls this after BEGIN. The row lock is the per-run
+    // serialization point shared with Commit's short plan-capture
+    // transaction, closing the load/hash/prewrite TOCTOU window.
+    let row = client
+        .query_opt(
+            "SELECT state FROM import_runs WHERE id = $1 FOR UPDATE",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to lock import run for plan edit: {e}")))?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    let run_state: String = row.get("state");
+    if !matches!(run_state.as_str(), "ready_to_commit" | "cancelled") {
+        return Err(AppError::Internal(format!(
+            "cannot edit import plan while run is in state '{run_state}'"
+        )));
+    }
+
     let active_transactions: i64 = client
         .query_one(
             "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
@@ -588,11 +661,22 @@ async fn finish_plan_edit_transaction(
     client: &Client,
     result: Result<(), AppError>,
 ) -> Result<(), AppError> {
+    finish_plan_transaction(client, result, "plan edit").await
+}
+
+async fn finish_plan_transaction<T>(
+    client: &Client,
+    result: Result<T, AppError>,
+    operation: &str,
+) -> Result<T, AppError> {
     match result {
-        Ok(()) => client
-            .batch_execute("COMMIT")
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to commit plan edit: {e}"))),
+        Ok(value) => {
+            client
+                .batch_execute("COMMIT")
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to commit {operation}: {e}")))?;
+            Ok(value)
+        }
         Err(e) => {
             let _ = client.batch_execute("ROLLBACK").await;
             Err(e)
@@ -1829,7 +1913,7 @@ mod tests {
     #[cfg(feature = "real-db-tests")]
     async fn real_review_decision_persists_and_filters_plan() {
         use crate::domain::import_state::{
-            DecodeState, DuplicateScope, ImportImageState, ImportRunState, MatchType,
+            DecodeState, DuplicateScope, ImportImageState, MatchType,
         };
         use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
         use crate::repositories::import_repository::{NewDuplicateCandidate, NewImportImage};
@@ -2014,6 +2098,29 @@ mod tests {
         )
         .await
         .unwrap();
+        let failed_image_id = ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id: album_b_id,
+                source_path: album_b_path.join("broken.png").display().to_string(),
+                relative_path: "album_b/broken.png".to_string(),
+                file_size: 7,
+                modified_at: None,
+                width: None,
+                height: None,
+                format: None,
+                decode_state: DecodeState::Failed,
+                blake3: None,
+                pixel_hash: None,
+                gradient_hash: None,
+                block_hash: None,
+                median_hash: None,
+                fingerprint_version: None,
+                state: ImportImageState::Failed,
+            },
+        )
+        .await
+        .unwrap();
         ImportRepository::insert_duplicate_candidate(
             &client,
             NewDuplicateCandidate {
@@ -2036,20 +2143,77 @@ mod tests {
         )
         .await
         .unwrap();
-        ImportRepository::refresh_album_workflow_summary(&client, album_id)
+        ImportRepository::mark_import_album_analyzing(&client, album_id)
             .await
             .unwrap();
-        ImportRepository::refresh_album_workflow_summary(&client, album_b_id)
+        ImportRepository::finalize_import_album_analysis(&client, album_id)
+            .await
+            .unwrap();
+        ImportRepository::mark_import_album_analyzing(&client, album_b_id)
+            .await
+            .unwrap();
+        ImportRepository::finalize_import_album_analysis(&client, album_b_id)
             .await
             .unwrap();
 
         ImportRepository::update_import_run_state(
             &client,
             import_run_id,
-            &ImportRunState::Completed,
+            &ImportRunState::Analyzing,
         )
         .await
         .unwrap();
+        let error = freeze_import_plan(&client, import_run_id)
+            .await
+            .expect_err("an in-flight run must block plan freezing");
+        assert!(
+            error.to_string().contains("state 'analyzing'"),
+            "expected in-flight run state in freeze error, got: {error}"
+        );
+
+        ImportRepository::update_import_run_state(
+            &client,
+            import_run_id,
+            &ImportRunState::ReviewRequired,
+        )
+        .await
+        .unwrap();
+
+        for invalid_state in [
+            ImportAlbumState::Analyzing,
+            ImportAlbumState::Pending,
+            ImportAlbumState::Failed,
+        ] {
+            ImportRepository::update_import_album_state(&client, album_b_id, &invalid_state)
+                .await
+                .unwrap();
+
+            let error = freeze_import_plan(&client, import_run_id)
+                .await
+                .expect_err("an incomplete album must block plan freezing");
+            let message = error.to_string();
+            assert!(
+                message.contains(&invalid_state.to_string()),
+                "expected invalid album state in freeze error, got: {message}"
+            );
+
+            let plan_count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM import_plans WHERE import_run_id = $1",
+                    &[&import_run_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(plan_count, 0, "rejected freeze must not persist a plan");
+
+            ImportRepository::mark_import_album_analyzing(&client, album_b_id)
+                .await
+                .unwrap();
+            ImportRepository::finalize_import_album_analysis(&client, album_b_id)
+                .await
+                .unwrap();
+        }
 
         let queue = get_review_queue(&client, import_run_id).await.unwrap();
         assert_eq!(queue.len(), 2);
@@ -2106,10 +2270,126 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert!(queue[0].has_decision);
 
-        let plan = generate_import_plan(&client, import_run_id).await.unwrap();
+        let (freeze_client_a, freeze_handle_a) = manager.connect().await.unwrap();
+        let (freeze_client_b, freeze_handle_b) = manager.connect().await.unwrap();
+        let (plan_a, plan_b) = tokio::join!(
+            generate_import_plan(&freeze_client_a, import_run_id),
+            generate_import_plan(&freeze_client_b, import_run_id),
+        );
+        drop(freeze_client_a);
+        drop(freeze_client_b);
+        freeze_handle_a.abort();
+        freeze_handle_b.abort();
+        let plan = plan_a.expect("first concurrent freeze must succeed");
+        let concurrent_plan = plan_b.expect("second concurrent freeze must reuse the frozen plan");
+        assert_eq!(concurrent_plan.total_images, plan.total_images);
+        assert_eq!(concurrent_plan.excluded_count, plan.excluded_count);
+        assert_eq!(concurrent_plan.kept_images, plan.kept_images);
+        let frozen_plan_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_plans WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            frozen_plan_count, 1,
+            "concurrent freeze calls must persist exactly one plan"
+        );
+        assert_eq!(plan.total_images, 4);
+        assert!(
+            plan.albums
+                .iter()
+                .flat_map(|album| &album.images)
+                .all(|image| image.image_id != failed_image_id.to_string()),
+            "failed images without a fingerprint must not enter the frozen plan"
+        );
         assert_eq!(plan.kept_images.len(), 1);
         assert_eq!(plan.kept_images[0].image_id, source_id.to_string());
         assert_eq!(plan.excluded_count, 3);
+
+        let reloaded_plan = get_frozen_plan_summary(&client, import_run_id)
+            .await
+            .unwrap()
+            .expect("generated plan must be reloadable");
+        assert_eq!(reloaded_plan.total_images, plan.total_images);
+        assert_eq!(reloaded_plan.excluded_count, plan.excluded_count);
+        assert_eq!(reloaded_plan.kept_images, plan.kept_images);
+
+        // Commit and plan edits serialize on the import_run row. Simulate the
+        // short Commit capture transaction holding that lock and publishing
+        // the guarded state transition; a concurrent editor must wait, then
+        // reject without changing persisted plan rows.
+        let plan_image_count_before: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_plan_images ipi
+                 JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
+                 JOIN import_plans ip ON ip.id = ipa.plan_id
+                 WHERE ip.import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        client.batch_execute("BEGIN").await.unwrap();
+        client
+            .query_one(
+                "SELECT id FROM import_runs WHERE id = $1 FOR UPDATE",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE import_runs SET state = 'committing' WHERE id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap();
+
+        let (edit_client, edit_handle) = manager.connect().await.unwrap();
+        let mut edit_task = tokio::spawn(async move {
+            let result =
+                set_plan_album_included(&edit_client, import_run_id, album_id, false).await;
+            drop(edit_client);
+            edit_handle.abort();
+            result
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut edit_task)
+                .await
+                .is_err(),
+            "plan editor must block while Commit holds the run lock"
+        );
+        client.batch_execute("COMMIT").await.unwrap();
+        let edit_error = edit_task
+            .await
+            .expect("plan edit task panicked")
+            .expect_err("plan edit must reject the committed 'committing' state");
+        assert!(edit_error.to_string().contains("state 'committing'"));
+        let plan_image_count_after: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_plan_images ipi
+                 JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
+                 JOIN import_plans ip ON ip.id = ipa.plan_id
+                 WHERE ip.import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(plan_image_count_after, plan_image_count_before);
+
+        let reloaded_while_committing = freeze_import_plan(&client, import_run_id)
+            .await
+            .expect("an existing frozen plan must remain readable after Commit advances the run");
+        assert_eq!(reloaded_while_committing.total_images, plan.total_images);
+        assert_eq!(
+            reloaded_while_committing.excluded_count,
+            plan.excluded_count
+        );
+        assert_eq!(reloaded_while_committing.kept_images, plan.kept_images);
 
         drop(client);
         db_handle.abort();

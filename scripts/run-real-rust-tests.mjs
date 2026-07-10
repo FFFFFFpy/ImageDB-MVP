@@ -30,18 +30,24 @@ if (!env.IMAGEDB_POSTGRES_BIN) {
 const cargoManifest = 'apps/desktop/src-tauri/Cargo.toml';
 const cargoCommand = 'cargo';
 const suites = [
+  { name: 'album workflow migration repair', filter: 'real_migration_0012_' },
   { name: 'scan persistence', filter: 'real_scan_' },
   { name: 'source snapshot verification', filter: 'real_snapshot_' },
   { name: 'review persistence', filter: 'real_review_' },
   { name: 'external empty database init', filter: 'real_external_empty_database_' },
+  {
+    name: 'external missing database creation',
+    filter: 'real_external_missing_database_is_created_during_initialize',
+  },
   { name: 'external unreachable fallback', filter: 'real_external_unreachable_fallback_' },
+  { name: 'external query timeout', filter: 'real_external_query_timeout_' },
   { name: 'external existing database compatibility', filter: 'real_external_existing_database_' },
   { name: 'external postgres migration', filter: 'real_migrate_managed_to_external_' },
   { name: 'file transaction protocol', filter: 'real_protocol_' },
   { name: 'formal commit pipeline', filter: 'real_commit_full_pipeline' },
   {
-    name: 'M9 public command main chain',
-    filter: 'm9_public_command_main_chain_first_run_to_completed_import',
+    name: 'M9 command, relaunch, review, freeze, and run-selection invariants',
+    filter: 'm9_main_chain_integration',
   },
   {
     name: 'M9 diagnostics export',
@@ -69,7 +75,48 @@ const suites = [
 // The pgvector lifecycle test was previously gated behind an env var because
 // its migration-version assertion was stale (asserted 0007 after migration
 // 0008 landed). That assertion is now fixed, so it runs by default.
-suites.unshift({ name: 'managed PostgreSQL lifecycle', filter: 'real_pgvector_full_lifecycle' });
+suites.unshift(
+  { name: 'managed PostgreSQL lifecycle and partial-init recovery', filter: 'real_pgvector_' },
+  { name: 'packaged runtime clean bootstrap', filter: 'real_packaged_runtime_clean_bootstrap' },
+);
+
+// Cargo exits successfully when a filter matches zero tests. Build the test
+// inventory once with every real-test feature enabled and fail closed if a
+// suite name drifts, is typoed, or is compiled out.
+const inventory = spawnSync(
+  cargoCommand,
+  [
+    'test',
+    '--manifest-path',
+    cargoManifest,
+    '--features',
+    'real-db-tests,fail-injection',
+    '--lib',
+    '--',
+    '--list',
+  ],
+  { cwd: repoRoot, env, encoding: 'utf8' },
+);
+if (inventory.error) {
+  console.error(inventory.error.message);
+  process.exit(1);
+}
+if (inventory.status !== 0) {
+  process.stderr.write(inventory.stderr ?? '');
+  process.exit(inventory.status ?? 1);
+}
+const testNames = (inventory.stdout ?? '')
+  .split(/\r?\n/)
+  .filter((line) => line.endsWith(': test'))
+  .map((line) => line.slice(0, -': test'.length));
+for (const suite of suites) {
+  if (!testNames.some((name) => name.includes(suite.filter))) {
+    console.error(
+      `[real-rust] ABORT: suite filter '${suite.filter}' (${suite.name}) matches zero tests`,
+    );
+    process.exit(1);
+  }
+}
 
 for (const suite of suites) {
   const features = suite.features ?? 'real-db-tests';

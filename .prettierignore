@@ -13,3 +13,6 @@ node_modules/
 
 # pnpm / build cache.
 apps/desktop/tsconfig.tsbuildinfo
+
+# Local design-review plugin cache.
+.impeccable/

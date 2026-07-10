@@ -1,4 +1,4 @@
-use crate::domain::import_state::{ImportRunState, ScanProgress, ScanSourceInfo};
+use crate::domain::import_state::{ScanProgress, ScanSourceInfo};
 use crate::repositories::import_repository::{
     ImportAlbumStatus, ImportRepository, ImportRunDashboard,
 };
@@ -248,6 +248,18 @@ pub async fn retry_import_album(
     state: State<'_, AppState>,
     album_id: String,
 ) -> Result<ImportAlbumStatus, String> {
+    // Keep the scan-state guard until the retry transaction commits. This
+    // closes the check/start race: start_scan must acquire the same guard and
+    // therefore cannot begin while retry is deleting partial album rows.
+    let scan_state = state.scan_state.lock().await;
+    if scan_state
+        .active
+        .as_ref()
+        .is_some_and(|handle| !handle.task.is_finished())
+    {
+        return Err("Cannot retry an album while a scan is running".to_string());
+    }
+
     let album_id = parse_uuid(&album_id)?;
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
@@ -266,13 +278,15 @@ pub async fn retry_import_album(
     .await
     .map_err(|e| format!("{e}"));
     handle.abort();
+    drop(scan_state);
     result
 }
 
 #[tauri::command]
-pub async fn resume_import_run(
+pub async fn resume_import_run<R: Runtime>(
     state: State<'_, AppState>,
     import_run_id: String,
+    app_handle: tauri::AppHandle<R>,
 ) -> Result<String, String> {
     let run_id = parse_uuid(&import_run_id)?;
     let (client, handle) = {
@@ -285,14 +299,26 @@ pub async fn resume_import_run(
             .ok_or_else(|| {
                 crate::error::AppError::Internal(format!("import run {run_id} was not found"))
             })?;
-        ImportRepository::mark_stale_analyzing_albums(&client, run_id).await?;
-        ImportRepository::update_import_run_state(&client, run_id, &ImportRunState::Analyzing)
-            .await?;
+        if !matches!(
+            run.state.as_str(),
+            "analyzing" | "scanning" | "fingerprinting" | "cancelled" | "failed"
+        ) {
+            return Err(crate::error::AppError::Internal(format!(
+                "import run {run_id} is not resumable from state '{}'",
+                run.state
+            )));
+        }
         Ok::<String, crate::error::AppError>(run.source_root)
     }
     .await
     .map_err(|e| format!("{e}"));
     handle.abort();
     let source_root = result?;
-    start_scan_for_state_inner(&state, source_root, Some(run_id)).await
+    let result = start_scan_for_state_inner(&state, source_root, Some(run_id)).await?;
+    let event_tracker = {
+        let scan_state = state.scan_state.lock().await;
+        scan_state.progress_tracker.clone()
+    };
+    spawn_scan_progress_events(event_tracker, app_handle);
+    Ok(result)
 }

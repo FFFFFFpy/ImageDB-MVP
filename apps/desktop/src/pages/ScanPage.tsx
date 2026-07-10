@@ -118,6 +118,10 @@ function canResumeRun(run: ImportRunDashboard | null): boolean {
   return run.pending_albums > 0 || run.analyzing_albums > 0;
 }
 
+function normalizedSourcePath(path: string): string {
+  return path.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLocaleLowerCase();
+}
+
 export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProps) {
   const queryClient = useQueryClient();
   const [sourcePath, setSourcePath] = useState(() => loadScanDraft().sourcePath);
@@ -130,8 +134,10 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [scanEvent, setScanEvent] = useState<ScanProgressEvent | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [globalScanBusyRunId, setGlobalScanBusyRunId] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const eventListenerRef = useRef<(() => void) | null>(null);
+  const validationRequestRef = useRef(0);
 
   const runsQuery = useQuery({
     queryKey: ['import-runs-dashboard'],
@@ -165,7 +171,15 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
 
   useEffect(() => {
     if (initialImportRunId) {
+      validationRequestRef.current += 1;
       setActiveImportRunId(initialImportRunId);
+      setScanEvent(null);
+      setProgress(null);
+      setIsScanning(false);
+      setGlobalScanBusyRunId(null);
+      setIsValidating(false);
+    } else {
+      setActiveImportRunId(null);
       setScanEvent(null);
       setProgress(null);
       setIsScanning(false);
@@ -175,6 +189,12 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   useEffect(() => {
     if (activeRun?.source_root) {
       setSourcePath(activeRun.source_root);
+      setSourceInfo((current) =>
+        current &&
+        normalizedSourcePath(current.path) === normalizedSourcePath(activeRun.source_root)
+          ? current
+          : null,
+      );
     }
   }, [activeRun?.source_root]);
 
@@ -194,10 +214,20 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
       try {
         const p = await api.getScanProgress();
         if (cancelled) return;
-        if (p && p.state && p.state !== 'idle' && p.import_run_id) {
+        if (p && p.state && p.state !== 'idle') {
+          const terminal = isTerminalScanState(p.state);
+          // A Dashboard-selected run remains authoritative. An older terminal
+          // tracker is ignored; a different live scan is recorded only as a
+          // global conflict so it cannot replace the selected run.
+          if (initialImportRunId && p.import_run_id !== initialImportRunId) {
+            if (!terminal) setGlobalScanBusyRunId(p.import_run_id ?? '正在初始化');
+            return;
+          }
+          if (!initialImportRunId && terminal) return;
           setProgress(p);
-          setActiveImportRunId(p.import_run_id);
-          setIsScanning(!isTerminalScanState(p.state));
+          if (p.import_run_id) setActiveImportRunId(p.import_run_id);
+          setIsScanning(!terminal);
+          setGlobalScanBusyRunId(null);
         }
       } catch {
         // No scan in flight.
@@ -206,9 +236,11 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [initialImportRunId]);
 
   const attachScanListener = useCallback(async () => {
+    eventListenerRef.current?.();
+    eventListenerRef.current = null;
     const unlisten = await listen<ScanProgressEvent>('scan-progress', (event) => {
       setScanEvent(event.payload);
       if (event.payload.import_run_id) {
@@ -218,16 +250,17 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
         setIsScanning(false);
       }
     });
-    eventListenerRef.current?.();
     eventListenerRef.current = unlisten;
     return unlisten;
   }, []);
 
   const handleValidate = useCallback(async () => {
-    if (!sourcePath.trim()) {
+    const requestedPath = sourcePath.trim();
+    if (!requestedPath) {
       setValidationError('请输入源目录路径');
       return;
     }
+    const requestId = ++validationRequestRef.current;
     setIsValidating(true);
     setValidationError(null);
     setSourceInfo(null);
@@ -235,41 +268,58 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
     setScanEvent(null);
     setProgress(null);
     try {
-      const info = await api.validateSourceDirectory(sourcePath.trim());
+      const info = await api.validateSourceDirectory(requestedPath);
+      if (validationRequestRef.current !== requestId) return;
       setSourceInfo(info);
       if (info.album_count === 0) {
         setValidationError('未找到图集（一级子目录）。');
       }
     } catch (e) {
+      if (validationRequestRef.current !== requestId) return;
       setValidationError(String(e));
     } finally {
-      setIsValidating(false);
+      if (validationRequestRef.current === requestId) setIsValidating(false);
     }
   }, [sourcePath]);
 
   const handleStartScan = useCallback(async () => {
-    if (!sourceInfo || sourceInfo.album_count === 0) return;
+    if (
+      !sourceInfo ||
+      sourceInfo.album_count === 0 ||
+      normalizedSourcePath(sourceInfo.path) !== normalizedSourcePath(sourcePath) ||
+      activeImportRunId ||
+      globalScanBusyRunId
+    ) {
+      return;
+    }
     setScanError(null);
     setActiveImportRunId(null);
+    setScanEvent(null);
+    setProgress(null);
     setIsScanning(true);
 
-    const unlisten = await attachScanListener();
+    let unlisten: (() => void) | null = null;
     try {
+      unlisten = await attachScanListener();
       await api.startScan(sourcePath.trim());
     } catch (e) {
       setScanError(String(e));
       setIsScanning(false);
-      unlisten();
+      unlisten?.();
+      if (eventListenerRef.current === unlisten) eventListenerRef.current = null;
     }
-  }, [attachScanListener, sourceInfo, sourcePath]);
+  }, [activeImportRunId, attachScanListener, globalScanBusyRunId, sourceInfo, sourcePath]);
 
   const handleResumeScan = useCallback(async () => {
-    if (!activeImportRunId) return;
+    if (!activeImportRunId || globalScanBusyRunId) return;
     setScanError(null);
+    setScanEvent(null);
+    setProgress(null);
     setIsScanning(true);
 
-    const unlisten = await attachScanListener();
+    let unlisten: (() => void) | null = null;
     try {
+      unlisten = await attachScanListener();
       await api.resumeImportRun(activeImportRunId);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
@@ -279,9 +329,10 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
     } catch (e) {
       setScanError(String(e));
       setIsScanning(false);
-      unlisten();
+      unlisten?.();
+      if (eventListenerRef.current === unlisten) eventListenerRef.current = null;
     }
-  }, [activeImportRunId, attachScanListener, queryClient]);
+  }, [activeImportRunId, attachScanListener, globalScanBusyRunId, queryClient]);
 
   const handleCancelScan = useCallback(async () => {
     try {
@@ -292,12 +343,29 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   }, []);
 
   useEffect(() => {
-    if (!isScanning) return;
+    if (!isScanning && !globalScanBusyRunId) return;
     const interval = setInterval(async () => {
       try {
         const p = await api.getScanProgress();
+        const terminal = isTerminalScanState(p.state);
+        if (p.state === 'idle' && !p.import_run_id && !isScanning) {
+          // The global tracker has returned to its empty state, so a scan
+          // that belonged to another run is no longer blocking this page.
+          setGlobalScanBusyRunId(null);
+          return;
+        }
+        if (activeImportRunId && p.import_run_id && p.import_run_id !== activeImportRunId) {
+          setGlobalScanBusyRunId(terminal ? null : p.import_run_id);
+          if (!terminal) setIsScanning(false);
+          return;
+        }
+        if (activeImportRunId && !p.import_run_id && !terminal && !isScanning) {
+          setGlobalScanBusyRunId('正在初始化');
+          return;
+        }
         setProgress(p);
         if (p.import_run_id) setActiveImportRunId(p.import_run_id);
+        setGlobalScanBusyRunId(null);
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
           queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
@@ -305,7 +373,10 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
             ? queryClient.invalidateQueries({ queryKey: ['import-run-albums', p.import_run_id] })
             : Promise.resolve(),
         ]);
-        if (isTerminalScanState(p.state)) {
+        if (terminal) {
+          // A missed terminal event must not let an older running event mask
+          // the authoritative polled terminal state.
+          setScanEvent(null);
           setIsScanning(false);
         }
       } catch {
@@ -313,13 +384,17 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [isScanning, queryClient]);
+  }, [activeImportRunId, globalScanBusyRunId, isScanning, queryClient]);
 
   const displayProgress = scanEvent ?? progress;
-  const isFinished = isTerminalScanState(displayProgress?.state);
+  const isFinished = !isScanning && isTerminalScanState(displayProgress?.state);
   const nextRoute = nextRouteForScanState(displayProgress?.state);
   const nextActionLabel = nextActionLabelForScanState(displayProgress?.state);
   const albumRows = albumsQuery.data ?? [];
+  const isAnyScanBusy = isScanning || globalScanBusyRunId !== null;
+  const sourceInfoMatchesPath =
+    sourceInfo !== null &&
+    normalizedSourcePath(sourceInfo.path) === normalizedSourcePath(sourcePath);
   const albumCounts = activeRun
     ? {
         total: activeRun.total_albums,
@@ -343,6 +418,8 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
             placeholder="输入源目录路径，例如 D:\\Photos\\2024"
             value={sourcePath}
             onChange={(e) => {
+              validationRequestRef.current += 1;
+              setIsValidating(false);
               setSourcePath(e.target.value);
               setSourceInfo(null);
               setValidationError(null);
@@ -350,7 +427,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
               setScanEvent(null);
               setProgress(null);
             }}
-            disabled={isScanning}
+            disabled={isScanning || isValidating}
           />
           <button
             className="btn-secondary"
@@ -361,7 +438,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
           </button>
         </div>
         {validationError && <p className="status-error">{validationError}</p>}
-        {sourceInfo && sourceInfo.album_count > 0 && (
+        {sourceInfo && sourceInfo.album_count > 0 && sourceInfoMatchesPath && (
           <div className="scan-source-info">
             <p>
               找到 <strong>{sourceInfo.album_count}</strong> 个图集：
@@ -372,17 +449,30 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
         )}
       </section>
 
-      {sourceInfo && sourceInfo.album_count > 0 && !isScanning && !isFinished && (
-        <section className="scan-action-section">
-          <button className="btn-primary" onClick={handleStartScan}>
-            开始分析
-          </button>
-        </section>
-      )}
+      {sourceInfo &&
+        sourceInfo.album_count > 0 &&
+        sourceInfoMatchesPath &&
+        !activeImportRunId &&
+        !isScanning &&
+        !isFinished && (
+          <section className="scan-action-section">
+            <button
+              className="btn-primary"
+              onClick={handleStartScan}
+              disabled={globalScanBusyRunId !== null}
+            >
+              开始分析
+            </button>
+          </section>
+        )}
 
       {activeRun && canResumeRun(activeRun) && !isScanning && (
         <section className="scan-action-section">
-          <button className="btn-primary" onClick={handleResumeScan}>
+          <button
+            className="btn-primary"
+            onClick={handleResumeScan}
+            disabled={globalScanBusyRunId !== null}
+          >
             继续分析
           </button>
           <p className="status-card-detail">
@@ -392,6 +482,18 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
       )}
 
       {scanError && <p className="status-error">{scanError}</p>}
+      {retryAlbum.isError && <p className="status-error">重试失败：{String(retryAlbum.error)}</p>}
+      {globalScanBusyRunId && (
+        <p className="status-warn">
+          另一个分析任务正在运行（{globalScanBusyRunId}）；当前任务的继续、重试和新建操作已暂停。
+        </p>
+      )}
+      {runsQuery.isError && (
+        <p className="status-error">加载导入任务失败：{String(runsQuery.error)}</p>
+      )}
+      {activeImportRunId && albumsQuery.isError && (
+        <p className="status-error">加载图集状态失败：{String(albumsQuery.error)}</p>
+      )}
 
       {activeRun ? (
         <section className="scan-progress-section">
@@ -454,7 +556,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
                         <button
                           className="btn-secondary"
                           onClick={() => retryAlbum.mutate(album.id)}
-                          disabled={retryAlbum.isPending}
+                          disabled={isAnyScanBusy || retryAlbum.isPending}
                         >
                           重试
                         </button>
@@ -467,7 +569,17 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
                     </td>
                   </tr>
                 ))}
-                {albumRows.length === 0 && (
+                {albumsQuery.isPending && (
+                  <tr>
+                    <td colSpan={7}>正在加载图集状态...</td>
+                  </tr>
+                )}
+                {albumsQuery.isError && (
+                  <tr>
+                    <td colSpan={7}>图集状态加载失败，请稍后重试。</td>
+                  </tr>
+                )}
+                {albumsQuery.isSuccess && albumRows.length === 0 && (
                   <tr>
                     <td colSpan={7}>暂无图集状态。验证源目录后开始分析。</td>
                   </tr>
@@ -483,7 +595,13 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
             <table className="data-table">
               <tbody>
                 <tr>
-                  <td>暂无图集状态。验证源目录后开始分析。</td>
+                  <td>
+                    {runsQuery.isPending
+                      ? '正在加载导入任务...'
+                      : runsQuery.isError
+                        ? '导入任务加载失败，请稍后重试。'
+                        : '暂无图集状态。验证源目录后开始分析。'}
+                  </td>
                 </tr>
               </tbody>
             </table>

@@ -13,6 +13,7 @@
 //!       real_protocol_ -- --ignored --test-threads=1
 #![cfg(test)]
 #![cfg(feature = "real-db-tests")]
+use crate::domain::import_state::ImportRunState;
 use crate::domain::state_machine::{FileOpState, TransactionState};
 use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 use crate::repositories::import_repository::ImportRepository;
@@ -473,6 +474,9 @@ async fn real_protocol_tampered_plan_hash_rejected() {
     ImportRepository::update_import_plan_state(&client, plan_id, &PlanState::Frozen)
         .await
         .unwrap();
+    ImportRepository::update_import_run_state(&client, run_id, &ImportRunState::ReadyToCommit)
+        .await
+        .unwrap();
     drop(client);
     db_handle.abort();
 
@@ -818,6 +822,9 @@ async fn real_protocol_manifest_path_is_published() {
         .await
         .unwrap();
     ImportRepository::update_import_plan_state(&client, plan_id, &PlanState::Frozen)
+        .await
+        .unwrap();
+    ImportRepository::update_import_run_state(&client, run_id, &ImportRunState::ReadyToCommit)
         .await
         .unwrap();
     drop(client);

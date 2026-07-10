@@ -29,12 +29,21 @@
 - [x] Commit 仍保持 run 级 frozen plan。
 - [x] Commit 不临场重算导入计划。
 - [x] Recovery / file transaction schema 未被重写。
+- [x] Scan 未结束或有失败图集时不能冻结部分计划。
+- [x] File transaction 与全部 operations 原子预写；Recovery 拒绝不完整预写证据。
 
 ## 验证
 
-- [ ] pnpm format:check
+- [x] pnpm format:check
 - [x] pnpm typecheck
 - [x] pnpm test:unit
 - [x] pnpm rust:test
 - [x] pnpm rust:clippy
 - [x] pnpm rust:test:real
+- [x] pnpm build
+- [x] pnpm release:verify-artifacts
+- [x] pnpm release:install-gate
+- [x] pnpm release:dataset
+- [x] pnpm release:performance
+
+2026-07-10 自动验证结果：42 项前端测试、209 项 Rust 默认测试通过（3 项真实测试按设计 ignored）；`rust:test:real` 的 21 组、95 项真实数据库 / 文件系统 / 故障注入测试全部通过。安装门禁覆盖 silent install、Unicode/空格路径下 initdb、严格使用安装目录内 PostgreSQL 18.4 / pgvector 0.8.3、迁移到 `0012_album_workflow_repair`、主窗口关闭触发有界停库、同版本覆盖安装、silent uninstall 和安装目录完全消失；本机已有 `%LOCALAPPDATA%/ImageDB` 用户数据，因此默认数据目录卸载哨兵按安全策略跳过，隔离 app-data 保留已验证。验收数据集为 8 个源图集、44 个源文件和 1 张历史图。120 图性能门禁总耗时 6.422 秒，scan 55.17 images/s，commit 148.88 images/s。以上自动验证不替代仍未勾选的人工交互验收项，也不替代 clean Windows 默认数据目录保留签字。

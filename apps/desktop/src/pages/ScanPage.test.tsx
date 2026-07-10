@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import type { ImportAlbumStatus, ImportRunDashboard } from '../lib/ipc/types';
+import type { ImportAlbumStatus, ImportRunDashboard, ScanProgress } from '../lib/ipc/types';
 import {
   isTerminalScanState,
   nextActionLabelForScanState,
@@ -83,7 +83,7 @@ const mockApi = vi.hoisted(() => ({
       last_error_message: null,
     }),
   ),
-  getScanProgress: vi.fn(() =>
+  getScanProgress: vi.fn((): Promise<ScanProgress> =>
     Promise.resolve({
       state: 'idle',
       import_run_id: null,
@@ -102,12 +102,14 @@ const mockApi = vi.hoisted(() => ({
   cancelScan: vi.fn(),
 }));
 
+const mockListen = vi.hoisted(() => vi.fn(() => Promise.resolve(() => undefined)));
+
 vi.mock('../lib/ipc/api', () => ({
   api: mockApi,
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn(() => Promise.resolve(() => undefined)),
+  listen: mockListen,
 }));
 
 function renderScanPage(onNavigate = vi.fn(), initialImportRunId: string | null = 'run-1') {
@@ -115,6 +117,7 @@ function renderScanPage(onNavigate = vi.fn(), initialImportRunId: string | null 
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return {
+    client,
     onNavigate,
     ...render(
       <QueryClientProvider client={client}>
@@ -127,6 +130,7 @@ function renderScanPage(onNavigate = vi.fn(), initialImportRunId: string | null 
 beforeEach(() => {
   window.localStorage.clear();
   vi.clearAllMocks();
+  mockListen.mockImplementation(() => Promise.resolve(() => undefined));
 });
 
 afterEach(() => {
@@ -162,6 +166,28 @@ describe('ScanPage state routing', () => {
 });
 
 describe('ScanPage album workflow', () => {
+  test('keeps an explicitly selected run instead of restoring an older global tracker run', async () => {
+    mockApi.getScanProgress.mockResolvedValueOnce({
+      state: 'cancelled',
+      import_run_id: 'run-old',
+      current_stage: 'cancelled',
+      current_album: null,
+      processed_images: 4,
+      total_albums: 1,
+      total_images: 4,
+      duplicate_count: 0,
+      error_count: 0,
+      errors: [],
+    });
+
+    renderScanPage(vi.fn(), 'run-1');
+
+    expect(await screen.findByText('review-album')).toBeInTheDocument();
+    expect(mockApi.getImportRunAlbums).toHaveBeenCalledWith('run-1');
+    expect(mockApi.getScanProgress).toHaveBeenCalledTimes(1);
+    expect(mockApi.getImportRunAlbums).not.toHaveBeenCalledWith('run-old');
+  });
+
   test('does not show stale latest-run albums until a run is active', async () => {
     renderScanPage(vi.fn(), null);
 
@@ -198,6 +224,29 @@ describe('ScanPage album workflow', () => {
     expect(mockApi.startScan).not.toHaveBeenCalled();
   });
 
+  test('clears stale terminal controls immediately when resuming a run', async () => {
+    mockApi.getScanProgress.mockResolvedValueOnce({
+      state: 'cancelled',
+      import_run_id: 'run-1',
+      current_stage: 'cancelled',
+      current_album: null,
+      processed_images: 6,
+      total_albums: 3,
+      total_images: 12,
+      duplicate_count: 2,
+      error_count: 0,
+      errors: [],
+    });
+
+    renderScanPage(vi.fn(), 'run-1');
+
+    expect(await screen.findByRole('button', { name: '重置' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '继续分析' }));
+
+    await waitFor(() => expect(mockApi.resumeImportRun).toHaveBeenCalledWith('run-1'));
+    expect(screen.queryByRole('button', { name: '重置' })).not.toBeInTheDocument();
+  });
+
   test('shows retry for failed albums and review only for albums with candidates', async () => {
     const { onNavigate } = renderScanPage();
 
@@ -214,6 +263,218 @@ describe('ScanPage album workflow', () => {
     expect(
       within(screen.getByText('done-album').closest('tr')!).queryAllByRole('button'),
     ).toHaveLength(0);
+  });
+
+  test('shows the active controls and disables retry while the selected run is scanning', async () => {
+    mockApi.getScanProgress.mockResolvedValueOnce({
+      state: 'running',
+      import_run_id: 'run-1',
+      current_stage: 'analyzing',
+      current_album: 'done-album',
+      processed_images: 2,
+      total_albums: 3,
+      total_images: 12,
+      duplicate_count: 0,
+      error_count: 0,
+      errors: [],
+    });
+
+    renderScanPage(vi.fn(), 'run-1');
+
+    const failedRow = (await screen.findByText('failed-album')).closest('tr');
+    expect(failedRow).not.toBeNull();
+    expect(within(failedRow!).getByRole('button', { name: '重试' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '取消扫描' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '继续分析' })).not.toBeInTheDocument();
+    expect(mockApi.retryImportAlbum).not.toHaveBeenCalled();
+  });
+
+  test('keeps the selected run visible but blocks its actions while another run is scanning', async () => {
+    mockApi.getScanProgress.mockResolvedValueOnce({
+      state: 'running',
+      import_run_id: 'run-other',
+      current_stage: 'analyzing',
+      current_album: 'other-album',
+      processed_images: 2,
+      total_albums: 4,
+      total_images: 20,
+      duplicate_count: 0,
+      error_count: 0,
+      errors: [],
+    });
+
+    renderScanPage(vi.fn(), 'run-1');
+
+    const failedRow = (await screen.findByText('failed-album')).closest('tr');
+    expect(failedRow).not.toBeNull();
+    expect(mockApi.getImportRunAlbums).toHaveBeenCalledWith('run-1');
+    expect(screen.getByText(/另一个分析任务正在运行（run-other）/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '继续分析' })).toBeDisabled();
+    expect(within(failedRow!).getByRole('button', { name: '重试' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '取消扫描' })).not.toBeInTheDocument();
+  });
+
+  test('clears the other-run lock when the global tracker returns to idle', async () => {
+    let pollScanProgress: (() => Promise<void>) | null = null;
+    const nativeSetInterval = globalThis.setInterval;
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (delay === 2000) {
+        pollScanProgress = handler as () => Promise<void>;
+        return 123 as unknown as ReturnType<typeof setInterval>;
+      }
+      return nativeSetInterval(handler, delay, ...args);
+    }) as typeof setInterval);
+    mockApi.getScanProgress
+      .mockResolvedValueOnce({
+        state: 'running',
+        import_run_id: 'run-other',
+        current_stage: 'analyzing',
+        current_album: 'other-album',
+        processed_images: 2,
+        total_albums: 4,
+        total_images: 20,
+        duplicate_count: 0,
+        error_count: 0,
+        errors: [],
+      })
+      .mockResolvedValueOnce({
+        state: 'idle',
+        import_run_id: null,
+        current_stage: 'idle',
+        current_album: null,
+        processed_images: 0,
+        total_albums: 0,
+        total_images: 0,
+        duplicate_count: 0,
+        error_count: 0,
+        errors: [],
+      });
+
+    try {
+      renderScanPage(vi.fn(), 'run-1');
+
+      const failedRow = (await screen.findByText('failed-album')).closest('tr');
+      expect(failedRow).not.toBeNull();
+      expect(screen.getByText(/另一个分析任务正在运行（run-other）/)).toBeInTheDocument();
+      await waitFor(() => expect(pollScanProgress).not.toBeNull());
+
+      await act(async () => {
+        await pollScanProgress!();
+      });
+
+      await waitFor(() =>
+        expect(screen.queryByText(/另一个分析任务正在运行/)).not.toBeInTheDocument(),
+      );
+      expect(screen.getByRole('button', { name: '继续分析' })).toBeEnabled();
+      expect(within(failedRow!).getByRole('button', { name: '重试' })).toBeEnabled();
+    } finally {
+      intervalSpy.mockRestore();
+    }
+  });
+
+  test('recovers the resume controls when scan event listener registration fails', async () => {
+    mockListen.mockRejectedValueOnce(new Error('listen failed'));
+    renderScanPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: '继续分析' }));
+
+    expect(await screen.findByText('Error: listen failed')).toBeInTheDocument();
+    expect(mockApi.resumeImportRun).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '继续分析' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '取消扫描' })).not.toBeInTheDocument();
+  });
+
+  test('shows an album query failure instead of presenting it as an empty result', async () => {
+    mockApi.getImportRunAlbums.mockRejectedValueOnce(new Error('albums unavailable'));
+    renderScanPage();
+
+    expect(
+      await screen.findByText('加载图集状态失败：Error: albums unavailable'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('图集状态加载失败，请稍后重试。')).toBeInTheDocument();
+    expect(screen.queryByText('暂无图集状态。验证源目录后开始分析。')).not.toBeInTheDocument();
+  });
+
+  test('shows a run query failure instead of presenting it as an empty result', async () => {
+    mockApi.getImportRunsDashboard.mockRejectedValueOnce(new Error('runs unavailable'));
+    renderScanPage(vi.fn(), null);
+
+    expect(
+      await screen.findByText('加载导入任务失败：Error: runs unavailable'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('导入任务加载失败，请稍后重试。')).toBeInTheDocument();
+    expect(screen.queryByText('暂无图集状态。验证源目录后开始分析。')).not.toBeInTheDocument();
+  });
+
+  test('does not reuse validated source details from an older draft for a selected run', async () => {
+    window.localStorage.setItem(
+      'imagedb.scan.draft',
+      JSON.stringify({
+        sourcePath: 'D:/Old',
+        sourceInfo: {
+          path: 'D:/Old',
+          albums: ['old-draft-album'],
+          album_count: 1,
+        },
+      }),
+    );
+
+    renderScanPage(vi.fn(), 'run-1');
+
+    expect(await screen.findByText('review-album')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toHaveValue('D:/Photos');
+    expect(screen.queryByText(/old-draft-album/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始分析' })).not.toBeInTheDocument();
+  });
+
+  test('ignores a late validation result after a dashboard run is selected', async () => {
+    let resolveValidation!: (value: {
+      path: string;
+      albums: string[];
+      album_count: number;
+    }) => void;
+    mockApi.validateSourceDirectory.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveValidation = resolve;
+        }),
+    );
+    window.localStorage.setItem(
+      'imagedb.scan.draft',
+      JSON.stringify({ sourcePath: 'D:/Old', sourceInfo: null }),
+    );
+
+    const view = renderScanPage(vi.fn(), null);
+    fireEvent.click(await screen.findByRole('button', { name: '验证' }));
+    expect(screen.getByRole('textbox')).toBeDisabled();
+
+    view.rerender(
+      <QueryClientProvider client={view.client}>
+        <ScanPage initialImportRunId="run-1" onNavigate={view.onNavigate} />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByDisplayValue('D:/Photos')).toBeInTheDocument();
+
+    resolveValidation({ path: 'D:/Old', albums: ['late-old-album'], album_count: 1 });
+
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('D:/Photos'));
+    expect(screen.queryByText(/late-old-album/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始分析' })).not.toBeInTheDocument();
+  });
+
+  test('shows retry failures instead of silently ignoring them', async () => {
+    mockApi.retryImportAlbum.mockRejectedValueOnce(new Error('retry failed'));
+    renderScanPage();
+
+    const failedRow = (await screen.findByText('failed-album')).closest('tr');
+    expect(failedRow).not.toBeNull();
+    fireEvent.click(within(failedRow!).getByRole('button', { name: '重试' }));
+
+    expect(await screen.findByText('重试失败：Error: retry failed')).toBeInTheDocument();
   });
 
   test('refetches album status after the page remounts', async () => {

@@ -161,6 +161,14 @@ pub struct NewImportImage {
     pub state: ImportImageState,
 }
 
+pub struct NewFileOperation {
+    pub source_path: String,
+    pub staging_path: String,
+    pub target_path: String,
+    pub expected_size: i64,
+    pub expected_blake3: Vec<u8>,
+}
+
 pub struct NewDuplicateCandidate {
     pub import_run_id: Uuid,
     pub source_image_id: Uuid,
@@ -633,6 +641,33 @@ impl ImportRepository {
         Ok(())
     }
 
+    /// Reopen a scan-phase run for analysis and clear terminal metadata left
+    /// by a prior cancellation/failure.  The guarded UPDATE prevents callers
+    /// from turning a reviewed, frozen, committing, or completed run back into
+    /// a mutable scan run.
+    pub async fn reopen_import_run_for_analysis(client: &Client, id: Uuid) -> Result<(), AppError> {
+        let state = ImportRunState::Analyzing.to_string();
+        let updated = client
+            .execute(
+                "UPDATE import_runs
+                 SET state = $1,
+                     completed_at = NULL,
+                     error_code = NULL,
+                     error_message = NULL
+                 WHERE id = $2
+                   AND state IN ('analyzing', 'scanning', 'fingerprinting', 'cancelled', 'failed')",
+                &[&state, &id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to reopen import run: {e}")))?;
+        if updated != 1 {
+            return Err(AppError::Internal(format!(
+                "import run {id} is no longer resumable"
+            )));
+        }
+        Ok(())
+    }
+
     /// Update an import run's state with explicit control over `completed_at`.
     ///
     /// - `Some(ts)` writes the timestamp verbatim (used when reconcile
@@ -890,10 +925,18 @@ impl ImportRepository {
                      duplicate_candidate_count = candidate_counts.duplicate_candidate_count,
                      review_candidate_count = candidate_counts.review_candidate_count,
                      state = CASE
-                         WHEN candidate_counts.review_candidate_count > 0 THEN 'review_required'
-                         ELSE 'analyzed'
+                         WHEN ia.state IN ('analyzed', 'review_required') THEN
+                             CASE
+                                 WHEN candidate_counts.review_candidate_count > 0 THEN 'review_required'
+                                 ELSE 'analyzed'
+                             END
+                         ELSE ia.state
                      END,
-                     analysis_completed_at = COALESCE(ia.analysis_completed_at, now()),
+                     analysis_completed_at = CASE
+                         WHEN ia.state IN ('analyzed', 'review_required')
+                             THEN COALESCE(ia.analysis_completed_at, now())
+                         ELSE ia.analysis_completed_at
+                     END,
                      updated_at = now()
                  FROM counts, candidate_counts
                  WHERE ia.id = $1
@@ -905,6 +948,50 @@ impl ImportRepository {
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to refresh album summary: {e}")))?;
+        Ok(Self::album_status_from_row(&row))
+    }
+
+    /// Finalize a successfully analyzed album. Unlike review/counter refresh,
+    /// this is the only path allowed to advance `analyzing` to an analysis-
+    /// complete state. The guarded update prevents cancellation, retry, or a
+    /// concurrent failure from being overwritten by a late checkpoint.
+    pub async fn finalize_import_album_analysis(
+        client: &Client,
+        album_id: Uuid,
+    ) -> Result<ImportAlbumStatus, AppError> {
+        Self::refresh_album_workflow_summary(client, album_id).await?;
+        let row = client
+            .query_opt(
+                "UPDATE import_albums ia
+                 SET state = CASE
+                         WHEN EXISTS (
+                             SELECT 1
+                             FROM duplicate_candidates dc
+                             JOIN import_images si ON si.id = dc.source_image_id
+                             LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                             WHERE si.import_album_id = ia.id
+                               AND dc.decision IS NULL
+                               AND rd.id IS NULL
+                         ) THEN 'review_required'
+                         ELSE 'analyzed'
+                     END,
+                     analysis_completed_at = now(),
+                     updated_at = now()
+                 WHERE ia.id = $1
+                   AND ia.state = 'analyzing'
+                 RETURNING ia.id, ia.import_run_id, ia.source_name, ia.source_path, ia.state,
+                           ia.image_count, ia.fingerprinted_count,
+                           ia.duplicate_candidate_count, ia.review_candidate_count,
+                           ia.last_error_message, ia.analysis_started_at, ia.analysis_completed_at",
+                &[&album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to finalize album analysis: {e}")))?
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "album {album_id} is no longer analyzing; refusing to finalize a stale checkpoint"
+                ))
+            })?;
         Ok(Self::album_status_from_row(&row))
     }
 
@@ -933,6 +1020,76 @@ impl ImportRepository {
             .map_err(|e| AppError::Internal(format!("failed to begin album retry reset: {e}")))?;
 
         let result: Result<(), AppError> = async {
+            let album = client
+                .query_opt(
+                    "SELECT state, import_run_id
+                     FROM import_albums
+                     WHERE id = $1
+                     FOR UPDATE",
+                    &[&album_id],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to lock album for retry: {e}"))
+                })?
+                .ok_or_else(|| AppError::Internal(format!("album {album_id} was not found")))?;
+            let current_state: String = album.get("state");
+            let import_run_id: Uuid = album.get("import_run_id");
+            if current_state != ImportAlbumState::Failed.to_string() {
+                return Err(AppError::Internal(format!(
+                    "album {album_id} cannot be retried from state '{current_state}'; expected 'failed'"
+                )));
+            }
+
+            let has_commit_evidence: bool = client
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM import_plan_albums WHERE import_album_id = $1
+                     ) OR EXISTS (
+                         SELECT 1 FROM file_transactions WHERE import_album_id = $1
+                     )",
+                    &[&album_id],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to check album retry safety: {e}"))
+                })?
+                .get(0);
+            if has_commit_evidence {
+                return Err(AppError::Internal(format!(
+                    "album {album_id} cannot be retried because an import plan or file transaction references it"
+                )));
+            }
+
+            let affected_album_rows = client
+                .query(
+                    "SELECT DISTINCT source_album.id
+                     FROM duplicate_candidates dc
+                     JOIN import_images source_image ON source_image.id = dc.source_image_id
+                     JOIN import_albums source_album ON source_album.id = source_image.import_album_id
+                     WHERE source_album.id <> $1
+                       AND source_album.state IN ('analyzed', 'review_required')
+                       AND (
+                           dc.source_image_id IN (
+                               SELECT id FROM import_images WHERE import_album_id = $1
+                           )
+                           OR dc.candidate_source_image_id IN (
+                               SELECT id FROM import_images WHERE import_album_id = $1
+                           )
+                       )",
+                    &[&album_id],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "failed to query album summaries affected by retry: {e}"
+                    ))
+                })?;
+            let affected_album_ids: Vec<Uuid> = affected_album_rows
+                .iter()
+                .map(|row| row.get("id"))
+                .collect();
+
             client
                 .execute(
                     "DELETE FROM duplicate_candidates dc
@@ -974,6 +1131,11 @@ impl ImportRepository {
                 )
                 .await
                 .map_err(|e| AppError::Internal(format!("failed to reset album: {e}")))?;
+
+            for affected_album_id in affected_album_ids {
+                Self::refresh_album_workflow_summary(client, affected_album_id).await?;
+            }
+            Self::refresh_import_run_statistics(client, import_run_id).await?;
             Ok(())
         }
         .await;
@@ -1530,7 +1692,9 @@ impl ImportRepository {
                         ia.source_name AS album_name
                  FROM import_images ii
                  JOIN import_albums ia ON ii.import_album_id = ia.id
-                 WHERE ia.import_run_id = $1",
+                 WHERE ia.import_run_id = $1
+                   AND ii.state = 'fingerprinted'
+                   AND ii.blake3 IS NOT NULL",
                 &[&import_run_id],
             )
             .await
@@ -1666,7 +1830,8 @@ impl ImportRepository {
                     "SELECT id
                      FROM import_albums
                      WHERE import_run_id = $1
-                       AND state IN ('analyzing', 'scanning', 'fingerprinting')",
+                       AND state IN ('analyzing', 'scanning', 'fingerprinting')
+                     FOR UPDATE",
                     &[&import_run_id],
                 )
                 .await
@@ -1675,6 +1840,55 @@ impl ImportRepository {
             if stale_album_ids.is_empty() {
                 return Ok(0);
             }
+
+            let has_commit_evidence: bool = client
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1
+                         FROM import_plan_albums
+                         WHERE import_album_id = ANY($1)
+                     ) OR EXISTS (
+                         SELECT 1
+                         FROM file_transactions
+                         WHERE import_album_id = ANY($1)
+                     )",
+                    &[&stale_album_ids],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to check stale album safety: {e}"))
+                })?
+                .get(0);
+            if has_commit_evidence {
+                return Err(AppError::Internal(
+                    "cannot reset stale albums referenced by an import plan or file transaction"
+                        .to_string(),
+                ));
+            }
+
+            let affected_album_rows = client
+                .query(
+                    "SELECT DISTINCT source_album.id
+                     FROM duplicate_candidates dc
+                     JOIN import_images source_image ON source_image.id = dc.source_image_id
+                     JOIN import_albums source_album ON source_album.id = source_image.import_album_id
+                     WHERE NOT (source_album.id = ANY($1))
+                       AND source_album.state IN ('analyzed', 'review_required')
+                       AND dc.candidate_source_image_id IN (
+                           SELECT id FROM import_images WHERE import_album_id = ANY($1)
+                       )",
+                    &[&stale_album_ids],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "failed to query album summaries affected by stale cleanup: {e}"
+                    ))
+                })?;
+            let affected_album_ids: Vec<Uuid> = affected_album_rows
+                .iter()
+                .map(|row| row.get("id"))
+                .collect();
 
             client
                 .execute(
@@ -1720,6 +1934,9 @@ impl ImportRepository {
                 )
                 .await
                 .map_err(|e| AppError::Internal(format!("failed to mark stale albums: {e}")))?;
+            for affected_album_id in affected_album_ids {
+                Self::refresh_album_workflow_summary(client, affected_album_id).await?;
+            }
             Ok(updated)
         }
         .await;
@@ -2131,6 +2348,90 @@ impl ImportRepository {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn prewrite_file_transaction(
+        client: &mut Client,
+        transaction_id: Uuid,
+        import_run_id: Uuid,
+        import_album_id: Uuid,
+        state: &TransactionState,
+        staging_path: &str,
+        target_path: &str,
+        plan_hash: &[u8],
+        operations: &[NewFileOperation],
+    ) -> Result<Vec<Uuid>, AppError> {
+        let transaction = client.transaction().await.map_err(|e| {
+            AppError::Internal(format!("failed to begin file transaction prewrite: {e}"))
+        })?;
+        let state = state.to_string();
+        let operation_state = FileOpState::Planned.to_string();
+
+        let result: Result<Vec<Uuid>, AppError> = async {
+            transaction
+                .execute(
+                    "INSERT INTO file_transactions
+                     (id, import_run_id, import_album_id, state, staging_path, target_path,
+                      manifest_path, plan_hash)
+                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)",
+                    &[
+                        &transaction_id,
+                        &import_run_id,
+                        &import_album_id,
+                        &state,
+                        &staging_path,
+                        &target_path,
+                        &plan_hash,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to prewrite file transaction: {e}"))
+                })?;
+
+            let mut operation_ids = Vec::with_capacity(operations.len());
+            for operation in operations {
+                let operation_id = Uuid::new_v4();
+                transaction
+                    .execute(
+                        "INSERT INTO file_operations
+                         (id, transaction_id, source_path, staging_path, target_path,
+                          expected_size, expected_blake3, state)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                        &[
+                            &operation_id,
+                            &transaction_id,
+                            &operation.source_path,
+                            &operation.staging_path,
+                            &operation.target_path,
+                            &operation.expected_size,
+                            &operation.expected_blake3,
+                            &operation_state,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!("failed to prewrite file operation: {e}"))
+                    })?;
+                operation_ids.push(operation_id);
+            }
+            Ok(operation_ids)
+        }
+        .await;
+
+        match result {
+            Ok(operation_ids) => {
+                transaction.commit().await.map_err(|e| {
+                    AppError::Internal(format!("failed to commit file transaction prewrite: {e}"))
+                })?;
+                Ok(operation_ids)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_file_transaction(
         client: &Client,
         transaction_id: Uuid,
@@ -2446,17 +2747,17 @@ impl ImportRepository {
 
     // ── Frozen plan full load (immutable commit source of truth) ──────
 
-    /// Atomically freeze an import plan: write the plan header, all plan
-    /// albums, all plan images, the plan hash, transition the plan to
-    /// `frozen`, and (when the run is still `review_required`) advance the
-    /// run to `ready_to_commit` — all inside a single `BEGIN`/`COMMIT`. A
-    /// crash mid-freeze cannot leave a half-written plan.
+    /// Write every frozen-plan row inside the caller's open transaction.
+    /// The caller must already hold the parent `import_runs` row lock; this
+    /// keeps candidate/image reads, hash computation, writes, and summary
+    /// projection behind one serialization point shared with plan edits and
+    /// Commit.
     ///
     /// `albums` is the full album set for the run (each carrying its source
     /// name) and `kept_images_by_album` is, per album id, the images the
     /// plan keeps (already resolved to full rows with BLAKE3 etc.). Albums
     /// with zero kept images contribute no `import_plan_albums` row.
-    pub async fn freeze_import_plan_transactionally(
+    pub async fn write_frozen_import_plan_in_transaction(
         client: &Client,
         import_run_id: Uuid,
         albums: &[AlbumRow],
@@ -2465,113 +2766,77 @@ impl ImportRepository {
         library_root_id: Uuid,
         plan_hash: &[u8],
     ) -> Result<Uuid, AppError> {
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to begin freeze transaction: {e}")))?;
+        // Idempotent for a second caller that waited on the run row lock.
+        if let Some(existing) = Self::load_plan_in_state(client, import_run_id, "frozen").await? {
+            return Ok(existing.plan_id);
+        }
 
-        let result = async {
-            // Idempotent: if a frozen plan already exists for this run,
-            // reuse it without writing duplicates.
-            if let Some(existing) =
-                Self::load_plan_in_state(client, import_run_id, "frozen").await?
-            {
-                return Ok(existing.plan_id);
+        let version = Self::next_import_plan_version(client, import_run_id).await?;
+        let plan_id = Self::create_import_plan(
+            client,
+            import_run_id,
+            version,
+            policy_version,
+            library_root_id,
+        )
+        .await?;
+
+        for album in albums {
+            let Some(images) = kept_images_by_album.get(&album.id) else {
+                continue;
+            };
+            if images.is_empty() {
+                continue;
             }
-
-            let version = Self::next_import_plan_version(client, import_run_id).await?;
-            let plan_id = Self::create_import_plan(
+            let plan_album_id = Self::insert_plan_album(
                 client,
-                import_run_id,
-                version,
-                policy_version,
-                library_root_id,
+                plan_id,
+                album.id,
+                &album.source_name,
+                images.len() as i32,
             )
             .await?;
 
-            for album in albums {
-                let Some(images) = kept_images_by_album.get(&album.id) else {
-                    continue;
-                };
-                if images.is_empty() {
-                    continue;
-                }
-                let plan_album_id = Self::insert_plan_album(
-                    client,
-                    plan_id,
-                    album.id,
-                    &album.source_name,
-                    images.len() as i32,
-                )
-                .await?;
-
-                for img in images {
-                    let expected_blake3 = img.blake3.as_deref().ok_or_else(|| {
-                        AppError::Internal(format!(
-                            "cannot freeze plan: image {} has no BLAKE3 fingerprint",
-                            img.id
-                        ))
-                    })?;
-                    let target_relative_path = target_relative_path_for_album_name(
-                        &album.source_name,
-                        &img.relative_path,
-                    )?;
-                    Self::insert_plan_image(
-                        client,
-                        plan_album_id,
-                        img.id,
-                        &img.source_path,
-                        &img.relative_path,
-                        &target_relative_path,
-                        img.file_size,
-                        expected_blake3,
-                        img.width,
-                        img.height,
-                        img.format.as_deref(),
-                    )
-                    .await?;
-                }
-            }
-
-            Self::set_plan_hash(client, plan_id, plan_hash).await?;
-            Self::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
-
-            // Advance the run to ready_to_commit so the commit page picks it
-            // up. The state-machine transition `review_required → finalize →
-            // ready_to_commit` is the validated path; a run that is already
-            // `ready_to_commit` (no review was needed) stays put.
-            let run = Self::get_import_run_by_id(client, import_run_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::Internal(format!("import run {import_run_id} not found"))
+            for img in images {
+                let expected_blake3 = img.blake3.as_deref().ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "cannot freeze plan: image {} has no BLAKE3 fingerprint",
+                        img.id
+                    ))
                 })?;
-            if run.state != ImportRunState::ReadyToCommit.to_string()
-                && run.state != ImportRunState::Committing.to_string()
-            {
-                Self::update_import_run_state(
+                let target_relative_path =
+                    target_relative_path_for_album_name(&album.source_name, &img.relative_path)?;
+                Self::insert_plan_image(
                     client,
-                    import_run_id,
-                    &ImportRunState::ReadyToCommit,
+                    plan_album_id,
+                    img.id,
+                    &img.source_path,
+                    &img.relative_path,
+                    &target_relative_path,
+                    img.file_size,
+                    expected_blake3,
+                    img.width,
+                    img.height,
+                    img.format.as_deref(),
                 )
                 .await?;
             }
-
-            Ok(plan_id)
         }
-        .await;
 
-        match result {
-            Ok(plan_id) => {
-                client.batch_execute("COMMIT").await.map_err(|e| {
-                    AppError::Internal(format!("failed to commit freeze transaction: {e}"))
-                })?;
-                Ok(plan_id)
-            }
-            Err(e) => {
-                let _ = client.batch_execute("ROLLBACK").await;
-                Err(e)
-            }
+        Self::set_plan_hash(client, plan_id, plan_hash).await?;
+        Self::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
+
+        // The service validated the pre-freeze state while holding the same
+        // row lock. A no-review run may already be ready_to_commit.
+        let run = Self::get_import_run_by_id(client, import_run_id)
+            .await?
+            .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+        if run.state != ImportRunState::ReadyToCommit.to_string() {
+            Self::update_import_run_state(client, import_run_id, &ImportRunState::ReadyToCommit)
+                .await?;
         }
+
+        Ok(plan_id)
     }
 
     /// Next 1-based version number for a new import plan on this run.
@@ -2720,16 +2985,7 @@ impl ImportRepository {
         // flicker between reads.
         kept_images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
-        let total_images: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM import_images ii
-                 JOIN import_albums ia ON ii.import_album_id = ia.id
-                 WHERE ia.import_run_id = $1",
-                &[&import_run_id],
-            )
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to count import images: {e}")))?
-            .get(0);
+        let total_images = all_images.len() as i64;
 
         let total_albums: i64 = client
             .query_one(

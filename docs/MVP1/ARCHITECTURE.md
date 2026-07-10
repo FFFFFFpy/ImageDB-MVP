@@ -46,16 +46,16 @@ Filesystem
 
 主要页面：
 
-| 页面 | 职责 |
-| --- | --- |
-| Onboarding | 初始化托管数据库或连接外部 PostgreSQL。 |
-| Dashboard | 展示数据库状态和导入入口。 |
-| Scan | 选择源目录、验证图集、启动扫描、展示进度。 |
-| Review | 审核候选、生成 / 冻结导入计划。 |
-| Commit | 展示 frozen plan summary，执行正式入库。 |
-| Recovery | 扫描并恢复未完成文件事务。 |
-| Settings | 数据库模式、图库根目录、诊断相关设置。 |
-| Probes | PostgreSQL、指纹、文件事务、存储能力探测。 |
+| 页面       | 职责                                       |
+| ---------- | ------------------------------------------ |
+| Onboarding | 初始化托管数据库或连接外部 PostgreSQL。    |
+| Dashboard  | 展示数据库状态和导入入口。                 |
+| Scan       | 选择源目录、验证图集、启动扫描、展示进度。 |
+| Review     | 审核候选、生成 / 冻结导入计划。            |
+| Commit     | 展示 frozen plan summary，执行正式入库。   |
+| Recovery   | 扫描并恢复未完成文件事务。                 |
+| Settings   | 数据库模式、图库根目录、诊断相关设置。     |
+| Probes     | PostgreSQL、指纹、文件事务、存储能力探测。 |
 
 ## 4. Rust 后端职责
 

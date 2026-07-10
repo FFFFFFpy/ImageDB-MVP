@@ -43,6 +43,7 @@ const MIGRATION_TABLES: &[&str] = &[
     "source_album_snapshots",
     "source_album_snapshot_files",
 ];
+const TRANSIENT_MIGRATION_TABLES: &[&str] = &["library_root_leases"];
 
 const MIGRATION_SCHEMA_KINDS: &[&str] = &["constraints", "indexes"];
 
@@ -167,7 +168,7 @@ impl DatabaseService {
     }
 
     async fn external_target_has_rows(client: &tokio_postgres::Client) -> Result<bool, AppError> {
-        for table in MIGRATION_TABLES {
+        for table in MIGRATION_TABLES.iter().chain(TRANSIENT_MIGRATION_TABLES) {
             let exists = client
                 .query_one(
                     "SELECT to_regclass($1) IS NOT NULL",
@@ -382,6 +383,11 @@ impl DatabaseService {
         client: &tokio_postgres::Client,
         kind: &str,
     ) -> Result<String, AppError> {
+        let schema_tables: Vec<&str> = MIGRATION_TABLES
+            .iter()
+            .chain(TRANSIENT_MIGRATION_TABLES)
+            .copied()
+            .collect();
         match kind {
             "constraints" => client
                 .query_one(
@@ -389,7 +395,7 @@ impl DatabaseService {
                      FROM pg_constraint c
                      WHERE connamespace = 'public'::regnamespace
                        AND conrelid::regclass::text = ANY($1)",
-                    &[&MIGRATION_TABLES],
+                    &[&schema_tables],
                 )
                 .await
                 .map(|row| row.get::<_, String>("fingerprint"))
@@ -402,7 +408,7 @@ impl DatabaseService {
                      FROM pg_indexes
                      WHERE schemaname = 'public'
                        AND tablename = ANY($1)",
-                    &[&MIGRATION_TABLES],
+                    &[&schema_tables],
                 )
                 .await
                 .map(|row| row.get::<_, String>("fingerprint"))
@@ -1545,6 +1551,7 @@ impl DatabaseService {
             .arg("--no-owner")
             .arg("--no-privileges")
             .arg("--exclude-table-data=schema_migrations")
+            .arg("--exclude-table-data=library_root_leases")
             .arg("--host=127.0.0.1")
             .arg(format!("--port={source_port}"))
             .arg(format!("--username={source_user}"))

@@ -20,11 +20,12 @@ use crate::infrastructure::storage_capabilities::{
     probe_storage_capabilities, CapabilityProbe, PublishStrategy as StoragePublishStrategy,
 };
 use crate::repositories::import_repository::{
-    FileTransactionFullRow, ImportRepository, PlanImageRow,
+    FileOperationRow, FileTransactionFullRow, ImportRepository, PlanImageRow,
 };
 use crate::services::commit_service::{
     build_manifest, commit_library_records_transaction, detect_extra_published_files,
-    normalize_relative_path, publish_verified_staging, read_commit_marker, read_manifest_with_hash,
+    ensure_no_symlink_or_reparse_escape, normalize_relative_path, path_eq,
+    publish_verified_staging, read_commit_marker, read_manifest_with_hash,
     select_commit_publish_strategy, stream_copy_with_hash, sync_parent_dir,
     validate_and_hash_frozen_plan, validate_commit_marker, verify_published_file_set,
     verify_source_snapshot_or_conflict, verify_staging_set, write_commit_marker,
@@ -626,10 +627,75 @@ async fn recover_active_transaction(
     let library_root = PathBuf::from(&library_root_path);
     let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
 
+    let (staging_dir, publish_dir) = match validate_recovery_transaction_evidence(
+        tx.id,
+        tx.staging_path.as_deref(),
+        tx.target_path.as_deref(),
+        tx.plan_hash.as_deref(),
+        &library_root,
+        Path::new(&album_relative_path),
+        &validated_plan_hash,
+    ) {
+        Ok(paths) => paths,
+        Err(message) => {
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&message),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, message));
+        }
+    };
+    // Every commit transaction prewrites its complete operation set before
+    // the first file is copied. Validate that evidence for every recoverable
+    // state, not only `planned`/`staging`: a damaged row may already claim to
+    // be verifying or publishing, and recovery must not advance it using the
+    // frozen plan as an implicit replacement for missing audit records.
+    let operations = ImportRepository::get_file_operations(client, tx.id).await?;
+    if let Err(message) = validate_prewritten_operation_set(
+        tx.id,
+        &staging_dir,
+        &publish_dir,
+        &plan_images,
+        &operations,
+    ) {
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&message),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, message));
+    }
+
     if let Some(msg) = recovery_storage_preflight(&library_root, current, &plan_images) {
         ImportRepository::update_file_transaction_state(client, tx.id, &current, Some(&msg))
             .await?;
         return Ok((current.to_string(), false, msg));
+    }
+
+    // The storage preflight deliberately runs first: a temporarily missing
+    // or disconnected root is retryable and cannot be canonicalized. Once
+    // the root is available, reject any symlink/reparse escape before the
+    // first recovery file operation.
+    for path in [&staging_dir, &publish_dir] {
+        if let Err(error) = ensure_no_symlink_or_reparse_escape(&library_root, path) {
+            let message = format!(
+                "recovery path escapes through a symlink or reparse point at '{}': {error}",
+                path.display()
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&message),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, message));
+        }
     }
 
     let lease_owner = format!("imagedb-recovery-{}", Uuid::new_v4());
@@ -650,8 +716,10 @@ async fn recover_active_transaction(
                 client,
                 tx,
                 &frozen.plan_id,
-                &validated_plan_hash,
                 &plan_images,
+                &staging_dir,
+                &publish_dir,
+                &operations,
             )
             .await
         }
@@ -720,22 +788,52 @@ async fn recover_active_transaction(
     }
 }
 
+fn validate_recovery_transaction_evidence(
+    transaction_id: Uuid,
+    staging_path: Option<&str>,
+    target_path: Option<&str>,
+    transaction_plan_hash: Option<&[u8]>,
+    library_root: &Path,
+    album_relative_path: &Path,
+    validated_plan_hash: &[u8],
+) -> Result<(PathBuf, PathBuf), String> {
+    if transaction_plan_hash != Some(validated_plan_hash) {
+        return Err(format!(
+            "transaction {transaction_id} plan hash is missing or does not match the frozen plan"
+        ));
+    }
+
+    let expected_staging = library_root
+        .join(".imagedb")
+        .join("staging")
+        .join(transaction_id.to_string())
+        .join(album_relative_path);
+    let expected_publish = library_root.join("Albums").join(album_relative_path);
+    let actual_staging = staging_path
+        .map(Path::new)
+        .ok_or_else(|| format!("transaction {transaction_id} has no staging_path"))?;
+    let actual_publish = target_path
+        .map(Path::new)
+        .ok_or_else(|| format!("transaction {transaction_id} has no target_path"))?;
+    if !path_eq(actual_staging, &expected_staging) || !path_eq(actual_publish, &expected_publish) {
+        return Err(format!(
+            "transaction {transaction_id} recovery paths do not match the bound library root and frozen album"
+        ));
+    }
+    Ok((expected_staging, expected_publish))
+}
+
 /// planned/staging: clean .part files, verify reusable staged files, resume
 /// copying the rest, then continue through verify/publish/commit.
 async fn resume_staging(
     client: &mut Client,
     tx: &FileTransactionFullRow,
     _plan_id: &Uuid,
-    _plan_hash: &[u8],
     plan_images: &[PlanImageRow],
+    staging_dir: &Path,
+    publish_dir: &Path,
+    operations: &[FileOperationRow],
 ) -> Result<(String, bool, String), AppError> {
-    let staging_dir = tx
-        .staging_path
-        .as_ref()
-        .map(PathBuf::from)
-        .ok_or_else(|| AppError::Internal("transaction has no staging_path".to_string()))?;
-    let ops = ImportRepository::get_file_operations(client, tx.id).await?;
-
     ImportRepository::update_file_transaction_state(
         client,
         tx.id,
@@ -770,8 +868,10 @@ async fn resume_staging(
                 if let Ok(actual) = hash_file(&staged).await {
                     if actual == img.expected_blake3 {
                         // Already verified — mark the op verified if not already.
-                        if let Some(op) = ops.iter().find(|o| o.target_path.ends_with(&target_rel))
-                        {
+                        let expected_target = publish_dir.join(&target_rel);
+                        if let Some(op) = operations.iter().find(|operation| {
+                            path_eq(Path::new(&operation.target_path), &expected_target)
+                        }) {
                             if FileOpState::parse(&op.state).ok() != Some(FileOpState::Verified) {
                                 ImportRepository::update_file_operation_state(
                                     client,
@@ -807,9 +907,10 @@ async fn resume_staging(
             return Ok((TransactionState::Staging.to_string(), false, msg));
         }
 
-        let op_id = ops
+        let expected_target = publish_dir.join(&target_rel);
+        let op_id = operations
             .iter()
-            .find(|o| o.target_path.ends_with(&target_rel))
+            .find(|operation| path_eq(Path::new(&operation.target_path), &expected_target))
             .map(|o| o.id);
         if let Some(op_id) = op_id {
             ImportRepository::update_file_operation_state(
@@ -859,7 +960,7 @@ async fn resume_staging(
         None,
     )
     .await?;
-    verify_staging_set(&staging_dir, plan_images).await?;
+    verify_staging_set(staging_dir, plan_images).await?;
     ImportRepository::update_file_transaction_state(
         client,
         tx.id,
@@ -873,6 +974,62 @@ async fn resume_staging(
         true,
         "staging resumed and verified; call recovery again to publish".to_string(),
     ))
+}
+
+fn validate_prewritten_operation_set(
+    transaction_id: Uuid,
+    staging_dir: &Path,
+    publish_dir: &Path,
+    plan_images: &[PlanImageRow],
+    operations: &[FileOperationRow],
+) -> Result<(), String> {
+    if operations.len() != plan_images.len() {
+        return Err(format!(
+            "file transaction prewrite is incomplete: {} operations for {} frozen-plan images",
+            operations.len(),
+            plan_images.len()
+        ));
+    }
+
+    let mut matched_operation_ids = HashSet::new();
+    for image in plan_images {
+        let relative_path = normalize_relative_path(&image.target_relative_path)
+            .map_err(|error| format!("invalid frozen-plan target during recovery: {error}"))?;
+        let expected_staging_path = staging_dir.join(&relative_path);
+        let expected_target_path = publish_dir.join(&relative_path);
+        let matches: Vec<&FileOperationRow> = operations
+            .iter()
+            .filter(|operation| path_eq(Path::new(&operation.target_path), &expected_target_path))
+            .collect();
+        if matches.len() != 1 {
+            return Err(format!(
+                "file transaction prewrite mismatch for '{relative_path}': expected exactly one operation, found {}",
+                matches.len()
+            ));
+        }
+        let operation = matches[0];
+        if operation.transaction_id != transaction_id
+            || !path_eq(
+                Path::new(&operation.source_path),
+                Path::new(&image.source_path),
+            )
+            || !path_eq(Path::new(&operation.staging_path), &expected_staging_path)
+            || operation.expected_size != image.expected_file_size
+            || operation.expected_blake3 != image.expected_blake3
+        {
+            return Err(format!(
+                "file transaction prewrite evidence does not match frozen plan for '{relative_path}'"
+            ));
+        }
+        if !matched_operation_ids.insert(operation.id) {
+            return Err(format!(
+                "file transaction prewrite reuses operation {} for multiple plan images",
+                operation.id
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn recovery_storage_preflight(
@@ -2221,6 +2378,58 @@ mod tests {
                 Path::new("/src/albuma")
             ));
         }
+    }
+
+    #[test]
+    fn recovery_transaction_evidence_binds_hash_and_canonical_paths() {
+        let root = tempfile::TempDir::new().unwrap();
+        let transaction_id = Uuid::new_v4();
+        let album = Path::new("album-a");
+        let hash = vec![7; 32];
+        let staging = root
+            .path()
+            .join(".imagedb")
+            .join("staging")
+            .join(transaction_id.to_string())
+            .join(album);
+        let publish = root.path().join("Albums").join(album);
+
+        assert!(validate_recovery_transaction_evidence(
+            transaction_id,
+            Some(&staging.display().to_string()),
+            Some(&publish.display().to_string()),
+            Some(&hash),
+            root.path(),
+            album,
+            &hash,
+        )
+        .is_ok());
+
+        let wrong_hash = vec![8; 32];
+        let hash_error = validate_recovery_transaction_evidence(
+            transaction_id,
+            Some(&staging.display().to_string()),
+            Some(&publish.display().to_string()),
+            Some(&wrong_hash),
+            root.path(),
+            album,
+            &hash,
+        )
+        .unwrap_err();
+        assert!(hash_error.contains("plan hash"));
+
+        let outside = root.path().parent().unwrap().join("outside-staging");
+        let path_error = validate_recovery_transaction_evidence(
+            transaction_id,
+            Some(&outside.display().to_string()),
+            Some(&publish.display().to_string()),
+            Some(&hash),
+            root.path(),
+            album,
+            &hash,
+        )
+        .unwrap_err();
+        assert!(path_error.contains("do not match"));
     }
 
     #[test]

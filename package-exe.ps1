@@ -14,12 +14,23 @@ function Run-Step {
 
     Write-Host ""
     Write-Host "==> $Name" -ForegroundColor Cyan
+    $global:LASTEXITCODE = 0
     & $Command
+    $ExitCode = $global:LASTEXITCODE
+    if ($ExitCode -ne 0) {
+        throw "$Name failed with exit code $ExitCode"
+    }
 }
 
-Run-Step "Checking toolchain" {
+Run-Step "Checking pnpm" {
     pnpm --version | Out-Host
+}
+
+Run-Step "Checking Node.js" {
     node --version | Out-Host
+}
+
+Run-Step "Checking Cargo" {
     cargo --version | Out-Host
 }
 
@@ -56,5 +67,5 @@ if ($artifacts.Count -gt 0) {
         Write-Host ("  " + $_.FullName)
     }
 } else {
-    Write-Host "No .exe or .msi artifacts found under $bundleRoot" -ForegroundColor Yellow
+    throw "Build reported success but no .exe or .msi artifacts were found under $bundleRoot"
 }

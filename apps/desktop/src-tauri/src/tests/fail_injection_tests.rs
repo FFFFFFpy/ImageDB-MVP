@@ -21,7 +21,7 @@
 //!       -- --ignored --test-threads=1
 #![cfg(test)]
 #![cfg(feature = "fail-injection")]
-use crate::domain::import_state::{DecodeState, ImportImageState};
+use crate::domain::import_state::{DecodeState, ImportImageState, ImportRunState};
 use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 use crate::infrastructure::storage_capabilities::{probe_storage_capabilities, PublishStrategy};
 use crate::repositories::import_repository::{ImportRepository, NewImportImage};
@@ -231,6 +231,12 @@ async fn freeze_test_plan(
     let hash = commit_service::compute_plan_hash(&frozen)?;
     ImportRepository::set_plan_hash(client, plan_id, &hash).await?;
     ImportRepository::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
+    ImportRepository::update_import_run_state(
+        client,
+        import_run_id,
+        &ImportRunState::ReadyToCommit,
+    )
+    .await?;
     Ok(())
 }
 
@@ -404,6 +410,262 @@ async fn fail_injection_after_db_write() {
             o
         );
     }
+    let mut m = pg.lock().await;
+    m.shutdown().await.unwrap();
+}
+
+/// Recovery evidence is a security boundary: a persisted transaction must
+/// stay bound to both the frozen plan hash and the canonical library paths.
+/// Corrupt either field and recovery must stop before touching disk or
+/// creating library records.
+#[tokio::test]
+#[ignore]
+async fn fail_injection_recovery_rejects_tampered_transaction_evidence() {
+    let (tmp, pg, run_id, lib_root, _album) = setup_full_env().await;
+    run_commit_with_fault(
+        pg.clone(),
+        &lib_root,
+        run_id,
+        CommitFaultPoint::AfterStagingCopy,
+    )
+    .await;
+
+    let outside_target = tmp.path().join("outside-recovery-target");
+    std::fs::create_dir_all(&outside_target).unwrap();
+    let sentinel = outside_target.join("sentinel.txt");
+    std::fs::write(&sentinel, b"must remain untouched").unwrap();
+
+    let (tx_id, original_staging, original_target, original_plan_hash) = {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let row = client
+            .query_one(
+                "SELECT id, staging_path, target_path, plan_hash
+                 FROM file_transactions
+                 WHERE import_run_id = $1
+                 ORDER BY started_at DESC
+                 LIMIT 1",
+                &[&run_id],
+            )
+            .await
+            .unwrap();
+        let values = (
+            row.get::<_, Uuid>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, Vec<u8>>(3),
+        );
+        drop(client);
+        handle.abort();
+        values
+    };
+
+    // First corrupt only the transaction's plan hash. The frozen plan itself
+    // remains valid, so this specifically exercises the transaction binding.
+    {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        client
+            .execute(
+                "UPDATE file_transactions SET plan_hash = decode('00', 'hex') WHERE id = $1",
+                &[&tx_id],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        handle.abort();
+    }
+    let hash_outcome = recovery_service::recover_transaction(pg.clone(), tx_id)
+        .await
+        .expect("tampered plan hash should produce a persisted conflict outcome");
+    assert_eq!(hash_outcome.final_state, "conflict");
+    assert!(!hash_outcome.recovered);
+    assert!(
+        hash_outcome.message.contains("plan hash"),
+        "expected plan-hash conflict, got: {}",
+        hash_outcome.message
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"must remain untouched");
+
+    // Reset the transaction to its pre-recovery state, restore the correct
+    // hash, then corrupt only target_path to point outside the library root.
+    // The outside directory already contains a sentinel so any accidental
+    // publish/cleanup is observable.
+    {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        client
+            .execute(
+                "UPDATE file_transactions
+                 SET state = 'staging', last_error = NULL, plan_hash = $2,
+                     staging_path = $3, target_path = $4
+                 WHERE id = $1",
+                &[
+                    &tx_id,
+                    &original_plan_hash,
+                    &original_staging,
+                    &outside_target.display().to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        handle.abort();
+    }
+    let path_outcome = recovery_service::recover_transaction(pg.clone(), tx_id)
+        .await
+        .expect("tampered recovery path should produce a persisted conflict outcome");
+    assert_eq!(path_outcome.final_state, "conflict");
+    assert!(!path_outcome.recovered);
+    assert!(
+        path_outcome.message.contains("recovery paths"),
+        "expected canonical-path conflict, got: {}",
+        path_outcome.message
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"must remain untouched");
+    assert!(
+        !outside_target.join("photo1.png").exists(),
+        "recovery must not publish into the tampered target"
+    );
+
+    let (client, handle) = {
+        let mgr = pg.lock().await;
+        mgr.connect().await.unwrap()
+    };
+    let row = client
+        .query_one(
+            "SELECT ft.state, ft.last_error, ir.state
+             FROM file_transactions ft
+             JOIN import_runs ir ON ir.id = ft.import_run_id
+             WHERE ft.id = $1",
+            &[&tx_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "conflict");
+    assert!(row
+        .get::<_, Option<String>>(1)
+        .as_deref()
+        .unwrap_or_default()
+        .contains("recovery paths"));
+    assert_eq!(row.get::<_, String>(2), "recovery_required");
+    let library_image_count: i64 = client
+        .query_one("SELECT COUNT(*) FROM library_images", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        library_image_count, 0,
+        "tampered evidence must be rejected before DB publish"
+    );
+    drop(client);
+    handle.abort();
+
+    // Finally restore all persisted evidence, then replace the canonical
+    // `Albums` ancestor with a real symlink/junction. This exercises the
+    // recovery-only filesystem guard after the DB evidence checks pass.
+    {
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        client
+            .execute(
+                "UPDATE file_transactions
+                 SET state = 'staging', last_error = NULL, plan_hash = $2,
+                     staging_path = $3, target_path = $4
+                 WHERE id = $1",
+                &[
+                    &tx_id,
+                    &original_plan_hash,
+                    &original_staging,
+                    &original_target,
+                ],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        handle.abort();
+    }
+
+    let albums_ancestor = lib_root.join("Albums");
+    std::fs::remove_dir(&albums_ancestor)
+        .expect("the unpublished Albums directory should still be empty");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_target, &albums_ancestor)
+        .expect("test directory symlink should be created");
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &albums_ancestor.display().to_string(),
+                &outside_target.display().to_string(),
+            ])
+            .status()
+            .expect("failed to run mklink /J");
+        assert!(status.success(), "mklink /J failed: {status}");
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        let symlink_outcome = recovery_service::recover_transaction(pg.clone(), tx_id)
+            .await
+            .expect("symlinked recovery ancestor should produce a persisted conflict outcome");
+        assert_eq!(symlink_outcome.final_state, "conflict");
+        assert!(!symlink_outcome.recovered);
+        assert!(
+            symlink_outcome.message.contains("symlink or reparse point"),
+            "expected symlink/reparse conflict, got: {}",
+            symlink_outcome.message
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"must remain untouched");
+        assert!(
+            !outside_target.join("album_a").exists(),
+            "recovery must not traverse the symlinked publish ancestor"
+        );
+
+        let (client, handle) = {
+            let mgr = pg.lock().await;
+            mgr.connect().await.unwrap()
+        };
+        let row = client
+            .query_one(
+                "SELECT state, last_error FROM file_transactions WHERE id = $1",
+                &[&tx_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "conflict");
+        assert!(row
+            .get::<_, Option<String>>(1)
+            .as_deref()
+            .unwrap_or_default()
+            .contains("symlink or reparse point"));
+        drop(client);
+        handle.abort();
+
+        #[cfg(unix)]
+        std::fs::remove_file(&albums_ancestor).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(&albums_ancestor).unwrap();
+    }
+
+    // Keep the original target value observable in the fixture and guard
+    // against accidentally testing a path that was already outside the root.
+    assert_eq!(
+        std::path::Path::new(&original_target),
+        lib_root.join("Albums").join("album_a")
+    );
+
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
 }

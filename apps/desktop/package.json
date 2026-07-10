@@ -7,7 +7,7 @@
     "dev": "tauri dev",
     "dev:web": "vite --port 1420",
     "package:runtime": "node ../../scripts/package-postgres-runtime.mjs",
-    "build": "pnpm package:runtime && tauri build",
+    "build": "pnpm package:runtime && tauri build --features bundled-runtime-required",
     "build:web": "tsc -b && vite build",
     "typecheck": "tsc --noEmit",
     "test:unit": "vitest run"

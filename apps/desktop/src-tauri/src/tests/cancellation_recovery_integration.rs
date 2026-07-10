@@ -204,6 +204,12 @@ async fn freeze_test_plan(
     let hash = commit_service::compute_plan_hash(&frozen)?;
     ImportRepository::set_plan_hash(client, plan_id, &hash).await?;
     ImportRepository::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
+    ImportRepository::update_import_run_state(
+        client,
+        import_run_id,
+        &ImportRunState::ReadyToCommit,
+    )
+    .await?;
     Ok(())
 }
 
@@ -381,7 +387,9 @@ async fn cancellation_recovery_mid_staging_resumable() {
 
     // Spawn a delayed cancel trigger: wait until the commit task reaches
     // `processing_album` (the album loop started, prewrite is in progress
-    // or done), then set the flag. The 64 MiB file gives the stream copy
+    // or done), then set the flag. Do not trigger on the earlier `committing`
+    // stage: on a loaded CI host that can cancel before the album loop and
+    // make this mid-staging test spuriously observe no transaction. The 64 MiB file gives the stream copy
     // many chunks; `stream_copy_with_hash` checks the flag before each
     // read chunk, so the cancel will land mid-copy (not before prewrite,
     // not after the file completes).
@@ -394,7 +402,7 @@ async fn cancellation_recovery_mid_staging_resumable() {
                 let p = progress_for_cancel.lock().await;
                 p.current_stage.clone()
             };
-            if stage == "processing_album" || stage == "committing" {
+            if stage == "processing_album" {
                 // Small delay so the prewrite completes and the copy loop
                 // is actually running before we cancel. The 64 MiB file
                 // ensures the copy is still in flight when the flag flips.
@@ -404,8 +412,7 @@ async fn cancellation_recovery_mid_staging_resumable() {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // Timed out waiting — cancel anyway so the test terminates.
-        cancelled_for_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        panic!("commit did not reach processing_album within 5 seconds");
     });
 
     let _ = commit_service::run_import_commit(
@@ -416,7 +423,7 @@ async fn cancellation_recovery_mid_staging_resumable() {
         progress,
     )
     .await;
-    let _ = cancel_handle.await;
+    cancel_handle.await.expect("cancel trigger task panicked");
 
     // The transaction must exist (prewrite happened before cancel) and be
     // in a recoverable mid-flight state — NOT `failed`/`cancelled`.

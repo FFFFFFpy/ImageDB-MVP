@@ -13,6 +13,7 @@ const MIGRATION_0009: &str =
     include_str!("../../../migrations/0009_drop_redundant_snapshot_hash.sql");
 const MIGRATION_0010: &str = include_str!("../../../migrations/0010_library_root_leases.sql");
 const MIGRATION_0011: &str = include_str!("../../../migrations/0011_album_workflow_state.sql");
+const MIGRATION_0012: &str = include_str!("../../../migrations/0012_album_workflow_repair.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
@@ -26,6 +27,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0009_drop_redundant_snapshot_hash", MIGRATION_0009),
     ("0010_library_root_leases", MIGRATION_0010),
     ("0011_album_workflow_state", MIGRATION_0011),
+    ("0012_album_workflow_repair", MIGRATION_0012),
 ];
 
 pub struct MigrationRunner;
@@ -117,10 +119,13 @@ impl MigrationRunner {
                 AppError::Internal(format!("failed to begin transaction for {version}: {e}"))
             })?;
 
-            transaction
-                .batch_execute(sql)
-                .await
-                .map_err(|e| AppError::Internal(format!("migration {version} failed: {e}")))?;
+            transaction.batch_execute(sql).await.map_err(|e| {
+                let detail = e
+                    .as_db_error()
+                    .map(|db_error| db_error.message().to_string())
+                    .unwrap_or_else(|| e.to_string());
+                AppError::Internal(format!("migration {version} failed: {detail}"))
+            })?;
 
             transaction
                 .execute(
@@ -159,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 11);
+        assert_eq!(MIGRATIONS.len(), 12);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
         assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
@@ -171,6 +176,8 @@ mod tests {
         assert!(MIGRATION_0009.contains("source_snapshot_hash"));
         assert!(MIGRATION_0010.contains("library_root_leases"));
         assert!(MIGRATION_0011.contains("analysis_started_at"));
+        assert!(MIGRATION_0012.contains("DELETE FROM duplicate_candidates"));
+        assert!(MIGRATION_0012.contains("fingerprinted_count"));
     }
 
     #[test]
@@ -188,12 +195,13 @@ mod tests {
                 "0008_source_album_snapshots",
                 "0009_drop_redundant_snapshot_hash",
                 "0010_library_root_leases",
-                "0011_album_workflow_state"
+                "0011_album_workflow_state",
+                "0012_album_workflow_repair"
             ]
         );
         assert_eq!(
             MigrationRunner::latest_version(),
-            "0011_album_workflow_state"
+            "0012_album_workflow_repair"
         );
     }
 
@@ -224,5 +232,289 @@ mod tests {
         assert!(gap
             .expect_err("non-contiguous migration history should fail")
             .contains("non-contiguous ImageDB migration history"));
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    async fn apply_migrations_through_0011(client: &mut Client) {
+        MigrationRunner::ensure_schema_migrations_table(client)
+            .await
+            .unwrap();
+        for (version, sql) in MIGRATIONS.iter().take(11) {
+            let transaction = client.transaction().await.unwrap();
+            transaction.batch_execute(sql).await.unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version) VALUES ($1)",
+                    &[version],
+                )
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0012_repairs_original_and_edited_0011_rows() {
+        use crate::domain::import_state::{
+            Decision, DecisionSource, DecodeState, DuplicateScope, ImportImageState, MatchType,
+        };
+        use crate::repositories::import_repository::{
+            ImportRepository, NewDuplicateCandidate, NewImportImage,
+        };
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+        let (mut client, handle) = manager.connect().await.unwrap();
+        apply_migrations_through_0011(&mut client).await;
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            "C:/migration-0012/source",
+            library_root_id,
+        )
+        .await
+        .unwrap();
+
+        async fn insert_image(client: &Client, album_id: Uuid, marker: u8) -> Uuid {
+            ImportRepository::insert_import_image(
+                client,
+                NewImportImage {
+                    album_id,
+                    source_path: format!("C:/migration-0012/{marker}.png"),
+                    relative_path: format!("album/{marker}.png"),
+                    file_size: 10,
+                    modified_at: None,
+                    width: Some(1),
+                    height: Some(1),
+                    format: Some("png".to_string()),
+                    decode_state: DecodeState::Decoded,
+                    blake3: Some(vec![marker; 32]),
+                    pixel_hash: Some(vec![marker; 8]),
+                    gradient_hash: Some(vec![marker; 8]),
+                    block_hash: Some(vec![marker; 8]),
+                    median_hash: Some(vec![marker; 8]),
+                    fingerprint_version: Some("test".to_string()),
+                    state: ImportImageState::Fingerprinted,
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        let original_stale_album = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            "C:/migration-0012/source/original-stale",
+            "original-stale",
+        )
+        .await
+        .unwrap();
+        let edited_pending_album = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            "C:/migration-0012/source/edited-pending",
+            "edited-pending",
+        )
+        .await
+        .unwrap();
+        let terminal_album = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            "C:/migration-0012/source/terminal",
+            "terminal",
+        )
+        .await
+        .unwrap();
+
+        let stale_image = insert_image(&client, original_stale_album, 1).await;
+        let _pending_image = insert_image(&client, edited_pending_album, 2).await;
+        let terminal_image = insert_image(&client, terminal_album, 3).await;
+        ImportRepository::insert_duplicate_candidate(
+            &client,
+            NewDuplicateCandidate {
+                import_run_id,
+                source_image_id: stale_image,
+                candidate_source_image_id: Some(terminal_image),
+                candidate_library_image_id: None,
+                scope: DuplicateScope::CrossAlbum,
+                match_type: MatchType::FileExact,
+                blake3_equal: true,
+                pixel_hash_equal: false,
+                gradient_distance: None,
+                block_distance: None,
+                median_distance: None,
+                transform_type: None,
+                confidence: Some(1.0),
+                decision: Some(Decision::AutoDuplicate),
+                decision_source: Some(DecisionSource::ExactRule),
+            },
+        )
+        .await
+        .unwrap();
+        client
+            .execute(
+                "UPDATE import_albums SET state = 'scanning' WHERE id = $1",
+                &[&original_stale_album],
+            )
+            .await
+            .unwrap();
+        // Simulate a database that already ran the briefly edited 0011: the
+        // state is pending, but partial import rows were not cleaned.
+        client
+            .execute(
+                "UPDATE import_albums SET state = 'pending' WHERE id = $1",
+                &[&edited_pending_album],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE import_albums SET state = 'completed' WHERE id = $1",
+                &[&terminal_album],
+            )
+            .await
+            .unwrap();
+
+        let applied = MigrationRunner::run_pending(&mut client).await.unwrap();
+        assert_eq!(applied, vec!["0012_album_workflow_repair"]);
+
+        for album_id in [original_stale_album, edited_pending_album] {
+            let row = client
+                .query_one(
+                    "SELECT state, image_count, fingerprinted_count
+                     FROM import_albums WHERE id = $1",
+                    &[&album_id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row.get::<_, String>("state"), "pending");
+            assert_eq!(row.get::<_, i32>("image_count"), 0);
+            assert_eq!(row.get::<_, i32>("fingerprinted_count"), 0);
+            let image_count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM import_images WHERE import_album_id = $1",
+                    &[&album_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(image_count, 0);
+        }
+        let terminal = client
+            .query_one(
+                "SELECT state, image_count, fingerprinted_count,
+                        duplicate_candidate_count, review_candidate_count
+                 FROM import_albums WHERE id = $1",
+                &[&terminal_album],
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.get::<_, String>("state"), "analyzed");
+        assert_eq!(terminal.get::<_, i32>("image_count"), 1);
+        assert_eq!(terminal.get::<_, i32>("fingerprinted_count"), 1);
+        assert_eq!(terminal.get::<_, i32>("duplicate_candidate_count"), 0);
+        assert_eq!(terminal.get::<_, i32>("review_candidate_count"), 0);
+        let candidate_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM duplicate_candidates", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(candidate_count, 0);
+        assert_eq!(
+            MigrationRunner::current_version(&client).await.unwrap(),
+            Some("0012_album_workflow_repair".to_string())
+        );
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0012_rejects_stale_plan_evidence_atomically() {
+        use crate::repositories::import_repository::ImportRepository;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+        let (mut client, handle) = manager.connect().await.unwrap();
+        apply_migrations_through_0011(&mut client).await;
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            "C:/migration-0012/guarded",
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            "C:/migration-0012/guarded/album",
+            "album",
+        )
+        .await
+        .unwrap();
+        let plan_id = ImportRepository::create_import_plan(
+            &client,
+            import_run_id,
+            1,
+            "test",
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        ImportRepository::insert_plan_album(&client, plan_id, album_id, "album", 0)
+            .await
+            .unwrap();
+
+        let error = MigrationRunner::run_pending(&mut client)
+            .await
+            .expect_err("stale rows with plan evidence must block migration atomically");
+        assert!(error.to_string().contains("referenced by an import plan"));
+        assert_eq!(
+            MigrationRunner::current_version(&client).await.unwrap(),
+            Some("0011_album_workflow_state".to_string())
+        );
+        let album_state: String = client
+            .query_one(
+                "SELECT state FROM import_albums WHERE id = $1",
+                &[&album_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(album_state, "pending");
+        let plan_album_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_plan_albums WHERE import_album_id = $1",
+                &[&album_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(plan_album_count, 1);
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
     }
 }
