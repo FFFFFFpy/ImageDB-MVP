@@ -35,20 +35,22 @@ analyzing / scanning / fingerprinting / cancelled / failed
 
 `abandoned` 是历史终态，不是失败任务的别名。Dashboard 的历史任务、图集和图片总数可以包含它，但待审核、失败、恢复等当前待办统计必须通过 `import_runs` 排除它；Dashboard 的下一步只使用同一个 `latest_actionable_run`，Review 和 Commit 的默认入口也不会重新选择 abandoned run。ScanPage 可以展示其历史状态，但不提供 resume、retry 或 review 主流程按钮。
 
-Dashboard 不在 React 中重新推断状态机。后端 `latest_actionable_run` 同时返回 `next_action`、`has_frozen_plan` 和 `has_active_transaction`，并按持久化事实路由：
+Dashboard 不在 React 中重新推断状态机。后端 `latest_actionable_run` 同时返回 `next_action`、`has_frozen_plan`、`has_recoverable_transaction`、`has_terminal_unresolved_transaction` 和 `has_missing_plan_album_transaction`，并按 frozen plan 对 file transaction 的实际覆盖关系路由：
 
 ```text
-recovery_required / committing / active transaction -> recover
-review_required + pending review                  -> review
-review_required + no pending review               -> generate_plan
-cancelled + frozen plan + no active transaction   -> resume_commit
-pending / analyzing album                         -> resume_analysis
-failed run / album                                 -> inspect_failed
-ready_to_commit                                    -> generate_plan
-no actionable run                                 -> new_import
+recoverable transaction (including conflict)                 -> recover
+committing / recovery_required + missing plan-album tx        -> resume_commit
+recovery_required + terminal failed/cancelled tx only         -> inspect_transaction_failure
+review_required + pending review                              -> review
+review_required + no pending review                           -> generate_plan
+cancelled + frozen plan + no unresolved transaction           -> resume_commit
+pending / analyzing album                                     -> resume_analysis
+failed run / album                                             -> inspect_failed
+ready_to_commit                                                -> generate_plan
+no actionable run                                             -> new_import
 ```
 
-因此最后一个审核决定提交后，即使父 run 仍保持 `review_required`，Dashboard 也会返回入库审核生成计划，而不是开始新的导入。没有 plan、未完成图集或事务事实的 cancelled/未知状态不会占据 `latest_actionable_run`。
+因此最后一个审核决定提交后，即使父 run 仍保持 `review_required`，Dashboard 也会返回入库审核生成计划，而不是开始新的导入。Commit 在首个事务预写前或两个图集之间崩溃时，缺少事务的 frozen-plan 图集会重新进入幂等 Commit；只有真实可恢复事务才进入自动 Recovery。failed/cancelled 终态事务会显示明确的人工处置入口，不会落入空 Recovery 页。没有 plan、未完成图集或事务事实的 cancelled/未知状态不会占据 `latest_actionable_run`。
 
 如果待清理图集已经被 frozen plan 或 file transaction 引用，续跑会 fail closed，不删除任何证据。
 

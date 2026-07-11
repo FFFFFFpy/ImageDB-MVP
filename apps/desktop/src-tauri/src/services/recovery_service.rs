@@ -75,7 +75,8 @@ pub struct RecoveryOutcome {
     pub message: String,
 }
 
-/// Scan all non-terminal transactions and generate recovery diagnostics.
+/// Scan all transactions requiring recovery or manual disposition and
+/// generate diagnostics. Fully resolved source_archived rows are omitted.
 pub async fn scan_recoverable_transactions(
     client: &Client,
 ) -> Result<Vec<RecoveryDiagnostic>, AppError> {
@@ -126,6 +127,12 @@ pub async fn scan_recoverable_transactions(
             }
             "conflict" => {
                 diags.push("conflict: manual resolution required".to_string());
+            }
+            "failed" | "cancelled" => {
+                diags.push(format!(
+                    "terminal state {}: automatic recovery is unavailable; manual resolution required",
+                    tx.state
+                ));
             }
             other => {
                 diags.push(format!("unhandled state: {other}"));

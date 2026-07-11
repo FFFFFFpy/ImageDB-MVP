@@ -234,7 +234,9 @@ test('sidebar new import clears a run selected from the dashboard', async () => 
       duplicate_candidates: 0,
       next_action: 'resume_analysis',
       has_frozen_plan: false,
-      has_active_transaction: false,
+      has_recoverable_transaction: false,
+      has_terminal_unresolved_transaction: false,
+      has_missing_plan_album_transaction: false,
     },
   };
 

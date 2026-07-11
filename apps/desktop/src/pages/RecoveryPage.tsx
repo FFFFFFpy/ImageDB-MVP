@@ -88,7 +88,7 @@ export function RecoveryPage({ onNavigate }: RecoveryPageProps) {
 
   return (
     <div className="recovery-page">
-      <h1>恢复</h1>
+      <h1>恢复与事务处置</h1>
 
       {diagnosticsQuery.isLoading && <p>正在扫描可恢复事务...</p>}
       {diagnosticsQuery.isError && (
@@ -125,8 +125,8 @@ export function RecoveryPage({ onNavigate }: RecoveryPageProps) {
 
       {transactions.length === 0 && !diagnosticsQuery.isLoading ? (
         <div className="empty-state">
-          <h1>没有可恢复事务</h1>
-          <p>所有文件事务都处于已完成或终态。</p>
+          <h1>没有待处理事务</h1>
+          <p>所有文件事务都已完成，不需要恢复或人工处置。</p>
           <div className="recovery-actions">
             <button className="btn-secondary" onClick={refresh}>
               刷新
@@ -169,6 +169,7 @@ interface RecoveryCardProps {
 
 function RecoveryCard({ tx, recovering, reverifying, onRecover, onReverify }: RecoveryCardProps) {
   const isConflict = tx.current_state === 'conflict';
+  const isTerminalUnresolved = tx.current_state === 'failed' || tx.current_state === 'cancelled';
   return (
     <div className="recovery-card">
       <div className="recovery-card-header">
@@ -210,10 +211,12 @@ function RecoveryCard({ tx, recovering, reverifying, onRecover, onReverify }: Re
         <button
           className="btn-primary"
           onClick={() => onRecover(tx.transaction_id)}
-          disabled={recovering || reverifying || isConflict}
-          title={isConflict ? '冲突需要手动解决，不能自动恢复' : '执行恢复'}
+          disabled={recovering || reverifying || isConflict || isTerminalUnresolved}
+          title={
+            isConflict || isTerminalUnresolved ? '该事务需要人工处理，不能自动恢复' : '执行恢复'
+          }
         >
-          {recovering ? '恢复中...' : '执行恢复'}
+          {isTerminalUnresolved ? '需要人工处理' : recovering ? '恢复中...' : '执行恢复'}
         </button>
         <button
           className="btn-secondary"

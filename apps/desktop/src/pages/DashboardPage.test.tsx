@@ -70,7 +70,9 @@ const mockState = vi.hoisted(() => ({
       duplicate_candidates: 4,
       next_action: 'resume_analysis',
       has_frozen_plan: false,
-      has_active_transaction: false,
+      has_recoverable_transaction: false,
+      has_terminal_unresolved_transaction: false,
+      has_missing_plan_album_transaction: false,
     },
     next_action: 'resume_analysis',
   } as DatabaseInfoDashboard,
@@ -137,7 +139,9 @@ beforeEach(() => {
           pending_reviews: 3,
           next_action: 'resume_analysis',
           has_frozen_plan: false,
-          has_active_transaction: false,
+          has_recoverable_transaction: false,
+          has_terminal_unresolved_transaction: false,
+          has_missing_plan_album_transaction: false,
         }
       : null,
   };
@@ -267,7 +271,9 @@ describe('DashboardPage database info', () => {
         failed_albums: 0,
         next_action: 'resume_commit',
         has_frozen_plan: true,
-        has_active_transaction: false,
+        has_recoverable_transaction: false,
+        has_terminal_unresolved_transaction: false,
+        has_missing_plan_album_transaction: true,
       },
       next_action: 'resume_commit',
     };
@@ -290,7 +296,9 @@ describe('DashboardPage database info', () => {
         failed_albums: 0,
         next_action: 'recover',
         has_frozen_plan: true,
-        has_active_transaction: true,
+        has_recoverable_transaction: true,
+        has_terminal_unresolved_transaction: false,
+        has_missing_plan_album_transaction: false,
       },
       next_action: 'recover',
     };
@@ -299,5 +307,31 @@ describe('DashboardPage database info', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '前往恢复' }));
     expect(onGoRecovery).toHaveBeenCalledOnce();
+  });
+
+  test('routes terminal failed or cancelled transactions to explicit manual disposition', async () => {
+    mockState.databaseInfo = {
+      ...mockState.databaseInfo,
+      latest_actionable_run: {
+        ...mockState.databaseInfo.latest_actionable_run!,
+        state: 'recovery_required',
+        pending_albums: 0,
+        analyzing_albums: 0,
+        pending_reviews: 0,
+        failed_albums: 0,
+        next_action: 'inspect_transaction_failure',
+        has_frozen_plan: true,
+        has_recoverable_transaction: false,
+        has_terminal_unresolved_transaction: true,
+        has_missing_plan_album_transaction: false,
+      },
+      next_action: 'inspect_transaction_failure',
+    };
+    const onGoRecovery = vi.fn();
+    renderDashboard(vi.fn(), vi.fn(), vi.fn(), onGoRecovery);
+
+    fireEvent.click(await screen.findByRole('button', { name: '处理失败事务' }));
+    expect(onGoRecovery).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: '前往恢复' })).not.toBeInTheDocument();
   });
 });

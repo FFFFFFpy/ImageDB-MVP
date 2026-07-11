@@ -2952,6 +2952,22 @@ mod tests {
         let plan_id = ImportRepository::create_import_plan(&client, new_run, 1, "test", root_id)
             .await
             .unwrap();
+        let second_album = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_albums
+                 (id, import_run_id, source_path, source_name, state)
+                 VALUES ($1, $2, 'C:/new/second', 'new-second', 'analyzed')",
+                &[&second_album, &new_run],
+            )
+            .await
+            .unwrap();
+        ImportRepository::insert_plan_album(&client, plan_id, new_album, "new-ready", 0)
+            .await
+            .unwrap();
+        ImportRepository::insert_plan_album(&client, plan_id, second_album, "new-second", 0)
+            .await
+            .unwrap();
         ImportRepository::set_plan_hash(&client, plan_id, &[7_u8; 32])
             .await
             .unwrap();
@@ -2986,11 +3002,44 @@ mod tests {
             crate::repositories::import_repository::DashboardNextAction::ResumeCommit
         );
         assert!(actionable.has_frozen_plan);
-        assert!(!actionable.has_active_transaction);
+        assert!(!actionable.has_recoverable_transaction);
+        assert!(!actionable.has_terminal_unresolved_transaction);
+        assert!(actionable.has_missing_plan_album_transaction);
 
+        client
+            .execute(
+                "UPDATE import_runs SET state = 'committing' WHERE id = $1",
+                &[&new_run],
+            )
+            .await
+            .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::ResumeCommit,
+            "committing before the first transaction prewrite must resume commit"
+        );
+        assert_eq!(
+            ImportRepository::get_latest_committable_run(&client)
+                .await
+                .unwrap(),
+            Some(new_run)
+        );
+
+        let first_transaction = Uuid::new_v4();
         ImportRepository::insert_file_transaction(
             &client,
-            Uuid::new_v4(),
+            first_transaction,
             new_run,
             new_album,
             &crate::domain::state_machine::TransactionState::Planned,
@@ -3027,8 +3076,159 @@ mod tests {
                 .latest_actionable_run
                 .as_ref()
                 .unwrap()
-                .has_active_transaction
+                .has_recoverable_transaction
         );
+
+        ImportRepository::update_file_transaction_state(
+            &client,
+            first_transaction,
+            &crate::domain::state_machine::TransactionState::SourceArchived,
+            None,
+        )
+        .await
+        .unwrap();
+        client
+            .execute(
+                "UPDATE import_runs SET state = 'recovery_required' WHERE id = $1",
+                &[&new_run],
+            )
+            .await
+            .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::ResumeCommit,
+            "a completed first album plus a missing second transaction must resume commit"
+        );
+        assert!(
+            dashboard
+                .latest_actionable_run
+                .as_ref()
+                .unwrap()
+                .has_missing_plan_album_transaction
+        );
+        assert_eq!(
+            ImportRepository::get_latest_committable_run(&client)
+                .await
+                .unwrap(),
+            Some(new_run)
+        );
+
+        let failed_transaction = Uuid::new_v4();
+        ImportRepository::insert_file_transaction(
+            &client,
+            failed_transaction,
+            new_run,
+            second_album,
+            &crate::domain::state_machine::TransactionState::SourceArchived,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::ResumeCommit,
+            "an all-archived stale parent run must re-enter commit for final reconciliation"
+        );
+        assert_eq!(
+            ImportRepository::get_latest_committable_run(&client)
+                .await
+                .unwrap(),
+            Some(new_run)
+        );
+
+        ImportRepository::update_file_transaction_state(
+            &client,
+            failed_transaction,
+            &crate::domain::state_machine::TransactionState::Failed,
+            Some("terminal failure"),
+        )
+        .await
+        .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        let actionable = dashboard.latest_actionable_run.as_ref().unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::InspectTransactionFailure
+        );
+        assert!(!actionable.has_recoverable_transaction);
+        assert!(actionable.has_terminal_unresolved_transaction);
+        assert!(!actionable.has_missing_plan_album_transaction);
+        assert_eq!(
+            ImportRepository::get_latest_committable_run(&client)
+                .await
+                .unwrap(),
+            None,
+            "terminal-only unresolved transactions require manual disposition"
+        );
+        let diagnostics = crate::services::recovery_service::scan_recoverable_transactions(&client)
+            .await
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].transaction_id, failed_transaction);
+        assert_eq!(diagnostics[0].current_state, "failed");
+
+        ImportRepository::update_file_transaction_state(
+            &client,
+            failed_transaction,
+            &crate::domain::state_machine::TransactionState::Cancelled,
+            Some("terminal cancellation"),
+        )
+        .await
+        .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::InspectTransactionFailure
+        );
+        let diagnostics = crate::services::recovery_service::scan_recoverable_transactions(&client)
+            .await
+            .unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].current_state, "cancelled");
 
         drop(client);
         handle.abort();

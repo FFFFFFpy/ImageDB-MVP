@@ -1,6 +1,6 @@
 {
   "gate": "M9 performance and stability thresholds",
-  "generated_at": "2026-07-11T18:26:09.784Z",
+  "generated_at": "2026-07-11T18:58:50.159Z",
   "command": "pnpm release:performance",
   "environment": {
     "platform": "win32",
@@ -20,18 +20,18 @@
     "total_ms_max": 120000
   },
   "metrics": {
-    "commit_images_per_sec": 148.14814814814815,
-    "commit_mib_per_sec": 0.9929515697337963,
-    "commit_ms": 810,
+    "commit_images_per_sec": 118.81188118811882,
+    "commit_mib_per_sec": 0.7963274965191831,
+    "commit_ms": 1010,
     "image_count": 120,
     "library_images": 120,
-    "managed_startup_ms": 3554,
-    "plan_ms": 57,
-    "recovery_scan_empty_ms": 17,
-    "scan_images_per_sec": 65.28835690968444,
-    "scan_ms": 1838,
+    "managed_startup_ms": 4114,
+    "plan_ms": 54,
+    "recovery_scan_empty_ms": 22,
+    "scan_images_per_sec": 67.49156355455568,
+    "scan_ms": 1778,
     "source_bytes": 843360,
-    "total_ms": 6297
+    "total_ms": 6999
   },
   "status": "passed",
   "failures": [],

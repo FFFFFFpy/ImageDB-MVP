@@ -245,6 +245,7 @@ export interface ImportRunDashboard {
 
 export type DashboardNextAction =
   | 'recover'
+  | 'inspect_transaction_failure'
   | 'review'
   | 'generate_plan'
   | 'resume_analysis'
@@ -255,7 +256,9 @@ export type DashboardNextAction =
 export interface DashboardActionableRun extends ImportRunDashboard {
   next_action: DashboardNextAction;
   has_frozen_plan: boolean;
-  has_active_transaction: boolean;
+  has_recoverable_transaction: boolean;
+  has_terminal_unresolved_transaction: boolean;
+  has_missing_plan_album_transaction: boolean;
 }
 
 export interface DatabaseInfoDashboard {

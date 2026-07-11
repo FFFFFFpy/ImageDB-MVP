@@ -20,6 +20,8 @@ MVP1 已定性为：
 
 合并复验收尾：Dashboard 下一步由后端 `next_action` 统一路由，覆盖审核完成后的计划生成、cancelled frozen plan 续提交以及 committing / active transaction 恢复入口；React 不再根据零散计数猜测状态机。
 
+恢复死锁修复：Dashboard 区分可恢复事务、failed/cancelled 终态未解决事务和 frozen plan 缺失图集事务；事务预写前与图集间崩溃重新进入幂等 Commit，终态失败进入明确人工处置入口。
+
 ## 状态摘要
 
 MVP1 本地主链已人工验收通过：

@@ -85,6 +85,8 @@ export function DashboardPage({
     switch (info?.next_action) {
       case 'recover':
         return { label: '前往恢复', onClick: onGoRecovery };
+      case 'inspect_transaction_failure':
+        return { label: '处理失败事务', onClick: onGoRecovery };
       case 'review':
         return { label: '继续审核', onClick: onGoReview };
       case 'generate_plan':

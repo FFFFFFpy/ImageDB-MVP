@@ -134,6 +134,7 @@ pub struct DatabaseInfoImportsSection {
 #[serde(rename_all = "snake_case")]
 pub enum DashboardNextAction {
     Recover,
+    InspectTransactionFailure,
     Review,
     GeneratePlan,
     ResumeAnalysis,
@@ -148,7 +149,9 @@ pub struct DashboardActionableRun {
     pub run: ImportRunDashboard,
     pub next_action: DashboardNextAction,
     pub has_frozen_plan: bool,
-    pub has_active_transaction: bool,
+    pub has_recoverable_transaction: bool,
+    pub has_terminal_unresolved_transaction: bool,
+    pub has_missing_plan_album_transaction: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2331,18 +2334,44 @@ impl ImportRepository {
                               'library_committed', 'source_archiving',
                               'cleanup_required', 'conflict'
                           )
-                    ) AS has_active_transaction
+                    ) AS has_recoverable_transaction,
+                    EXISTS (
+                        SELECT 1 FROM file_transactions ft
+                        WHERE ft.import_run_id = r.id
+                          AND ft.state IN ('failed', 'cancelled')
+                    ) AS has_terminal_unresolved_transaction,
+                    EXISTS (
+                        SELECT 1
+                        FROM import_plans p
+                        JOIN import_plan_albums ipa ON ipa.plan_id = p.id
+                        WHERE p.import_run_id = r.id
+                          AND p.state IN ('frozen', 'consumed')
+                          AND p.plan_hash IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM file_transactions ft
+                              WHERE ft.import_run_id = r.id
+                                AND ft.import_album_id = ipa.import_album_id
+                          )
+                    ) AS has_missing_plan_album_transaction
                FROM import_runs r
                LEFT JOIN import_albums a ON a.import_run_id = r.id
                WHERE r.state NOT IN ('abandoned', 'completed')
                GROUP BY r.id, r.source_root, r.state, r.started_at
              ), routed AS (
                SELECT *, CASE
-                   WHEN state IN ('recovery_required', 'committing')
-                        OR has_active_transaction THEN 'recover'
+                   WHEN has_recoverable_transaction THEN 'recover'
                    WHEN state = 'review_required' AND pending_reviews > 0 THEN 'review'
                    WHEN state = 'review_required' AND pending_reviews = 0 THEN 'generate_plan'
-                   WHEN state = 'cancelled' AND has_frozen_plan THEN 'resume_commit'
+                   WHEN state = 'cancelled' AND has_frozen_plan
+                        AND NOT has_terminal_unresolved_transaction THEN 'resume_commit'
+                   WHEN state IN ('committing', 'recovery_required')
+                        AND has_frozen_plan
+                        AND has_missing_plan_album_transaction THEN 'resume_commit'
+                   WHEN state IN ('committing', 'recovery_required')
+                        AND has_terminal_unresolved_transaction THEN 'inspect_transaction_failure'
+                   WHEN state IN ('committing', 'recovery_required')
+                        AND has_frozen_plan THEN 'resume_commit'
+                   WHEN state IN ('committing', 'recovery_required') THEN 'inspect_transaction_failure'
                    WHEN pending_albums > 0 OR analyzing_albums > 0 THEN 'resume_analysis'
                    WHEN state = 'failed' OR failed_albums > 0 THEN 'inspect_failed'
                    WHEN state = 'ready_to_commit' THEN 'generate_plan'
@@ -2354,12 +2383,13 @@ impl ImportRepository {
              WHERE next_action <> 'new_import'
              ORDER BY CASE next_action
                         WHEN 'recover' THEN 0
-                        WHEN 'review' THEN 1
-                        WHEN 'generate_plan' THEN 2
-                        WHEN 'resume_analysis' THEN 3
-                        WHEN 'inspect_failed' THEN 4
-                        WHEN 'resume_commit' THEN 5
-                        ELSE 6
+                        WHEN 'inspect_transaction_failure' THEN 1
+                        WHEN 'review' THEN 2
+                        WHEN 'generate_plan' THEN 3
+                        WHEN 'resume_analysis' THEN 4
+                        WHEN 'inspect_failed' THEN 5
+                        WHEN 'resume_commit' THEN 6
+                        ELSE 7
                       END,
                       started_at DESC
              LIMIT 1",
@@ -2372,6 +2402,7 @@ impl ImportRepository {
         Ok(row.map(|r| {
             let next_action = match r.get::<_, String>("next_action").as_str() {
                 "recover" => DashboardNextAction::Recover,
+                "inspect_transaction_failure" => DashboardNextAction::InspectTransactionFailure,
                 "review" => DashboardNextAction::Review,
                 "generate_plan" => DashboardNextAction::GeneratePlan,
                 "resume_analysis" => DashboardNextAction::ResumeAnalysis,
@@ -2396,7 +2427,9 @@ impl ImportRepository {
                 },
                 next_action,
                 has_frozen_plan: r.get("has_frozen_plan"),
-                has_active_transaction: r.get("has_active_transaction"),
+                has_recoverable_transaction: r.get("has_recoverable_transaction"),
+                has_terminal_unresolved_transaction: r.get("has_terminal_unresolved_transaction"),
+                has_missing_plan_album_transaction: r.get("has_missing_plan_album_transaction"),
             }
         }))
     }
@@ -2559,22 +2592,25 @@ impl ImportRepository {
     ///
     /// Priority (highest first):
     /// 1. `ready_to_commit` — a frozen plan exists, nothing committed yet.
-    /// 2. `cancelled` with no active file transaction — cancel-before-prewrite
-    ///    (P0) leaves the run re-committable from the same frozen plan; a
-    ///    cancelled run that still has an in-flight transaction routes to the
-    ///    recovery page, not here.
+    /// 2. `cancelled` with no recoverable or unresolved terminal transaction —
+    ///    cancel-before-prewrite leaves the run re-committable from the same
+    ///    frozen plan.
+    /// 3. `committing` / `recovery_required` with no recoverable transaction
+    ///    and either a missing frozen-plan album transaction or no unresolved
+    ///    terminal transaction — the idempotent commit loop creates missing
+    ///    rows or reconciles an already-archived plan to completed.
     ///
-    /// `completed`/`failed`/`recovery_required` runs never enter the default
-    /// commit page. Within a priority tier, the newest run by `started_at`
-    /// wins (the frozen plan is what makes the run committable, not the
-    /// completion timestamp). Only runs with a frozen/consumed plan and a
-    /// non-null `plan_hash` are eligible, so an aborted scan (still in
-    /// `scanning`/`fingerprinting`/...) is never picked up here.
+    /// `completed`/`failed` runs never enter the default commit page. Within a
+    /// priority tier, the newest run by `started_at` wins (the frozen plan is
+    /// what makes the run committable, not the completion timestamp). Only
+    /// runs with a frozen/consumed plan and a non-null `plan_hash` are eligible,
+    /// so an aborted scan (still in `scanning`/`fingerprinting`/...) is never
+    /// picked up here.
     pub async fn get_latest_committable_run(client: &Client) -> Result<Option<Uuid>, AppError> {
         let row = client
             .query_opt(
                 "SELECT r.id FROM import_runs r
-                 WHERE r.state IN ('ready_to_commit', 'cancelled')
+                 WHERE r.state IN ('ready_to_commit', 'cancelled', 'committing', 'recovery_required')
                    AND EXISTS (
                        SELECT 1 FROM import_plans p
                        WHERE p.import_run_id = r.id
@@ -2583,18 +2619,56 @@ impl ImportRepository {
                    )
                    AND (
                        r.state = 'ready_to_commit'
-                       OR NOT EXISTS (
-                           SELECT 1 FROM file_transactions ft
-                           WHERE ft.import_run_id = r.id
-                             AND ft.state NOT IN (
-                                 'library_committed', 'source_archived',
-                                 'cancelled', 'failed', 'conflict'
-                             )
+                       OR (r.state = 'cancelled'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM file_transactions ft
+                               WHERE ft.import_run_id = r.id
+                                 AND ft.state IN (
+                                     'planned', 'staging', 'verifying', 'verified',
+                                     'publishing', 'published', 'db_committing',
+                                     'library_committed', 'source_archiving',
+                                     'cleanup_required', 'conflict', 'failed', 'cancelled'
+                                 )
+                           )
+                       )
+                       OR (r.state IN ('committing', 'recovery_required')
+                           AND NOT EXISTS (
+                               SELECT 1 FROM file_transactions ft
+                               WHERE ft.import_run_id = r.id
+                                 AND ft.state IN (
+                                     'planned', 'staging', 'verifying', 'verified',
+                                     'publishing', 'published', 'db_committing',
+                                     'library_committed', 'source_archiving',
+                                     'cleanup_required', 'conflict'
+                                 )
+                           )
+                           AND (
+                               EXISTS (
+                                   SELECT 1
+                                   FROM import_plans p2
+                                   JOIN import_plan_albums ipa ON ipa.plan_id = p2.id
+                                   WHERE p2.import_run_id = r.id
+                                     AND p2.state IN ('frozen', 'consumed')
+                                     AND p2.plan_hash IS NOT NULL
+                                     AND NOT EXISTS (
+                                         SELECT 1 FROM file_transactions ft
+                                         WHERE ft.import_run_id = r.id
+                                           AND ft.import_album_id = ipa.import_album_id
+                                     )
+                                 )
+                               OR NOT EXISTS (
+                                   SELECT 1 FROM file_transactions ft
+                                   WHERE ft.import_run_id = r.id
+                                     AND ft.state IN ('failed', 'cancelled')
+                               )
+                           )
                        )
                    )
                  ORDER BY CASE r.state
                             WHEN 'ready_to_commit' THEN 0
                             WHEN 'cancelled' THEN 1
+                            WHEN 'committing' THEN 2
+                            WHEN 'recovery_required' THEN 3
                           END,
                           r.started_at DESC
                  LIMIT 1",
@@ -3589,17 +3663,23 @@ impl ImportRepository {
         }))
     }
 
-    /// All non-terminal file transactions needing recovery at startup.
+    /// All actionable transaction diagnostics at startup. This includes
+    /// failed/cancelled terminal rows so the Recovery surface can present an
+    /// explicit manual-disposition state instead of an empty page. Only
+    /// source_archived is omitted because it is fully resolved.
     pub async fn get_recoverable_transactions(
         client: &Client,
     ) -> Result<Vec<FileTransactionFullRow>, AppError> {
         let rows = client
             .query(
-                "SELECT id, import_run_id, import_album_id, state, staging_path, target_path,
-                        manifest_path, plan_hash, manifest_hash, last_error
-                 FROM file_transactions
-                 WHERE state NOT IN ('source_archived', 'failed', 'cancelled')
-                 ORDER BY started_at",
+                "SELECT ft.id, ft.import_run_id, ft.import_album_id, ft.state,
+                        ft.staging_path, ft.target_path, ft.manifest_path,
+                        ft.plan_hash, ft.manifest_hash, ft.last_error
+                 FROM file_transactions ft
+                 JOIN import_runs r ON r.id = ft.import_run_id
+                 WHERE ft.state <> 'source_archived'
+                   AND r.state NOT IN ('abandoned', 'completed')
+                 ORDER BY ft.started_at",
                 &[],
             )
             .await
