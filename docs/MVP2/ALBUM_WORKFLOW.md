@@ -33,6 +33,8 @@ analyzing / scanning / fingerprinting / cancelled / failed
 
 用户也可以显式放弃旧任务。`abandon_import_run(import_run_id)` 将 run 标记为 `abandoned`，保留 snapshot、图片和候选作为历史证据；存在 frozen plan 或 file transaction 时 fail closed。UI 的“放弃旧 checkpoint，重新分析”随后为同一源目录创建全新 run，因此修复过的源文件不会再被旧 snapshot 永久阻挡。
 
+`abandoned` 是历史终态，不是失败任务的别名。Dashboard 的历史任务、图集和图片总数可以包含它，但待审核、失败、恢复等当前待办统计必须通过 `import_runs` 排除它；Dashboard 的下一步只使用同一个 `latest_actionable_run`，Review 和 Commit 的默认入口也不会重新选择 abandoned run。ScanPage 可以展示其历史状态，但不提供 resume、retry 或 review 主流程按钮。
+
 如果待清理图集已经被 frozen plan 或 file transaction 引用，续跑会 fail closed，不删除任何证据。
 
 ## 单图集 checkpoint
@@ -67,6 +69,14 @@ mark analyzed or review_required
 因此 Review 可以在整批分析结束前看到已经落库的 review candidates。
 
 同一 import/import 或 import/library 图片对在数据库中只能有一个 candidate。重复证据按 `file_exact`、`pixel_exact`、`perceptual_near`、`perceptual_similar` 的优先级合并；历史图库 exact 命中不再重复进入 perceptual 比较。感知 bucket 使用稳定顺序并完整遍历，不再用无序 `LIMIT 50` 随机丢弃候选。
+
+当前感知 bucket API 明确执行完整 bucket 查询并按 UUID 稳定排序，不再接受虚假的 `max_candidates=50` 参数。后续若超大 bucket 的内存占用成为实测问题，再加入 UUID keyset 分页与批次取消检查，但不得改变完整召回语义。
+
+## Migration 0013 / 0014
+
+当前 migration head 是 `0014_candidate_review_semantics_and_abandoned_filters`。修正版 0013 对每条人工审核交叉校验 `decision` 与 `selected_image_id`，再把 import/import 反向 pair 归一化为最终选中图片或 `KEEP_ALL` / `SKIP_ALBUM`；冲突会携带 pair 类型、run 和图片 ID fail closed。只有结果兼容后才按“已审核、匹配强度、created_at、UUID”选择 survivor，并在必要时重写方向相关的 decision 字段而不改变最终选择。
+
+0014 会校验旧 0013 之后仍存在的审核行、安装持续写入约束并确认唯一索引。它不能恢复旧开发版 0013 已经删除的 candidate 或 review decision；需要验证迁移语义的非生产测试库应从 0012 fixture 或全新数据库重新执行，不得改写历史 migration 记录。
 
 ## Retry
 

@@ -114,7 +114,7 @@ export function nextActionLabelForScanState(state: string | null | undefined): s
 }
 
 function canResumeRun(run: ImportRunDashboard | null): boolean {
-  if (!run) return false;
+  if (!run || run.state === 'abandoned') return false;
   return run.pending_albums > 0 || run.analyzing_albums > 0;
 }
 
@@ -614,7 +614,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
                     <td>{album.review_candidate_count}</td>
                     <td className="status-error">{album.last_error_message ?? ''}</td>
                     <td>
-                      {album.state === 'failed' && (
+                      {activeRun.state !== 'abandoned' && album.state === 'failed' && (
                         <button
                           className="btn-secondary"
                           onClick={() => retryAlbum.mutate(album.id)}
@@ -623,7 +623,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
                           重试
                         </button>
                       )}
-                      {album.review_candidate_count > 0 && (
+                      {activeRun.state !== 'abandoned' && album.review_candidate_count > 0 && (
                         <button className="btn-primary" onClick={() => onNavigate('review')}>
                           审核
                         </button>

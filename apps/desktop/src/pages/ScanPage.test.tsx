@@ -225,6 +225,26 @@ describe('ScanPage album workflow', () => {
     expect(mockApi.startScan).not.toHaveBeenCalled();
   });
 
+  test('shows abandoned history without resume or retry workflow controls', async () => {
+    const original = mockState.dashboard;
+    mockState.dashboard = original.map((run) =>
+      run.import_run_id === 'run-1'
+        ? { ...run, state: 'abandoned', pending_albums: 1, failed_albums: 1 }
+        : run,
+    );
+    try {
+      renderScanPage();
+      expect(await screen.findByText('review-album')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '继续分析' })).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: '放弃旧 checkpoint，重新分析' }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
+    } finally {
+      mockState.dashboard = original;
+    }
+  });
+
   test('abandons an old checkpoint and starts a clean run for the same source', async () => {
     const original = mockState.dashboard;
     mockState.dashboard = [{ ...original[0], state: 'failed', pending_albums: 0 }];

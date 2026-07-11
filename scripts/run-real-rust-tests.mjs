@@ -31,6 +31,8 @@ const cargoManifest = 'apps/desktop/src-tauri/Cargo.toml';
 const cargoCommand = 'cargo';
 const suites = [
   { name: 'album workflow migration repair', filter: 'real_migration_0012_' },
+  { name: 'candidate review semantics migration', filter: 'real_migration_0013_' },
+  { name: 'abandoned workflow isolation', filter: 'real_abandoned_' },
   { name: 'scan persistence', filter: 'real_scan_' },
   { name: 'source snapshot verification', filter: 'real_snapshot_' },
   { name: 'review persistence', filter: 'real_review_' },

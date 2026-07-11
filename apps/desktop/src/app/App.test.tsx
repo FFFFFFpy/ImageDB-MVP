@@ -218,6 +218,20 @@ test('sidebar new import clears a run selected from the dashboard', async () => 
       pending_reviews: 0,
       duplicate_candidates: 0,
     },
+    latest_actionable_run: {
+      import_run_id: 'run-selected',
+      source_root: 'D:/Selected',
+      state: 'analyzing',
+      total_albums: 1,
+      pending_albums: 1,
+      analyzing_albums: 0,
+      analyzed_albums: 0,
+      review_required_albums: 0,
+      failed_albums: 0,
+      total_images: 1,
+      pending_reviews: 0,
+      duplicate_candidates: 0,
+    },
   };
 
   renderApp();

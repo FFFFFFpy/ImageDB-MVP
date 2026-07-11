@@ -55,6 +55,20 @@ const mockState = vi.hoisted(() => ({
       pending_reviews: 3,
       duplicate_candidates: 4,
     },
+    latest_actionable_run: {
+      import_run_id: 'run-1',
+      source_root: 'D:/Photos',
+      state: 'analyzing',
+      total_albums: 4,
+      pending_albums: 1,
+      analyzing_albums: 0,
+      analyzed_albums: 2,
+      review_required_albums: 1,
+      failed_albums: 1,
+      total_images: 20,
+      pending_reviews: 3,
+      duplicate_candidates: 4,
+    },
   } as DatabaseInfoDashboard,
 }));
 
@@ -67,19 +81,20 @@ vi.mock('../lib/ipc/api', () => ({
   api: mockApi,
 }));
 
-function renderDashboard(onGoScan = vi.fn()) {
+function renderDashboard(onGoScan = vi.fn(), onGoReview = vi.fn()) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return {
     onGoScan,
+    onGoReview,
     ...render(
       <QueryClientProvider client={client}>
         <DashboardPage
           needsOnboarding={false}
           onConfigureDatabase={vi.fn()}
           onGoScan={onGoScan}
-          onGoReview={vi.fn()}
+          onGoReview={onGoReview}
           onGoRecovery={vi.fn()}
         />
       </QueryClientProvider>,
@@ -98,6 +113,13 @@ beforeEach(() => {
     latest_run: mockState.databaseInfo.latest_run
       ? {
           ...mockState.databaseInfo.latest_run,
+          pending_albums: 1,
+          pending_reviews: 3,
+        }
+      : null,
+    latest_actionable_run: mockState.databaseInfo.latest_actionable_run
+      ? {
+          ...mockState.databaseInfo.latest_actionable_run,
           pending_albums: 1,
           pending_reviews: 3,
         }
@@ -127,10 +149,65 @@ describe('DashboardPage database info', () => {
     mockState.databaseInfo = {
       ...mockState.databaseInfo,
       imports: { ...mockState.databaseInfo.imports, pending_review_count: 0 },
+      latest_actionable_run: {
+        ...mockState.databaseInfo.latest_actionable_run!,
+        pending_reviews: 0,
+      },
     };
     const { onGoScan } = renderDashboard();
 
     fireEvent.click(await screen.findByRole('button', { name: '继续分析' }));
     expect(onGoScan).toHaveBeenCalledWith('run-1');
+  });
+
+  test('ignores abandoned historical failures and pending reviews for the next action', async () => {
+    mockState.databaseInfo = {
+      ...mockState.databaseInfo,
+      imports: {
+        ...mockState.databaseInfo.imports,
+        pending_review_count: 0,
+        failed_album_count: 0,
+      },
+      latest_run: {
+        ...mockState.databaseInfo.latest_run!,
+        state: 'abandoned',
+        pending_reviews: 9,
+        failed_albums: 2,
+      },
+      latest_actionable_run: null,
+    };
+    const { onGoScan, onGoReview } = renderDashboard();
+
+    expect(await screen.findByText(/已放弃/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '查看失败图集' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '继续审核' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '开始导入' }));
+    expect(onGoScan).toHaveBeenCalledWith(null);
+    expect(onGoReview).not.toHaveBeenCalled();
+  });
+
+  test('routes a new ready-to-commit run to import review despite abandoned history', async () => {
+    mockState.databaseInfo = {
+      ...mockState.databaseInfo,
+      imports: {
+        ...mockState.databaseInfo.imports,
+        pending_review_count: 0,
+        failed_album_count: 0,
+      },
+      latest_run: { ...mockState.databaseInfo.latest_run!, state: 'abandoned' },
+      latest_actionable_run: {
+        ...mockState.databaseInfo.latest_actionable_run!,
+        import_run_id: 'run-new',
+        state: 'ready_to_commit',
+        pending_albums: 0,
+        pending_reviews: 0,
+        failed_albums: 0,
+      },
+    };
+    const onGoReview = vi.fn();
+    renderDashboard(vi.fn(), onGoReview);
+
+    fireEvent.click(await screen.findByRole('button', { name: '前往入库审核' }));
+    expect(onGoReview).toHaveBeenCalledOnce();
   });
 });

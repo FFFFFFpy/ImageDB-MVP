@@ -74,22 +74,27 @@ export function DashboardPage({
           ? '尚未选择数据库模式'
           : null;
   const latestRun = info?.latest_run ?? null;
-  const pendingReviews = info?.imports.pending_review_count ?? latestRun?.pending_reviews ?? 0;
-  const failedAlbums = info?.imports.failed_album_count ?? latestRun?.failed_albums ?? 0;
+  const actionableRun = info?.latest_actionable_run ?? null;
+  const pendingReviews = info?.imports.pending_review_count ?? 0;
+  const failedAlbums = info?.imports.failed_album_count ?? 0;
   const recoveryRequiredRuns = info?.imports.recovery_required_run_count ?? 0;
-  const hasRecoveryTask = recoveryRequiredRuns > 0 || latestRun?.state === 'recovery_required';
+  const hasRecoveryTask = actionableRun?.state === 'recovery_required';
   const hasResumableRun =
-    !!latestRun && (latestRun.pending_albums > 0 || latestRun.analyzing_albums > 0);
-  const hasFailedRun = !!latestRun && failedAlbums > 0;
+    !!actionableRun && (actionableRun.pending_albums > 0 || actionableRun.analyzing_albums > 0);
+  const hasFailedRun = !!actionableRun && actionableRun.failed_albums > 0;
+  const hasReviewTask = !!actionableRun && actionableRun.pending_reviews > 0;
+  const isReadyToCommit = actionableRun?.state === 'ready_to_commit';
   const nextAction = hasRecoveryTask
     ? { label: '前往恢复', onClick: onGoRecovery }
-    : pendingReviews > 0
+    : hasReviewTask
       ? { label: '继续审核', onClick: onGoReview }
       : hasResumableRun
-        ? { label: '继续分析', onClick: () => onGoScan(latestRun.import_run_id) }
+        ? { label: '继续分析', onClick: () => onGoScan(actionableRun.import_run_id) }
         : hasFailedRun
-          ? { label: '查看失败图集', onClick: () => onGoScan(latestRun.import_run_id) }
-          : { label: '开始导入', onClick: () => onGoScan(null) };
+          ? { label: '查看失败图集', onClick: () => onGoScan(actionableRun.import_run_id) }
+          : isReadyToCommit
+            ? { label: '前往入库审核', onClick: onGoReview }
+            : { label: '开始导入', onClick: () => onGoScan(null) };
 
   return (
     <div className="dashboard-page">
@@ -175,6 +180,7 @@ export function DashboardPage({
           <p className="status-card-detail">
             最近任务：{latestRun.total_albums} 个图集，已分析 {latestRun.analyzed_albums}，待审核{' '}
             {latestRun.review_required_albums}，失败 {latestRun.failed_albums}
+            {latestRun.state === 'abandoned' ? '，已放弃' : ''}
           </p>
         )}
       </section>

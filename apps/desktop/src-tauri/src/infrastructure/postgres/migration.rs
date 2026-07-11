@@ -16,6 +16,8 @@ const MIGRATION_0011: &str = include_str!("../../../migrations/0011_album_workfl
 const MIGRATION_0012: &str = include_str!("../../../migrations/0012_album_workflow_repair.sql");
 const MIGRATION_0013: &str =
     include_str!("../../../migrations/0013_workflow_escape_and_candidate_uniqueness.sql");
+const MIGRATION_0014: &str =
+    include_str!("../../../migrations/0014_candidate_review_semantics_and_abandoned_filters.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
@@ -33,6 +35,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0013_workflow_escape_and_candidate_uniqueness",
         MIGRATION_0013,
+    ),
+    (
+        "0014_candidate_review_semantics_and_abandoned_filters",
+        MIGRATION_0014,
     ),
 ];
 
@@ -170,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 13);
+        assert_eq!(MIGRATIONS.len(), 14);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
         assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
@@ -186,6 +192,8 @@ mod tests {
         assert!(MIGRATION_0012.contains("fingerprinted_count"));
         assert!(MIGRATION_0013.contains("'abandoned'"));
         assert!(MIGRATION_0013.contains("idx_duplicate_candidates_library_pair"));
+        assert!(MIGRATION_0013.contains("conflicting normalized review outcomes"));
+        assert!(MIGRATION_0014.contains("enforce_review_decision_semantics"));
     }
 
     #[test]
@@ -205,12 +213,13 @@ mod tests {
                 "0010_library_root_leases",
                 "0011_album_workflow_state",
                 "0012_album_workflow_repair",
-                "0013_workflow_escape_and_candidate_uniqueness"
+                "0013_workflow_escape_and_candidate_uniqueness",
+                "0014_candidate_review_semantics_and_abandoned_filters"
             ]
         );
         assert_eq!(
             MigrationRunner::latest_version(),
-            "0013_workflow_escape_and_candidate_uniqueness"
+            "0014_candidate_review_semantics_and_abandoned_filters"
         );
     }
 
@@ -265,6 +274,362 @@ mod tests {
     #[cfg(feature = "real-db-tests")]
     async fn apply_migrations_through_0011(client: &mut Client) {
         apply_migration_prefix(client, 11).await;
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    async fn insert_duplicate_pair_fixture(
+        client: &Client,
+        library_pair: bool,
+    ) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+        use uuid::Uuid;
+
+        let root_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let album_id = Uuid::new_v4();
+        let image_a = Uuid::new_v4();
+        let image_b = Uuid::new_v4();
+        let candidate_1 = Uuid::new_v4();
+        let candidate_2 = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO library_roots (id, path, display_name) VALUES ($1, $2, $3)",
+                &[
+                    &root_id,
+                    &format!("C:/migration-root-{root_id}"),
+                    &"fixture",
+                ],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_runs (id, source_root, library_root_id, state, policy_version)
+                 VALUES ($1, $2, $3, 'review_required', 'fixture')",
+                &[&run_id, &format!("C:/migration-source-{run_id}"), &root_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_albums (id, import_run_id, source_path, source_name, state)
+                 VALUES ($1, $2, $3, 'album', 'review_required')",
+                &[
+                    &album_id,
+                    &run_id,
+                    &format!("C:/migration-album-{album_id}"),
+                ],
+            )
+            .await
+            .unwrap();
+        for (id, marker) in [(image_a, "a"), (image_b, "b")] {
+            client
+                .execute(
+                    "INSERT INTO import_images
+                        (id, import_album_id, source_path, relative_path, file_size, decode_state, state)
+                     VALUES ($1, $2, $3, $4, 1, 'decoded', 'fingerprinted')",
+                    &[
+                        &id,
+                        &album_id,
+                        &format!("C:/migration/{marker}.png"),
+                        &format!("{marker}.png"),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        if library_pair {
+            let library_album_id = Uuid::new_v4();
+            client
+                .execute(
+                    "INSERT INTO library_albums
+                        (id, library_root_id, display_name, relative_path, manifest_version,
+                         manifest_hash, image_count, state)
+                     VALUES ($1, $2, 'library', $3, '1', $4, 1, 'active')",
+                    &[
+                        &library_album_id,
+                        &root_id,
+                        &format!("library-{library_album_id}"),
+                        &vec![1_u8],
+                    ],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "INSERT INTO library_images
+                        (id, album_id, relative_path, file_size, width, height, format, blake3,
+                         fingerprint_version, state)
+                     VALUES ($1, $2, 'library.png', 1, 1, 1, 'png', $3, '1', 'active')",
+                    &[&image_b, &library_album_id, &vec![2_u8]],
+                )
+                .await
+                .unwrap();
+            for (id, match_type) in [(candidate_1, "pixel_exact"), (candidate_2, "file_exact")] {
+                client.execute(
+                    "INSERT INTO duplicate_candidates
+                        (id, import_run_id, source_image_id, candidate_library_image_id, scope, match_type)
+                     VALUES ($1, $2, $3, $4, 'library', $5)",
+                    &[&id, &run_id, &image_a, &image_b, &match_type],
+                ).await.unwrap();
+            }
+        } else {
+            client.execute(
+                "INSERT INTO duplicate_candidates
+                    (id, import_run_id, source_image_id, candidate_source_image_id, scope, match_type)
+                 VALUES ($1, $2, $3, $4, 'cross_album', 'pixel_exact'),
+                        ($5, $2, $4, $3, 'cross_album', 'file_exact')",
+                &[&candidate_1, &run_id, &image_a, &image_b, &candidate_2],
+            ).await.unwrap();
+        }
+        (run_id, image_a, image_b, candidate_1, candidate_2)
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0013_preserves_equivalent_import_and_library_outcomes() {
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+        manager.initialize().await.unwrap();
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
+        apply_migration_prefix(&mut client, 12).await;
+
+        let (_, import_a, _, import_c1, import_c2) =
+            insert_duplicate_pair_fixture(&client, false).await;
+        client
+            .execute(
+                "INSERT INTO review_decisions (id, candidate_id, decision, selected_image_id)
+             VALUES ($1, $2, 'keep_source', $3), ($4, $5, 'keep_candidate', $3)",
+                &[
+                    &Uuid::new_v4(),
+                    &import_c1,
+                    &import_a,
+                    &Uuid::new_v4(),
+                    &import_c2,
+                ],
+            )
+            .await
+            .unwrap();
+
+        let (_, library_source, _, library_c1, library_c2) =
+            insert_duplicate_pair_fixture(&client, true).await;
+        client
+            .execute(
+                "INSERT INTO review_decisions (id, candidate_id, decision, selected_image_id)
+             VALUES ($1, $2, 'keep_source', $3), ($4, $5, 'keep_source', $3)",
+                &[
+                    &Uuid::new_v4(),
+                    &library_c1,
+                    &library_source,
+                    &Uuid::new_v4(),
+                    &library_c2,
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            MigrationRunner::run_pending(&mut client)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        for selected in [import_a, library_source] {
+            let row = client
+                .query_one(
+                    "SELECT COUNT(*) AS candidates, COUNT(rd.id) AS decisions,
+                        MIN(rd.selected_image_id::text) AS selected
+                 FROM duplicate_candidates dc
+                 LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                 WHERE dc.source_image_id = $1 OR dc.candidate_source_image_id = $1",
+                    &[&selected],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row.get::<_, i64>("candidates"), 1);
+            assert_eq!(row.get::<_, i64>("decisions"), 1);
+            assert_eq!(
+                row.get::<_, Option<String>>("selected").as_deref(),
+                Some(selected.to_string().as_str())
+            );
+        }
+        let import_survivor = client.query_one(
+            "SELECT dc.source_image_id, dc.candidate_source_image_id, rd.decision, rd.selected_image_id
+             FROM duplicate_candidates dc JOIN review_decisions rd ON rd.candidate_id = dc.id
+             WHERE dc.import_run_id = (SELECT import_run_id FROM duplicate_candidates WHERE source_image_id = $1 OR candidate_source_image_id = $1 LIMIT 1)",
+            &[&import_a],
+        ).await.unwrap();
+        let source: Uuid = import_survivor.get("source_image_id");
+        let candidate: Uuid = import_survivor.get("candidate_source_image_id");
+        let decision: String = import_survivor.get("decision");
+        let selected: Uuid = import_survivor.get("selected_image_id");
+        assert_eq!(selected, import_a);
+        assert_eq!(
+            decision,
+            if source == import_a {
+                "keep_source"
+            } else {
+                "keep_candidate"
+            }
+        );
+        assert!(source == import_a || candidate == import_a);
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0013_rejects_conflicts_and_invalid_selected_atomically() {
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        for case in [
+            "opposite_selection",
+            "invalid_selected",
+            "keep_all_conflict",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+            manager.initialize().await.unwrap();
+            let (mut client, handle) = manager.connect_raw().await.unwrap();
+            apply_migration_prefix(&mut client, 12).await;
+            let (_, image_a, image_b, c1, c2) = insert_duplicate_pair_fixture(&client, false).await;
+            match case {
+                "opposite_selection" => client.execute(
+                    "INSERT INTO review_decisions (id, candidate_id, decision, selected_image_id)
+                     VALUES ($1, $2, 'keep_source', $3), ($4, $5, 'keep_source', $6)",
+                    &[&Uuid::new_v4(), &c1, &image_a, &Uuid::new_v4(), &c2, &image_b],
+                ).await.unwrap(),
+                "invalid_selected" => client.execute(
+                    "INSERT INTO review_decisions (id, candidate_id, decision, selected_image_id)
+                     VALUES ($1, $2, 'keep_source', $3)",
+                    &[&Uuid::new_v4(), &c1, &image_b],
+                ).await.unwrap(),
+                _ => client.execute(
+                    "INSERT INTO review_decisions (id, candidate_id, decision, selected_image_id)
+                     VALUES ($1, $2, 'keep_all', NULL), ($3, $4, 'keep_candidate', $5)",
+                    &[&Uuid::new_v4(), &c1, &Uuid::new_v4(), &c2, &image_a],
+                ).await.unwrap(),
+            };
+            let before_candidates: i64 = client
+                .query_one("SELECT COUNT(*) FROM duplicate_candidates", &[])
+                .await
+                .unwrap()
+                .get(0);
+            let before_decisions: i64 = client
+                .query_one("SELECT COUNT(*) FROM review_decisions", &[])
+                .await
+                .unwrap()
+                .get(0);
+            let error = MigrationRunner::run_pending(&mut client)
+                .await
+                .expect_err(case);
+            if case == "invalid_selected" {
+                assert!(error
+                    .to_string()
+                    .contains("invalid review decision structure"));
+            } else {
+                assert!(error
+                    .to_string()
+                    .contains("conflicting normalized review outcomes"));
+            }
+            assert_eq!(
+                MigrationRunner::current_version(&client)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("0012_album_workflow_repair")
+            );
+            assert_eq!(
+                client
+                    .query_one("SELECT COUNT(*) FROM duplicate_candidates", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0),
+                before_candidates
+            );
+            assert_eq!(
+                client
+                    .query_one("SELECT COUNT(*) FROM review_decisions", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0),
+                before_decisions
+            );
+            drop(client);
+            handle.abort();
+            manager.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0013_rejects_library_outcome_conflict_atomically() {
+        use tempfile::TempDir;
+        use uuid::Uuid;
+        let tmp = TempDir::new().unwrap();
+        let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+        manager.initialize().await.unwrap();
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
+        apply_migration_prefix(&mut client, 12).await;
+        let (_, source, library, c1, c2) = insert_duplicate_pair_fixture(&client, true).await;
+        client
+            .execute(
+                "INSERT INTO review_decisions (id, candidate_id, decision, selected_image_id)
+             VALUES ($1, $2, 'keep_source', $3), ($4, $5, 'keep_candidate', $6)",
+                &[
+                    &Uuid::new_v4(),
+                    &c1,
+                    &source,
+                    &Uuid::new_v4(),
+                    &c2,
+                    &library,
+                ],
+            )
+            .await
+            .unwrap();
+        let error = MigrationRunner::run_pending(&mut client)
+            .await
+            .expect_err("library conflict");
+        assert!(error.to_string().contains("import/library pair"));
+        assert!(error
+            .to_string()
+            .contains("conflicting normalized review outcomes"));
+        assert_eq!(
+            client
+                .query_one("SELECT COUNT(*) FROM duplicate_candidates", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            2
+        );
+        assert_eq!(
+            client
+                .query_one("SELECT COUNT(*) FROM review_decisions", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            2
+        );
+        assert_eq!(
+            MigrationRunner::current_version(&client)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0012_album_workflow_repair")
+        );
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -471,7 +836,8 @@ mod tests {
             applied,
             vec![
                 "0012_album_workflow_repair",
-                "0013_workflow_escape_and_candidate_uniqueness"
+                "0013_workflow_escape_and_candidate_uniqueness",
+                "0014_candidate_review_semantics_and_abandoned_filters"
             ]
         );
 
@@ -519,7 +885,7 @@ mod tests {
         assert_eq!(candidate_count, 0);
         assert_eq!(
             MigrationRunner::current_version(&client).await.unwrap(),
-            Some("0013_workflow_escape_and_candidate_uniqueness".to_string())
+            Some("0014_candidate_review_semantics_and_abandoned_filters".to_string())
         );
 
         drop(client);

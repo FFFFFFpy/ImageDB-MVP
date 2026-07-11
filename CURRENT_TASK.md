@@ -14,6 +14,10 @@ MVP1 已定性为：
 
 当前显式任务包：MVP2 图集级断点续跑 + 异步审核入口 + 数据状态可见，文档入口为 [`docs/MVP2/README.md`](docs/MVP2/README.md)。
 
+当前工作分支：`feat/mvp2-album-workflow-dashboard`
+
+当前 Debug / 合并审查任务：修复 candidate review 规范化语义冲突与 abandoned run 当前工作流隔离，migration head 更新为 `0014_candidate_review_semantics_and_abandoned_filters`。修复范围不改变 frozen plan、Commit 或 Recovery 文件事务语义。
+
 ## 状态摘要
 
 MVP1 本地主链已人工验收通过：

@@ -17,10 +17,19 @@ MVP2 不是 SQL 控制台、表浏览器，也不是新匹配算法或图集级 
 - 单个图集分析完成后立即落库为 `analyzed` 或 `review_required`。
 - 中断后通过显式 resume 继续 pending / stale analyzing / failed retry 图集；普通开始创建新 run。
 - 可显式 abandoned 旧 checkpoint，并在源文件修复后重新分析。
+- abandoned run 保留 albums、images、candidates 和 decisions 作为历史证据，但不参与当前待办统计、Review/Commit 自动选择或 Dashboard 下一步导航。
 - 失败图集可单独重置为待分析。
 - Dashboard / Scan / Review 显示图集状态、待审核、失败入口。
 - Dashboard 显示数据库概览：图库根目录、已入库图集/图片、导入任务、待审核、失败、恢复和冻结计划数量。
 - Commit 仍保持 run 级 frozen plan / commit 主链。
+
+当前数据库 migration head：
+
+```text
+0014_candidate_review_semantics_and_abandoned_filters
+```
+
+从 0012 升级时，0013 会先校验人工审核结构与规范化最终选择，再对方向无关的候选 pair 去重；0014 为后续写入增加审核语义约束。曾运行旧开发版 0013 的测试库无法由 0014 恢复已经删除的行，需要从 0012 fixture 或全新数据库重建后验证迁移语义。
 
 ## 文档
 

@@ -136,6 +136,7 @@ pub struct DatabaseInfoDashboard {
     pub library: DatabaseInfoLibrarySection,
     pub imports: DatabaseInfoImportsSection,
     pub latest_run: Option<ImportRunDashboard>,
+    pub latest_actionable_run: Option<ImportRunDashboard>,
 }
 
 pub struct ImportImageRecord {
@@ -1601,11 +1602,12 @@ impl ImportRepository {
     /// Query library images by perceptual band (bucketed similarity recall).
     /// Returns every row in a matching bucket in stable order. Silently
     /// dropping row 51 made correctness depend on heap order and VACUUM.
+    /// TODO: add UUID keyset pagination plus cancellation without changing
+    /// complete-bucket recall semantics.
     pub async fn find_library_images_by_perceptual_band(
         client: &Client,
         band_index: u8,
         band_value: &[u8],
-        _max_candidates: usize,
     ) -> Result<Vec<LibraryImageRow>, AppError> {
         let band_col = match band_index {
             0 => "perceptual_band_0",
@@ -2277,6 +2279,57 @@ impl ImportRepository {
             .collect())
     }
 
+    async fn get_latest_actionable_run_summary(
+        client: &Client,
+    ) -> Result<Option<ImportRunDashboard>, AppError> {
+        let row = client.query_opt(
+            "SELECT r.id AS import_run_id, r.source_root, r.state,
+                    COUNT(a.id)::INTEGER AS total_albums,
+                    COUNT(a.id) FILTER (WHERE a.state = 'pending')::INTEGER AS pending_albums,
+                    COUNT(a.id) FILTER (WHERE a.state IN ('analyzing', 'scanning', 'fingerprinting'))::INTEGER AS analyzing_albums,
+                    COUNT(a.id) FILTER (WHERE a.state = 'analyzed')::INTEGER AS analyzed_albums,
+                    COUNT(a.id) FILTER (WHERE a.state = 'review_required')::INTEGER AS review_required_albums,
+                    COUNT(a.id) FILTER (WHERE a.state = 'failed')::INTEGER AS failed_albums,
+                    COALESCE(SUM(a.image_count), 0)::INTEGER AS total_images,
+                    COALESCE(SUM(a.review_candidate_count), 0)::INTEGER AS pending_reviews,
+                    COALESCE(SUM(a.duplicate_candidate_count), 0)::INTEGER AS duplicate_candidates
+             FROM import_runs r
+             LEFT JOIN import_albums a ON a.import_run_id = r.id
+             WHERE r.state NOT IN ('abandoned', 'completed')
+             GROUP BY r.id, r.source_root, r.state, r.started_at
+             ORDER BY CASE
+                        WHEN r.state = 'recovery_required' THEN 0
+                        WHEN r.state = 'review_required' THEN 1
+                        WHEN r.state IN ('created', 'scanning', 'fingerprinting',
+                                         'detecting_duplicates', 'analyzing', 'cancelled') THEN 2
+                        WHEN r.state = 'failed' THEN 3
+                        WHEN r.state = 'ready_to_commit' THEN 4
+                        ELSE 5
+                      END,
+                      r.started_at DESC
+             LIMIT 1",
+            &[],
+        ).await.map_err(|e| AppError::Internal(format!(
+            "failed to query latest actionable run: {}",
+            postgres_error_detail(&e)
+        )))?;
+
+        Ok(row.map(|r| ImportRunDashboard {
+            import_run_id: r.get::<_, Uuid>("import_run_id").to_string(),
+            source_root: r.get("source_root"),
+            state: r.get("state"),
+            total_albums: r.get("total_albums"),
+            pending_albums: r.get("pending_albums"),
+            analyzing_albums: r.get("analyzing_albums"),
+            analyzed_albums: r.get("analyzed_albums"),
+            review_required_albums: r.get("review_required_albums"),
+            failed_albums: r.get("failed_albums"),
+            total_images: r.get("total_images"),
+            pending_reviews: r.get("pending_reviews"),
+            duplicate_candidates: r.get("duplicate_candidates"),
+        }))
+    }
+
     pub async fn get_database_info_dashboard(
         client: &Client,
         database: DatabaseInfoDatabaseSection,
@@ -2301,10 +2354,16 @@ impl ImportRepository {
                     (
                         SELECT COUNT(*)
                         FROM duplicate_candidates dc
+                        JOIN import_runs r ON r.id = dc.import_run_id
                         LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
-                        WHERE dc.decision IS NULL AND rd.id IS NULL
+                        WHERE r.state <> 'abandoned'
+                          AND dc.decision IS NULL AND rd.id IS NULL
                     )::BIGINT AS pending_review_count,
-                    (SELECT COUNT(*) FROM import_albums WHERE state = 'failed')::BIGINT AS failed_album_count,
+                    (
+                        SELECT COUNT(*) FROM import_albums a
+                        JOIN import_runs r ON r.id = a.import_run_id
+                        WHERE r.state <> 'abandoned' AND a.state = 'failed'
+                    )::BIGINT AS failed_album_count,
                     (SELECT COUNT(*) FROM import_runs WHERE state = 'recovery_required')::BIGINT AS recovery_required_run_count,
                     (SELECT COUNT(*) FROM import_runs WHERE state = 'failed')::BIGINT AS failed_run_count,
                     (SELECT COUNT(*) FROM import_plans WHERE state = 'frozen')::BIGINT AS frozen_plan_count",
@@ -2317,6 +2376,7 @@ impl ImportRepository {
             .await?
             .into_iter()
             .next();
+        let latest_actionable_run = Self::get_latest_actionable_run_summary(client).await?;
 
         Ok(DatabaseInfoDashboard {
             database,
@@ -2336,6 +2396,7 @@ impl ImportRepository {
                 frozen_plan_count: imports_row.get("frozen_plan_count"),
             },
             latest_run,
+            latest_actionable_run,
         })
     }
 
@@ -2360,6 +2421,7 @@ impl ImportRepository {
                 frozen_plan_count: 0,
             },
             latest_run: None,
+            latest_actionable_run: None,
         }
     }
 
@@ -2388,7 +2450,8 @@ impl ImportRepository {
         let row = client
             .query_opt(
                 "SELECT id FROM import_runs
-                 WHERE state IN ('review_required', 'ready_to_commit')
+                 WHERE state <> 'abandoned'
+                   AND (state IN ('review_required', 'ready_to_commit')
                     OR EXISTS (
                         SELECT 1
                         FROM duplicate_candidates dc
@@ -2398,7 +2461,7 @@ impl ImportRepository {
                         WHERE ia.import_run_id = import_runs.id
                           AND dc.decision IS NULL
                           AND rd.id IS NULL
-                    )
+                    ))
                  ORDER BY started_at DESC
                  LIMIT 1",
                 &[],

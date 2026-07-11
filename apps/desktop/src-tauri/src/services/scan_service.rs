@@ -718,7 +718,6 @@ async fn detect_album_duplicates(
         }
     }
 
-    let max_perceptual_candidates: usize = 50;
     for entry in images {
         if ctx.cancelled.load(Ordering::Relaxed) {
             return Ok(());
@@ -734,7 +733,6 @@ async fn detect_album_duplicates(
                 ctx.client,
                 band_idx as u8,
                 band_val,
-                max_perceptual_candidates,
             )
             .await?;
             for lib in candidates {
@@ -2200,11 +2198,11 @@ mod tests {
         }
 
         let recalled_a =
-            ImportRepository::find_library_images_by_perceptual_band(&client, 0, &bands[0], 50)
+            ImportRepository::find_library_images_by_perceptual_band(&client, 0, &bands[0])
                 .await
                 .unwrap();
         let recalled_b =
-            ImportRepository::find_library_images_by_perceptual_band(&client, 0, &bands[0], 50)
+            ImportRepository::find_library_images_by_perceptual_band(&client, 0, &bands[0])
                 .await
                 .unwrap();
         assert_eq!(recalled_a.len(), 51, "bucket rows must not be truncated");
@@ -2764,6 +2762,145 @@ mod tests {
         drop(verify_client);
         verify_handle.abort();
         manager.lock().await.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_abandoned_runs_are_history_not_actionable_workflow() {
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::repositories::import_repository::DatabaseInfoDatabaseSection;
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = PostgresManager::new(tmp.path());
+        manager.initialize().await.unwrap();
+        let (client, handle) = manager.connect().await.unwrap();
+        let root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let old_run = Uuid::new_v4();
+        let new_run = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_runs
+                (id, source_root, library_root_id, state, policy_version, started_at)
+             VALUES ($1, 'C:/old', $3, 'abandoned', 'test', now() - interval '1 hour'),
+                    ($2, 'C:/new', $3, 'ready_to_commit', 'test', now())",
+                &[&old_run, &new_run, &root_id],
+            )
+            .await
+            .unwrap();
+        let old_album = Uuid::new_v4();
+        let new_album = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_albums
+                (id, import_run_id, source_path, source_name, state)
+             VALUES ($1, $2, 'C:/old/failed', 'old-failed', 'failed'),
+                    ($3, $4, 'C:/new/ready', 'new-ready', 'analyzed')",
+                &[&old_album, &old_run, &new_album, &new_run],
+            )
+            .await
+            .unwrap();
+        let old_a = Uuid::new_v4();
+        let old_b = Uuid::new_v4();
+        let new_a = Uuid::new_v4();
+        let new_b = Uuid::new_v4();
+        for (id, album, path) in [
+            (old_a, old_album, "old-a.png"),
+            (old_b, old_album, "old-b.png"),
+            (new_a, new_album, "new-a.png"),
+            (new_b, new_album, "new-b.png"),
+        ] {
+            client.execute(
+                "INSERT INTO import_images
+                    (id, import_album_id, source_path, relative_path, file_size, decode_state, state)
+                 VALUES ($1, $2, $3, $3, 1, 'decoded', 'fingerprinted')",
+                &[&id, &album, &path],
+            ).await.unwrap();
+        }
+        client
+            .execute(
+                "INSERT INTO duplicate_candidates
+                (id, import_run_id, source_image_id, candidate_source_image_id, scope, match_type)
+             VALUES ($1, $2, $3, $4, 'cross_album', 'perceptual_similar')",
+                &[&Uuid::new_v4(), &old_run, &old_a, &old_b],
+            )
+            .await
+            .unwrap();
+
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: Some(
+                    "0014_candidate_review_semantics_and_abandoned_filters".to_string(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dashboard.imports.import_run_count, 2);
+        assert_eq!(dashboard.imports.import_album_count, 2);
+        assert_eq!(dashboard.imports.import_image_count, 4);
+        assert_eq!(dashboard.imports.pending_review_count, 0);
+        assert_eq!(dashboard.imports.failed_album_count, 0);
+        assert_eq!(
+            dashboard.latest_run.as_ref().unwrap().import_run_id,
+            new_run.to_string()
+        );
+        assert_eq!(
+            dashboard
+                .latest_actionable_run
+                .as_ref()
+                .unwrap()
+                .import_run_id,
+            new_run.to_string()
+        );
+        assert_eq!(
+            ImportRepository::get_latest_reviewable_run(&client)
+                .await
+                .unwrap(),
+            Some(new_run)
+        );
+        let old_evidence: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM duplicate_candidates WHERE import_run_id = $1",
+                &[&old_run],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(old_evidence, 1);
+
+        client
+            .execute(
+                "UPDATE import_runs SET state = 'review_required' WHERE id = $1",
+                &[&new_run],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO duplicate_candidates
+                (id, import_run_id, source_image_id, candidate_source_image_id, scope, match_type)
+             VALUES ($1, $2, $3, $4, 'cross_album', 'perceptual_similar')",
+                &[&Uuid::new_v4(), &new_run, &new_a, &new_b],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ImportRepository::get_latest_reviewable_run(&client)
+                .await
+                .unwrap(),
+            Some(new_run)
+        );
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
     }
 
     fn make_snapshot_file(path: &str, ft: &str, size: i64, hash: u8) -> NewSnapshotFile {

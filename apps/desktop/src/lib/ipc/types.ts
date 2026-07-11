@@ -266,6 +266,7 @@ export interface DatabaseInfoDashboard {
     frozen_plan_count: number;
   };
   latest_run: ImportRunDashboard | null;
+  latest_actionable_run: ImportRunDashboard | null;
 }
 
 export interface ReviewCandidateSummary {
