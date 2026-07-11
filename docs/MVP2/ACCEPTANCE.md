@@ -7,6 +7,9 @@
 - [x] ScanPage 继续分析按钮调用 `resumeImportRun(importRunId)`。
 - [x] ScanPage 不再无脑展示最新 run 的旧图集表。
 - [x] retry failed album 只重置该图集，不影响其他图集。
+- [x] 普通开始始终创建新 run；只有显式 resume 才复用旧 snapshot。
+- [x] 可显式 abandoned 旧 checkpoint 并为同源目录重新分析。
+- [x] 取消后的 run 状态由 album / review 持久化事实归并。
 - [ ] 手工中断 / 重开 / 续跑实测通过。
 - [ ] 已完成图集不重跑实测通过。
 
@@ -15,6 +18,9 @@
 - [x] Review 可从已有 candidates 进入。
 - [x] 审核后 album / dashboard counters 会刷新。
 - [x] `skip_review_album` 后 album summary 会刷新。
+- [x] `skip_review_album` decision 与 summary 在同一事务内提交或回滚。
+- [x] 同一图片对候选唯一，exact 优先且不会再生成 perceptual 平行候选。
+- [x] 感知 bucket 超过 50 条时稳定完整召回。
 - [ ] 手工审核后 Dashboard / Scan / Review 计数同步复验通过。
 
 ## MVP2.3 Database Info Dashboard

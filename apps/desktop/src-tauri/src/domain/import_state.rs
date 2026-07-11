@@ -15,6 +15,7 @@ pub enum ImportRunState {
     Completed,
     Cancelled,
     Failed,
+    Abandoned,
 }
 
 impl fmt::Display for ImportRunState {
@@ -32,6 +33,7 @@ impl fmt::Display for ImportRunState {
             Self::Completed => write!(f, "completed"),
             Self::Cancelled => write!(f, "cancelled"),
             Self::Failed => write!(f, "failed"),
+            Self::Abandoned => write!(f, "abandoned"),
         }
     }
 }
@@ -52,6 +54,7 @@ impl ImportRunState {
             "completed" => Some(Self::Completed),
             "cancelled" => Some(Self::Cancelled),
             "failed" => Some(Self::Failed),
+            "abandoned" => Some(Self::Abandoned),
             _ => None,
         }
     }

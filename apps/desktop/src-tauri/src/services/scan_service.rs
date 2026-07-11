@@ -18,8 +18,9 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -49,6 +50,32 @@ struct ScannedImage {
     relative_path: String,
     file_size: i64,
     modified_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+const MAX_FINGERPRINT_WORKERS: usize = 4;
+
+fn fingerprint_worker_limit() -> Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_FINGERPRINT_WORKERS)))
+        .clone()
+}
+
+async fn fingerprint_scanned_image(
+    img: ScannedImage,
+) -> Result<(ScannedImage, Result<FingerprintedData, AppError>), AppError> {
+    let permit = fingerprint_worker_limit()
+        .acquire_owned()
+        .await
+        .map_err(|e| AppError::Internal(format!("fingerprint worker pool closed: {e}")))?;
+    let path = img.source_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        fingerprint_image_sync(&path)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("fingerprint worker failed: {e}")))?;
+    Ok((img, result))
 }
 
 struct FingerprintedData {
@@ -149,9 +176,19 @@ fn compute_perceptual_bands(fp: &FingerprintedData) -> Vec<Vec<u8>> {
 }
 
 fn scan_directory_for_albums(source_root: &Path) -> Result<Vec<AlbumEntry>, AppError> {
+    scan_directory_for_albums_with_cancel(source_root, None)
+}
+
+fn scan_directory_for_albums_with_cancel(
+    source_root: &Path,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<AlbumEntry>, AppError> {
     let entries = std::fs::read_dir(source_root)?;
     let mut albums = Vec::new();
     for entry in entries {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(AppError::Internal("scan cancelled".to_string()));
+        }
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -165,12 +202,21 @@ fn scan_directory_for_albums(source_root: &Path) -> Result<Vec<AlbumEntry>, AppE
     Ok(albums)
 }
 
+#[cfg(test)]
 fn scan_album_for_images(
     album_path: &Path,
     album_name: &str,
 ) -> Result<Vec<ScannedImage>, AppError> {
+    scan_album_for_images_with_cancel(album_path, album_name, None)
+}
+
+fn scan_album_for_images_with_cancel(
+    album_path: &Path,
+    album_name: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<ScannedImage>, AppError> {
     let mut images = Vec::new();
-    walk_album_images(album_path, album_path, album_name, &mut images)?;
+    walk_album_images(album_path, album_path, album_name, cancelled, &mut images)?;
     images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(images)
 }
@@ -179,14 +225,18 @@ fn walk_album_images(
     dir: &Path,
     album_path: &Path,
     album_name: &str,
+    cancelled: Option<&AtomicBool>,
     images: &mut Vec<ScannedImage>,
 ) -> Result<(), AppError> {
     let entries = std::fs::read_dir(dir)?;
     for entry in entries {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(AppError::Internal("scan cancelled".to_string()));
+        }
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            walk_album_images(&path, album_path, album_name, images)?;
+            walk_album_images(&path, album_path, album_name, cancelled, images)?;
             continue;
         }
         if !path.is_file() {
@@ -449,8 +499,10 @@ async fn insert_candidate_and_count(
     progress: &mut ScanProgressEvent,
     progress_tracker: &Mutex<ScanProgress>,
 ) -> Result<(), AppError> {
-    ImportRepository::insert_duplicate_candidate(client, candidate).await?;
-    *duplicate_count += 1;
+    let (_, inserted) = ImportRepository::upsert_duplicate_candidate(client, candidate).await?;
+    if inserted {
+        *duplicate_count += 1;
+    }
     progress.duplicate_count = *duplicate_count;
     emit_progress(progress, progress_tracker).await;
     Ok(())
@@ -565,6 +617,8 @@ async fn detect_album_duplicates(
             }
         })
         .collect();
+    let mut exact_library_pairs: std::collections::HashSet<(Uuid, Uuid)> =
+        std::collections::HashSet::new();
     if !album_blake3.is_empty() {
         let siblings = ImportRepository::find_sibling_images_by_blake3(
             ctx.client,
@@ -629,6 +683,7 @@ async fn detect_album_duplicates(
         for entry in images {
             if let Some(libs) = blake3_to_lib.get(&entry.fp.blake3_bytes) {
                 for lib in libs {
+                    exact_library_pairs.insert((entry.image_db_id, lib.id));
                     let pixel_exact = lib
                         .pixel_hash
                         .as_ref()
@@ -683,6 +738,9 @@ async fn detect_album_duplicates(
             )
             .await?;
             for lib in candidates {
+                if exact_library_pairs.contains(&(entry.image_db_id, lib.id)) {
+                    continue;
+                }
                 if recalled.contains(&lib.id) {
                     continue;
                 }
@@ -792,7 +850,8 @@ async fn run_scan_inner(
         errors: Vec::new(),
     };
     let mut errors: Vec<String> = Vec::new();
-    let mut total_images: u32 = 0;
+    let mut processed_images: u32 = 0;
+    let mut discovered_images: u32 = 0;
     let mut duplicate_count: u32 = 0;
 
     let source_path = PathBuf::from(&source_root);
@@ -833,17 +892,9 @@ async fn run_scan_inner(
             })?;
         Some(row)
     } else {
-        client
-            .query_opt(
-                "SELECT id FROM import_runs
-                 WHERE source_root = $1
-                   AND state IN ('analyzing', 'scanning', 'fingerprinting', 'cancelled', 'failed')
-                 ORDER BY started_at DESC
-                 LIMIT 1",
-                &[&source_root],
-            )
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to query resumable import run: {e}")))?
+        // An ordinary start is an explicit request for a clean analysis. Only
+        // resume_import_run may reuse immutable snapshots from an older run.
+        None
     };
     let import_run_id = if let Some(row) = existing_run {
         let id: Uuid = row.get("id");
@@ -863,7 +914,14 @@ async fn run_scan_inner(
 
     emit_progress(&progress, &progress_tracker).await;
 
-    let albums = match scan_directory_for_albums(&source_path) {
+    let scan_root = source_path.clone();
+    let root_cancel = cancelled.clone();
+    let albums = match tokio::task::spawn_blocking(move || {
+        scan_directory_for_albums_with_cancel(&scan_root, Some(&root_cancel))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("source album enumeration worker failed: {e}")))?
+    {
         Ok(albums) => albums,
         Err(e) => {
             ImportRepository::update_import_run_error(
@@ -945,6 +1003,33 @@ async fn run_scan_inner(
         )
         .await
         .map_err(|e| AppError::Internal(format!("failed to query albums: {e}")))?;
+
+    // Establish the denominator before any fingerprint work starts. This is
+    // deliberately a read-only pre-count; each album is enumerated again only
+    // after its immutable snapshot is captured and verified.
+    for album_row in &album_rows {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let album_path = PathBuf::from(album_row.get::<_, String>("source_path"));
+        let album_name: String = album_row.get("source_name");
+        let count_cancel = cancelled.clone();
+        match tokio::task::spawn_blocking(move || {
+            scan_album_for_images_with_cancel(&album_path, &album_name, Some(&count_cancel))
+                .map(|images| images.len() as u32)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("image pre-count worker failed: {e}")))?
+        {
+            Ok(count) => discovered_images += count,
+            Err(_) if cancelled.load(Ordering::Relaxed) => break,
+            // The authoritative album pass records a per-album failure with
+            // context; a pre-count failure must not fail the whole run early.
+            Err(_) => {}
+        }
+    }
+    progress.total_images = discovered_images;
+    emit_progress(&progress, &progress_tracker).await;
 
     for album_row in &album_rows {
         if cancelled.load(Ordering::Relaxed) {
@@ -1048,7 +1133,19 @@ async fn run_scan_inner(
 
         progress.current_stage = "fingerprinting".to_string();
         emit_progress(&progress, &progress_tracker).await;
-        let scanned_images = match scan_album_for_images(&album_path, &album_name) {
+        let scan_album_path = album_path.clone();
+        let scan_album_name = album_name.clone();
+        let album_cancel = cancelled.clone();
+        let scanned_images = match tokio::task::spawn_blocking(move || {
+            scan_album_for_images_with_cancel(
+                &scan_album_path,
+                &scan_album_name,
+                Some(&album_cancel),
+            )
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("album enumeration worker failed: {e}")))?
+        {
             Ok(imgs) => imgs,
             Err(e) => {
                 let msg = format!("Failed to scan album '{}': {e}", album_name);
@@ -1074,17 +1171,33 @@ async fn run_scan_inner(
             }
         };
 
+        let mut fingerprint_jobs = tokio::task::JoinSet::new();
         for img in scanned_images {
-            if cancelled.load(Ordering::Relaxed) {
-                break;
-            }
+            fingerprint_jobs.spawn(fingerprint_scanned_image(img));
+        }
 
-            let fp_result = fingerprint_image_sync(&img.source_path);
+        let mut image_batch: Vec<(Uuid, NewImportImage)> = Vec::new();
+        let mut fingerprinted_batch: Vec<(Uuid, FingerprintedData)> = Vec::new();
+        while !fingerprint_jobs.is_empty() {
+            let joined = tokio::select! {
+                result = fingerprint_jobs.join_next() => result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                    if cancelled.load(Ordering::Relaxed) {
+                        fingerprint_jobs.abort_all();
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(joined) = joined else { break };
+            let (img, fp_result) = joined
+                .map_err(|e| AppError::Internal(format!("fingerprint task failed: {e}")))??;
 
             match fp_result {
                 Ok(fp) => {
-                    let image_id = ImportRepository::insert_import_image(
-                        &client,
+                    let image_id = Uuid::new_v4();
+                    image_batch.push((
+                        image_id,
                         NewImportImage {
                             album_id: album_db_id,
                             source_path: img.source_path.display().to_string(),
@@ -1103,23 +1216,16 @@ async fn run_scan_inner(
                             fingerprint_version: Some("1".to_string()),
                             state: ImportImageState::Fingerprinted,
                         },
-                    )
-                    .await?;
+                    ));
+                    fingerprinted_batch.push((image_id, fp));
 
-                    all_album_images.push(AlbumImageEntry {
-                        album_db_id,
-                        image_db_id: image_id,
-                        fp,
-                    });
-
-                    total_images += 1;
-                    progress.total_images = total_images;
-                    progress.processed_images = total_images;
+                    processed_images += 1;
+                    progress.processed_images = processed_images;
                     emit_progress(&progress, &progress_tracker).await;
                 }
                 Err(e) => {
-                    ImportRepository::insert_import_image(
-                        &client,
+                    image_batch.push((
+                        Uuid::new_v4(),
                         NewImportImage {
                             album_id: album_db_id,
                             source_path: img.source_path.display().to_string(),
@@ -1138,8 +1244,7 @@ async fn run_scan_inner(
                             fingerprint_version: None,
                             state: ImportImageState::Failed,
                         },
-                    )
-                    .await?;
+                    ));
 
                     let msg = format!("Failed to fingerprint '{}': {e}", img.source_path.display());
                     tracing::warn!(
@@ -1153,13 +1258,21 @@ async fn run_scan_inner(
                     errors.push(msg.clone());
                     progress.error_count = errors.len() as u32;
                     progress.errors = errors.clone();
-                    total_images += 1;
-                    progress.total_images = total_images;
-                    progress.processed_images = total_images;
+                    processed_images += 1;
+                    progress.processed_images = processed_images;
                     emit_progress(&progress, &progress_tracker).await;
                 }
             }
         }
+
+        ImportRepository::insert_import_images_batch(&client, &image_batch).await?;
+        all_album_images.extend(fingerprinted_batch.into_iter().map(|(image_db_id, fp)| {
+            AlbumImageEntry {
+                album_db_id,
+                image_db_id,
+                fp,
+            }
+        }));
 
         if cancelled.load(Ordering::Relaxed) {
             break;
@@ -1227,14 +1340,13 @@ async fn run_scan_inner(
     }
 
     if cancelled.load(Ordering::Relaxed) {
-        ImportRepository::update_import_run_state(
-            &client,
-            import_run_id,
-            &ImportRunState::Cancelled,
-        )
-        .await?;
-        progress.state = "cancelled".to_string();
-        progress.current_stage = "cancelled".to_string();
+        ImportRepository::refresh_import_run_statistics(&client, import_run_id).await?;
+        let final_state =
+            ImportRepository::reconcile_scan_run_state_after_cancellation(&client, import_run_id)
+                .await?;
+        let final_state_str = final_state.to_string();
+        progress.state = final_state_str.clone();
+        progress.current_stage = final_state_str.clone();
         emit_progress(&progress, &progress_tracker).await;
         tracing::warn!(
             %import_run_id,
@@ -1243,10 +1355,9 @@ async fn run_scan_inner(
             elapsed_ms = started_at.elapsed().as_millis(),
             "scan cancelled"
         );
-        ImportRepository::refresh_import_run_statistics(&client, import_run_id).await?;
         handle.abort();
         return Ok(ScanProgress {
-            state: "cancelled".to_string(),
+            state: final_state_str,
             ..ScanProgress::idle()
         });
     }
@@ -1286,7 +1397,7 @@ async fn run_scan_inner(
         %import_run_id,
         final_state = %final_run_state,
         total_albums = progress.total_albums,
-        total_images,
+        total_images = discovered_images,
         duplicate_count,
         error_count = errors.len(),
         elapsed_ms = started_at.elapsed().as_millis(),
@@ -1300,9 +1411,9 @@ async fn run_scan_inner(
         import_run_id: Some(import_run_id.to_string()),
         current_stage: final_run_state.to_string(),
         current_album: None,
-        processed_images: total_images,
+        processed_images,
         total_albums: progress.total_albums,
-        total_images,
+        total_images: discovered_images,
         duplicate_count,
         error_count: errors.len() as u32,
         errors,
@@ -1527,6 +1638,31 @@ mod tests {
         assert!(!fp.block_hash_bytes.is_empty());
         assert!(!fp.median_hash_bytes.is_empty());
         assert_eq!(fp.transform_variants.len(), 8);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fingerprint_worker_keeps_async_runtime_responsive() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("large.png");
+        let image = image::RgbImage::from_fn(3000, 3000, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+        });
+        image.save(&path).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let scanned = ScannedImage {
+            source_path: path,
+            relative_path: "album/large.png".to_string(),
+            file_size: metadata.len() as i64,
+            modified_at: None,
+        };
+
+        let mut job = tokio::spawn(fingerprint_scanned_image(scanned));
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            _ = &mut job => panic!("fingerprint unexpectedly completed before runtime responsiveness probe"),
+        }
+        let (_, fingerprint) = job.await.unwrap().unwrap();
+        assert!(fingerprint.is_ok());
     }
 
     #[test]
@@ -1996,6 +2132,146 @@ mod tests {
             .get(0);
         assert_eq!(library_image_count, 0);
 
+        let library_album_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO library_albums
+                    (id, library_root_id, display_name, relative_path, manifest_version,
+                     manifest_hash, image_count, state)
+                 VALUES ($1, $2, 'history', 'history', '1', $3, 51, 'committed')",
+                &[&library_album_id, &library_root_id, &vec![7u8; 32]],
+            )
+            .await
+            .unwrap();
+        let exact_import = persisted.remove(0);
+        let bands = compute_perceptual_bands(&exact_import.fp);
+        let exact_library_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO library_images
+                    (id, album_id, relative_path, file_size, width, height, format,
+                     blake3, pixel_hash, gradient_hash, block_hash, median_hash,
+                     fingerprint_version, state,
+                     perceptual_band_0, perceptual_band_1, perceptual_band_2)
+                 VALUES ($1, $2, 'exact.png', $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                         '1', 'committed', $12, $13, $14)",
+                &[
+                    &exact_library_id,
+                    &library_album_id,
+                    &(exact_import.fp.file_size as i64),
+                    &(exact_import.fp.width as i32),
+                    &(exact_import.fp.height as i32),
+                    &exact_import.fp.format,
+                    &exact_import.fp.blake3_bytes,
+                    &exact_import.fp.pixel_hash_bytes,
+                    &exact_import.fp.gradient_hash_bytes,
+                    &exact_import.fp.block_hash_bytes,
+                    &exact_import.fp.median_hash_bytes,
+                    &bands[0],
+                    &bands[1],
+                    &bands[2],
+                ],
+            )
+            .await
+            .unwrap();
+        for index in 0..50u8 {
+            client
+                .execute(
+                    "INSERT INTO library_images
+                        (id, album_id, relative_path, file_size, width, height, format,
+                         blake3, pixel_hash, gradient_hash, block_hash, median_hash,
+                         fingerprint_version, state, perceptual_band_0)
+                     VALUES ($1, $2, $3, 1, 1, 1, 'png', $4, $5, $6, $7, $8,
+                             '1', 'committed', $9)",
+                    &[
+                        &Uuid::new_v4(),
+                        &library_album_id,
+                        &format!("decoy-{index}.png"),
+                        &vec![index; 32],
+                        &vec![index; 8],
+                        &vec![index; 8],
+                        &vec![index.wrapping_add(1); 8],
+                        &vec![index.wrapping_add(2); 8],
+                        &bands[0],
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let recalled_a =
+            ImportRepository::find_library_images_by_perceptual_band(&client, 0, &bands[0], 50)
+                .await
+                .unwrap();
+        let recalled_b =
+            ImportRepository::find_library_images_by_perceptual_band(&client, 0, &bands[0], 50)
+                .await
+                .unwrap();
+        assert_eq!(recalled_a.len(), 51, "bucket rows must not be truncated");
+        assert!(recalled_a.iter().any(|row| row.id == exact_library_id));
+        assert_eq!(
+            recalled_a.iter().map(|row| row.id).collect::<Vec<_>>(),
+            recalled_b.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
+
+        let exact_entry = AlbumImageEntry {
+            album_db_id: album_id,
+            image_db_id: exact_import.id,
+            fp: exact_import.fp,
+        };
+        let tracker = Mutex::new(ScanProgress::idle());
+        let cancelled = AtomicBool::new(false);
+        let detection_ctx = AlbumDetectionContext {
+            client: &client,
+            import_run_id,
+            album_id,
+            progress_tracker: &tracker,
+            cancelled: &cancelled,
+        };
+        let mut detected = 0;
+        let mut detection_progress = ScanProgressEvent {
+            state: "running".to_string(),
+            import_run_id: Some(import_run_id.to_string()),
+            current_stage: "detecting_duplicates".to_string(),
+            current_album: Some("album_a".to_string()),
+            processed_images: 1,
+            total_albums: 1,
+            total_images: 1,
+            duplicate_count: 0,
+            error_count: 0,
+            errors: vec![],
+        };
+        detect_album_duplicates(
+            &detection_ctx,
+            &[&exact_entry],
+            &mut detected,
+            &mut detection_progress,
+        )
+        .await
+        .unwrap();
+        let exact_pair_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM duplicate_candidates
+                 WHERE import_run_id = $1 AND source_image_id = $2
+                   AND candidate_library_image_id = $3",
+                &[&import_run_id, &exact_entry.image_db_id, &exact_library_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(exact_pair_rows, 1);
+        let exact_pair_type: String = client
+            .query_one(
+                "SELECT match_type FROM duplicate_candidates
+                 WHERE import_run_id = $1 AND source_image_id = $2
+                   AND candidate_library_image_id = $3",
+                &[&import_run_id, &exact_entry.image_db_id, &exact_library_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(exact_pair_type, "file_exact");
+
         drop(client);
         db_handle.abort();
         manager.shutdown().await.unwrap();
@@ -2438,9 +2714,56 @@ mod tests {
             .unwrap();
         assert_eq!(run_summary.pending_reviews, 0);
 
+        ImportRepository::update_import_run_state(&client, import_run_id, &ImportRunState::Failed)
+            .await
+            .unwrap();
+        ImportRepository::abandon_import_run(&client, import_run_id)
+            .await
+            .unwrap();
         drop(client);
         db_handle.abort();
-        manager.shutdown().await.unwrap();
+
+        let manager = Arc::new(Mutex::new(manager));
+        let settings = Arc::new(Mutex::new(
+            crate::infrastructure::settings::SettingsStore::new(&app_data).unwrap(),
+        ));
+        let tracker = Arc::new(Mutex::new(ScanProgress::idle()));
+        let clean_scan = run_scan(
+            manager.clone(),
+            settings,
+            source_root.display().to_string(),
+            Arc::new(AtomicBool::new(false)),
+            tracker,
+        )
+        .await
+        .unwrap();
+        let new_run_id = Uuid::parse_str(clean_scan.import_run_id.as_deref().unwrap()).unwrap();
+        assert_ne!(new_run_id, import_run_id);
+        let (verify_client, verify_handle) = {
+            let manager = manager.lock().await;
+            manager.connect().await.unwrap()
+        };
+        let old_state: String = verify_client
+            .query_one(
+                "SELECT state FROM import_runs WHERE id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(old_state, "abandoned");
+        let same_root_runs: i64 = verify_client
+            .query_one(
+                "SELECT COUNT(*) FROM import_runs WHERE source_root = $1",
+                &[&source_root.display().to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(same_root_runs, 2, "ordinary start must create a new run");
+        drop(verify_client);
+        verify_handle.abort();
+        manager.lock().await.shutdown().await.unwrap();
     }
 
     fn make_snapshot_file(path: &str, ft: &str, size: i64, hash: u8) -> NewSnapshotFile {

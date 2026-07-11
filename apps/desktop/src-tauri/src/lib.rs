@@ -531,6 +531,7 @@ pub fn run() {
             commands::get_import_run_albums,
             commands::resume_import_run,
             commands::retry_import_album,
+            commands::abandon_import_run,
             commands::get_review_queue,
             commands::get_review_candidate_detail,
             commands::submit_review_decision,

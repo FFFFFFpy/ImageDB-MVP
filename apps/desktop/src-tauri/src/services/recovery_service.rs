@@ -249,7 +249,8 @@ pub async fn reconcile_import_run_state(
         | ImportRunState::ReviewRequired
         | ImportRunState::ReadyToCommit
         | ImportRunState::Cancelled
-        | ImportRunState::Failed => {
+        | ImportRunState::Failed
+        | ImportRunState::Abandoned => {
             return Ok(ReconciledRunState {
                 import_run_id,
                 state: current,

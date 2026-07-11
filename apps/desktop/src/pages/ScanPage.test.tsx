@@ -83,6 +83,7 @@ const mockApi = vi.hoisted(() => ({
       last_error_message: null,
     }),
   ),
+  abandonImportRun: vi.fn(() => Promise.resolve()),
   getScanProgress: vi.fn((): Promise<ScanProgress> =>
     Promise.resolve({
       state: 'idle',
@@ -222,6 +223,27 @@ describe('ScanPage album workflow', () => {
     fireEvent.click(await screen.findByRole('button', { name: '继续分析' }));
     await waitFor(() => expect(mockApi.resumeImportRun).toHaveBeenCalledWith('run-1'));
     expect(mockApi.startScan).not.toHaveBeenCalled();
+  });
+
+  test('abandons an old checkpoint and starts a clean run for the same source', async () => {
+    const original = mockState.dashboard;
+    mockState.dashboard = [{ ...original[0], state: 'failed', pending_albums: 0 }];
+    mockApi.validateSourceDirectory.mockResolvedValueOnce({
+      path: 'D:/Photos',
+      albums: ['album-a'],
+      album_count: 1,
+    });
+    mockApi.startScan.mockResolvedValueOnce('scan started');
+    try {
+      renderScanPage();
+      fireEvent.click(await screen.findByRole('button', { name: '放弃旧 checkpoint，重新分析' }));
+      await waitFor(() => expect(mockApi.abandonImportRun).toHaveBeenCalledWith('run-1'));
+      expect(mockApi.validateSourceDirectory).toHaveBeenCalledWith('D:/Photos');
+      await waitFor(() => expect(mockApi.startScan).toHaveBeenCalledWith('D:/Photos'));
+      expect(mockApi.resumeImportRun).not.toHaveBeenCalled();
+    } finally {
+      mockState.dashboard = original;
+    }
   });
 
   test('clears stale terminal controls immediately when resuming a run', async () => {

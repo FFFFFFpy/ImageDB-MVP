@@ -113,31 +113,46 @@ pub async fn skip_album_candidates(
     import_run_id: Uuid,
     album_id: Uuid,
 ) -> Result<u32, AppError> {
-    let candidates = ImportRepository::get_review_candidates(client, import_run_id).await?;
-    let mut count = 0u32;
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin skip album transaction: {e}")))?;
+    let result = async {
+        let inserted = client
+            .execute(
+                "INSERT INTO review_decisions
+                    (id, candidate_id, decision, selected_image_id, notes)
+                 SELECT gen_random_uuid(), dc.id, 'skip_album', NULL, 'album skipped'
+                 FROM duplicate_candidates dc
+                 JOIN import_images source ON source.id = dc.source_image_id
+                 LEFT JOIN review_decisions existing ON existing.candidate_id = dc.id
+                 WHERE dc.import_run_id = $1
+                   AND source.import_album_id = $2
+                   AND dc.decision IS NULL
+                   AND existing.id IS NULL
+                 ON CONFLICT (candidate_id) DO NOTHING",
+                &[&import_run_id, &album_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to skip album candidates: {e}")))?;
 
-    for c in &candidates {
-        if c.has_decision {
-            continue;
+        ImportRepository::refresh_review_album_and_run(client, album_id).await?;
+        Ok::<u32, AppError>(inserted as u32)
+    }
+    .await;
+
+    match result {
+        Ok(count) => {
+            client.batch_execute("COMMIT").await.map_err(|e| {
+                AppError::Internal(format!("failed to commit skip album transaction: {e}"))
+            })?;
+            Ok(count)
         }
-        let detail = ImportRepository::get_review_candidate_detail(client, c.candidate_id).await?;
-        if let Some(d) = detail {
-            if d.album_id == album_id {
-                ImportRepository::insert_review_decision_once(
-                    client,
-                    c.candidate_id,
-                    &ReviewDecisionAction::SkipAlbum.to_string(),
-                    None,
-                    Some("album skipped"),
-                )
-                .await?;
-                count += 1;
-            }
+        Err(e) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(e)
         }
     }
-
-    ImportRepository::refresh_review_album_and_run(client, album_id).await?;
-    Ok(count)
 }
 
 pub async fn get_review_progress(
@@ -2249,6 +2264,48 @@ mod tests {
         )
         .await;
         assert!(conflicting.is_err());
+
+        client
+            .batch_execute(
+                "CREATE FUNCTION imagedb_test_reject_skip() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                     RAISE EXCEPTION 'injected skip failure';
+                 END $$;
+                 CREATE TRIGGER imagedb_test_reject_skip_trigger
+                 BEFORE INSERT ON review_decisions
+                 FOR EACH ROW WHEN (NEW.decision = 'skip_album')
+                 EXECUTE FUNCTION imagedb_test_reject_skip();",
+            )
+            .await
+            .unwrap();
+        let injected = skip_album_candidates(&client, import_run_id, album_b_id).await;
+        assert!(injected.is_err(), "injected skip failure must surface");
+        let decisions_after_rollback: i64 = client
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM review_decisions rd
+                 JOIN duplicate_candidates dc ON dc.id = rd.candidate_id
+                 JOIN import_images ii ON ii.id = dc.source_image_id
+                 WHERE ii.import_album_id = $1",
+                &[&album_b_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(decisions_after_rollback, 0);
+        let album_b_after_rollback =
+            ImportRepository::get_import_album_status_by_id(&client, album_b_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(album_b_after_rollback.review_candidate_count, 1);
+        client
+            .batch_execute(
+                "DROP TRIGGER imagedb_test_reject_skip_trigger ON review_decisions;
+                 DROP FUNCTION imagedb_test_reject_skip();",
+            )
+            .await
+            .unwrap();
 
         let skipped = skip_album_candidates(&client, import_run_id, album_b_id)
             .await

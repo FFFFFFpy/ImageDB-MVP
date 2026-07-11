@@ -1732,12 +1732,15 @@ mod tests {
             let applied = MigrationRunner::run_pending(&mut client)
                 .await
                 .expect("run_pending #1");
-            assert!(!applied.is_empty());
+            assert!(
+                applied.is_empty(),
+                "connect must already prepare the active schema: {applied:?}"
+            );
 
             let version = MigrationRunner::current_version(&client)
                 .await
                 .expect("current_version #1");
-            // Migration 0010 is the current head of the embedded migration chain.
+            // The normal connection path must expose the current migration head.
             assert_eq!(version.as_deref(), Some(MigrationRunner::latest_version()));
 
             drop(client);
@@ -1762,7 +1765,7 @@ mod tests {
             let version2 = MigrationRunner::current_version(&client2)
                 .await
                 .expect("current_version #2");
-            // Migration 0010 is the current head of the embedded migration chain.
+            // Relaunch remains idempotently at the current migration head.
             assert_eq!(version2.as_deref(), Some(MigrationRunner::latest_version()));
 
             drop(client2);
@@ -1929,8 +1932,8 @@ mod tests {
                 .await
                 .expect("run_pending");
             assert!(
-                !applied.is_empty(),
-                "migrations should apply on a fresh bootstrap"
+                applied.is_empty(),
+                "connect must migrate a fresh bootstrap before returning: {applied:?}"
             );
             let version = MigrationRunner::current_version(&client)
                 .await

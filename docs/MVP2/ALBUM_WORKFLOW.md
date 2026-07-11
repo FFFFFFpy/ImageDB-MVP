@@ -16,7 +16,7 @@ failed
 
 ## 断点续跑
 
-同一个 source root 再次开始分析时，后端会优先查找可续跑 import run：
+普通“开始分析”始终创建新的 import run，不会按 source root 暗中复用旧 checkpoint。只有显式调用 `resume_import_run(import_run_id)` 才会恢复以下状态的任务：
 
 ```text
 analyzing / scanning / fingerprinting / cancelled / failed
@@ -30,6 +30,8 @@ analyzing / scanning / fingerprinting / cancelled / failed
 4. 只处理 `pending` 图集。
 5. 已经 `analyzed` / `review_required` 的图集不重跑。
 6. `failed` 图集必须先通过 `retry_import_album(album_id)` 单独重置为 `pending`。
+
+用户也可以显式放弃旧任务。`abandon_import_run(import_run_id)` 将 run 标记为 `abandoned`，保留 snapshot、图片和候选作为历史证据；存在 frozen plan 或 file transaction 时 fail closed。UI 的“放弃旧 checkpoint，重新分析”随后为同一源目录创建全新 run，因此修复过的源文件不会再被旧 snapshot 永久阻挡。
 
 如果待清理图集已经被 frozen plan 或 file transaction 引用，续跑会 fail closed，不删除任何证据。
 
@@ -50,6 +52,10 @@ mark analyzed or review_required
 
 如果图集级步骤失败，该图集进入 `failed`，并记录 `last_error_code` / `last_error_message`。其它图集继续处理。
 
+目录遍历和图片指纹在 blocking worker 中执行；指纹池全局最多并发 4 个任务，避免占用 Tokio runtime。每个图集的图片记录以单次批量 SQL 持久化。正式 fingerprint 前先完成整批图片预计数，进度使用已处理数 / 预计总数。
+
+取消后的 run 状态由持久化事实重新归并：存在未完成图集为 `cancelled`，存在失败图集为 `failed`，存在未审核候选为 `review_required`，否则为 `ready_to_commit`。最后一个图集 checkpoint 后到达的取消信号不会再把可提交任务困在 `cancelled`。
+
 ## 候选生成
 
 图集完成后立即生成并持久化：
@@ -59,6 +65,8 @@ mark analyzed or review_required
 - 与历史图库的 exact / perceptual 候选。
 
 因此 Review 可以在整批分析结束前看到已经落库的 review candidates。
+
+同一 import/import 或 import/library 图片对在数据库中只能有一个 candidate。重复证据按 `file_exact`、`pixel_exact`、`perceptual_near`、`perceptual_similar` 的优先级合并；历史图库 exact 命中不再重复进入 perceptual 比较。感知 bucket 使用稳定顺序并完整遍历，不再用无序 `LIMIT 50` 随机丢弃候选。
 
 ## Retry
 
@@ -72,7 +80,7 @@ pending
 
 ## 审核计数刷新
 
-`submit_review_decision` 和 `skip_review_album` 会在写入 review decision 后刷新对应 album summary，并重算 run statistics。Dashboard / Scan / Review 依赖这些刷新后的计数，不需要用户刷新整个应用。
+`submit_review_decision` 和 `skip_review_album` 会在写入 review decision 后刷新对应 album summary，并重算 run statistics。`skip_review_album` 使用单事务集合写入；任一 decision 或 summary 写入失败会全部回滚。Dashboard / Scan / Review 依赖这些刷新后的计数，不需要用户刷新整个应用。
 
 ## Commit 边界
 

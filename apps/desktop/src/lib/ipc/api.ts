@@ -95,6 +95,8 @@ export const api = {
   retryImportAlbum: (albumId: string) =>
     invoke<ImportAlbumStatus>('retry_import_album', { albumId }),
 
+  abandonImportRun: (importRunId: string) => invoke<void>('abandon_import_run', { importRunId }),
+
   getReviewQueue: (importRunId: string) =>
     invoke<ReviewCandidateSummary[]>('get_review_queue', { importRunId }),
 

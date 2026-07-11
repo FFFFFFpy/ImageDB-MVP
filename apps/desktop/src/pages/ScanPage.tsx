@@ -118,6 +118,12 @@ function canResumeRun(run: ImportRunDashboard | null): boolean {
   return run.pending_albums > 0 || run.analyzing_albums > 0;
 }
 
+function canAbandonRun(run: ImportRunDashboard | null): boolean {
+  return Boolean(
+    run && ['analyzing', 'scanning', 'fingerprinting', 'cancelled', 'failed'].includes(run.state),
+  );
+}
+
 function normalizedSourcePath(path: string): string {
   return path.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLocaleLowerCase();
 }
@@ -136,6 +142,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   const [isScanning, setIsScanning] = useState(false);
   const [globalScanBusyRunId, setGlobalScanBusyRunId] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [isAbandoning, setIsAbandoning] = useState(false);
   const eventListenerRef = useRef<(() => void) | null>(null);
   const validationRequestRef = useRef(0);
 
@@ -342,6 +349,37 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
     }
   }, []);
 
+  const handleAbandonAndRestart = useCallback(async () => {
+    if (!activeImportRunId || !activeRun || globalScanBusyRunId) return;
+    setScanError(null);
+    setIsAbandoning(true);
+    let unlisten: (() => void) | null = null;
+    try {
+      await api.abandonImportRun(activeImportRunId);
+      const info = await api.validateSourceDirectory(activeRun.source_root);
+      if (info.album_count === 0) throw new Error('未找到图集（一级子目录）。');
+      setSourcePath(activeRun.source_root);
+      setSourceInfo(info);
+      setActiveImportRunId(null);
+      setScanEvent(null);
+      setProgress(null);
+      setIsScanning(true);
+      unlisten = await attachScanListener();
+      await api.startScan(activeRun.source_root);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
+        queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
+      ]);
+    } catch (e) {
+      setScanError(String(e));
+      setIsScanning(false);
+      unlisten?.();
+      if (eventListenerRef.current === unlisten) eventListenerRef.current = null;
+    } finally {
+      setIsAbandoning(false);
+    }
+  }, [activeImportRunId, activeRun, attachScanListener, globalScanBusyRunId, queryClient]);
+
   useEffect(() => {
     if (!isScanning && !globalScanBusyRunId) return;
     const interval = setInterval(async () => {
@@ -477,6 +515,30 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
           </button>
           <p className="status-card-detail">
             将继续任务 {activeRun.import_run_id}，不会要求重新输入源目录。
+          </p>
+          {canAbandonRun(activeRun) && (
+            <button
+              className="btn-danger"
+              onClick={handleAbandonAndRestart}
+              disabled={globalScanBusyRunId !== null || isAbandoning}
+            >
+              {isAbandoning ? '正在放弃旧任务...' : '放弃旧 checkpoint，重新分析'}
+            </button>
+          )}
+        </section>
+      )}
+
+      {activeRun && canAbandonRun(activeRun) && !canResumeRun(activeRun) && !isScanning && (
+        <section className="scan-action-section">
+          <button
+            className="btn-danger"
+            onClick={handleAbandonAndRestart}
+            disabled={globalScanBusyRunId !== null || isAbandoning}
+          >
+            {isAbandoning ? '正在放弃旧任务...' : '放弃旧 checkpoint，重新分析'}
+          </button>
+          <p className="status-card-detail">
+            保留旧任务作为历史证据，并为当前源目录创建全新的分析任务。
           </p>
         </section>
       )}

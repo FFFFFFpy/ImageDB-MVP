@@ -38,6 +38,22 @@ fn target_relative_path_for_album_name(
 
 pub struct ImportRepository;
 
+fn scan_run_state_from_facts(
+    unfinished_albums: i64,
+    failed_albums: i64,
+    pending_reviews: i64,
+) -> ImportRunState {
+    if unfinished_albums > 0 {
+        ImportRunState::Cancelled
+    } else if failed_albums > 0 {
+        ImportRunState::Failed
+    } else if pending_reviews > 0 {
+        ImportRunState::ReviewRequired
+    } else {
+        ImportRunState::ReadyToCommit
+    }
+}
+
 pub struct ImportRunRecord {
     pub id: Uuid,
     pub source_root: String,
@@ -633,9 +649,10 @@ impl ImportRepository {
     ) -> Result<(), AppError> {
         let state_str = state.to_string();
         let completed_at = match state {
-            ImportRunState::Completed | ImportRunState::Cancelled | ImportRunState::Failed => {
-                Some(chrono::Utc::now())
-            }
+            ImportRunState::Completed
+            | ImportRunState::Cancelled
+            | ImportRunState::Failed
+            | ImportRunState::Abandoned => Some(chrono::Utc::now()),
             _ => None,
         };
         client
@@ -646,6 +663,99 @@ impl ImportRepository {
             .await
             .map_err(|e| AppError::Internal(format!("failed to update import run state: {e}")))?;
         Ok(())
+    }
+
+    /// Resolve a cancellation race from persisted album/candidate facts. A
+    /// late cancel after the last album checkpoint must not strand a complete
+    /// run in `cancelled` with no work left to resume.
+    pub async fn reconcile_scan_run_state_after_cancellation(
+        client: &Client,
+        id: Uuid,
+    ) -> Result<ImportRunState, AppError> {
+        let row = client
+            .query_one(
+                "SELECT
+                    COUNT(*) FILTER (WHERE state IN ('pending', 'analyzing', 'scanning', 'fingerprinting'))::BIGINT AS unfinished,
+                    COUNT(*) FILTER (WHERE state = 'failed')::BIGINT AS failed,
+                    (SELECT COUNT(*)
+                     FROM duplicate_candidates dc
+                     LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                     WHERE dc.import_run_id = $1
+                       AND dc.decision IS NULL
+                       AND rd.id IS NULL)::BIGINT AS pending_reviews
+                 FROM import_albums
+                 WHERE import_run_id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to reconcile cancelled scan: {e}")))?;
+
+        let state = scan_run_state_from_facts(
+            row.get("unfinished"),
+            row.get("failed"),
+            row.get("pending_reviews"),
+        );
+        Self::update_import_run_state(client, id, &state).await?;
+        Ok(state)
+    }
+
+    /// Preserve a run's checkpoint as historical evidence while making it
+    /// explicit that it must never be resumed. Frozen plans and file
+    /// transactions remain fail-closed and cannot be abandoned here.
+    pub async fn abandon_import_run(client: &Client, id: Uuid) -> Result<(), AppError> {
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to begin import run abandon: {e}")))?;
+        let result = async {
+            let row = client
+                .query_opt(
+                    "SELECT state,
+                            EXISTS (SELECT 1 FROM import_plans WHERE import_run_id = $1) AS has_plan,
+                            EXISTS (SELECT 1 FROM file_transactions WHERE import_run_id = $1) AS has_transaction
+                     FROM import_runs WHERE id = $1 FOR UPDATE",
+                    &[&id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to lock import run for abandon: {e}")))?
+                .ok_or_else(|| AppError::Internal(format!("import run {id} was not found")))?;
+            let state: String = row.get("state");
+            if !matches!(state.as_str(), "analyzing" | "scanning" | "fingerprinting" | "cancelled" | "failed") {
+                return Err(AppError::Internal(format!(
+                    "import run {id} cannot be abandoned from state '{state}'"
+                )));
+            }
+            if row.get::<_, bool>("has_plan") || row.get::<_, bool>("has_transaction") {
+                return Err(AppError::Internal(
+                    "cannot abandon an import run referenced by a plan or file transaction".to_string(),
+                ));
+            }
+            let updated = client
+                .execute(
+                    "UPDATE import_runs SET state = 'abandoned', completed_at = now()
+                     WHERE id = $1 AND state = $2",
+                    &[&id, &state],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to abandon import run: {e}")))?;
+            if updated != 1 {
+                return Err(AppError::Internal(format!("import run {id} changed while abandoning")));
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                client.batch_execute("COMMIT").await.map_err(|e| {
+                    AppError::Internal(format!("failed to commit import run abandon: {e}"))
+                })?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(e)
+            }
+        }
     }
 
     /// Reopen a scan-phase run for analysis and clear terminal metadata left
@@ -1199,6 +1309,74 @@ impl ImportRepository {
         Ok(id)
     }
 
+    /// Persist an album checkpoint in one PostgreSQL round trip. IDs are
+    /// allocated by the caller so duplicate detection can retain the mapping
+    /// without reading every row back individually.
+    pub async fn insert_import_images_batch(
+        client: &Client,
+        images: &[(Uuid, NewImportImage)],
+    ) -> Result<(), AppError> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        let hex = |value: &Option<Vec<u8>>| {
+            value
+                .as_ref()
+                .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        };
+        let payload = serde_json::Value::Array(
+            images
+                .iter()
+                .map(|(id, image)| {
+                    serde_json::json!({
+                        "id": id,
+                        "album_id": image.album_id,
+                        "source_path": image.source_path,
+                        "relative_path": image.relative_path,
+                        "file_size": image.file_size,
+                        "modified_at": image.modified_at,
+                        "width": image.width,
+                        "height": image.height,
+                        "format": image.format,
+                        "decode_state": image.decode_state.to_string(),
+                        "blake3": hex(&image.blake3),
+                        "pixel_hash": hex(&image.pixel_hash),
+                        "gradient_hash": hex(&image.gradient_hash),
+                        "block_hash": hex(&image.block_hash),
+                        "median_hash": hex(&image.median_hash),
+                        "fingerprint_version": image.fingerprint_version,
+                        "state": image.state.to_string()
+                    })
+                })
+                .collect(),
+        );
+        client
+            .execute(
+                "INSERT INTO import_images
+                    (id, import_album_id, source_path, relative_path, file_size, modified_at,
+                     width, height, format, decode_state, blake3, pixel_hash,
+                     gradient_hash, block_hash, median_hash, fingerprint_version, state)
+                 SELECT x.id, x.album_id, x.source_path, x.relative_path, x.file_size, x.modified_at,
+                        x.width, x.height, x.format, x.decode_state,
+                        CASE WHEN x.blake3 IS NULL THEN NULL ELSE decode(x.blake3, 'hex') END,
+                        CASE WHEN x.pixel_hash IS NULL THEN NULL ELSE decode(x.pixel_hash, 'hex') END,
+                        CASE WHEN x.gradient_hash IS NULL THEN NULL ELSE decode(x.gradient_hash, 'hex') END,
+                        CASE WHEN x.block_hash IS NULL THEN NULL ELSE decode(x.block_hash, 'hex') END,
+                        CASE WHEN x.median_hash IS NULL THEN NULL ELSE decode(x.median_hash, 'hex') END,
+                        x.fingerprint_version, x.state
+                 FROM jsonb_to_recordset($1) AS x(
+                    id uuid, album_id uuid, source_path text, relative_path text,
+                    file_size bigint, modified_at timestamptz, width integer, height integer,
+                    format text, decode_state text, blake3 text, pixel_hash text,
+                    gradient_hash text, block_hash text, median_hash text,
+                    fingerprint_version text, state text) ",
+                &[&payload],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to batch insert import images: {e}")))?;
+        Ok(())
+    }
+
     pub async fn get_import_images_by_album(
         client: &Client,
         album_id: Uuid,
@@ -1238,13 +1416,25 @@ impl ImportRepository {
         client: &Client,
         candidate: NewDuplicateCandidate,
     ) -> Result<Uuid, AppError> {
+        let (id, _) = Self::upsert_duplicate_candidate(client, candidate).await?;
+        Ok(id)
+    }
+
+    /// Insert one logical image pair, or merge stronger evidence into the
+    /// existing row. The database unique indexes are the final concurrency
+    /// guard; the returned bool tells progress accounting whether a row was
+    /// actually added.
+    pub async fn upsert_duplicate_candidate(
+        client: &Client,
+        candidate: NewDuplicateCandidate,
+    ) -> Result<(Uuid, bool), AppError> {
         let id = Uuid::new_v4();
         let scope_str = candidate.scope.to_string();
         let match_str = candidate.match_type.to_string();
         let decision_str = candidate.decision.as_ref().map(|d| d.to_string());
         let source_str = candidate.decision_source.as_ref().map(|s| s.to_string());
-        client
-            .execute(
+        let inserted = client
+            .query_opt(
                 "INSERT INTO duplicate_candidates
                  (id, import_run_id, source_image_id, candidate_source_image_id,
                   candidate_library_image_id, scope, match_type,
@@ -1252,7 +1442,9 @@ impl ImportRepository {
                   gradient_distance, block_distance, median_distance,
                   transform_type, confidence,
                   decision, decision_source, rule_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                 ON CONFLICT DO NOTHING
+                 RETURNING id",
                 &[
                     &id,
                     &candidate.import_run_id,
@@ -1277,7 +1469,76 @@ impl ImportRepository {
             .map_err(|e| {
                 AppError::Internal(format!("failed to insert duplicate candidate: {e}"))
             })?;
-        Ok(id)
+        if inserted.is_some() {
+            return Ok((id, true));
+        }
+
+        let existing = if let Some(candidate_source_id) = candidate.candidate_source_image_id {
+            client
+                .query_one(
+                    "SELECT id, match_type FROM duplicate_candidates
+                     WHERE import_run_id = $1
+                       AND candidate_source_image_id IS NOT NULL
+                       AND LEAST(source_image_id, candidate_source_image_id) = LEAST($2::uuid, $3::uuid)
+                       AND GREATEST(source_image_id, candidate_source_image_id) = GREATEST($2::uuid, $3::uuid)",
+                    &[&candidate.import_run_id, &candidate.source_image_id, &candidate_source_id],
+                )
+                .await
+        } else if let Some(candidate_library_id) = candidate.candidate_library_image_id {
+            client
+                .query_one(
+                    "SELECT id, match_type FROM duplicate_candidates
+                     WHERE import_run_id = $1 AND source_image_id = $2
+                       AND candidate_library_image_id = $3",
+                    &[&candidate.import_run_id, &candidate.source_image_id, &candidate_library_id],
+                )
+                .await
+        } else {
+            return Err(AppError::Internal(
+                "duplicate candidate has no candidate image".to_string(),
+            ));
+        }
+        .map_err(|e| AppError::Internal(format!("failed to load conflicting candidate: {e}")))?;
+        let existing_id: Uuid = existing.get("id");
+        let existing_match: String = existing.get("match_type");
+        let priority = |value: &str| match value {
+            "file_exact" => 0,
+            "pixel_exact" => 1,
+            "perceptual_near" => 2,
+            _ => 3,
+        };
+        if priority(&match_str) < priority(&existing_match) {
+            client
+                .execute(
+                    "UPDATE duplicate_candidates
+                     SET scope = $2, match_type = $3,
+                         blake3_equal = $4, pixel_hash_equal = $5,
+                         gradient_distance = $6, block_distance = $7, median_distance = $8,
+                         transform_type = $9, confidence = $10,
+                         decision = $11, decision_source = $12, rule_version = $13
+                     WHERE id = $1",
+                    &[
+                        &existing_id,
+                        &scope_str,
+                        &match_str,
+                        &candidate.blake3_equal,
+                        &candidate.pixel_hash_equal,
+                        &candidate.gradient_distance,
+                        &candidate.block_distance,
+                        &candidate.median_distance,
+                        &candidate.transform_type,
+                        &candidate.confidence,
+                        &decision_str,
+                        &source_str,
+                        &SCAN_POLICY_VERSION.to_string(),
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to merge candidate evidence: {e}"))
+                })?;
+        }
+        Ok((existing_id, false))
     }
 
     pub async fn get_library_images_for_comparison(
@@ -1338,12 +1599,13 @@ impl ImportRepository {
     }
 
     /// Query library images by perceptual band (bucketed similarity recall).
-    /// Returns at most `max_candidates` results per band.
+    /// Returns every row in a matching bucket in stable order. Silently
+    /// dropping row 51 made correctness depend on heap order and VACUUM.
     pub async fn find_library_images_by_perceptual_band(
         client: &Client,
         band_index: u8,
         band_value: &[u8],
-        max_candidates: usize,
+        _max_candidates: usize,
     ) -> Result<Vec<LibraryImageRow>, AppError> {
         let band_col = match band_index {
             0 => "perceptual_band_0",
@@ -1357,12 +1619,12 @@ impl ImportRepository {
             "SELECT id, file_size, blake3, pixel_hash, gradient_hash, block_hash, median_hash
              FROM library_images
              WHERE {} = $1
-             LIMIT $2",
+             ORDER BY id",
             band_col
         );
 
         let rows = client
-            .query(&query, &[&band_value, &(max_candidates as i64)])
+            .query(&query, &[&band_value])
             .await
             .map_err(|e| AppError::Internal(format!("failed to query library by band: {e}")))?;
 
@@ -3583,5 +3845,28 @@ impl ImportRepository {
                 blake3: r.get("blake3"),
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_scan_state_is_derived_from_persisted_facts() {
+        assert_eq!(
+            scan_run_state_from_facts(1, 0, 0),
+            ImportRunState::Cancelled
+        );
+        assert_eq!(scan_run_state_from_facts(0, 1, 0), ImportRunState::Failed);
+        assert_eq!(
+            scan_run_state_from_facts(0, 0, 1),
+            ImportRunState::ReviewRequired
+        );
+        assert_eq!(
+            scan_run_state_from_facts(0, 0, 0),
+            ImportRunState::ReadyToCommit,
+            "a cancel after the last album checkpoint must remain committable"
+        );
     }
 }

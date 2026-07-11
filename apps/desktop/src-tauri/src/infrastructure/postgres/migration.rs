@@ -14,6 +14,8 @@ const MIGRATION_0009: &str =
 const MIGRATION_0010: &str = include_str!("../../../migrations/0010_library_root_leases.sql");
 const MIGRATION_0011: &str = include_str!("../../../migrations/0011_album_workflow_state.sql");
 const MIGRATION_0012: &str = include_str!("../../../migrations/0012_album_workflow_repair.sql");
+const MIGRATION_0013: &str =
+    include_str!("../../../migrations/0013_workflow_escape_and_candidate_uniqueness.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
@@ -28,6 +30,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0010_library_root_leases", MIGRATION_0010),
     ("0011_album_workflow_state", MIGRATION_0011),
     ("0012_album_workflow_repair", MIGRATION_0012),
+    (
+        "0013_workflow_escape_and_candidate_uniqueness",
+        MIGRATION_0013,
+    ),
 ];
 
 pub struct MigrationRunner;
@@ -164,7 +170,7 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 12);
+        assert_eq!(MIGRATIONS.len(), 13);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
         assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
@@ -178,6 +184,8 @@ mod tests {
         assert!(MIGRATION_0011.contains("analysis_started_at"));
         assert!(MIGRATION_0012.contains("DELETE FROM duplicate_candidates"));
         assert!(MIGRATION_0012.contains("fingerprinted_count"));
+        assert!(MIGRATION_0013.contains("'abandoned'"));
+        assert!(MIGRATION_0013.contains("idx_duplicate_candidates_library_pair"));
     }
 
     #[test]
@@ -196,12 +204,13 @@ mod tests {
                 "0009_drop_redundant_snapshot_hash",
                 "0010_library_root_leases",
                 "0011_album_workflow_state",
-                "0012_album_workflow_repair"
+                "0012_album_workflow_repair",
+                "0013_workflow_escape_and_candidate_uniqueness"
             ]
         );
         assert_eq!(
             MigrationRunner::latest_version(),
-            "0012_album_workflow_repair"
+            "0013_workflow_escape_and_candidate_uniqueness"
         );
     }
 
@@ -458,7 +467,13 @@ mod tests {
             .unwrap();
 
         let applied = MigrationRunner::run_pending(&mut client).await.unwrap();
-        assert_eq!(applied, vec!["0012_album_workflow_repair"]);
+        assert_eq!(
+            applied,
+            vec![
+                "0012_album_workflow_repair",
+                "0013_workflow_escape_and_candidate_uniqueness"
+            ]
+        );
 
         for album_id in [original_stale_album, edited_pending_album] {
             let row = client
@@ -504,7 +519,7 @@ mod tests {
         assert_eq!(candidate_count, 0);
         assert_eq!(
             MigrationRunner::current_version(&client).await.unwrap(),
-            Some("0012_album_workflow_repair".to_string())
+            Some("0013_workflow_escape_and_candidate_uniqueness".to_string())
         );
 
         drop(client);

@@ -15,7 +15,8 @@ MVP2 不是 SQL 控制台、表浏览器，也不是新匹配算法或图集级 
 - 选择源目录后发现图集列表。
 - `import_albums` 成为分析阶段的持久进度单位。
 - 单个图集分析完成后立即落库为 `analyzed` 或 `review_required`。
-- 中断后同源目录重新开始分析时，继续 pending / stale analyzing / failed retry 图集。
+- 中断后通过显式 resume 继续 pending / stale analyzing / failed retry 图集；普通开始创建新 run。
+- 可显式 abandoned 旧 checkpoint，并在源文件修复后重新分析。
 - 失败图集可单独重置为待分析。
 - Dashboard / Scan / Review 显示图集状态、待审核、失败入口。
 - Dashboard 显示数据库概览：图库根目录、已入库图集/图片、导入任务、待审核、失败、恢复和冻结计划数量。

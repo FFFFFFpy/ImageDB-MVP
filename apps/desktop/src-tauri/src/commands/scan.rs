@@ -283,6 +283,34 @@ pub async fn retry_import_album(
 }
 
 #[tauri::command]
+pub async fn abandon_import_run(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<(), String> {
+    // Serialize against start/resume/retry so an in-flight analysis cannot be
+    // abandoned underneath its worker.
+    let scan_state = state.scan_state.lock().await;
+    if scan_state
+        .active
+        .as_ref()
+        .is_some_and(|handle| !handle.task.is_finished())
+    {
+        return Err("Cannot abandon an import run while a scan is running".to_string());
+    }
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = ImportRepository::abandon_import_run(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    drop(scan_state);
+    result
+}
+
+#[tauri::command]
 pub async fn resume_import_run<R: Runtime>(
     state: State<'_, AppState>,
     import_run_id: String,
