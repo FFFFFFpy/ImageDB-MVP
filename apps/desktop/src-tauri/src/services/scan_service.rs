@@ -2856,8 +2856,13 @@ mod tests {
                 .latest_actionable_run
                 .as_ref()
                 .unwrap()
+                .run
                 .import_run_id,
             new_run.to_string()
+        );
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::GeneratePlan
         );
         assert_eq!(
             ImportRepository::get_latest_reviewable_run(&client)
@@ -2882,20 +2887,147 @@ mod tests {
             )
             .await
             .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::GeneratePlan,
+            "review_required with no pending reviews must return to plan generation"
+        );
+
+        let new_candidate = Uuid::new_v4();
         client
             .execute(
                 "INSERT INTO duplicate_candidates
                 (id, import_run_id, source_image_id, candidate_source_image_id, scope, match_type)
              VALUES ($1, $2, $3, $4, 'cross_album', 'perceptual_similar')",
-                &[&Uuid::new_v4(), &new_run, &new_a, &new_b],
+                &[&new_candidate, &new_run, &new_a, &new_b],
             )
             .await
             .unwrap();
+        ImportRepository::refresh_album_workflow_summary(&client, new_album)
+            .await
+            .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::Review
+        );
         assert_eq!(
             ImportRepository::get_latest_reviewable_run(&client)
                 .await
                 .unwrap(),
             Some(new_run)
+        );
+
+        client
+            .execute(
+                "DELETE FROM duplicate_candidates WHERE id = $1",
+                &[&new_candidate],
+            )
+            .await
+            .unwrap();
+        ImportRepository::refresh_album_workflow_summary(&client, new_album)
+            .await
+            .unwrap();
+        let plan_id = ImportRepository::create_import_plan(&client, new_run, 1, "test", root_id)
+            .await
+            .unwrap();
+        ImportRepository::set_plan_hash(&client, plan_id, &[7_u8; 32])
+            .await
+            .unwrap();
+        ImportRepository::update_import_plan_state(
+            &client,
+            plan_id,
+            &crate::domain::state_machine::PlanState::Frozen,
+        )
+        .await
+        .unwrap();
+        client
+            .execute(
+                "UPDATE import_runs SET state = 'cancelled' WHERE id = $1",
+                &[&new_run],
+            )
+            .await
+            .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        let actionable = dashboard.latest_actionable_run.as_ref().unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::ResumeCommit
+        );
+        assert!(actionable.has_frozen_plan);
+        assert!(!actionable.has_active_transaction);
+
+        ImportRepository::insert_file_transaction(
+            &client,
+            Uuid::new_v4(),
+            new_run,
+            new_album,
+            &crate::domain::state_machine::TransactionState::Planned,
+            Some("C:/staging"),
+            Some("C:/target"),
+            None,
+        )
+        .await
+        .unwrap();
+        client
+            .execute(
+                "UPDATE import_runs SET state = 'committing' WHERE id = $1",
+                &[&new_run],
+            )
+            .await
+            .unwrap();
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dashboard.next_action,
+            crate::repositories::import_repository::DashboardNextAction::Recover
+        );
+        assert!(
+            dashboard
+                .latest_actionable_run
+                .as_ref()
+                .unwrap()
+                .has_active_transaction
         );
 
         drop(client);

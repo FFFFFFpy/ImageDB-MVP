@@ -34,6 +34,8 @@
 - [x] abandoned 历史证据保留，但不计入当前待审核、失败或恢复统计。
 - [x] Dashboard 下一步仅基于同一个非 abandoned `latest_actionable_run`。
 - [x] Review 默认选择与 ScanPage 主流程操作均排除 abandoned run。
+- [x] `review_required` 的待审核归零后，Dashboard 进入入库审核 / 计划生成，不会开始新导入。
+- [x] cancelled frozen plan、committing 和 active transaction 由后端显式 `next_action` 路由。
 
 ## 保持不变
 
@@ -57,6 +59,6 @@
 - [x] pnpm release:dataset
 - [x] pnpm release:performance
 
-2026-07-12 自动验证结果：46 项前端测试通过；Rust 默认测试 212 项通过、3 项真实测试按设计 ignored；`rust:test:real` 的 22 组、99 项真实 PostgreSQL / 文件系统 / 故障注入测试全部通过，其中 migration 0013 语义测试 3 项、abandoned 工作流隔离测试 1 项已纳入门禁。`format:check`、`typecheck`、`rust:clippy`、生产构建和 release artifacts 验证通过，生成的应用迁移 head 为 `0014_candidate_review_semantics_and_abandoned_filters`。验收数据集为 8 个源图集、44 个源文件和 1 张历史图；120 图性能门禁总耗时 7.225 秒，scan 63.69 images/s，commit 117.65 images/s。
+2026-07-12 自动验证结果：49 项前端测试通过；Rust 默认测试 212 项通过、3 项真实测试按设计 ignored；`rust:test:real` 的 22 组、99 项真实 PostgreSQL / 文件系统 / 故障注入测试全部通过。Dashboard 真实库测试覆盖 abandoned 历史隔离、审核完成后生成计划、待审核路由、cancelled frozen plan 续提交以及 committing active transaction 恢复路由。`format:check`、`typecheck`、`rust:clippy`、生产构建和 release artifacts 验证通过，生成的应用迁移 head 为 `0014_candidate_review_semantics_and_abandoned_filters`。验收数据集为 8 个源图集、44 个源文件和 1 张历史图；120 图性能门禁总耗时 6.297 秒，scan 65.29 images/s，commit 148.15 images/s。
 
 本轮未运行 `release:install-gate`，也未执行仍未勾选的手工中断/重开/续跑、交互计数同步和空库/异常状态人工测试；自动测试不替代这些人工验收，也不替代 clean Windows 默认数据目录保留签字。

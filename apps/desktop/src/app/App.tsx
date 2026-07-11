@@ -67,6 +67,7 @@ export function App() {
                 navigate('scan');
               }}
               onGoReview={() => navigate('review')}
+              onGoCommit={() => navigate('commit')}
               onGoRecovery={() => navigate('recovery')}
             />
           )}

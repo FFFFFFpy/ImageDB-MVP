@@ -243,6 +243,21 @@ export interface ImportRunDashboard {
   duplicate_candidates: number;
 }
 
+export type DashboardNextAction =
+  | 'recover'
+  | 'review'
+  | 'generate_plan'
+  | 'resume_analysis'
+  | 'inspect_failed'
+  | 'resume_commit'
+  | 'new_import';
+
+export interface DashboardActionableRun extends ImportRunDashboard {
+  next_action: DashboardNextAction;
+  has_frozen_plan: boolean;
+  has_active_transaction: boolean;
+}
+
 export interface DatabaseInfoDashboard {
   database: {
     mode: 'managed_local' | 'external' | null;
@@ -266,7 +281,8 @@ export interface DatabaseInfoDashboard {
     frozen_plan_count: number;
   };
   latest_run: ImportRunDashboard | null;
-  latest_actionable_run: ImportRunDashboard | null;
+  latest_actionable_run: DashboardActionableRun | null;
+  next_action: DashboardNextAction;
 }
 
 export interface ReviewCandidateSummary {

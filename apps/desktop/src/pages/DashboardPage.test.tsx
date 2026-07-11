@@ -68,7 +68,11 @@ const mockState = vi.hoisted(() => ({
       total_images: 20,
       pending_reviews: 3,
       duplicate_candidates: 4,
+      next_action: 'resume_analysis',
+      has_frozen_plan: false,
+      has_active_transaction: false,
     },
+    next_action: 'resume_analysis',
   } as DatabaseInfoDashboard,
 }));
 
@@ -81,13 +85,20 @@ vi.mock('../lib/ipc/api', () => ({
   api: mockApi,
 }));
 
-function renderDashboard(onGoScan = vi.fn(), onGoReview = vi.fn()) {
+function renderDashboard(
+  onGoScan = vi.fn(),
+  onGoReview = vi.fn(),
+  onGoCommit = vi.fn(),
+  onGoRecovery = vi.fn(),
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return {
     onGoScan,
     onGoReview,
+    onGoCommit,
+    onGoRecovery,
     ...render(
       <QueryClientProvider client={client}>
         <DashboardPage
@@ -95,7 +106,8 @@ function renderDashboard(onGoScan = vi.fn(), onGoReview = vi.fn()) {
           onConfigureDatabase={vi.fn()}
           onGoScan={onGoScan}
           onGoReview={onGoReview}
-          onGoRecovery={vi.fn()}
+          onGoCommit={onGoCommit}
+          onGoRecovery={onGoRecovery}
         />
       </QueryClientProvider>,
     ),
@@ -117,11 +129,15 @@ beforeEach(() => {
           pending_reviews: 3,
         }
       : null,
+    next_action: 'resume_analysis',
     latest_actionable_run: mockState.databaseInfo.latest_actionable_run
       ? {
           ...mockState.databaseInfo.latest_actionable_run,
           pending_albums: 1,
           pending_reviews: 3,
+          next_action: 'resume_analysis',
+          has_frozen_plan: false,
+          has_active_transaction: false,
         }
       : null,
   };
@@ -152,7 +168,9 @@ describe('DashboardPage database info', () => {
       latest_actionable_run: {
         ...mockState.databaseInfo.latest_actionable_run!,
         pending_reviews: 0,
+        next_action: 'resume_analysis',
       },
+      next_action: 'resume_analysis',
     };
     const { onGoScan } = renderDashboard();
 
@@ -175,6 +193,7 @@ describe('DashboardPage database info', () => {
         failed_albums: 2,
       },
       latest_actionable_run: null,
+      next_action: 'new_import',
     };
     const { onGoScan, onGoReview } = renderDashboard();
 
@@ -202,12 +221,83 @@ describe('DashboardPage database info', () => {
         pending_albums: 0,
         pending_reviews: 0,
         failed_albums: 0,
+        next_action: 'generate_plan',
       },
+      next_action: 'generate_plan',
     };
     const onGoReview = vi.fn();
     renderDashboard(vi.fn(), onGoReview);
 
     fireEvent.click(await screen.findByRole('button', { name: '前往入库审核' }));
     expect(onGoReview).toHaveBeenCalledOnce();
+  });
+
+  test('routes a fully reviewed review-required run to plan generation', async () => {
+    mockState.databaseInfo = {
+      ...mockState.databaseInfo,
+      imports: { ...mockState.databaseInfo.imports, pending_review_count: 0 },
+      latest_actionable_run: {
+        ...mockState.databaseInfo.latest_actionable_run!,
+        state: 'review_required',
+        pending_albums: 0,
+        analyzing_albums: 0,
+        pending_reviews: 0,
+        failed_albums: 0,
+        next_action: 'generate_plan',
+      },
+      next_action: 'generate_plan',
+    };
+    const onGoReview = vi.fn();
+    renderDashboard(vi.fn(), onGoReview);
+
+    fireEvent.click(await screen.findByRole('button', { name: '前往入库审核' }));
+    expect(onGoReview).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: '开始导入' })).not.toBeInTheDocument();
+  });
+
+  test('routes a cancelled frozen-plan run without an active transaction to commit', async () => {
+    mockState.databaseInfo = {
+      ...mockState.databaseInfo,
+      latest_actionable_run: {
+        ...mockState.databaseInfo.latest_actionable_run!,
+        state: 'cancelled',
+        pending_albums: 0,
+        analyzing_albums: 0,
+        pending_reviews: 0,
+        failed_albums: 0,
+        next_action: 'resume_commit',
+        has_frozen_plan: true,
+        has_active_transaction: false,
+      },
+      next_action: 'resume_commit',
+    };
+    const onGoCommit = vi.fn();
+    renderDashboard(vi.fn(), vi.fn(), onGoCommit);
+
+    fireEvent.click(await screen.findByRole('button', { name: '继续入库' }));
+    expect(onGoCommit).toHaveBeenCalledOnce();
+  });
+
+  test('routes committing or active-transaction work to recovery', async () => {
+    mockState.databaseInfo = {
+      ...mockState.databaseInfo,
+      latest_actionable_run: {
+        ...mockState.databaseInfo.latest_actionable_run!,
+        state: 'committing',
+        pending_albums: 0,
+        analyzing_albums: 0,
+        pending_reviews: 0,
+        failed_albums: 0,
+        next_action: 'recover',
+        has_frozen_plan: true,
+        has_active_transaction: true,
+      },
+      next_action: 'recover',
+    };
+    const onGoRecovery = vi.fn();
+    renderDashboard(vi.fn(), vi.fn(), vi.fn(), onGoRecovery);
+
+    fireEvent.click(await screen.findByRole('button', { name: '前往恢复' }));
+    expect(onGoRecovery).toHaveBeenCalledOnce();
   });
 });

@@ -7,6 +7,7 @@ interface DashboardPageProps {
   onConfigureDatabase: () => void;
   onGoScan: (importRunId?: string | null) => void;
   onGoReview: () => void;
+  onGoCommit: () => void;
   onGoRecovery: () => void;
 }
 
@@ -21,6 +22,7 @@ export function DashboardPage({
   onConfigureDatabase,
   onGoScan,
   onGoReview,
+  onGoCommit,
   onGoRecovery,
 }: DashboardPageProps) {
   const dbStatus = useQuery({
@@ -78,23 +80,31 @@ export function DashboardPage({
   const pendingReviews = info?.imports.pending_review_count ?? 0;
   const failedAlbums = info?.imports.failed_album_count ?? 0;
   const recoveryRequiredRuns = info?.imports.recovery_required_run_count ?? 0;
-  const hasRecoveryTask = actionableRun?.state === 'recovery_required';
-  const hasResumableRun =
-    !!actionableRun && (actionableRun.pending_albums > 0 || actionableRun.analyzing_albums > 0);
-  const hasFailedRun = !!actionableRun && actionableRun.failed_albums > 0;
-  const hasReviewTask = !!actionableRun && actionableRun.pending_reviews > 0;
-  const isReadyToCommit = actionableRun?.state === 'ready_to_commit';
-  const nextAction = hasRecoveryTask
-    ? { label: '前往恢复', onClick: onGoRecovery }
-    : hasReviewTask
-      ? { label: '继续审核', onClick: onGoReview }
-      : hasResumableRun
-        ? { label: '继续分析', onClick: () => onGoScan(actionableRun.import_run_id) }
-        : hasFailedRun
-          ? { label: '查看失败图集', onClick: () => onGoScan(actionableRun.import_run_id) }
-          : isReadyToCommit
-            ? { label: '前往入库审核', onClick: onGoReview }
-            : { label: '开始导入', onClick: () => onGoScan(null) };
+  const hasRecoveryTask = info?.next_action === 'recover';
+  const nextAction = (() => {
+    switch (info?.next_action) {
+      case 'recover':
+        return { label: '前往恢复', onClick: onGoRecovery };
+      case 'review':
+        return { label: '继续审核', onClick: onGoReview };
+      case 'generate_plan':
+        return { label: '前往入库审核', onClick: onGoReview };
+      case 'resume_analysis':
+        return {
+          label: '继续分析',
+          onClick: () => onGoScan(actionableRun?.import_run_id ?? null),
+        };
+      case 'inspect_failed':
+        return {
+          label: '查看失败图集',
+          onClick: () => onGoScan(actionableRun?.import_run_id ?? null),
+        };
+      case 'resume_commit':
+        return { label: '继续入库', onClick: onGoCommit };
+      default:
+        return { label: '开始导入', onClick: () => onGoScan(null) };
+    }
+  })();
 
   return (
     <div className="dashboard-page">

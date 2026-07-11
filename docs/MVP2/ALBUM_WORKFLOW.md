@@ -35,6 +35,21 @@ analyzing / scanning / fingerprinting / cancelled / failed
 
 `abandoned` 是历史终态，不是失败任务的别名。Dashboard 的历史任务、图集和图片总数可以包含它，但待审核、失败、恢复等当前待办统计必须通过 `import_runs` 排除它；Dashboard 的下一步只使用同一个 `latest_actionable_run`，Review 和 Commit 的默认入口也不会重新选择 abandoned run。ScanPage 可以展示其历史状态，但不提供 resume、retry 或 review 主流程按钮。
 
+Dashboard 不在 React 中重新推断状态机。后端 `latest_actionable_run` 同时返回 `next_action`、`has_frozen_plan` 和 `has_active_transaction`，并按持久化事实路由：
+
+```text
+recovery_required / committing / active transaction -> recover
+review_required + pending review                  -> review
+review_required + no pending review               -> generate_plan
+cancelled + frozen plan + no active transaction   -> resume_commit
+pending / analyzing album                         -> resume_analysis
+failed run / album                                 -> inspect_failed
+ready_to_commit                                    -> generate_plan
+no actionable run                                 -> new_import
+```
+
+因此最后一个审核决定提交后，即使父 run 仍保持 `review_required`，Dashboard 也会返回入库审核生成计划，而不是开始新的导入。没有 plan、未完成图集或事务事实的 cancelled/未知状态不会占据 `latest_actionable_run`。
+
 如果待清理图集已经被 frozen plan 或 file transaction 引用，续跑会 fail closed，不删除任何证据。
 
 ## 单图集 checkpoint

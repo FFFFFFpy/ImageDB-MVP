@@ -218,6 +218,7 @@ test('sidebar new import clears a run selected from the dashboard', async () => 
       pending_reviews: 0,
       duplicate_candidates: 0,
     },
+    next_action: 'resume_analysis',
     latest_actionable_run: {
       import_run_id: 'run-selected',
       source_root: 'D:/Selected',
@@ -231,6 +232,9 @@ test('sidebar new import clears a run selected from the dashboard', async () => 
       total_images: 1,
       pending_reviews: 0,
       duplicate_candidates: 0,
+      next_action: 'resume_analysis',
+      has_frozen_plan: false,
+      has_active_transaction: false,
     },
   };
 

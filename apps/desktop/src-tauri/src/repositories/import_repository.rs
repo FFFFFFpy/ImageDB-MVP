@@ -130,13 +130,35 @@ pub struct DatabaseInfoImportsSection {
     pub frozen_plan_count: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardNextAction {
+    Recover,
+    Review,
+    GeneratePlan,
+    ResumeAnalysis,
+    InspectFailed,
+    ResumeCommit,
+    NewImport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardActionableRun {
+    #[serde(flatten)]
+    pub run: ImportRunDashboard,
+    pub next_action: DashboardNextAction,
+    pub has_frozen_plan: bool,
+    pub has_active_transaction: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseInfoDashboard {
     pub database: DatabaseInfoDatabaseSection,
     pub library: DatabaseInfoLibrarySection,
     pub imports: DatabaseInfoImportsSection,
     pub latest_run: Option<ImportRunDashboard>,
-    pub latest_actionable_run: Option<ImportRunDashboard>,
+    pub latest_actionable_run: Option<DashboardActionableRun>,
+    pub next_action: DashboardNextAction,
 }
 
 pub struct ImportImageRecord {
@@ -2281,9 +2303,10 @@ impl ImportRepository {
 
     async fn get_latest_actionable_run_summary(
         client: &Client,
-    ) -> Result<Option<ImportRunDashboard>, AppError> {
+    ) -> Result<Option<DashboardActionableRun>, AppError> {
         let row = client.query_opt(
-            "SELECT r.id AS import_run_id, r.source_root, r.state,
+            "WITH run_facts AS (
+               SELECT r.id AS import_run_id, r.source_root, r.state, r.started_at,
                     COUNT(a.id)::INTEGER AS total_albums,
                     COUNT(a.id) FILTER (WHERE a.state = 'pending')::INTEGER AS pending_albums,
                     COUNT(a.id) FILTER (WHERE a.state IN ('analyzing', 'scanning', 'fingerprinting'))::INTEGER AS analyzing_albums,
@@ -2292,21 +2315,53 @@ impl ImportRepository {
                     COUNT(a.id) FILTER (WHERE a.state = 'failed')::INTEGER AS failed_albums,
                     COALESCE(SUM(a.image_count), 0)::INTEGER AS total_images,
                     COALESCE(SUM(a.review_candidate_count), 0)::INTEGER AS pending_reviews,
-                    COALESCE(SUM(a.duplicate_candidate_count), 0)::INTEGER AS duplicate_candidates
-             FROM import_runs r
-             LEFT JOIN import_albums a ON a.import_run_id = r.id
-             WHERE r.state NOT IN ('abandoned', 'completed')
-             GROUP BY r.id, r.source_root, r.state, r.started_at
-             ORDER BY CASE
-                        WHEN r.state = 'recovery_required' THEN 0
-                        WHEN r.state = 'review_required' THEN 1
-                        WHEN r.state IN ('created', 'scanning', 'fingerprinting',
-                                         'detecting_duplicates', 'analyzing', 'cancelled') THEN 2
-                        WHEN r.state = 'failed' THEN 3
-                        WHEN r.state = 'ready_to_commit' THEN 4
-                        ELSE 5
+                    COALESCE(SUM(a.duplicate_candidate_count), 0)::INTEGER AS duplicate_candidates,
+                    EXISTS (
+                        SELECT 1 FROM import_plans p
+                        WHERE p.import_run_id = r.id
+                          AND p.state IN ('frozen', 'consumed')
+                          AND p.plan_hash IS NOT NULL
+                    ) AS has_frozen_plan,
+                    EXISTS (
+                        SELECT 1 FROM file_transactions ft
+                        WHERE ft.import_run_id = r.id
+                          AND ft.state IN (
+                              'planned', 'staging', 'verifying', 'verified',
+                              'publishing', 'published', 'db_committing',
+                              'library_committed', 'source_archiving',
+                              'cleanup_required', 'conflict'
+                          )
+                    ) AS has_active_transaction
+               FROM import_runs r
+               LEFT JOIN import_albums a ON a.import_run_id = r.id
+               WHERE r.state NOT IN ('abandoned', 'completed')
+               GROUP BY r.id, r.source_root, r.state, r.started_at
+             ), routed AS (
+               SELECT *, CASE
+                   WHEN state IN ('recovery_required', 'committing')
+                        OR has_active_transaction THEN 'recover'
+                   WHEN state = 'review_required' AND pending_reviews > 0 THEN 'review'
+                   WHEN state = 'review_required' AND pending_reviews = 0 THEN 'generate_plan'
+                   WHEN state = 'cancelled' AND has_frozen_plan THEN 'resume_commit'
+                   WHEN pending_albums > 0 OR analyzing_albums > 0 THEN 'resume_analysis'
+                   WHEN state = 'failed' OR failed_albums > 0 THEN 'inspect_failed'
+                   WHEN state = 'ready_to_commit' THEN 'generate_plan'
+                   ELSE 'new_import'
+               END AS next_action
+               FROM run_facts
+             )
+             SELECT * FROM routed
+             WHERE next_action <> 'new_import'
+             ORDER BY CASE next_action
+                        WHEN 'recover' THEN 0
+                        WHEN 'review' THEN 1
+                        WHEN 'generate_plan' THEN 2
+                        WHEN 'resume_analysis' THEN 3
+                        WHEN 'inspect_failed' THEN 4
+                        WHEN 'resume_commit' THEN 5
+                        ELSE 6
                       END,
-                      r.started_at DESC
+                      started_at DESC
              LIMIT 1",
             &[],
         ).await.map_err(|e| AppError::Internal(format!(
@@ -2314,19 +2369,35 @@ impl ImportRepository {
             postgres_error_detail(&e)
         )))?;
 
-        Ok(row.map(|r| ImportRunDashboard {
-            import_run_id: r.get::<_, Uuid>("import_run_id").to_string(),
-            source_root: r.get("source_root"),
-            state: r.get("state"),
-            total_albums: r.get("total_albums"),
-            pending_albums: r.get("pending_albums"),
-            analyzing_albums: r.get("analyzing_albums"),
-            analyzed_albums: r.get("analyzed_albums"),
-            review_required_albums: r.get("review_required_albums"),
-            failed_albums: r.get("failed_albums"),
-            total_images: r.get("total_images"),
-            pending_reviews: r.get("pending_reviews"),
-            duplicate_candidates: r.get("duplicate_candidates"),
+        Ok(row.map(|r| {
+            let next_action = match r.get::<_, String>("next_action").as_str() {
+                "recover" => DashboardNextAction::Recover,
+                "review" => DashboardNextAction::Review,
+                "generate_plan" => DashboardNextAction::GeneratePlan,
+                "resume_analysis" => DashboardNextAction::ResumeAnalysis,
+                "inspect_failed" => DashboardNextAction::InspectFailed,
+                "resume_commit" => DashboardNextAction::ResumeCommit,
+                _ => DashboardNextAction::NewImport,
+            };
+            DashboardActionableRun {
+                run: ImportRunDashboard {
+                    import_run_id: r.get::<_, Uuid>("import_run_id").to_string(),
+                    source_root: r.get("source_root"),
+                    state: r.get("state"),
+                    total_albums: r.get("total_albums"),
+                    pending_albums: r.get("pending_albums"),
+                    analyzing_albums: r.get("analyzing_albums"),
+                    analyzed_albums: r.get("analyzed_albums"),
+                    review_required_albums: r.get("review_required_albums"),
+                    failed_albums: r.get("failed_albums"),
+                    total_images: r.get("total_images"),
+                    pending_reviews: r.get("pending_reviews"),
+                    duplicate_candidates: r.get("duplicate_candidates"),
+                },
+                next_action,
+                has_frozen_plan: r.get("has_frozen_plan"),
+                has_active_transaction: r.get("has_active_transaction"),
+            }
         }))
     }
 
@@ -2377,6 +2448,10 @@ impl ImportRepository {
             .into_iter()
             .next();
         let latest_actionable_run = Self::get_latest_actionable_run_summary(client).await?;
+        let next_action = latest_actionable_run
+            .as_ref()
+            .map(|run| run.next_action)
+            .unwrap_or(DashboardNextAction::NewImport);
 
         Ok(DatabaseInfoDashboard {
             database,
@@ -2397,6 +2472,7 @@ impl ImportRepository {
             },
             latest_run,
             latest_actionable_run,
+            next_action,
         })
     }
 
@@ -2422,6 +2498,7 @@ impl ImportRepository {
             },
             latest_run: None,
             latest_actionable_run: None,
+            next_action: DashboardNextAction::NewImport,
         }
     }
 

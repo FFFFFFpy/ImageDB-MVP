@@ -21,6 +21,7 @@ MVP2 不是 SQL 控制台、表浏览器，也不是新匹配算法或图集级 
 - 失败图集可单独重置为待分析。
 - Dashboard / Scan / Review 显示图集状态、待审核、失败入口。
 - Dashboard 显示数据库概览：图库根目录、已入库图集/图片、导入任务、待审核、失败、恢复和冻结计划数量。
+- Dashboard 的主 CTA 由后端根据 run、frozen plan 和 file transaction 事实返回显式 `next_action`，前端不再拼凑工作流状态。
 - Commit 仍保持 run 级 frozen plan / commit 主链。
 
 当前数据库 migration head：
