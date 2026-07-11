@@ -628,9 +628,16 @@ impl DatabaseService {
                     self.credentials.as_ref(),
                 );
                 match external_config {
-                    Ok(Some(config)) => match connect_external(&config).await {
-                        Ok((client, handle)) => {
-                            let pgvector = client
+                    Ok(Some(config)) => {
+                        // The profile may have been configured by an older
+                        // ImageDB build. Activate it before connecting so the
+                        // normal application connection boundary applies any
+                        // newly embedded migrations before dashboard/scan
+                        // queries can observe the schema.
+                        mgr.use_external_profile(config);
+                        match mgr.connect().await {
+                            Ok((client, handle)) => {
+                                let pgvector = client
                             .query_one(
                                 "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')",
                                 &[],
@@ -638,26 +645,27 @@ impl DatabaseService {
                             .await
                             .map(|row| row.get::<_, bool>(0))
                             .unwrap_or(false);
-                            let migration_version = MigrationRunner::current_version(&client)
-                                .await
-                                .ok()
-                                .flatten();
-                            handle.abort();
-                            mgr.use_external_profile(config);
-                            (
-                                DatabaseStatus::Connected,
-                                pgvector,
-                                migration_version,
-                                vec!["Active external PostgreSQL profile is reachable".to_string()],
-                            )
+                                let migration_version = MigrationRunner::current_version(&client)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                handle.abort();
+                                (
+                                    DatabaseStatus::Connected,
+                                    pgvector,
+                                    migration_version,
+                                    vec!["Active external PostgreSQL profile is reachable"
+                                        .to_string()],
+                                )
+                            }
+                            Err(e) => (
+                                DatabaseStatus::Error(e.to_string()),
+                                false,
+                                None,
+                                Self::external_unreachable_diagnostics(e.to_string()),
+                            ),
                         }
-                        Err(e) => (
-                            DatabaseStatus::Error(e.to_string()),
-                            false,
-                            None,
-                            Self::external_unreachable_diagnostics(e.to_string()),
-                        ),
-                    },
+                    }
                     Ok(None) => (
                         DatabaseStatus::Error(
                             "External database profile is incomplete".to_string(),
@@ -1992,8 +2000,10 @@ mod tests {
             Some(MigrationRunner::latest_version())
         );
 
-        let (target_client, target_handle) =
-            target_manager.connect().await.expect("target reconnect");
+        let (target_client, target_handle) = target_manager
+            .connect_raw()
+            .await
+            .expect("target reconnect");
         let vector_installed = target_client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')",
@@ -2209,7 +2219,7 @@ mod tests {
         assert_eq!(external_state.status, DatabaseStatus::Connected);
 
         let (target_client, target_handle) =
-            target_manager.connect().await.expect("target connect");
+            target_manager.connect_raw().await.expect("target connect");
         target_client
             .execute(
                 "INSERT INTO app_meta (key, value) VALUES ($1, $2)
@@ -2269,8 +2279,10 @@ mod tests {
             "target restart failed: {:?}",
             restart_probe.diagnostics
         );
-        let (target_client, target_handle) =
-            target_manager.connect().await.expect("target reconnect");
+        let (target_client, target_handle) = target_manager
+            .connect_raw()
+            .await
+            .expect("target reconnect");
         let external_probe = target_client
             .query_one(
                 "SELECT value FROM app_meta WHERE key = 'm7_fallback_probe'",
@@ -2323,7 +2335,7 @@ mod tests {
         );
 
         let (target_client, target_handle) =
-            target_manager.connect().await.expect("target connect");
+            target_manager.connect_raw().await.expect("target connect");
         target_client
             .batch_execute(MIGRATION_0001)
             .await
@@ -2371,18 +2383,26 @@ mod tests {
         );
         assert_eq!(preflight.migration_version.as_deref(), Some("0001_initial"));
 
-        let state = service
-            .initialize_external(&target_config)
+        // Simulate an external profile saved by an older ImageDB build. On a
+        // relaunch there is no onboarding/initialize action: get_state is the
+        // first production path and must upgrade the active database before
+        // dashboard or scan commands can query the newer schema.
+        service
+            .store_and_activate_external_profile(&target_config)
             .await
-            .expect("initialize external old database");
+            .expect("activate existing external profile");
+        let state = service.get_state().await;
         assert_eq!(state.mode, Some(DatabaseMode::External));
+        assert_eq!(state.status, DatabaseStatus::Connected);
         assert_eq!(
             state.migration_version.as_deref(),
             Some(MigrationRunner::latest_version())
         );
 
-        let (upgraded_client, upgraded_handle) =
-            target_manager.connect().await.expect("target reconnect");
+        let (upgraded_client, upgraded_handle) = target_manager
+            .connect_raw()
+            .await
+            .expect("target reconnect");
         let source_snapshot_hash_exists = upgraded_client
             .query_one(
                 "SELECT EXISTS (
@@ -2435,7 +2455,7 @@ mod tests {
         );
 
         let (target_client, target_handle) =
-            target_manager.connect().await.expect("target connect");
+            target_manager.connect_raw().await.expect("target connect");
         target_client
             .batch_execute(
                 "CREATE TABLE schema_migrations (
@@ -2611,7 +2631,7 @@ mod tests {
         assert!(backup_sql.contains("m7_migration_probe"));
 
         let (target_client, target_handle) =
-            target_manager.connect().await.expect("target connect");
+            target_manager.connect_raw().await.expect("target connect");
         let migrated = target_client
             .query_one(
                 "SELECT value FROM app_meta WHERE key = 'm7_migration_probe'",

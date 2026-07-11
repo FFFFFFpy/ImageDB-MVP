@@ -11,6 +11,13 @@ use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+fn postgres_error_detail(error: &tokio_postgres::Error) -> String {
+    error
+        .as_db_error()
+        .map(|db_error| format!("{}: {}", db_error.code().code(), db_error.message()))
+        .unwrap_or_else(|| error.to_string())
+}
+
 /// Strip the album-name prefix (forward or backward slash) from a source
 /// relative path and normalize the remainder to a forward-slash target
 /// relative path. Mirrors `review_service::target_relative_path_for_album`
@@ -1982,7 +1989,12 @@ impl ImportRepository {
                 &[],
             )
             .await
-            .map_err(|e| AppError::Internal(format!("failed to query run dashboard: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "failed to query run dashboard: {}",
+                    postgres_error_detail(&e)
+                ))
+            })?;
 
         Ok(rows
             .iter()

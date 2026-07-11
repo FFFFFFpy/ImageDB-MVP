@@ -1,11 +1,13 @@
 use crate::domain::ConnectionConfig;
 use crate::error::AppError;
 use crate::infrastructure::postgres::connect_external;
+use crate::infrastructure::postgres::MigrationRunner;
 use rand::Rng;
 use serde::Serialize;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
@@ -70,6 +72,7 @@ pub struct PostgresManager {
     diagnostics: Vec<String>,
     server_running: bool,
     active_external: Option<ConnectionConfig>,
+    schema_ready: AtomicBool,
 }
 
 impl PostgresManager {
@@ -88,6 +91,7 @@ impl PostgresManager {
             diagnostics: Vec::new(),
             server_running: false,
             active_external: None,
+            schema_ready: AtomicBool::new(false),
         };
         mgr.locate_binaries();
         mgr.load_saved_config();
@@ -351,10 +355,25 @@ impl PostgresManager {
     }
 
     pub fn use_external_profile(&mut self, config: ConnectionConfig) {
+        let same_database = self
+            .active_external
+            .as_ref()
+            .map(|current| {
+                current.host == config.host
+                    && current.port == config.port
+                    && current.database == config.database
+            })
+            .unwrap_or(false);
+        if !same_database {
+            self.schema_ready.store(false, Ordering::Release);
+        }
         self.active_external = Some(config);
     }
 
     pub fn use_managed_profile(&mut self) {
+        if self.active_external.is_some() {
+            self.schema_ready.store(false, Ordering::Release);
+        }
         self.active_external = None;
     }
 
@@ -456,6 +475,7 @@ impl PostgresManager {
     }
 
     pub async fn initialize(&mut self) -> Result<PostgresProbeResult, AppError> {
+        self.schema_ready.store(false, Ordering::Release);
         if !self.binaries_available() {
             return Ok(PostgresProbeResult {
                 available: false,
@@ -1062,7 +1082,7 @@ impl PostgresManager {
         }
     }
 
-    pub async fn connect(
+    pub async fn connect_raw(
         &self,
     ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), AppError> {
         if let Some(config) = &self.active_external {
@@ -1080,6 +1100,30 @@ impl PostgresManager {
             }
         });
 
+        Ok((client, handle))
+    }
+
+    /// Connect to the active application database and ensure its embedded
+    /// schema is current before returning the client to business code.
+    ///
+    /// Raw/preflight/migration-copy paths must use `connect_raw`; normal app
+    /// commands use this method so an already configured database is upgraded
+    /// automatically after installing a newer ImageDB build.
+    pub async fn connect(
+        &self,
+    ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), AppError> {
+        let (mut client, handle) = self.connect_raw().await?;
+        if self.schema_ready.load(Ordering::Acquire) {
+            return Ok((client, handle));
+        }
+
+        if let Err(error) = MigrationRunner::run_pending(&mut client).await {
+            handle.abort();
+            return Err(AppError::Internal(format!(
+                "failed to prepare active ImageDB schema: {error}"
+            )));
+        }
+        self.schema_ready.store(true, Ordering::Release);
         Ok((client, handle))
     }
 
@@ -1556,6 +1600,7 @@ mod tests {
             diagnostics: Vec::new(),
             server_running: false,
             active_external: None,
+            schema_ready: AtomicBool::new(false),
         };
 
         let conn_str = mgr.connection_string();
@@ -1564,6 +1609,48 @@ mod tests {
         assert!(conn_str.contains("user=testuser"));
         assert!(conn_str.contains("dbname=testdb"));
         assert!(conn_str.contains("password=secret123"));
+    }
+
+    #[test]
+    fn schema_readiness_cache_is_invalidated_only_when_database_changes() {
+        use crate::domain::TlsMode;
+
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = PostgresManager::new(tmp.path());
+        mgr.schema_ready.store(true, Ordering::Release);
+
+        let external = ConnectionConfig {
+            host: "db.example.test".to_string(),
+            port: 5432,
+            database: "imagedb".to_string(),
+            username: "user-a".to_string(),
+            password: Some("secret-a".to_string()),
+            tls_mode: TlsMode::Require,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: 10,
+            query_timeout_secs: 15,
+            profile_name: None,
+        };
+        mgr.use_external_profile(external.clone());
+        assert!(!mgr.schema_ready.load(Ordering::Acquire));
+
+        mgr.schema_ready.store(true, Ordering::Release);
+        let mut same_database = external.clone();
+        same_database.username = "user-b".to_string();
+        same_database.password = Some("secret-b".to_string());
+        mgr.use_external_profile(same_database);
+        assert!(mgr.schema_ready.load(Ordering::Acquire));
+
+        let mut different_database = external;
+        different_database.database = "other".to_string();
+        mgr.use_external_profile(different_database);
+        assert!(!mgr.schema_ready.load(Ordering::Acquire));
+
+        mgr.schema_ready.store(true, Ordering::Release);
+        mgr.use_managed_profile();
+        assert!(!mgr.schema_ready.load(Ordering::Acquire));
     }
 
     #[test]

@@ -235,11 +235,11 @@ mod tests {
     }
 
     #[cfg(feature = "real-db-tests")]
-    async fn apply_migrations_through_0011(client: &mut Client) {
+    async fn apply_migration_prefix(client: &mut Client, count: usize) {
         MigrationRunner::ensure_schema_migrations_table(client)
             .await
             .unwrap();
-        for (version, sql) in MIGRATIONS.iter().take(11) {
+        for (version, sql) in MIGRATIONS.iter().take(count) {
             let transaction = client.transaction().await.unwrap();
             transaction.batch_execute(sql).await.unwrap();
             transaction
@@ -251,6 +251,78 @@ mod tests {
                 .unwrap();
             transaction.commit().await.unwrap();
         }
+    }
+
+    #[cfg(feature = "real-db-tests")]
+    async fn apply_migrations_through_0011(client: &mut Client) {
+        apply_migration_prefix(client, 11).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0012_active_connection_upgrades_0010_dashboard_schema() {
+        use crate::repositories::import_repository::ImportRepository;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+
+        let (mut old_client, old_handle) = manager.connect_raw().await.unwrap();
+        apply_migration_prefix(&mut old_client, 10).await;
+        let library_root_id = ImportRepository::upsert_default_library_root(&old_client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &old_client,
+            "C:/active-upgrade/source",
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let old_album_id = uuid::Uuid::new_v4();
+        old_client
+            .execute(
+                "INSERT INTO import_albums
+                    (id, import_run_id, source_path, source_name, state)
+                 VALUES ($1, $2, $3, $4, 'pending')",
+                &[
+                    &old_album_id,
+                    &import_run_id,
+                    &"C:/active-upgrade/source/album-a",
+                    &"album-a",
+                ],
+            )
+            .await
+            .unwrap();
+        drop(old_client);
+        old_handle.abort();
+
+        // This is the production connection boundary used by dashboard and
+        // scan commands after an application upgrade. It must upgrade an
+        // already configured 0010 database before returning the client.
+        let (client, handle) = manager.connect().await.unwrap();
+        assert_eq!(
+            MigrationRunner::current_version(&client)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(MigrationRunner::latest_version())
+        );
+        let runs = ImportRepository::list_import_runs_summary(&client)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].import_run_id, import_run_id.to_string());
+        assert_eq!(runs[0].total_albums, 1);
+        assert_eq!(runs[0].pending_albums, 1);
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -271,7 +343,7 @@ mod tests {
         assert!(manager.binaries_available());
         let probe = manager.initialize().await.unwrap();
         assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
-        let (mut client, handle) = manager.connect().await.unwrap();
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
         apply_migrations_through_0011(&mut client).await;
 
         let library_root_id = ImportRepository::upsert_default_library_root(&client)
@@ -452,7 +524,7 @@ mod tests {
         assert!(manager.binaries_available());
         let probe = manager.initialize().await.unwrap();
         assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
-        let (mut client, handle) = manager.connect().await.unwrap();
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
         apply_migrations_through_0011(&mut client).await;
 
         let library_root_id = ImportRepository::upsert_default_library_root(&client)
