@@ -9,9 +9,12 @@ import type {
   ScanProgress,
   ScanSourceInfo,
 } from '../lib/ipc/types';
+import { AppIcon, Button, PageHeader, Progress, StatusBadge, StatusBanner } from '../components/ui';
 
 interface ScanPageProps {
   initialImportRunId?: string | null;
+  initialProgress?: ScanProgress | null;
+  enablePolling?: boolean;
   onNavigate: (route: Route) => void;
 }
 
@@ -128,7 +131,12 @@ function normalizedSourcePath(path: string): string {
   return path.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLocaleLowerCase();
 }
 
-export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProps) {
+export function ScanPage({
+  initialImportRunId = null,
+  initialProgress = null,
+  enablePolling = true,
+  onNavigate,
+}: ScanPageProps) {
   const queryClient = useQueryClient();
   const [sourcePath, setSourcePath] = useState(() => loadScanDraft().sourcePath);
   const [sourceInfo, setSourceInfo] = useState<ScanSourceInfo | null>(
@@ -137,9 +145,11 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   const [activeImportRunId, setActiveImportRunId] = useState<string | null>(initialImportRunId);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isValidating, setIsValidating] = useState(false);
-  const [progress, setProgress] = useState<ScanProgress | null>(null);
+  const [progress, setProgress] = useState<ScanProgress | null>(initialProgress);
   const [scanEvent, setScanEvent] = useState<ScanProgressEvent | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
+  const [isScanning, setIsScanning] = useState(
+    () => Boolean(initialProgress) && !isTerminalScanState(initialProgress?.state),
+  );
   const [globalScanBusyRunId, setGlobalScanBusyRunId] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [isAbandoning, setIsAbandoning] = useState(false);
@@ -149,7 +159,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   const runsQuery = useQuery({
     queryKey: ['import-runs-dashboard'],
     queryFn: api.getImportRunsDashboard,
-    refetchInterval: isScanning ? 1500 : 5000,
+    refetchInterval: enablePolling ? (isScanning ? 1500 : 5000) : false,
   });
 
   const activeRun = useMemo(
@@ -161,7 +171,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
     queryKey: ['import-run-albums', activeImportRunId],
     queryFn: () => api.getImportRunAlbums(activeImportRunId!),
     enabled: Boolean(activeImportRunId),
-    refetchInterval: isScanning ? 1500 : 5000,
+    refetchInterval: enablePolling ? (isScanning ? 1500 : 5000) : false,
   });
 
   const retryAlbum = useMutation({
@@ -181,8 +191,8 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
       validationRequestRef.current += 1;
       setActiveImportRunId(initialImportRunId);
       setScanEvent(null);
-      setProgress(null);
-      setIsScanning(false);
+      setProgress(initialProgress);
+      setIsScanning(Boolean(initialProgress) && !isTerminalScanState(initialProgress?.state));
       setGlobalScanBusyRunId(null);
       setIsValidating(false);
     } else {
@@ -191,7 +201,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
       setProgress(null);
       setIsScanning(false);
     }
-  }, [initialImportRunId]);
+  }, [initialImportRunId, initialProgress]);
 
   useEffect(() => {
     if (activeRun?.source_root) {
@@ -216,6 +226,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   }, [sourcePath, sourceInfo]);
 
   useEffect(() => {
+    if (!enablePolling) return;
     let cancelled = false;
     (async () => {
       try {
@@ -243,7 +254,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
     return () => {
       cancelled = true;
     };
-  }, [initialImportRunId]);
+  }, [enablePolling, initialImportRunId]);
 
   const attachScanListener = useCallback(async () => {
     eventListenerRef.current?.();
@@ -288,6 +299,28 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
       if (validationRequestRef.current === requestId) setIsValidating(false);
     }
   }, [sourcePath]);
+
+  const handleSelectDirectory = useCallback(async () => {
+    setValidationError(null);
+    try {
+      const selectedPath = await api.selectSourceDirectory();
+      if (!selectedPath) return;
+      validationRequestRef.current += 1;
+      setSourcePath(selectedPath);
+      setSourceInfo(null);
+      setActiveImportRunId(null);
+      setScanEvent(null);
+      setProgress(null);
+      setIsValidating(true);
+      const info = await api.validateSourceDirectory(selectedPath);
+      setSourceInfo(info);
+      if (info.album_count === 0) setValidationError('未找到图集（一级子目录）。');
+    } catch (error) {
+      setValidationError(String(error));
+    } finally {
+      setIsValidating(false);
+    }
+  }, []);
 
   const handleStartScan = useCallback(async () => {
     if (
@@ -381,7 +414,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
   }, [activeImportRunId, activeRun, attachScanListener, globalScanBusyRunId, queryClient]);
 
   useEffect(() => {
-    if (!isScanning && !globalScanBusyRunId) return;
+    if (!enablePolling || (!isScanning && !globalScanBusyRunId)) return;
     const interval = setInterval(async () => {
       try {
         const p = await api.getScanProgress();
@@ -422,7 +455,7 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [activeImportRunId, globalScanBusyRunId, isScanning, queryClient]);
+  }, [activeImportRunId, enablePolling, globalScanBusyRunId, isScanning, queryClient]);
 
   const displayProgress = scanEvent ?? progress;
   const isFinished = !isScanning && isTerminalScanState(displayProgress?.state);
@@ -445,14 +478,29 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
     : null;
 
   return (
-    <div className="scan-page">
-      <h1>新建导入</h1>
+    <div className="scan-page scan-page--m3">
+      <PageHeader
+        title="新建导入"
+        description="选择源目录，验证图集后开始分析。分析阶段只读取图片，不修改任何源文件。"
+        meta={activeRun ? <StatusBadge tone="info">任务进行中</StatusBadge> : undefined}
+      />
 
-      <section className="scan-source-section">
-        <h2>选择源目录</h2>
-        <div className="scan-source-input">
+      <section className="scan-source-panel" aria-labelledby="scan-source-title">
+        <div className="scan-section-heading">
+          <span className="scan-step">1</span>
+          <div>
+            <h2 id="scan-source-title">选择源目录</h2>
+            <p>目录的一级子目录会作为图集。</p>
+          </div>
+        </div>
+
+        <div className="scan-source-picker">
+          <span className="scan-source-picker__icon" aria-hidden="true">
+            <AppIcon name="import" size={22} />
+          </span>
           <input
             type="text"
+            aria-label="源目录路径"
             placeholder="输入源目录路径，例如 D:\\Photos\\2024"
             value={sourcePath}
             onChange={(e) => {
@@ -467,260 +515,185 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
             }}
             disabled={isScanning || isValidating}
           />
-          <button
-            className="btn-secondary"
+          <Button
+            onClick={handleSelectDirectory}
+            disabled={isScanning || isValidating}
+            loading={isValidating}
+            loadingLabel="正在读取…"
+          >
+            选择目录
+          </Button>
+          <Button
+            variant="quiet"
             onClick={handleValidate}
             disabled={isValidating || isScanning || !sourcePath.trim()}
           >
-            {isValidating ? '验证中...' : '验证'}
-          </button>
+            验证
+          </Button>
         </div>
-        {validationError && <p className="status-error">{validationError}</p>}
+
+        {validationError && (
+          <StatusBanner tone="danger" title="无法使用这个目录">
+            {validationError}
+          </StatusBanner>
+        )}
+
         {sourceInfo && sourceInfo.album_count > 0 && sourceInfoMatchesPath && (
-          <div className="scan-source-info">
-            <p>
-              找到 <strong>{sourceInfo.album_count}</strong> 个图集：
-              {sourceInfo.albums.slice(0, 5).join('、')}
-              {sourceInfo.albums.length > 5 && `...等 ${sourceInfo.albums.length} 个`}
-            </p>
+          <div className="scan-discovery">
+            <div className="scan-discovery__summary">
+              <StatusBadge tone="success">目录验证通过</StatusBadge>
+              <p>
+                找到 <strong>{sourceInfo.album_count}</strong> 个图集
+              </p>
+            </div>
+            <div className="scan-album-preview-list">
+              {sourceInfo.albums.slice(0, 6).map((album) => (
+                <div key={album} className="scan-album-preview">
+                  <AppIcon name="commit" size={18} />
+                  <span title={album}>{album}</span>
+                </div>
+              ))}
+            </div>
+            {sourceInfo.albums.length > 6 && (
+              <p className="scan-discovery__more">另有 {sourceInfo.albums.length - 6} 个图集</p>
+            )}
+            <StatusBanner tone="info" title="源文件保持不变">
+              分析只会读取图片并写入数据库；正式入库前不会移动、覆盖或归档源图集。
+            </StatusBanner>
           </div>
         )}
+
+        <div className="scan-primary-actions">
+          {sourceInfo &&
+            sourceInfo.album_count > 0 &&
+            sourceInfoMatchesPath &&
+            !activeImportRunId &&
+            !isScanning &&
+            !isFinished && (
+              <Button
+                variant="primary"
+                onClick={handleStartScan}
+                disabled={globalScanBusyRunId !== null}
+              >
+                开始分析
+              </Button>
+            )}
+
+          {activeRun && canResumeRun(activeRun) && !isScanning && (
+            <>
+              <Button
+                variant="primary"
+                onClick={handleResumeScan}
+                disabled={globalScanBusyRunId !== null}
+              >
+                继续分析
+              </Button>
+              <p className="scan-run-context mono">
+                将继续任务 {activeRun.import_run_id}，不会要求重新输入源目录。
+              </p>
+              {canAbandonRun(activeRun) && (
+                <Button
+                  variant="danger"
+                  onClick={handleAbandonAndRestart}
+                  disabled={globalScanBusyRunId !== null || isAbandoning}
+                  loading={isAbandoning}
+                  loadingLabel="正在放弃旧任务..."
+                >
+                  放弃旧 checkpoint，重新分析
+                </Button>
+              )}
+            </>
+          )}
+
+          {activeRun && canAbandonRun(activeRun) && !canResumeRun(activeRun) && !isScanning && (
+            <>
+              <Button
+                variant="danger"
+                onClick={handleAbandonAndRestart}
+                disabled={globalScanBusyRunId !== null || isAbandoning}
+                loading={isAbandoning}
+                loadingLabel="正在放弃旧任务..."
+              >
+                放弃旧 checkpoint，重新分析
+              </Button>
+              <p className="scan-run-context">
+                保留旧任务作为历史证据，并为当前源目录创建全新的分析任务。
+              </p>
+            </>
+          )}
+        </div>
       </section>
 
-      {sourceInfo &&
-        sourceInfo.album_count > 0 &&
-        sourceInfoMatchesPath &&
-        !activeImportRunId &&
-        !isScanning &&
-        !isFinished && (
-          <section className="scan-action-section">
-            <button
-              className="btn-primary"
-              onClick={handleStartScan}
-              disabled={globalScanBusyRunId !== null}
-            >
-              开始分析
-            </button>
-          </section>
+      <div className="scan-messages" aria-live="polite">
+        {scanError && (
+          <StatusBanner tone="danger" title="分析操作失败">
+            {scanError}
+          </StatusBanner>
         )}
-
-      {activeRun && canResumeRun(activeRun) && !isScanning && (
-        <section className="scan-action-section">
-          <button
-            className="btn-primary"
-            onClick={handleResumeScan}
-            disabled={globalScanBusyRunId !== null}
-          >
-            继续分析
-          </button>
-          <p className="status-card-detail">
-            将继续任务 {activeRun.import_run_id}，不会要求重新输入源目录。
-          </p>
-          {canAbandonRun(activeRun) && (
-            <button
-              className="btn-danger"
-              onClick={handleAbandonAndRestart}
-              disabled={globalScanBusyRunId !== null || isAbandoning}
-            >
-              {isAbandoning ? '正在放弃旧任务...' : '放弃旧 checkpoint，重新分析'}
-            </button>
-          )}
-        </section>
-      )}
-
-      {activeRun && canAbandonRun(activeRun) && !canResumeRun(activeRun) && !isScanning && (
-        <section className="scan-action-section">
-          <button
-            className="btn-danger"
-            onClick={handleAbandonAndRestart}
-            disabled={globalScanBusyRunId !== null || isAbandoning}
-          >
-            {isAbandoning ? '正在放弃旧任务...' : '放弃旧 checkpoint，重新分析'}
-          </button>
-          <p className="status-card-detail">
-            保留旧任务作为历史证据，并为当前源目录创建全新的分析任务。
-          </p>
-        </section>
-      )}
-
-      {scanError && <p className="status-error">{scanError}</p>}
-      {retryAlbum.isError && <p className="status-error">重试失败：{String(retryAlbum.error)}</p>}
-      {globalScanBusyRunId && (
-        <p className="status-warn">
-          另一个分析任务正在运行（{globalScanBusyRunId}）；当前任务的继续、重试和新建操作已暂停。
-        </p>
-      )}
-      {runsQuery.isError && (
-        <p className="status-error">加载导入任务失败：{String(runsQuery.error)}</p>
-      )}
-      {activeImportRunId && albumsQuery.isError && (
-        <p className="status-error">加载图集状态失败：{String(albumsQuery.error)}</p>
-      )}
-
-      {activeRun ? (
-        <section className="scan-progress-section">
-          <h2>图集流程</h2>
-          <div className="scan-progress-grid">
-            <div className="scan-progress-card">
-              <h3>总图集</h3>
-              <p>{albumCounts?.total ?? 0}</p>
-            </div>
-            <div className="scan-progress-card">
-              <h3>已分析</h3>
-              <p>{albumCounts?.analyzed ?? 0}</p>
-            </div>
-            <div className="scan-progress-card">
-              <h3>分析中</h3>
-              <p>{albumCounts?.analyzing ?? 0}</p>
-            </div>
-            <div className="scan-progress-card">
-              <h3>待分析</h3>
-              <p>{albumCounts?.pending ?? 0}</p>
-            </div>
-            <div className="scan-progress-card">
-              <h3>待审核</h3>
-              <p className={(albumCounts?.review ?? 0) > 0 ? 'status-warn' : ''}>
-                {albumCounts?.review ?? 0}
-              </p>
-            </div>
-            <div className="scan-progress-card">
-              <h3>失败</h3>
-              <p className={(albumCounts?.failed ?? 0) > 0 ? 'status-error' : ''}>
-                {albumCounts?.failed ?? 0}
-              </p>
-            </div>
-          </div>
-
-          <div className="table-wrapper">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>图集</th>
-                  <th>图片</th>
-                  <th>状态</th>
-                  <th>重复候选</th>
-                  <th>待审核</th>
-                  <th>错误</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {albumRows.map((album: ImportAlbumStatus) => (
-                  <tr key={album.id}>
-                    <td>{album.source_name}</td>
-                    <td>{album.image_count}</td>
-                    <td>{ALBUM_STATE_LABELS[album.state] ?? album.state}</td>
-                    <td>{album.duplicate_candidate_count}</td>
-                    <td>{album.review_candidate_count}</td>
-                    <td className="status-error">{album.last_error_message ?? ''}</td>
-                    <td>
-                      {activeRun.state !== 'abandoned' && album.state === 'failed' && (
-                        <button
-                          className="btn-secondary"
-                          onClick={() => retryAlbum.mutate(album.id)}
-                          disabled={isAnyScanBusy || retryAlbum.isPending}
-                        >
-                          重试
-                        </button>
-                      )}
-                      {activeRun.state !== 'abandoned' && album.review_candidate_count > 0 && (
-                        <button className="btn-primary" onClick={() => onNavigate('review')}>
-                          审核
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-                {albumsQuery.isPending && (
-                  <tr>
-                    <td colSpan={7}>正在加载图集状态...</td>
-                  </tr>
-                )}
-                {albumsQuery.isError && (
-                  <tr>
-                    <td colSpan={7}>图集状态加载失败，请稍后重试。</td>
-                  </tr>
-                )}
-                {albumsQuery.isSuccess && albumRows.length === 0 && (
-                  <tr>
-                    <td colSpan={7}>暂无图集状态。验证源目录后开始分析。</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      ) : (
-        <section className="scan-progress-section">
-          <h2>图集流程</h2>
-          <div className="table-wrapper">
-            <table className="data-table">
-              <tbody>
-                <tr>
-                  <td>
-                    {runsQuery.isPending
-                      ? '正在加载导入任务...'
-                      : runsQuery.isError
-                        ? '导入任务加载失败，请稍后重试。'
-                        : '暂无图集状态。验证源目录后开始分析。'}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-      )}
+        {retryAlbum.isError && (
+          <StatusBanner tone="danger" title="图集重试失败">
+            重试失败：{String(retryAlbum.error)}
+          </StatusBanner>
+        )}
+        {globalScanBusyRunId && (
+          <StatusBanner tone="warning" title="另一个分析任务正在运行">
+            另一个分析任务正在运行（{globalScanBusyRunId}）；当前任务的继续、重试和新建操作已暂停。
+          </StatusBanner>
+        )}
+        {runsQuery.isError && (
+          <StatusBanner tone="danger" title="无法加载导入任务">
+            加载导入任务失败：{String(runsQuery.error)}
+          </StatusBanner>
+        )}
+        {activeImportRunId && albumsQuery.isError && (
+          <StatusBanner tone="danger" title="无法加载图集状态">
+            加载图集状态失败：{String(albumsQuery.error)}
+          </StatusBanner>
+        )}
+      </div>
 
       {(isScanning || isFinished) && displayProgress && (
-        <section className="scan-progress-section">
-          <h2>分析进度</h2>
-
-          <div className="scan-progress-grid">
-            <div className="scan-progress-card">
-              <h3>状态</h3>
-              <p className={displayProgress.state === 'failed' ? 'status-error' : ''}>
-                {STAGE_LABELS[displayProgress.current_stage] ?? displayProgress.current_stage}
-              </p>
+        <section className="scan-progress-panel" aria-labelledby="scan-progress-title">
+          <div className="scan-section-heading">
+            <span className="scan-step">2</span>
+            <div>
+              <h2 id="scan-progress-title">分析进度</h2>
+              <p>{STAGE_LABELS[displayProgress.current_stage] ?? displayProgress.current_stage}</p>
             </div>
+            <StatusBadge
+              tone={displayProgress.state === 'failed' ? 'danger' : isFinished ? 'success' : 'info'}
+            >
+              {STAGE_LABELS[displayProgress.state] ?? displayProgress.state}
+            </StatusBadge>
+          </div>
 
-            <div className="scan-progress-card">
-              <h3>当前图集</h3>
-              <p>{displayProgress.current_album ?? '-'}</p>
-            </div>
+          <Progress
+            label={
+              displayProgress.current_album
+                ? `正在处理：${displayProgress.current_album}`
+                : '分析图片'
+            }
+            value={displayProgress.total_images ? displayProgress.processed_images : undefined}
+            max={displayProgress.total_images || undefined}
+            detail={`${displayProgress.processed_images} / ${displayProgress.total_images || '正在统计'} 张图片`}
+          />
 
-            <div className="scan-progress-card">
-              <h3>已处理图片</h3>
-              <p>
-                {displayProgress.processed_images} / {displayProgress.total_images || '?'}
-              </p>
-            </div>
-
-            <div className="scan-progress-card">
-              <h3>图集数</h3>
-              <p>{displayProgress.total_albums}</p>
-            </div>
-
-            <div className="scan-progress-card">
-              <h3>重复候选</h3>
-              <p className={displayProgress.duplicate_count > 0 ? 'status-warn' : ''}>
-                {displayProgress.duplicate_count}
-              </p>
-            </div>
-
-            <div className="scan-progress-card">
-              <h3>错误</h3>
-              <p className={displayProgress.error_count > 0 ? 'status-error' : ''}>
-                {displayProgress.error_count}
-              </p>
-            </div>
+          <div className="scan-progress-facts">
+            <span>
+              <strong>{displayProgress.total_albums}</strong> 图集
+            </span>
+            <span>
+              <strong>{displayProgress.duplicate_count}</strong> 重复候选
+            </span>
+            <span className={displayProgress.error_count > 0 ? 'is-danger' : ''}>
+              <strong>{displayProgress.error_count}</strong> 错误
+            </span>
           </div>
 
           {isScanning && (
-            <div className="scan-action-section">
-              <button className="btn-danger" onClick={handleCancelScan}>
-                取消扫描
-              </button>
-            </div>
+            <Button variant="danger" onClick={handleCancelScan}>
+              取消扫描
+            </Button>
           )}
 
           {displayProgress.errors.length > 0 && (
@@ -737,14 +710,13 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
           )}
 
           {isFinished && (
-            <div className="scan-action-section">
+            <div className="scan-finished-actions">
               {nextRoute && nextActionLabel && (
-                <button className="btn-primary" onClick={() => onNavigate(nextRoute)}>
+                <Button variant="primary" onClick={() => onNavigate(nextRoute)}>
                   {nextActionLabel}
-                </button>
+                </Button>
               )}
-              <button
-                className="btn-secondary"
+              <Button
                 onClick={() => {
                   setScanEvent(null);
                   setProgress(null);
@@ -753,11 +725,138 @@ export function ScanPage({ initialImportRunId = null, onNavigate }: ScanPageProp
                 }}
               >
                 重置
-              </button>
+              </Button>
             </div>
           )}
         </section>
       )}
+
+      <section className="scan-albums-panel" aria-labelledby="scan-albums-title">
+        <div className="scan-section-heading">
+          <span className="scan-step">3</span>
+          <div>
+            <h2 id="scan-albums-title">图集流程</h2>
+            <p>每个图集独立推进；失败图集可以单独重试。</p>
+          </div>
+        </div>
+
+        {activeRun && albumCounts && (
+          <div className="scan-summary-strip">
+            <span>
+              <strong>{albumCounts.total}</strong> 总图集
+            </span>
+            <span>
+              <strong>{albumCounts.analyzed}</strong> 已分析
+            </span>
+            <span>
+              <strong>{albumCounts.analyzing}</strong> 分析中
+            </span>
+            <span>
+              <strong>{albumCounts.pending}</strong> 待分析
+            </span>
+            <span>
+              <strong>{albumCounts.review}</strong> 待审核
+            </span>
+            <span>
+              <strong>{albumCounts.failed}</strong> 失败
+            </span>
+          </div>
+        )}
+
+        <div className="scan-album-table-wrap">
+          <table className="scan-album-table">
+            {activeRun && (
+              <thead>
+                <tr>
+                  <th>图集</th>
+                  <th>图片</th>
+                  <th>状态</th>
+                  <th>重复候选</th>
+                  <th>待审核</th>
+                  <th>错误</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+            )}
+            <tbody>
+              {activeRun &&
+                albumRows.map((album: ImportAlbumStatus) => (
+                  <tr key={album.id}>
+                    <td data-label="图集">
+                      <strong>{album.source_name}</strong>
+                    </td>
+                    <td data-label="图片">{album.image_count}</td>
+                    <td data-label="状态">
+                      <StatusBadge
+                        tone={
+                          album.state === 'failed'
+                            ? 'danger'
+                            : album.state === 'review_required'
+                              ? 'warning'
+                              : album.state === 'analyzing'
+                                ? 'info'
+                                : album.state === 'analyzed'
+                                  ? 'success'
+                                  : 'neutral'
+                        }
+                      >
+                        {ALBUM_STATE_LABELS[album.state] ?? album.state}
+                      </StatusBadge>
+                    </td>
+                    <td data-label="重复候选">{album.duplicate_candidate_count}</td>
+                    <td data-label="待审核">{album.review_candidate_count}</td>
+                    <td data-label="错误" className="scan-album-error">
+                      {album.last_error_message ?? ''}
+                    </td>
+                    <td data-label="操作">
+                      <div className="scan-row-actions">
+                        {activeRun.state !== 'abandoned' && album.state === 'failed' && (
+                          <Button
+                            onClick={() => retryAlbum.mutate(album.id)}
+                            disabled={isAnyScanBusy || retryAlbum.isPending}
+                          >
+                            重试
+                          </Button>
+                        )}
+                        {activeRun.state !== 'abandoned' && album.review_candidate_count > 0 && (
+                          <Button variant="quiet" onClick={() => onNavigate('review')}>
+                            审核
+                          </Button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              {activeRun && albumsQuery.isPending && (
+                <tr>
+                  <td colSpan={7}>正在加载图集状态...</td>
+                </tr>
+              )}
+              {activeRun && albumsQuery.isError && (
+                <tr>
+                  <td colSpan={7}>图集状态加载失败，请稍后重试。</td>
+                </tr>
+              )}
+              {activeRun && albumsQuery.isSuccess && albumRows.length === 0 && (
+                <tr>
+                  <td colSpan={7}>暂无图集状态。验证源目录后开始分析。</td>
+                </tr>
+              )}
+              {!activeRun && (
+                <tr>
+                  <td>
+                    {runsQuery.isPending
+                      ? '正在加载导入任务...'
+                      : runsQuery.isError
+                        ? '导入任务加载失败，请稍后重试。'
+                        : '暂无图集状态。验证源目录后开始分析。'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
   );
 }

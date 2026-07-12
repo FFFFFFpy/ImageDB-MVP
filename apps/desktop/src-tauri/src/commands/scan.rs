@@ -9,6 +9,18 @@ use tauri::{Emitter, Runtime, State};
 use uuid::Uuid;
 
 #[tauri::command]
+pub async fn select_source_directory() -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择包含图集的源目录")
+            .pick_folder()
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| format!("source directory dialog failed: {error}"))
+}
+
+#[tauri::command]
 pub async fn validate_source_directory(source_root: String) -> Result<ScanSourceInfo, String> {
     scan_service::scan_source_info(&source_root)
         .await

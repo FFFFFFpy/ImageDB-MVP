@@ -523,6 +523,7 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::probe_storage_capabilities,
+            commands::select_source_directory,
             commands::validate_source_directory,
             commands::start_scan,
             commands::cancel_scan,

@@ -99,6 +99,7 @@ const mockApi = vi.hoisted(() => ({
     }),
   ),
   validateSourceDirectory: vi.fn(),
+  selectSourceDirectory: vi.fn<() => Promise<string | null>>(() => Promise.resolve(null)),
   startScan: vi.fn(),
   cancelScan: vi.fn(),
 }));
@@ -506,6 +507,24 @@ describe('ScanPage album workflow', () => {
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('D:/Photos'));
     expect(screen.queryByText(/late-old-album/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '开始分析' })).not.toBeInTheDocument();
+  });
+
+  test('uses the native directory selection result as the validated source path', async () => {
+    mockApi.selectSourceDirectory.mockResolvedValueOnce('D:/相册（待导入）');
+    mockApi.validateSourceDirectory.mockResolvedValueOnce({
+      path: 'D:/相册（待导入）',
+      albums: ['旅行', '宠物'],
+      album_count: 2,
+    });
+    renderScanPage(vi.fn(), null);
+
+    fireEvent.click(await screen.findByRole('button', { name: '选择目录' }));
+
+    expect(await screen.findByDisplayValue('D:/相册（待导入）')).toBeInTheDocument();
+    expect(mockApi.validateSourceDirectory).toHaveBeenCalledWith('D:/相册（待导入）');
+    expect(screen.getByText('旅行')).toBeInTheDocument();
+    expect(screen.getByText('宠物')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '开始分析' })).toBeEnabled();
   });
 
   test('shows retry failures instead of silently ignoring them', async () => {

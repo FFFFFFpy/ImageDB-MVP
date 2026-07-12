@@ -78,6 +78,7 @@ export const api = {
 
   validateSourceDirectory: (sourceRoot: string) =>
     invoke<ScanSourceInfo>('validate_source_directory', { sourceRoot }),
+  selectSourceDirectory: () => invoke<string | null>('select_source_directory'),
 
   startScan: (sourceRoot: string) => invoke<string>('start_scan', { sourceRoot }),
 
