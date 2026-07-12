@@ -12,15 +12,15 @@ MVP1 已定性为：
 
 当前 canonical 文档入口：[`docs/MVP1/README.md`](docs/MVP1/README.md)
 
-当前显式任务包：MVP2 图集级断点续跑 + 异步审核入口 + 数据状态可见，文档入口为 [`docs/MVP2/README.md`](docs/MVP2/README.md)。
+当前显式任务包：MVP3 / M3 桌面端 UI 重设计，文档入口为 [`docs/MVP3/README.md`](docs/MVP3/README.md)。
 
-当前工作分支：`feat/mvp2-album-workflow-dashboard`
+当前工作分支：`codex/mvp3-ui-redesign`
 
-当前 Debug / 合并审查任务：修复 candidate review 规范化语义冲突与 abandoned run 当前工作流隔离，migration head 更新为 `0014_candidate_review_semantics_and_abandoned_filters`。修复范围不改变 frozen plan、Commit 或 Recovery 文件事务语义。
+当前实施阶段：M3.0 / M3.1，验证 `animal-island-ui` 兼容性，建立语义 design tokens、本地 UI 适配层与基础组件测试。
 
-合并复验收尾：Dashboard 下一步由后端 `next_action` 统一路由，覆盖审核完成后的计划生成、cancelled frozen plan 续提交以及 committing / active transaction 恢复入口；React 不再根据零散计数猜测状态机。
+M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。M3 不修改 frozen plan、Commit、Recovery、数据库 migration 或匹配算法语义。
 
-恢复死锁修复：Dashboard 区分可恢复事务、failed/cancelled 终态未解决事务和 frozen plan 缺失图集事务；事务预写前与图集间崩溃重新进入幂等 Commit，终态失败进入明确人工处置入口。
+MVP2 图集级断点续跑、异步审核入口和数据状态可见已经作为 M3 的业务基线保留；其 canonical 文档仍为 [`docs/MVP2/README.md`](docs/MVP2/README.md)。
 
 ## 状态摘要
 
@@ -37,7 +37,7 @@ MVP1 本地主链已人工验收通过：
 → 本地目录正式入库
 ```
 
-当前不是继续扩功能阶段。默认只接受：
+MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用户明确要求的 M3 UI 重设计：
 
 - 实战测试暴露的 bugfix。
 - Debug / 诊断 / 日志增强。
@@ -45,8 +45,9 @@ MVP1 本地主链已人工验收通过：
 - 文档收敛。
 - release gate / install gate 修正。
 - clean Windows 发布验收补强。
+- 不改变业务语义的呈现层、交互层和设计系统迁移。
 
-例外：用户明确要求的 MVP2 任务在独立 feature 分支上执行，仍必须保持 frozen plan / commit / recovery 文件事务安全边界。
+例外：用户明确要求的 MVP2 / MVP3 任务在独立 feature 分支上执行，仍必须保持 frozen plan / commit / recovery 文件事务安全边界。
 
 ## 发布签字状态
 

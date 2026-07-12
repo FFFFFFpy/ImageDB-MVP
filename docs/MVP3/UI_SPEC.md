@@ -23,23 +23,23 @@
 
 ### 颜色
 
-| Token | 建议值 | 用途 |
-| --- | --- | --- |
-| `--color-canvas` | `#F5F7F4` | 应用背景 |
-| `--color-surface` | `#FFFFFF` | 主工作面 |
-| `--color-surface-soft` | `#EEF4EE` | 选中、辅助区 |
-| `--color-ink` | `#172019` | 主文字 |
-| `--color-ink-muted` | `#59635B` | 次级文字，需满足 AA |
-| `--color-border` | `#DCE4DD` | 标准边框 |
-| `--color-primary` | `#168B4B` | 主 CTA、当前状态 |
-| `--color-primary-hover` | `#11763F` | 主 CTA hover |
+| Token                     | 建议值    | 用途                 |
+| ------------------------- | --------- | -------------------- |
+| `--color-canvas`          | `#F5F7F4` | 应用背景             |
+| `--color-surface`         | `#FFFFFF` | 主工作面             |
+| `--color-surface-soft`    | `#EEF4EE` | 选中、辅助区         |
+| `--color-ink`             | `#172019` | 主文字               |
+| `--color-ink-muted`       | `#59635B` | 次级文字，需满足 AA  |
+| `--color-border`          | `#DCE4DD` | 标准边框             |
+| `--color-primary`         | `#168B4B` | 主 CTA、当前状态     |
+| `--color-primary-hover`   | `#11763F` | 主 CTA hover         |
 | `--color-primary-pressed` | `#0C6033` | 主 CTA active / 底层 |
-| `--color-info` | `#3267B1` | 信息、链接 |
-| `--color-warning` | `#B86B13` | 等待、需注意 |
-| `--color-danger` | `#B63D3D` | 错误、破坏性操作 |
-| `--color-success-soft` | `#EAF6EE` | 成功背景 |
-| `--color-warning-soft` | `#FFF4E3` | 警告背景 |
-| `--color-danger-soft` | `#FCECEC` | 错误背景 |
+| `--color-info`            | `#3267B1` | 信息、链接           |
+| `--color-warning`         | `#B86B13` | 等待、需注意         |
+| `--color-danger`          | `#B63D3D` | 错误、破坏性操作     |
+| `--color-success-soft`    | `#EAF6EE` | 成功背景             |
+| `--color-warning-soft`    | `#FFF4E3` | 警告背景             |
+| `--color-danger-soft`     | `#FCECEC` | 错误背景             |
 
 正文与背景对比度至少 4.5:1；大文字至少 3:1；focus ring、状态图标和边界也需可辨认。最终实现以自动对比度检查结果为准。
 
@@ -173,12 +173,12 @@
 
 M3 以桌面为主，不按手机页面设计，但必须支持窗口缩放：
 
-| 宽度 | 行为 |
-| --- | --- |
-| `>= 1280px` | 完整侧栏；审核可显示双图 + 详情 |
-| `960–1279px` | 完整或紧凑侧栏；次级面板可折叠 |
-| `720–959px` | 图标侧栏；统计区换行；表格折叠次级列 |
-| `< 720px` | 最低可用兜底；审核双图改上下排列，不承诺移动端完整生产体验 |
+| 宽度         | 行为                                                       |
+| ------------ | ---------------------------------------------------------- |
+| `>= 1280px`  | 完整侧栏；审核可显示双图 + 详情                            |
+| `960–1279px` | 完整或紧凑侧栏；次级面板可折叠                             |
+| `720–959px`  | 图标侧栏；统计区换行；表格折叠次级列                       |
+| `< 720px`    | 最低可用兜底；审核双图改上下排列，不承诺移动端完整生产体验 |
 
 必须在 Windows 100%、125%、150% 缩放下检查；主 CTA、底部操作区和弹层不得被裁切。
 
