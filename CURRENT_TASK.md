@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`codex/mvp3-ui-redesign`
 
-当前实施阶段：M3.0 / M3.1，验证 `animal-island-ui` 兼容性，建立语义 design tokens、本地 UI 适配层与基础组件测试。
+当前实施阶段：M3.2，迁移应用壳与工作台；M3.0 视觉兼容性基线和 M3.1 语义 design tokens、本地 UI 适配层、基础组件测试已完成。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。M3 不修改 frozen plan、Commit、Recovery、数据库 migration 或匹配算法语义。
 

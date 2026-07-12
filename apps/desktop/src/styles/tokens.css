@@ -1,0 +1,88 @@
+:root {
+  --color-canvas: #f5f7f4;
+  --color-surface: #ffffff;
+  --color-surface-soft: #eef4ee;
+  --color-surface-muted: #e5ece6;
+  --color-ink: #172019;
+  --color-ink-muted: #59635b;
+  --color-ink-subtle: #6c766e;
+  --color-border: #dce4dd;
+  --color-border-strong: #b8c6ba;
+  --color-primary: #127c42;
+  --color-primary-hover: #0f6f3b;
+  --color-primary-pressed: #0c6033;
+  --color-primary-soft: #e7f4eb;
+  --color-on-primary: #ffffff;
+  --color-info: #3267b1;
+  --color-info-ink: #264f89;
+  --color-info-soft: #edf3fb;
+  --color-info-border: #b9cdec;
+  --color-warning: #9b570f;
+  --color-warning-ink: #7b430a;
+  --color-warning-border: #e9cca5;
+  --color-danger: #b63d3d;
+  --color-danger-hover: #9d3030;
+  --color-danger-pressed: #7f2525;
+  --color-danger-ink: #8c2c2c;
+  --color-danger-border: #e6bcbc;
+  --color-success-soft: #eaf6ee;
+  --color-success-border: #b7d9c1;
+  --color-warning-soft: #fff4e3;
+  --color-danger-soft: #fcecec;
+  --color-focus: #d89e00;
+
+  --font-ui:
+    Nunito, 'Noto Sans SC', Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, ui-monospace, monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  --radius-control: 12px;
+  --radius-panel: 16px;
+  --radius-image: 12px;
+  --radius-pill: 999px;
+
+  --shadow-float: 0 12px 32px rgb(23 32 25 / 12%);
+  --shadow-button-primary: 0 3px 0 var(--color-primary-pressed);
+  --shadow-button-danger: 0 3px 0 var(--color-danger-pressed);
+
+  --motion-fast: 150ms;
+  --motion-base: 200ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --z-dropdown: 10;
+  --z-sticky: 20;
+  --z-modal-backdrop: 30;
+  --z-modal: 40;
+  --z-toast: 50;
+  --z-tooltip: 60;
+
+  /* animal-island-ui bridge: ImageDB owns the semantic palette. */
+  --animal-primary-color: var(--color-primary);
+  --animal-primary-color-hover: var(--color-primary-hover);
+  --animal-primary-color-active: var(--color-primary-pressed);
+  --animal-primary-color-bg: var(--color-primary-soft);
+  --animal-success-color: var(--color-primary);
+  --animal-warning-color: var(--color-warning);
+  --animal-error-color: var(--color-danger);
+  --animal-text-color: var(--color-ink);
+  --animal-text-color-secondary: var(--color-ink-muted);
+  --animal-text-color-muted: var(--color-ink-muted);
+  --animal-border-color: var(--color-border-strong);
+  --animal-border-color-hover: var(--color-primary);
+  --animal-border-color-light: var(--color-border);
+  --animal-bg-color: var(--color-surface);
+  --animal-bg-color-secondary: var(--color-surface-soft);
+  --animal-font-family: var(--font-ui);
+  --animal-motion-duration-fast: var(--motion-fast);
+  --animal-motion-duration-base: var(--motion-base);
+  --animal-motion-ease: var(--ease-out);
+}

@@ -19,12 +19,12 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] 产品目标、范围、非目标和架构边界已定义。
 - [x] 应用壳、页面、组件、状态、响应式和可访问性规范已定义。
 - [x] 项目所有者已确认个人自用、非商业用途，可采用 `animal-island-ui`。
-- [ ] `animal-island-ui` 通过本地 UI 适配层接入，页面未与其 API 深度耦合。
+- [x] `animal-island-ui` 通过本地 UI 适配层接入，页面未与其 API 深度耦合。
 - [x] 原作者 attribution、CC BY-NC 4.0 和非商业用途声明已进入 M3 许可证文档。
 - [ ] 第三方许可证声明已纳入应用 About 区域与最终分发检查。
 - [ ] 语义 design tokens 已落地，页面不再散写主要颜色、圆角和阴影。
-- [ ] 基础组件具备一致的 default / hover / focus / active / disabled / loading / error 状态。
-- [ ] 图标来源、许可证和打包策略已记录。
+- [x] 基础组件具备一致的 default / hover / focus / active / disabled / loading / error 状态。
+- [x] 图标来源、许可证和打包策略已记录。
 
 ## 3. 页面迁移
 

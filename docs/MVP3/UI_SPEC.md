@@ -31,8 +31,8 @@
 | `--color-ink`             | `#172019` | 主文字               |
 | `--color-ink-muted`       | `#59635B` | 次级文字，需满足 AA  |
 | `--color-border`          | `#DCE4DD` | 标准边框             |
-| `--color-primary`         | `#168B4B` | 主 CTA、当前状态     |
-| `--color-primary-hover`   | `#11763F` | 主 CTA hover         |
+| `--color-primary`         | `#127C42` | 主 CTA、当前状态     |
+| `--color-primary-hover`   | `#0F6F3B` | 主 CTA hover         |
 | `--color-primary-pressed` | `#0C6033` | 主 CTA active / 底层 |
 | `--color-info`            | `#3267B1` | 信息、链接           |
 | `--color-warning`         | `#B86B13` | 等待、需注意         |
@@ -195,6 +195,7 @@ M3 以桌面为主，不按手机页面设计，但必须支持窗口缩放：
 ## 7. 图标与图像
 
 - 使用同一套线性、圆角图标，建议 1.75–2px stroke；禁止混用 emoji、填充图标和多套风格。
+- M3 基础状态图标由 ImageDB 在 `components/ui/StatusIcon.tsx` 中以自有 inline SVG 实现，采用 2px 圆角描边，不引入额外图标包，也不复制参考项目的图标资产。后续导航与领域图标继续沿用同一实现和打包策略。
 - 图集封面与真实图片是主要视觉资产；没有图片时使用中性语义占位，不生成假照片。
 - 可以为成功完成设计一个轻量的自有几何图形，但不使用 Nintendo 或参考库素材。
 - 背景纹理仅可在空状态或小面积品牌区域低对比使用，不覆盖高密度工作区。
