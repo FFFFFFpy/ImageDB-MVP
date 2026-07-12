@@ -9,6 +9,7 @@ import type {
   FileTransactionProbeResult,
   AllProbeResults,
 } from '../lib/ipc/types';
+import { Button, PageHeader, StatusBadge } from '../components/ui';
 
 type TabKey = 'postgres' | 'fingerprint' | 'file_tx';
 
@@ -70,16 +71,27 @@ export function ProbesPage() {
   const isRunning = allProbes.isPending;
 
   return (
-    <div className="probes-page">
-      <h1>技术探针</h1>
+    <div className="probes-page probes-page--m3">
+      <PageHeader
+        title="技术探针"
+        description="面向环境诊断的开发工具，不属于日常导入流程。运行文件事务探针会使用隔离测试目录。"
+        meta={<StatusBadge tone="warning">高级诊断</StatusBadge>}
+        actions={
+          <Button variant="primary" onClick={runAll} loading={isRunning} loadingLabel="运行中…">
+            运行全部探针
+          </Button>
+        }
+      />
 
       <div className="toolbar">
-        <button onClick={() => connectionStatus.mutate()} disabled={connectionStatus.isPending}>
+        <Button
+          variant="secondary"
+          onClick={() => connectionStatus.mutate()}
+          loading={connectionStatus.isPending}
+          loadingLabel="测试中…"
+        >
           连接测试
-        </button>
-        <button onClick={runAll} disabled={isRunning}>
-          {isRunning ? '运行中…' : '运行全部探针'}
-        </button>
+        </Button>
       </div>
 
       {connectionStatus.data && <p className="status-ok">{connectionStatus.data}</p>}
@@ -87,12 +99,13 @@ export function ProbesPage() {
         <pre className="status-err">{String(connectionStatus.error)}</pre>
       )}
 
-      <nav className="tabs">
+      <nav className="tabs" aria-label="探针类别">
         {(['postgres', 'fingerprint', 'file_tx'] as TabKey[]).map((key) => (
           <button
             key={key}
             className={tab === key ? 'tab active' : 'tab'}
             onClick={() => setTab(key)}
+            aria-pressed={tab === key}
           >
             {key === 'postgres' ? '数据库' : key === 'fingerprint' ? '图片指纹' : '文件事务'}
           </button>

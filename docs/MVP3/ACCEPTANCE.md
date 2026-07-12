@@ -21,22 +21,22 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] 项目所有者已确认个人自用、非商业用途，可采用 `animal-island-ui`。
 - [x] `animal-island-ui` 通过本地 UI 适配层接入，页面未与其 API 深度耦合。
 - [x] 原作者 attribution、CC BY-NC 4.0 和非商业用途声明已进入 M3 许可证文档。
-- [ ] 第三方许可证声明已纳入应用 About 区域与最终分发检查。
+- [x] 第三方许可证声明已纳入应用 About 区域与最终分发检查。
 - [ ] 语义 design tokens 已落地，页面不再散写主要颜色、圆角和阴影。
 - [x] 基础组件具备一致的 default / hover / focus / active / disabled / loading / error 状态。
 - [x] 图标来源、许可证和打包策略已记录。
 
 ## 3. 页面迁移
 
-- [ ] 首次配置完成 M3 迁移。
+- [x] 首次配置完成 M3 迁移。
 - [x] 全局导航和应用壳完成 M3 迁移。
 - [x] 工作台完成 M3 迁移。
 - [x] 新建导入与分析进度完成 M3 迁移。
 - [x] 审核工作台完成 M3 迁移。
 - [x] 导入计划完成 M3 迁移。
 - [x] 入库执行与结果完成 M3 迁移。
-- [ ] Recovery 完成 M3 迁移。
-- [ ] 设置与技术诊断完成 M3 迁移。
+- [x] Recovery 完成 M3 迁移。
+- [x] 设置与技术诊断完成 M3 迁移。
 - [ ] 不存在仍使用旧视觉词汇的生产页面或孤立组件。
 
 ## 4. 工作流与状态
@@ -49,8 +49,8 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] 审核左右布局或排序变化不改变最终 selected image 语义。
 - [x] 生成/冻结计划与执行 Commit 是两个清楚的步骤。
 - [x] Commit 展示与读取的 frozen plan 一致，不临场重算。
-- [ ] recover、resume_commit、inspect_transaction_failure 入口语义准确。
-- [ ] conflict、证据不完整和终态失败保持 fail closed。
+- [x] recover、resume_commit、inspect_transaction_failure 入口语义准确。
+- [x] conflict、证据不完整和终态失败保持 fail closed。
 
 ## 5. 视觉与交互
 

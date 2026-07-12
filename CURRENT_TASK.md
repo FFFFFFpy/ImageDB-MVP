@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`codex/mvp3-ui-redesign`
 
-当前实施阶段：M3.6，迁移 Recovery、设置与首次配置；M3.0–M3.5 的视觉基线、基础设计系统、应用壳、工作台、新建导入、分析进度、图片审核、导入计划与 Commit 已完成。
+当前实施阶段：M3.7，统一收尾、可访问性/性能审计与真实环境发布门禁；M3.0–M3.6 的视觉基线、设计系统及全部生产页面迁移已完成。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。M3 不修改 frozen plan、Commit、Recovery、数据库 migration 或匹配算法语义。
 

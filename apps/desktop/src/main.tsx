@@ -7,6 +7,10 @@ import { DashboardFixture } from './components/fixtures/DashboardFixture';
 import { ScanFixture } from './components/fixtures/ScanFixture';
 import { ReviewFixture } from './components/fixtures/ReviewFixture';
 import { CommitFixture, type CommitFixtureState } from './components/fixtures/CommitFixture';
+import { RecoveryFixture } from './components/fixtures/RecoveryFixture';
+import { SettingsFixture } from './components/fixtures/SettingsFixture';
+import { OnboardingFixture } from './components/fixtures/OnboardingFixture';
+import { ProbesFixture } from './components/fixtures/ProbesFixture';
 import { UiShowcase } from './components/ui';
 import 'animal-island-ui/style';
 import './styles/tokens.css';
@@ -18,6 +22,10 @@ import './styles/scan.css';
 import './styles/review.css';
 import './styles/plan.css';
 import './styles/commit.css';
+import './styles/recovery.css';
+import './styles/onboarding.css';
+import './styles/settings.css';
+import './styles/probes.css';
 
 const showM3FoundationFixture =
   import.meta.env.DEV &&
@@ -33,6 +41,17 @@ const showM3PlanFixture =
   import.meta.env.DEV && new URLSearchParams(window.location.search).get('m3-fixture') === 'plan';
 const showM3CommitFixture =
   import.meta.env.DEV && new URLSearchParams(window.location.search).get('m3-fixture') === 'commit';
+const showM3RecoveryFixture =
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get('m3-fixture') === 'recovery';
+const showM3SettingsFixture =
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get('m3-fixture') === 'settings';
+const showM3OnboardingFixture =
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get('m3-fixture') === 'onboarding';
+const showM3ProbesFixture =
+  import.meta.env.DEV && new URLSearchParams(window.location.search).get('m3-fixture') === 'probes';
 const commitFixtureState =
   (new URLSearchParams(window.location.search).get('m3-state') as CommitFixtureState | null) ??
   'confirm';
@@ -51,6 +70,14 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       <ReviewFixture view="plan" />
     ) : showM3CommitFixture ? (
       <CommitFixture state={commitFixtureState} />
+    ) : showM3RecoveryFixture ? (
+      <RecoveryFixture />
+    ) : showM3SettingsFixture ? (
+      <SettingsFixture />
+    ) : showM3OnboardingFixture ? (
+      <OnboardingFixture />
+    ) : showM3ProbesFixture ? (
+      <ProbesFixture />
     ) : (
       <QueryClientProvider client={queryClient}>
         <App />

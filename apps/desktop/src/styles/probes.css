@@ -1,0 +1,86 @@
+.probes-page--m3 {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.probes-page--m3 > .toolbar {
+  margin: 0;
+}
+
+.probes-page--m3 .tabs {
+  display: flex;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-1);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-soft);
+}
+
+.probes-page--m3 .tab {
+  min-height: 38px;
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--color-ink-muted);
+  font: 800 13px/1 var(--font-ui);
+  cursor: pointer;
+}
+
+.probes-page--m3 .tab.active {
+  background: var(--color-surface);
+  color: var(--color-primary-pressed);
+  box-shadow: 0 1px 3px rgb(23 32 25 / 10%);
+}
+
+.probes-page--m3 .tab:focus-visible,
+.probes-page--m3 .probe-panel > button:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.probes-page--m3 .probe-panel {
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+}
+
+.probes-page--m3 .probe-panel > button {
+  min-height: 40px;
+  margin-bottom: var(--space-4);
+  padding: 8px 14px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font: 800 13px/1 var(--font-ui);
+  cursor: pointer;
+}
+
+.probes-page--m3 .probe-panel > button:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+  color: var(--color-primary-pressed);
+}
+
+.probes-page--m3 .probe-result table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.probes-page--m3 .probe-result td {
+  padding: 9px var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-ink);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.probes-page--m3 .probe-result td:first-child {
+  width: 32%;
+  color: var(--color-ink-muted);
+}

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
-import { RecoveryPage } from './RecoveryPage';
+import { RecoveryPage, recoveryDisposition } from './RecoveryPage';
 
 const mockApi = vi.hoisted(() => ({
   scanRecoverableTransactions: vi.fn(),
@@ -47,10 +47,18 @@ describe('RecoveryPage transaction disposition', () => {
   test('shows terminal failed transactions as manual work instead of an empty recovery state', async () => {
     renderRecoveryPage();
 
-    expect(await screen.findByText('事务 11111111...')).toBeInTheDocument();
+    expect(await screen.findByText('11111111…')).toBeInTheDocument();
     expect(screen.queryByText('没有待处理事务')).not.toBeInTheDocument();
     expect(screen.getByText('失败')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '需要人工处理' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '自动恢复不可用' })).toBeDisabled();
     expect(screen.getByText('错误: terminal failure')).toBeInTheDocument();
+  });
+
+  test('keeps conflicts, terminal states, and recoverable states distinct', () => {
+    expect(recoveryDisposition('conflict')).toBe('conflict');
+    expect(recoveryDisposition('failed')).toBe('terminal');
+    expect(recoveryDisposition('cancelled')).toBe('terminal');
+    expect(recoveryDisposition('cleanup_required')).toBe('recoverable');
+    expect(recoveryDisposition('staging')).toBe('recoverable');
   });
 });

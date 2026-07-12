@@ -3,20 +3,30 @@ import { api } from '../lib/ipc/api';
 import type { DatabaseState, ExternalConnectionConfig } from '../lib/ipc/types';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useState } from 'react';
+import { Button, PageHeader, StatusBadge, StatusBanner } from '../components/ui';
 
 interface OnboardingPageProps {
   onComplete: () => void;
+  initialMode?: 'managed' | 'external' | null;
+  initialDatabaseState?: DatabaseState;
+  enablePolling?: boolean;
 }
 
-export function OnboardingPage({ onComplete }: OnboardingPageProps) {
-  const [mode, setMode] = useState<'managed' | 'external' | null>(null);
+export function OnboardingPage({
+  onComplete,
+  initialMode = null,
+  initialDatabaseState,
+  enablePolling = true,
+}: OnboardingPageProps) {
+  const [mode, setMode] = useState<'managed' | 'external' | null>(initialMode);
   const [connectedState, setConnectedState] = useState<DatabaseState | null>(null);
   const queryClient = useQueryClient();
 
   const dbStatus = useQuery({
     queryKey: ['database-status'],
     queryFn: api.getDatabaseStatus,
-    refetchInterval: 2000,
+    initialData: initialDatabaseState,
+    refetchInterval: enablePolling ? 2000 : false,
   });
   const databaseState = connectedState ?? dbStatus.data;
   const isConnected = databaseState && taggedStatusCode(databaseState.status) === 'connected';
@@ -25,35 +35,46 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
   // poll), surface one explicit entry action.
   if (isConnected && databaseState) {
     return (
-      <div className="onboarding-page">
-        <h1>数据库已就绪</h1>
-        <p>数据库连接正常，可以开始使用 ImageDB。</p>
+      <div className="onboarding-page onboarding-page--m3">
+        <PageHeader
+          title="数据库已就绪"
+          description="数据库连接正常，可以开始使用 ImageDB。"
+          meta={<StatusBadge tone="success">连接成功</StatusBadge>}
+        />
+        <StatusBanner tone="success" title="首次配置完成">
+          ImageDB 已验证 PostgreSQL、pgvector 和迁移版本。
+        </StatusBanner>
         <DbStateSummary state={databaseState} />
         <div className="onboarding-actions">
-          <button className="btn-primary" onClick={onComplete}>
+          <Button variant="primary" onClick={onComplete}>
             进入应用
-          </button>
+          </Button>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="onboarding-page">
-      <h1>欢迎使用 ImageDB</h1>
-      <p>
-        {mode === 'external'
-          ? '正在配置外部 PostgreSQL。修正连接、权限或 TLS 参数后，可以在这里重新连接并初始化。'
-          : mode === 'managed'
-            ? '正在初始化托管 PostgreSQL。数据库就绪后即可进入应用。'
-            : '请选择数据库模式以完成初始设置。'}
-      </p>
+    <div className="onboarding-page onboarding-page--m3">
+      <PageHeader
+        title="欢迎使用 ImageDB"
+        description={
+          mode === 'external'
+            ? '正在配置外部 PostgreSQL。修正连接、权限或 TLS 参数后，可以在这里重新连接并初始化。'
+            : mode === 'managed'
+              ? '正在初始化托管 PostgreSQL。数据库就绪后即可进入应用。'
+              : '请选择数据库模式以完成初始设置。'
+        }
+        meta={<StatusBadge tone="info">首次配置</StatusBadge>}
+      />
 
       {databaseState && <DbStateSummary state={databaseState} />}
 
       <div className="mode-cards">
-        <div
+        <button
+          type="button"
           className={`mode-card ${mode === 'managed' ? 'selected' : ''}`}
+          aria-pressed={mode === 'managed'}
           onClick={() => {
             setMode('managed');
             setConnectedState(null);
@@ -61,9 +82,12 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
         >
           <h3>托管模式（推荐）</h3>
           <p>应用自动管理本地 PostgreSQL 实例。无需手动安装和配置。</p>
-        </div>
-        <div
+          <span>适合个人本地使用</span>
+        </button>
+        <button
+          type="button"
           className={`mode-card ${mode === 'external' ? 'selected' : ''}`}
+          aria-pressed={mode === 'external'}
           onClick={() => {
             setMode('external');
             setConnectedState(null);
@@ -71,7 +95,8 @@ export function OnboardingPage({ onComplete }: OnboardingPageProps) {
         >
           <h3>外部连接</h3>
           <p>连接已有的 PostgreSQL 数据库。需要提供连接参数。</p>
-        </div>
+          <span>适合已有数据库环境</span>
+        </button>
       </div>
 
       {mode === 'managed' && (
@@ -151,9 +176,14 @@ function ManagedSetup({ onInitialized }: { onInitialized: (state: DatabaseState)
     <div className="setup-panel">
       <h3>初始化托管数据库</h3>
       <p>将在本地创建并启动 PostgreSQL 实例。</p>
-      <button className="btn-primary" onClick={() => init.mutate()} disabled={init.isPending}>
-        {init.isPending ? '初始化中…' : '开始初始化'}
-      </button>
+      <Button
+        variant="primary"
+        onClick={() => init.mutate()}
+        loading={init.isPending}
+        loadingLabel="初始化中…"
+      >
+        开始初始化
+      </Button>
       {init.data && <DbStateSummary state={init.data} />}
       {init.isError && <pre className="status-err">{String(init.error)}</pre>}
       {init.data && taggedStatusCode(init.data.status) === 'connected' && (
@@ -243,16 +273,22 @@ function ExternalSetup({ onInitialized }: { onInitialized: (state: DatabaseState
         </label>
       </div>
       <div className="toolbar">
-        <button onClick={() => testConn.mutate()} disabled={testConn.isPending}>
-          {testConn.isPending ? '测试中…' : '测试连接'}
-        </button>
-        <button
-          className="btn-primary"
-          onClick={() => initExt.mutate()}
-          disabled={initExt.isPending}
+        <Button
+          variant="secondary"
+          onClick={() => testConn.mutate()}
+          loading={testConn.isPending}
+          loadingLabel="测试中…"
         >
-          {initExt.isPending ? '连接中…' : '连接并初始化'}
-        </button>
+          测试连接
+        </Button>
+        <Button
+          variant="primary"
+          onClick={() => initExt.mutate()}
+          loading={initExt.isPending}
+          loadingLabel="连接中…"
+        >
+          连接并初始化
+        </Button>
       </div>
       {testConn.data && (
         <div className="check-result">

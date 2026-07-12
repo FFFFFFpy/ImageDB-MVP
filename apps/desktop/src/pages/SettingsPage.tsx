@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useState } from 'react';
+import { Button, PageHeader, StatusBadge } from '../components/ui';
 import type {
   CapabilityProbe,
   DatabaseState,
@@ -97,7 +98,13 @@ function DbActivationResult({
   );
 }
 
-export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
+export function SettingsPage({
+  onOpenProbes,
+  enablePolling = true,
+}: {
+  onOpenProbes?: () => void;
+  enablePolling?: boolean;
+}) {
   const queryClient = useQueryClient();
 
   const settings = useQuery({
@@ -108,7 +115,7 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
   const dbStatus = useQuery({
     queryKey: ['database-status'],
     queryFn: api.getDatabaseStatus,
-    refetchInterval: 5000,
+    refetchInterval: enablePolling ? 5000 : false,
   });
 
   const [extHost, setExtHost] = useState('');
@@ -152,7 +159,7 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
   const migrationProgress = useQuery({
     queryKey: ['external-migration-progress'],
     queryFn: api.getExternalMigrationProgress,
-    refetchInterval: 1000,
+    refetchInterval: enablePolling ? 1000 : false,
   });
 
   const startMigration = useMutation({
@@ -223,11 +230,36 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
   const managedConfig = dbStatus.data?.managed_config;
 
   return (
-    <div className="settings-page">
-      <h1>设置</h1>
+    <div className="settings-page settings-page--m3">
+      <PageHeader
+        title="设置"
+        description="管理数据库、图库目录与诊断工具。日常导入不需要修改高级选项。"
+        meta={
+          dbStatus.data ? (
+            <StatusBadge
+              tone={taggedStatusCode(dbStatus.data.status) === 'connected' ? 'success' : 'warning'}
+            >
+              {formatTaggedStatus(dbStatus.data.status)}
+            </StatusBadge>
+          ) : undefined
+        }
+        actions={
+          onOpenProbes ? (
+            <Button variant="quiet" onClick={onOpenProbes}>
+              打开技术探针
+            </Button>
+          ) : undefined
+        }
+      />
 
       <section className="settings-section">
-        <h2>数据库状态</h2>
+        <div className="settings-section-heading">
+          <div>
+            <span>数据库</span>
+            <h2>连接与运行状态</h2>
+          </div>
+          <p>托管本地 PostgreSQL 是推荐模式；切换或停止数据库会影响当前任务。</p>
+        </div>
         {dbStatus.data && (
           <div className="db-status-card">
             {!dbStatus.data.mode && (
@@ -315,7 +347,11 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
                 </ul>
               </details>
             )}
-            <button onClick={() => shutdown.mutate()} disabled={shutdown.isPending}>
+            <button
+              className="settings-danger-action"
+              onClick={() => shutdown.mutate()}
+              disabled={shutdown.isPending}
+            >
               {shutdown.isPending ? '停止中…' : '停止数据库'}
             </button>
             <button onClick={() => switchManaged.mutate()} disabled={switchManaged.isPending}>
@@ -368,7 +404,13 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
       </section>
 
       <section className="settings-section">
-        <h2>外部数据库连接</h2>
+        <div className="settings-section-heading">
+          <div>
+            <span>高级</span>
+            <h2>外部数据库连接</h2>
+          </div>
+          <p>仅在已有数据库环境或需要迁移托管库时配置。</p>
+        </div>
         <div className="form-grid">
           <label>
             主机
@@ -448,7 +490,7 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
           {initExternal.isPending ? '连接中…' : '连接并初始化外部库'}
         </button>
         <button
-          className="btn-primary"
+          className="settings-secondary-action"
           onClick={() => startMigration.mutate()}
           disabled={migrationRunning}
         >
@@ -597,7 +639,13 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
       </section>
 
       <section className="settings-section">
-        <h2>图库目录</h2>
+        <div className="settings-section-heading">
+          <div>
+            <span>存储</span>
+            <h2>图库目录</h2>
+          </div>
+          <p>保存目标根目录，并在首次正式入库前检测文件系统能力。</p>
+        </div>
         <label>
           目标图库根目录
           <input
@@ -607,6 +655,7 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
           />
         </label>
         <button
+          className="settings-primary-action"
           onClick={() => {
             if (settings.data) {
               saveSettings.mutate({
@@ -631,16 +680,37 @@ export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
 
       {onOpenProbes && (
         <section className="settings-section">
-          <h2>诊断</h2>
+          <div className="settings-section-heading">
+            <div>
+              <span>支持</span>
+              <h2>诊断与技术探针</h2>
+            </div>
+            <p>导出的诊断包会隐藏敏感连接信息。</p>
+          </div>
           <p className="settings-help">
             运行
             PostgreSQL、图片指纹和文件事务技术探针。这里的工具用于排查环境问题，不属于日常导入流程。
           </p>
-          <button type="button" onClick={onOpenProbes}>
-            打开技术探针
-          </button>
         </section>
       )}
+
+      <section className="settings-section settings-about">
+        <div className="settings-section-heading">
+          <div>
+            <span>About</span>
+            <h2>ImageDB M3</h2>
+          </div>
+          <p>个人自用、非商业项目。</p>
+        </div>
+        <p>
+          界面组件使用{' '}
+          <a href="https://github.com/guokaigdg/animal-island-ui" target="_blank" rel="noreferrer">
+            animal-island-ui
+          </a>
+          ，作者 guokaigdg，按 CC BY-NC 4.0 许可使用。完整声明见{' '}
+          <span className="mono">docs/MVP3/THIRD_PARTY_NOTICES.md</span>。
+        </p>
+      </section>
     </div>
   );
 }

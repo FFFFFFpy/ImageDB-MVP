@@ -331,4 +331,16 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     expect(screen.getByText('敏感信息已隐藏')).toBeInTheDocument();
     expect(mockedApi.exportDiagnostics).toHaveBeenCalledTimes(1);
   });
+
+  test('shows the noncommercial third-party attribution in About', async () => {
+    renderSettingsPage();
+
+    expect(await screen.findByRole('heading', { name: 'ImageDB M3' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'animal-island-ui' })).toHaveAttribute(
+      'href',
+      'https://github.com/guokaigdg/animal-island-ui',
+    );
+    expect(screen.getByText(/CC BY-NC 4\.0/)).toBeInTheDocument();
+    expect(screen.getByText(/个人自用、非商业项目/)).toBeInTheDocument();
+  });
 });

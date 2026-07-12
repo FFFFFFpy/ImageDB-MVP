@@ -1,0 +1,150 @@
+.onboarding-page--m3 {
+  display: grid;
+  gap: var(--space-5);
+  width: min(100%, 980px);
+  max-width: 980px;
+  min-width: 0;
+  margin: 0 auto;
+  padding: var(--space-8);
+  align-content: start;
+}
+
+.onboarding-page--m3 .mode-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+  margin: 0;
+}
+
+.onboarding-page--m3 .mode-card {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-5);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--motion-fast) var(--ease-out),
+    background-color var(--motion-fast) var(--ease-out),
+    transform var(--motion-fast) var(--ease-out);
+}
+
+.onboarding-page--m3 .mode-card:hover {
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+  transform: translateY(-1px);
+}
+
+.onboarding-page--m3 .mode-card:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 3px;
+}
+
+.onboarding-page--m3 .mode-card.selected {
+  border-color: var(--color-primary);
+  background: var(--color-primary-soft);
+  box-shadow: inset 0 0 0 1px var(--color-primary);
+}
+
+.onboarding-page--m3 .mode-card h3,
+.onboarding-page--m3 .mode-card p,
+.onboarding-page--m3 .mode-card span {
+  margin: 0;
+}
+
+.onboarding-page--m3 .mode-card h3 {
+  font-size: 17px;
+}
+
+.onboarding-page--m3 .mode-card p {
+  color: var(--color-ink-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.onboarding-page--m3 .mode-card span {
+  color: var(--color-primary-pressed);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.onboarding-page--m3 .setup-panel,
+.onboarding-page--m3 .db-state-summary {
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+}
+
+.onboarding-page--m3 .setup-panel h3 {
+  margin: 0 0 var(--space-1);
+  font-size: 17px;
+}
+
+.onboarding-page--m3 .setup-panel > p {
+  margin: 0 0 var(--space-4);
+  color: var(--color-ink-muted);
+}
+
+.onboarding-page--m3 .form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.onboarding-page--m3 label {
+  display: grid;
+  gap: var(--space-1);
+  color: var(--color-ink-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.onboarding-page--m3 input,
+.onboarding-page--m3 select {
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  padding: 9px 11px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font: inherit;
+}
+
+.onboarding-page--m3 input:focus-visible,
+.onboarding-page--m3 select:focus-visible {
+  border-color: var(--color-primary);
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.onboarding-page--m3 .onboarding-actions {
+  display: flex;
+  justify-content: center;
+  margin: 0;
+}
+
+@media (max-width: 700px) {
+  .onboarding-page--m3 {
+    padding: var(--space-5);
+  }
+
+  .onboarding-page--m3 .mode-cards,
+  .onboarding-page--m3 .form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-page--m3 .mode-card {
+    transition: none;
+  }
+}

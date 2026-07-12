@@ -3,9 +3,27 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { Route } from '../hooks/use-router';
 import type { RecoveryDiagnostic, RecoveryOutcome, ReverifyResult } from '../lib/ipc/types';
+import {
+  Button,
+  EmptyState,
+  PageHeader,
+  Skeleton,
+  StatusBadge,
+  StatusBanner,
+} from '../components/ui';
 
 interface RecoveryPageProps {
   onNavigate: (route: Route) => void;
+  initialDiagnostics?: RecoveryDiagnostic[];
+  enablePolling?: boolean;
+}
+
+export type RecoveryDisposition = 'recoverable' | 'conflict' | 'terminal';
+
+export function recoveryDisposition(state: string): RecoveryDisposition {
+  if (state === 'conflict') return 'conflict';
+  if (state === 'failed' || state === 'cancelled') return 'terminal';
+  return 'recoverable';
 }
 
 function formatState(state: string): string {
@@ -28,7 +46,11 @@ function formatState(state: string): string {
   return map[state] ?? state;
 }
 
-export function RecoveryPage({ onNavigate }: RecoveryPageProps) {
+export function RecoveryPage({
+  onNavigate,
+  initialDiagnostics,
+  enablePolling = true,
+}: RecoveryPageProps) {
   const queryClient = useQueryClient();
   const [recovering, setRecovering] = useState<string | null>(null);
   const [reverifying, setReverifying] = useState<string | null>(null);
@@ -39,7 +61,8 @@ export function RecoveryPage({ onNavigate }: RecoveryPageProps) {
   const diagnosticsQuery = useQuery({
     queryKey: ['recoverableTransactions'],
     queryFn: api.scanRecoverableTransactions,
-    refetchInterval: 5000,
+    initialData: initialDiagnostics,
+    refetchInterval: enablePolling ? 5000 : false,
   });
 
   useEffect(() => {
@@ -87,62 +110,67 @@ export function RecoveryPage({ onNavigate }: RecoveryPageProps) {
   const transactions = diagnosticsQuery.data ?? [];
 
   return (
-    <div className="recovery-page">
-      <h1>恢复与事务处置</h1>
+    <div className="recovery-page recovery-page--m3">
+      <PageHeader
+        title="恢复与事务处置"
+        description="依据 staging、目标目录、清单和计划哈希判断下一步；证据冲突时不会自动覆盖。"
+        meta={
+          transactions.length > 0 ? (
+            <StatusBadge tone="warning">{transactions.length} 个待处理事务</StatusBadge>
+          ) : undefined
+        }
+        actions={
+          <Button variant="quiet" onClick={refresh} disabled={recovering !== null}>
+            刷新诊断
+          </Button>
+        }
+      />
 
-      {diagnosticsQuery.isLoading && <p>正在扫描可恢复事务...</p>}
+      {diagnosticsQuery.isLoading && (
+        <div className="recovery-loading" role="status" aria-label="正在扫描可恢复事务">
+          <Skeleton height={180} radius="var(--radius-panel)" />
+        </div>
+      )}
       {diagnosticsQuery.isError && (
-        <div className="recovery-error">无法读取恢复诊断: {String(diagnosticsQuery.error)}</div>
+        <StatusBanner tone="danger" title="无法读取恢复诊断">
+          {String(diagnosticsQuery.error)}
+        </StatusBanner>
       )}
 
-      {actionError && <div className="recovery-error">{actionError}</div>}
+      {actionError && (
+        <StatusBanner tone="danger" title="事务操作失败">
+          {actionError}
+        </StatusBanner>
+      )}
 
       {lastOutcome && (
-        <div
-          className={`recovery-card ${lastOutcome.recovered ? 'success' : lastOutcome.terminal ? 'failed' : ''}`}
+        <StatusBanner
+          tone={lastOutcome.recovered ? 'success' : lastOutcome.terminal ? 'danger' : 'warning'}
+          title="恢复结果"
         >
-          <h3>恢复结果</h3>
-          <p>
-            事务 {lastOutcome.transaction_id.slice(0, 8)}... →{' '}
-            {formatState(lastOutcome.final_state)}
-          </p>
-          <p>{lastOutcome.message}</p>
+          事务 {lastOutcome.transaction_id.slice(0, 8)}… → {formatState(lastOutcome.final_state)}。
+          {lastOutcome.message}
           {!lastOutcome.recovered && lastOutcome.terminal && (
-            <p className="recovery-error-detail">此事务处于终态但未恢复成功，需要手动解决。</p>
+            <span> 此事务处于终态但未恢复成功，需要手动解决。</span>
           )}
-        </div>
+        </StatusBanner>
       )}
 
       {lastReverify && (
-        <div className="recovery-card">
-          <h3>重新验证</h3>
-          <p>
-            事务 {lastReverify.transaction_id.slice(0, 8)}... → {lastReverify.verdict}
-          </p>
-          <p>{lastReverify.message}</p>
-        </div>
+        <StatusBanner tone="info" title="重新验证结果">
+          事务 {lastReverify.transaction_id.slice(0, 8)}… → {lastReverify.verdict}。
+          {lastReverify.message}
+        </StatusBanner>
       )}
 
       {transactions.length === 0 && !diagnosticsQuery.isLoading ? (
-        <div className="empty-state">
-          <h1>没有待处理事务</h1>
-          <p>所有文件事务都已完成，不需要恢复或人工处置。</p>
-          <div className="recovery-actions">
-            <button className="btn-secondary" onClick={refresh}>
-              刷新
-            </button>
-            <button className="btn-primary" onClick={() => onNavigate('dashboard')}>
-              返回工作台
-            </button>
-          </div>
-        </div>
+        <EmptyState
+          title="没有待处理事务"
+          description="所有文件事务都已完成，不需要恢复或人工处置。"
+          action={<Button onClick={() => onNavigate('dashboard')}>返回工作台</Button>}
+        />
       ) : (
         <div className="recovery-transactions">
-          <div className="recovery-actions">
-            <button className="btn-secondary" onClick={refresh} disabled={recovering !== null}>
-              刷新
-            </button>
-          </div>
           {transactions.map((tx) => (
             <RecoveryCard
               key={tx.transaction_id}
@@ -168,32 +196,53 @@ interface RecoveryCardProps {
 }
 
 function RecoveryCard({ tx, recovering, reverifying, onRecover, onReverify }: RecoveryCardProps) {
-  const isConflict = tx.current_state === 'conflict';
-  const isTerminalUnresolved = tx.current_state === 'failed' || tx.current_state === 'cancelled';
+  const disposition = recoveryDisposition(tx.current_state);
+  const isConflict = disposition === 'conflict';
+  const isTerminalUnresolved = disposition === 'terminal';
   return (
-    <div className="recovery-card">
+    <article className={`recovery-card recovery-card--${disposition}`}>
       <div className="recovery-card-header">
-        <h3>事务 {tx.transaction_id.slice(0, 8)}...</h3>
-        <span className={`state-badge state-${tx.current_state}`}>
+        <div>
+          <span className="recovery-card-kicker">文件事务</span>
+          <h2>{tx.transaction_id.slice(0, 8)}…</h2>
+        </div>
+        <StatusBadge tone={isConflict || isTerminalUnresolved ? 'danger' : 'warning'}>
           {formatState(tx.current_state)}
-        </span>
+        </StatusBadge>
       </div>
+
+      {(isConflict || isTerminalUnresolved) && (
+        <StatusBanner
+          tone="danger"
+          title={isConflict ? '证据冲突，已阻止自动恢复' : '事务已进入终态'}
+        >
+          {isConflict
+            ? '请先重新验证并人工核对目录与清单；ImageDB 不会提供覆盖按钮。'
+            : '此事务不能自动重启，需要保留诊断信息并人工处置。'}
+        </StatusBanner>
+      )}
 
       <div className="recovery-card-details">
         <div className="recovery-evidence">
           <h4>证据</h4>
-          <ul>
-            <li className={tx.staging_exists ? 'present' : 'missing'}>
-              暂存区: {tx.staging_exists ? '存在' : '缺失'}
-            </li>
-            <li className={tx.target_exists ? 'present' : 'missing'}>
-              正式目录: {tx.target_exists ? '存在' : '缺失'}
-            </li>
-            <li className={tx.manifest_exists ? 'present' : 'missing'}>
-              清单: {tx.manifest_exists ? '存在' : '缺失'}
-            </li>
-            {tx.plan_hash && <li>计划哈希: {tx.plan_hash.slice(0, 12)}...</li>}
-          </ul>
+          <dl>
+            <div>
+              <dt>暂存区</dt>
+              <dd>{tx.staging_exists ? '存在' : '缺失'}</dd>
+            </div>
+            <div>
+              <dt>正式目录</dt>
+              <dd>{tx.target_exists ? '存在' : '缺失'}</dd>
+            </div>
+            <div>
+              <dt>清单</dt>
+              <dd>{tx.manifest_exists ? '存在' : '缺失'}</dd>
+            </div>
+            <div>
+              <dt>计划哈希</dt>
+              <dd className="mono">{tx.plan_hash ? `${tx.plan_hash.slice(0, 12)}…` : '缺失'}</dd>
+            </div>
+          </dl>
         </div>
 
         <div className="recovery-diagnostics">
@@ -208,25 +257,29 @@ function RecoveryCard({ tx, recovering, reverifying, onRecover, onReverify }: Re
       </div>
 
       <div className="recovery-actions">
-        <button
-          className="btn-primary"
+        <Button
+          variant="primary"
           onClick={() => onRecover(tx.transaction_id)}
           disabled={recovering || reverifying || isConflict || isTerminalUnresolved}
+          loading={recovering}
+          loadingLabel="恢复中…"
           title={
             isConflict || isTerminalUnresolved ? '该事务需要人工处理，不能自动恢复' : '执行恢复'
           }
         >
-          {isTerminalUnresolved ? '需要人工处理' : recovering ? '恢复中...' : '执行恢复'}
-        </button>
-        <button
-          className="btn-secondary"
+          {isConflict || isTerminalUnresolved ? '自动恢复不可用' : '执行恢复'}
+        </Button>
+        <Button
+          variant="secondary"
           onClick={() => onReverify(tx.transaction_id)}
           disabled={recovering || reverifying}
+          loading={reverifying}
+          loadingLabel="验证中…"
         >
-          {reverifying ? '验证中...' : '重新验证'}
-        </button>
+          重新验证
+        </Button>
         {/* No "overwrite" button — conflicts require manual resolution. */}
       </div>
-    </div>
+    </article>
   );
 }
