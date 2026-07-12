@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
+import { PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
 import type { Route } from '../hooks/use-router';
 import type {
   ReviewCandidateDetail,
@@ -11,12 +12,22 @@ import type {
   ImportPlanAlbum,
   ImportPlanImage,
 } from '../lib/ipc/types';
-import { AppIcon, Button, EmptyState, PageHeader, Skeleton, StatusBadge } from '../components/ui';
+import {
+  AppIcon,
+  Button,
+  EmptyState,
+  PageHeader,
+  Skeleton,
+  StatusBadge,
+  StatusBanner,
+} from '../components/ui';
 
 interface ReviewPageProps {
   onNavigate: (route: Route) => void;
   initialImportRunId?: string | null;
   initialPreviews?: { left: string; right: string } | null;
+  initialPlan?: ImportPlan | null;
+  initialShowPlan?: boolean;
   enablePolling?: boolean;
 }
 
@@ -193,6 +204,8 @@ export function ReviewPage({
   onNavigate,
   initialImportRunId = null,
   initialPreviews = null,
+  initialPlan = null,
+  initialShowPlan = false,
   enablePolling = true,
 }: ReviewPageProps) {
   const queryClient = useQueryClient();
@@ -206,9 +219,10 @@ export function ReviewPage({
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
   const [leftPreview, setLeftPreview] = useState<string | null>(null);
   const [rightPreview, setRightPreview] = useState<string | null>(null);
-  const [importPlan, setImportPlan] = useState<ImportPlan | null>(null);
-  const [showPlan, setShowPlan] = useState(false);
+  const [importPlan, setImportPlan] = useState<ImportPlan | null>(initialPlan);
+  const [showPlan, setShowPlan] = useState(initialShowPlan);
   const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
+  const [planImageLimits, setPlanImageLimits] = useState<Record<string, number>>({});
   const [planEditError, setPlanEditError] = useState<string | null>(null);
   const [planEditPending, setPlanEditPending] = useState(false);
   const [previewModal, setPreviewModal] = useState<{
@@ -247,7 +261,7 @@ export function ReviewPage({
   const frozenPlanQuery = useQuery({
     queryKey: ['reviewFrozenImportPlanSummary', importRunId],
     queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
-    enabled: !!importRunId && !showPlan && !importPlan,
+    enabled: !!importRunId && !showPlan && !importPlan && !initialPlan,
   });
 
   useEffect(() => {
@@ -589,42 +603,55 @@ export function ReviewPage({
     const keptAlbums = albumGroups.filter((album) => album.included).length;
 
     return (
-      <div className="review-page">
-        <div className="import-plan-header">
-          <h1>导入计划</h1>
-          <div className="toolbar import-plan-actions">
-            <button className="btn-primary" onClick={() => onNavigate('commit')}>
-              前往提交
-            </button>
-            <button className="btn-secondary" onClick={() => setShowPlan(false)}>
-              返回审核
-            </button>
-          </div>
-        </div>
+      <div className="review-page plan-page--m3">
+        <PageHeader
+          title="导入计划"
+          description="这是当前已冻结的入库清单；在正式提交前仍可调整，所有修改都会更新同一份 frozen plan。"
+          meta={<StatusBadge tone="success">计划已冻结</StatusBadge>}
+          actions={
+            <>
+              <Button variant="quiet" onClick={() => setShowPlan(false)}>
+                返回审核
+              </Button>
+              <Button variant="primary" onClick={() => onNavigate('commit')}>
+                前往提交确认
+              </Button>
+            </>
+          }
+        />
+        <StatusBanner tone="info" title="计划与入库是两个步骤">
+          此页只调整并保存计划；下一页会重新读取这份 frozen plan，再由你确认开始文件事务。
+        </StatusBanner>
         <div className="import-plan-summary">
           <div className="import-plan-stats">
-            <div className="scan-progress-card">
-              <h3>图集数</h3>
-              <p>{importPlan.total_albums}</p>
+            <div className="plan-stat">
+              <span>图集数</span>
+              <strong>{importPlan.total_albums}</strong>
             </div>
-            <div className="scan-progress-card">
-              <h3>图片总数</h3>
-              <p>{importPlan.total_images}</p>
+            <div className="plan-stat">
+              <span>图片总数</span>
+              <strong>{importPlan.total_images}</strong>
             </div>
-            <div className="scan-progress-card ok">
-              <h3>保留</h3>
-              <p>{importPlan.kept_images.length}</p>
+            <div className="plan-stat plan-stat--success">
+              <span>计划导入</span>
+              <strong>{importPlan.kept_images.length}</strong>
             </div>
-            <div className="scan-progress-card warn">
-              <h3>排除</h3>
-              <p>{importPlan.excluded_count}</p>
+            <div className="plan-stat plan-stat--warning">
+              <span>计划排除</span>
+              <strong>{importPlan.excluded_count}</strong>
             </div>
           </div>
           {planEditError && <div className="commit-error-msg">{planEditError}</div>}
           <div className="import-plan-kept">
-            <h3>
-              导入图集 ({keptAlbums}) / 导入图片 ({importPlan.kept_images.length})
-            </h3>
+            <div className="plan-list-heading">
+              <div>
+                <h2>图集清单</h2>
+                <p>仅展开图集时加载图片行与预览，避免长清单一次渲染全部内容。</p>
+              </div>
+              <StatusBadge>
+                {keptAlbums} 个图集 · {importPlan.kept_images.length} 张图片
+              </StatusBadge>
+            </div>
             <div className="import-plan-albums">
               {albumGroups.map((album) => {
                 const isOpen = openPlanAlbums.has(album.albumId);
@@ -674,39 +701,60 @@ export function ReviewPage({
                     </summary>
                     {isOpen && (
                       <div className="import-plan-image-list">
-                        {album.images.map((img) => (
-                          <div
-                            className={`import-plan-image-row ${img.included ? 'included' : 'skipped'}`}
-                            key={img.image_id}
-                            draggable
-                            onDragStart={(event) => {
-                              event.dataTransfer.setData('text/plain', img.image_id);
-                              event.dataTransfer.effectAllowed = 'move';
-                            }}
+                        {album.images
+                          .slice(0, planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE)
+                          .map((img) => (
+                            <div
+                              className={`import-plan-image-row ${img.included ? 'included' : 'skipped'}`}
+                              key={img.image_id}
+                              draggable
+                              onDragStart={(event) => {
+                                event.dataTransfer.setData('text/plain', img.image_id);
+                                event.dataTransfer.effectAllowed = 'move';
+                              }}
+                            >
+                              <PlanImageThumbnail
+                                importRunId={importPlan.import_run_id}
+                                image={img}
+                                onOpen={openPlanImagePreview}
+                              />
+                              <button
+                                type="button"
+                                className="import-plan-image-info"
+                                onClick={() => openPlanImagePreview(img, null)}
+                              >
+                                <span className="mono">{img.relative_path}</span>
+                                <span>{formatFileSize(img.file_size)}</span>
+                              </button>
+                              <button
+                                type="button"
+                                className={`plan-toggle ${img.included ? 'is-on' : 'is-off'}`}
+                                disabled={planEditPending}
+                                onClick={() => togglePlanImage(album, img)}
+                              >
+                                {img.included ? '导入' : '跳过'}
+                              </button>
+                            </div>
+                          ))}
+                        {album.images.length > (planImageLimits[album.albumId] ?? 24) && (
+                          <Button
+                            variant="quiet"
+                            className="plan-load-more"
+                            onClick={() =>
+                              setPlanImageLimits((current) => ({
+                                ...current,
+                                [album.albumId]:
+                                  (current[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE) +
+                                  PLAN_IMAGE_BATCH_SIZE,
+                              }))
+                            }
                           >
-                            <PlanImageThumbnail
-                              importRunId={importPlan.import_run_id}
-                              image={img}
-                              onOpen={openPlanImagePreview}
-                            />
-                            <button
-                              type="button"
-                              className="import-plan-image-info"
-                              onClick={() => openPlanImagePreview(img, null)}
-                            >
-                              <span className="mono">{img.relative_path}</span>
-                              <span>{formatFileSize(img.file_size)}</span>
-                            </button>
-                            <button
-                              type="button"
-                              className={`plan-toggle ${img.included ? 'is-on' : 'is-off'}`}
-                              disabled={planEditPending}
-                              onClick={() => togglePlanImage(album, img)}
-                            >
-                              {img.included ? '导入' : '跳过'}
-                            </button>
-                          </div>
-                        ))}
+                            再显示 {PLAN_IMAGE_BATCH_SIZE} 张（剩余{' '}
+                            {album.images.length -
+                              (planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE)}{' '}
+                            张）
+                          </Button>
+                        )}
                       </div>
                     )}
                   </details>

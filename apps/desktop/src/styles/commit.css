@@ -1,0 +1,244 @@
+.commit-page--m3 {
+  display: grid;
+  gap: var(--space-5);
+  max-width: none;
+  min-width: 0;
+}
+
+.commit-page--m3 .imagedb-page-header,
+.commit-page--m3 .import-plan-summary,
+.commit-page--m3 .import-plan-kept {
+  margin: 0;
+}
+
+.commit-empty-actions,
+.commit-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  justify-content: center;
+}
+
+.commit-loading {
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+}
+
+.commit-confirm {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.commit-page--m3 .import-plan-stats,
+.commit-page--m3 .commit-stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-5);
+}
+
+.commit-page--m3 .import-plan-album {
+  border-color: var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-surface);
+}
+
+.commit-page--m3 .import-plan-album summary {
+  min-height: 52px;
+  padding: var(--space-3) var(--space-4);
+}
+
+.commit-page--m3 .import-plan-album summary:hover {
+  background: var(--color-surface-soft);
+}
+
+.commit-page--m3 .plan-toggle {
+  border-color: var(--color-success-border);
+  background: var(--color-success-soft);
+  color: var(--color-primary-pressed);
+}
+
+.commit-progress-panel,
+.commit-pipeline {
+  padding: var(--space-5);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+}
+
+.commit-progress-heading,
+.commit-section-heading {
+  display: flex;
+  gap: var(--space-4);
+  align-items: start;
+  justify-content: space-between;
+  margin-bottom: var(--space-5);
+}
+
+.commit-progress-heading h2,
+.commit-section-heading h2 {
+  margin: 0;
+  color: var(--color-ink);
+  font-size: 17px;
+}
+
+.commit-progress-heading p,
+.commit-section-heading p {
+  margin: var(--space-1) 0 0;
+  color: var(--color-ink-muted);
+  font-size: 13px;
+}
+
+.commit-progress-heading > strong {
+  color: var(--color-primary);
+  font-size: 28px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.commit-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+  margin: var(--space-5) 0 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.commit-metrics > div {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4) 0;
+  border-right: 1px solid var(--color-border);
+}
+
+.commit-metrics > div:first-child {
+  padding-left: 0;
+}
+
+.commit-metrics > div:last-child {
+  padding-right: 0;
+  border-right: 0;
+}
+
+.commit-metrics dt {
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+.commit-metrics dd {
+  margin: 0;
+  color: var(--color-ink);
+  font-size: 18px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.commit-page--m3 .pipeline-steps {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.commit-page--m3 .pipeline-steps li {
+  position: relative;
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  justify-items: center;
+  padding: var(--space-3) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-soft);
+  color: var(--color-ink-subtle);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.commit-page--m3 .pipeline-steps li.done {
+  border-color: var(--color-success-border);
+  background: var(--color-success-soft);
+  color: var(--color-primary-pressed);
+}
+
+.commit-page--m3 .pipeline-steps li.active {
+  border-color: var(--color-info-border);
+  background: var(--color-info-soft);
+  color: var(--color-info-ink);
+}
+
+.commit-result {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+  margin: 0;
+  padding: var(--space-5);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-warning-soft);
+  color: var(--color-warning-ink);
+}
+
+.commit-result.success {
+  border-color: var(--color-success-border);
+  background: var(--color-success-soft);
+  color: var(--color-primary-pressed);
+}
+
+.commit-result-copy h2 {
+  margin: 0;
+  color: currentColor;
+  font-size: 20px;
+}
+
+.commit-result-copy p {
+  margin: var(--space-1) 0 0;
+  color: currentColor;
+  font-size: 13px;
+}
+
+.commit-result .commit-stats {
+  grid-column: 1 / -1;
+  width: 100%;
+  margin: var(--space-2) 0 0;
+}
+
+@media (max-width: 1040px) {
+  .commit-page--m3 .import-plan-stats,
+  .commit-page--m3 .commit-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .commit-page--m3 .pipeline-steps {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 680px) {
+  .commit-page--m3 .import-plan-stats,
+  .commit-page--m3 .commit-stats,
+  .commit-page--m3 .pipeline-steps,
+  .commit-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .commit-metrics > div,
+  .commit-metrics > div:first-child,
+  .commit-metrics > div:last-child {
+    padding: var(--space-3) 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .commit-metrics > div:last-child {
+    border-bottom: 0;
+  }
+}

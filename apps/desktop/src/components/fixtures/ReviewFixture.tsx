@@ -6,6 +6,7 @@ import type {
 } from '../../lib/ipc/types';
 import { ReviewPage } from '../../pages/ReviewPage';
 import { Layout } from '../Layout';
+import { importPlanFixture } from './importPlanFixture';
 
 const importRunId = 'fixture-run-review';
 const candidateId = 'fixture-candidate-summer';
@@ -107,17 +108,36 @@ fixtureClient.setQueryData(['reviewQueue', importRunId], queue);
 fixtureClient.setQueryData(['reviewProgress', importRunId], progress);
 fixtureClient.setQueryData(['reviewDetail', candidateId], detail);
 fixtureClient.setQueryData(['reviewFrozenImportPlanSummary', importRunId], null);
+fixtureClient.setQueryData(['reviewQueue', importPlanFixture.import_run_id], []);
+fixtureClient.setQueryData(['reviewProgress', importPlanFixture.import_run_id], {
+  ...progress,
+  import_run_id: importPlanFixture.import_run_id,
+  decided_count: 34,
+  remaining_count: 0,
+  all_decided: true,
+});
+fixtureClient.setQueryData(
+  ['reviewFrozenImportPlanSummary', importPlanFixture.import_run_id],
+  importPlanFixture,
+);
 fixtureClient.setQueryData(['database-info-dashboard'], {
   imports: { failed_album_count: 0, pending_review_count: 32, recovery_required_run_count: 0 },
 });
 
-export function ReviewFixture() {
+interface ReviewFixtureProps {
+  view?: 'review' | 'plan';
+}
+
+export function ReviewFixture({ view = 'review' }: ReviewFixtureProps) {
+  const showPlan = view === 'plan';
   return (
     <QueryClientProvider client={fixtureClient}>
       <Layout currentRoute="review" onNavigate={() => undefined} enablePolling={false}>
         <ReviewPage
-          initialImportRunId={importRunId}
+          initialImportRunId={showPlan ? importPlanFixture.import_run_id : importRunId}
           initialPreviews={{ left: imageDataUrl('source'), right: imageDataUrl('candidate') }}
+          initialPlan={showPlan ? importPlanFixture : null}
+          initialShowPlan={showPlan}
           enablePolling={false}
           onNavigate={() => undefined}
         />

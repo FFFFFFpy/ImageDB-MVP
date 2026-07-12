@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
+import { PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
 import type { Route } from '../hooks/use-router';
 import type {
   CommitProgress,
@@ -8,9 +9,24 @@ import type {
   ImportPlanAlbum,
   ImportPlanImage,
 } from '../lib/ipc/types';
+import {
+  Button,
+  EmptyState,
+  PageHeader,
+  Progress,
+  Skeleton,
+  StatusBadge,
+  StatusBanner,
+  StatusIcon,
+} from '../components/ui';
 
 interface CommitPageProps {
   onNavigate: (route: Route) => void;
+  initialPhase?: Phase;
+  initialPlan?: ImportPlan | null;
+  initialProgress?: CommitProgress | null;
+  initialImportRunId?: string | null;
+  enablePolling?: boolean;
 }
 
 type Phase = 'confirm' | 'committing' | 'result';
@@ -108,7 +124,7 @@ function CommitImageThumbnail({ importRunId, image, onOpen }: CommitImageThumbna
   );
 }
 
-function isTerminalProgress(progress: CommitProgress): boolean {
+export function isTerminalProgress(progress: CommitProgress): boolean {
   // Phase 2: the persisted DB state is the single source of truth. The
   // only terminal states are the reconciler's outputs — no
   // `completed_with_errors` / `cancelled_pending_recovery` overlay.
@@ -118,6 +134,41 @@ function isTerminalProgress(progress: CommitProgress): boolean {
     progress.state === 'recovery_required' ||
     progress.state === 'cancelled'
   );
+}
+
+export const COMMIT_PIPELINE = [
+  { key: 'preparing', label: '准备事务' },
+  { key: 'staging', label: '复制到暂存区' },
+  { key: 'verifying', label: '验证暂存区' },
+  { key: 'publishing', label: '发布目录' },
+  { key: 'db', label: '数据库确认' },
+  { key: 'archiving', label: '源图集归档' },
+] as const;
+
+const stageOrder: Record<string, number> = {
+  preparing: 0,
+  committing: 1,
+  processing_album: 1,
+  verifying: 2,
+  verified: 3,
+  publishing: 3,
+  published: 4,
+  db_committing: 4,
+  library_committed: 5,
+  source_archiving: 5,
+  source_archived: 6,
+  done: 6,
+};
+
+export function commitPipelineStepState(
+  currentStage: string | undefined,
+  stepIndex: number,
+): 'pending' | 'active' | 'done' {
+  if (!currentStage || !(currentStage in stageOrder)) return 'pending';
+  const currentIndex = stageOrder[currentStage];
+  if (currentIndex > stepIndex) return 'done';
+  if (currentIndex === stepIndex) return 'active';
+  return 'pending';
 }
 
 function stageLabel(stage: string | undefined): string {
@@ -141,13 +192,21 @@ function stageLabel(stage: string | undefined): string {
   return map[stage] ?? stage;
 }
 
-export function CommitPage({ onNavigate }: CommitPageProps) {
-  const [phase, setPhase] = useState<Phase>('confirm');
-  const [plan, setPlan] = useState<ImportPlan | null>(null);
-  const [progress, setProgress] = useState<CommitProgress | null>(null);
+export function CommitPage({
+  onNavigate,
+  initialPhase = 'confirm',
+  initialPlan = null,
+  initialProgress = null,
+  initialImportRunId = null,
+  enablePolling = true,
+}: CommitPageProps) {
+  const [phase, setPhase] = useState<Phase>(initialPhase);
+  const [plan, setPlan] = useState<ImportPlan | null>(initialPlan);
+  const [progress, setProgress] = useState<CommitProgress | null>(initialProgress);
   const [error, setError] = useState<string | null>(null);
-  const [importRunId, setImportRunId] = useState<string | null>(null);
+  const [importRunId, setImportRunId] = useState<string | null>(initialImportRunId);
   const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
+  const [planImageLimits, setPlanImageLimits] = useState<Record<string, number>>({});
   const [previewModal, setPreviewModal] = useState<{
     image: ImportPlanImage;
     dataUrl: string | null;
@@ -161,12 +220,15 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   const latestRun = useQuery({
     queryKey: ['latestCommittableImportRun'],
     queryFn: api.getLatestCommittableImportRun,
+    enabled: !initialImportRunId,
   });
 
+  const committableRunId = latestRun.data ?? importRunId;
+
   const planQuery = useQuery({
-    queryKey: ['frozenImportPlanSummary', latestRun.data],
-    queryFn: () => api.getFrozenImportPlanSummary(latestRun.data!),
-    enabled: !!latestRun.data && phase === 'confirm',
+    queryKey: ['frozenImportPlanSummary', committableRunId],
+    queryFn: () => api.getFrozenImportPlanSummary(committableRunId!),
+    enabled: !!committableRunId && phase === 'confirm' && !initialPlan,
   });
 
   useEffect(() => {
@@ -177,7 +239,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   }, [planQuery.data]);
 
   useEffect(() => {
-    if (phase !== 'committing') return;
+    if (phase !== 'committing' || !enablePolling) return;
 
     pollRef.current = setInterval(async () => {
       try {
@@ -196,7 +258,7 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, [phase]);
+  }, [phase, enablePolling]);
 
   const commitMutation = useMutation({
     mutationFn: (runId: string) => api.startImportCommit(runId),
@@ -253,91 +315,120 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
     const keptAlbums = albumGroups.filter((album) => album.included).length;
 
     return (
-      <div className="commit-page">
-        {plan ? (
-          <div className="import-plan-header">
-            <h1>提交确认</h1>
-            <div className="toolbar import-plan-actions">
-              <button
-                className="btn-primary"
-                onClick={handleStartCommit}
-                disabled={commitMutation.isPending || plan.kept_images.length === 0}
-              >
-                {commitMutation.isPending ? '提交中…' : '提交导入'}
-              </button>
-              <button className="btn-secondary" onClick={() => onNavigate('review')}>
-                退回至导入计划
-              </button>
-            </div>
-          </div>
-        ) : (
-          <h1>提交确认</h1>
-        )}
+      <div className="commit-page commit-page--m3">
+        <PageHeader
+          title="提交入库"
+          description="确认 frozen plan 摘要后，才会开始 staging、校验、发布与数据库提交。"
+          meta={plan ? <StatusBadge tone="success">读取 frozen plan</StatusBadge> : undefined}
+          actions={
+            plan ? (
+              <>
+                <Button variant="quiet" onClick={() => onNavigate('review')}>
+                  退回导入计划
+                </Button>
+                <Button
+                  variant="primary"
+                  onClick={handleStartCommit}
+                  disabled={plan.kept_images.length === 0}
+                  loading={commitMutation.isPending}
+                  loadingLabel="正在启动…"
+                >
+                  确认并开始入库
+                </Button>
+              </>
+            ) : undefined
+          }
+        />
 
-        {latestRun.isLoading && <p>正在加载可提交的导入任务…</p>}
-        {!latestRun.data && !latestRun.isLoading && (
-          <div className="commit-empty">
-            <p>当前没有已冻结计划的可提交任务。</p>
-            <button className="btn-primary" onClick={() => onNavigate('review')}>
-              前往审核 / 生成导入计划
-            </button>
-            <button className="btn-secondary" onClick={() => onNavigate('scan')}>
-              前往扫描
-            </button>
+        {latestRun.isLoading && !plan && (
+          <div className="commit-loading" role="status" aria-label="正在加载可提交的导入任务">
+            <Skeleton height={96} radius="var(--radius-panel)" />
           </div>
         )}
+        {!committableRunId && !latestRun.isLoading && !plan && (
+          <EmptyState
+            title="没有可提交的计划"
+            description="当前没有已冻结计划的可提交任务。请先完成审核并生成导入计划。"
+            action={
+              <div className="commit-empty-actions">
+                <Button variant="primary" onClick={() => onNavigate('review')}>
+                  前往审核 / 生成计划
+                </Button>
+                <Button variant="quiet" onClick={() => onNavigate('scan')}>
+                  前往扫描
+                </Button>
+              </div>
+            }
+          />
+        )}
 
-        {planQuery.isLoading && <p>正在准备导入计划…</p>}
+        {planQuery.isLoading && !plan && (
+          <div className="commit-loading" role="status" aria-label="正在读取 frozen plan">
+            <Skeleton height={160} radius="var(--radius-panel)" />
+          </div>
+        )}
         {planQuery.isError && (
-          <div className="commit-error">
-            <p>{String(planQuery.error)}</p>
-            <button className="btn-primary" onClick={() => onNavigate('review')}>
-              前往审核
-            </button>
-          </div>
+          <StatusBanner
+            tone="danger"
+            title="无法读取 frozen plan"
+            actions={<Button onClick={() => onNavigate('review')}>前往审核</Button>}
+          >
+            {String(planQuery.error)}
+          </StatusBanner>
         )}
-        {!planQuery.isLoading && !planQuery.isError && latestRun.data && !planQuery.data && (
-          <div className="commit-error">
-            <p>该导入任务尚未冻结计划。请先在审核页冻结计划后再提交。</p>
-            <button className="btn-primary" onClick={() => onNavigate('review')}>
-              前往审核
-            </button>
-            <button className="btn-secondary" onClick={() => onNavigate('scan')}>
-              前往扫描
-            </button>
-          </div>
-        )}
+        {!planQuery.isLoading &&
+          !planQuery.isError &&
+          committableRunId &&
+          !planQuery.data &&
+          !plan && (
+            <StatusBanner
+              tone="warning"
+              title="计划尚未冻结"
+              actions={<Button onClick={() => onNavigate('review')}>返回审核</Button>}
+            >
+              该导入任务没有可读取的 frozen plan；为保证提交输入稳定，入库操作已阻止。
+            </StatusBanner>
+          )}
 
         {plan && (
           <div className="commit-confirm">
+            <StatusBanner tone="warning" title="开始后将写入文件系统与数据库">
+              发布成功并完成完整性校验前不会归档源图集；取消后可能需要通过恢复页继续处理。
+            </StatusBanner>
             <div className="import-plan-summary">
               <div className="import-plan-stats">
-                <div className="scan-progress-card">
-                  <h3>图集数</h3>
-                  <p>{plan.total_albums}</p>
+                <div className="plan-stat">
+                  <span>图集数</span>
+                  <strong>{plan.total_albums}</strong>
                 </div>
-                <div className="scan-progress-card">
-                  <h3>图片总数</h3>
-                  <p>{plan.total_images}</p>
+                <div className="plan-stat">
+                  <span>图片总数</span>
+                  <strong>{plan.total_images}</strong>
                 </div>
-                <div className="scan-progress-card ok">
-                  <h3>导入</h3>
-                  <p>{plan.kept_images.length}</p>
+                <div className="plan-stat plan-stat--success">
+                  <span>计划导入</span>
+                  <strong>{plan.kept_images.length}</strong>
                 </div>
-                <div className="scan-progress-card warn">
-                  <h3>排除</h3>
-                  <p>{plan.excluded_count}</p>
+                <div className="plan-stat plan-stat--warning">
+                  <span>计划排除</span>
+                  <strong>{plan.excluded_count}</strong>
                 </div>
-                <div className="scan-progress-card">
-                  <h3>预计大小</h3>
-                  <p>{formatFileSize(totalFileSize)}</p>
+                <div className="plan-stat">
+                  <span>预计大小</span>
+                  <strong>{formatFileSize(totalFileSize)}</strong>
                 </div>
               </div>
 
               <div className="import-plan-kept">
-                <h3>
-                  导入图集 ({keptAlbums}) / 导入图片 ({plan.kept_images.length})
-                </h3>
+                <div className="plan-list-heading">
+                  <div>
+                    <h2>只读提交清单</h2>
+                    <p>内容来自 frozen plan，不在此页重新计算。</p>
+                  </div>
+                  <StatusBadge>
+                    {keptAlbums} 个图集 · {plan.kept_images.length} 张图片
+                  </StatusBadge>
+                </div>
                 <div className="import-plan-albums">
                   {albumGroups.map((album) => {
                     const isOpen = openPlanAlbums.has(album.albumId);
@@ -374,33 +465,54 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
                         </summary>
                         {isOpen && (
                           <div className="import-plan-image-list">
-                            {album.images.map((image) => (
-                              <div
-                                className={`import-plan-image-row ${
-                                  image.included ? 'included' : 'skipped'
-                                }`}
-                                key={image.image_id}
+                            {album.images
+                              .slice(0, planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE)
+                              .map((image) => (
+                                <div
+                                  className={`import-plan-image-row ${
+                                    image.included ? 'included' : 'skipped'
+                                  }`}
+                                  key={image.image_id}
+                                >
+                                  <CommitImageThumbnail
+                                    importRunId={plan.import_run_id}
+                                    image={image}
+                                    onOpen={openPlanImagePreview}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="import-plan-image-info"
+                                    onClick={() => openPlanImagePreview(image, null)}
+                                  >
+                                    <span className="mono">{image.relative_path}</span>
+                                    <span>{formatFileSize(image.file_size)}</span>
+                                  </button>
+                                  <span
+                                    className={`plan-toggle ${image.included ? 'is-on' : 'is-off'}`}
+                                  >
+                                    {image.included ? '导入' : '跳过'}
+                                  </span>
+                                </div>
+                              ))}
+                            {album.images.length > (planImageLimits[album.albumId] ?? 24) && (
+                              <Button
+                                variant="quiet"
+                                className="plan-load-more"
+                                onClick={() =>
+                                  setPlanImageLimits((current) => ({
+                                    ...current,
+                                    [album.albumId]:
+                                      (current[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE) +
+                                      PLAN_IMAGE_BATCH_SIZE,
+                                  }))
+                                }
                               >
-                                <CommitImageThumbnail
-                                  importRunId={plan.import_run_id}
-                                  image={image}
-                                  onOpen={openPlanImagePreview}
-                                />
-                                <button
-                                  type="button"
-                                  className="import-plan-image-info"
-                                  onClick={() => openPlanImagePreview(image, null)}
-                                >
-                                  <span className="mono">{image.relative_path}</span>
-                                  <span>{formatFileSize(image.file_size)}</span>
-                                </button>
-                                <span
-                                  className={`plan-toggle ${image.included ? 'is-on' : 'is-off'}`}
-                                >
-                                  {image.included ? '导入' : '跳过'}
-                                </span>
-                              </div>
-                            ))}
+                                再显示 {PLAN_IMAGE_BATCH_SIZE} 张（剩余{' '}
+                                {album.images.length -
+                                  (planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE)}{' '}
+                                张）
+                              </Button>
+                            )}
                           </div>
                         )}
                       </details>
@@ -437,145 +549,79 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
         : 0;
 
     return (
-      <div className="commit-page">
-        <h1>提交进行中</h1>
-        <div className="commit-progress">
-          <div className="progress-bar-container">
-            <div className="progress-bar" style={{ transform: `scaleX(${pct / 100})` }} />
-          </div>
-          <div className="progress-text">{pct}%</div>
+      <div className="commit-page commit-page--m3">
+        <PageHeader
+          title="正在入库"
+          description="请保持 ImageDB 运行；当前阶段与持久化事务状态同步。"
+          meta={<StatusBadge tone="info">{stageLabel(progress?.current_stage)}</StatusBadge>}
+          actions={
+            <Button variant="danger" onClick={handleCancel}>
+              取消入库
+            </Button>
+          }
+        />
 
-          <div className="progress-details">
-            <div>阶段: {stageLabel(progress?.current_stage)}</div>
-            {progress?.current_album && <div>当前图集: {progress.current_album}</div>}
+        <section className="commit-progress-panel" aria-labelledby="commit-progress-title">
+          <div className="commit-progress-heading">
             <div>
-              图集: {progress?.albums_completed ?? 0} / {progress?.albums_total ?? 0}
+              <h2 id="commit-progress-title">{progress?.current_album ?? '正在准备首个图集'}</h2>
+              <p>
+                已处理 {progress?.albums_completed ?? 0} / {progress?.albums_total ?? 0} 个图集
+              </p>
             </div>
-            <div>已提交图片: {progress?.images_committed ?? 0}</div>
-            <div>跳过: {progress?.albums_skipped ?? 0}</div>
-            <div>失败: {progress?.albums_failed ?? 0}</div>
+            <strong>{pct}%</strong>
           </div>
+          <Progress
+            value={pct}
+            label="整体入库进度"
+            detail={`${progress?.images_committed ?? 0} 张图片已提交`}
+          />
+          <dl className="commit-metrics">
+            <div>
+              <dt>已提交图片</dt>
+              <dd>{progress?.images_committed ?? 0}</dd>
+            </div>
+            <div>
+              <dt>已跳过图集</dt>
+              <dd>{progress?.albums_skipped ?? 0}</dd>
+            </div>
+            <div>
+              <dt>失败图集</dt>
+              <dd>{progress?.albums_failed ?? 0}</dd>
+            </div>
+          </dl>
+        </section>
 
-          {/* Detailed staging pipeline progress */}
-          <div className="commit-pipeline">
-            <h3>流程</h3>
-            <ul className="pipeline-steps">
-              <li
-                className={
-                  progress?.current_stage === 'preparing' ? 'active' : progress ? 'done' : ''
-                }
-              >
-                准备事务
-              </li>
-              <li
-                className={
-                  progress?.current_stage === 'committing' ||
-                  progress?.current_stage === 'processing_album'
-                    ? 'active'
-                    : progress?.current_stage === 'done' ||
-                        progress?.current_stage === 'verifying' ||
-                        progress?.current_stage === 'publishing' ||
-                        progress?.current_stage === 'db_committing' ||
-                        progress?.current_stage === 'library_committed' ||
-                        progress?.current_stage === 'source_archiving'
-                      ? 'done'
-                      : ''
-                }
-              >
-                复制到暂存区
-              </li>
-              <li
-                className={
-                  progress?.current_stage === 'verifying'
-                    ? 'active'
-                    : progress &&
-                        [
-                          'verified',
-                          'publishing',
-                          'published',
-                          'db_committing',
-                          'library_committed',
-                          'source_archiving',
-                          'source_archived',
-                          'done',
-                        ].includes(progress.current_stage)
-                      ? 'done'
-                      : ''
-                }
-              >
-                验证暂存区
-              </li>
-              <li
-                className={
-                  progress?.current_stage === 'publishing'
-                    ? 'active'
-                    : progress &&
-                        [
-                          'published',
-                          'db_committing',
-                          'library_committed',
-                          'source_archiving',
-                          'source_archived',
-                          'done',
-                        ].includes(progress.current_stage)
-                      ? 'done'
-                      : ''
-                }
-              >
-                发布目录
-              </li>
-              <li
-                className={
-                  progress?.current_stage === 'db_committing'
-                    ? 'active'
-                    : progress &&
-                        [
-                          'library_committed',
-                          'source_archiving',
-                          'source_archived',
-                          'done',
-                        ].includes(progress.current_stage)
-                      ? 'done'
-                      : ''
-                }
-              >
-                数据库确认
-              </li>
-              <li
-                className={
-                  progress?.current_stage === 'source_archiving'
-                    ? 'active'
-                    : progress?.current_stage === 'source_archived' ||
-                        progress?.current_stage === 'done'
-                      ? 'done'
-                      : ''
-                }
-              >
-                源图集归档
-              </li>
-            </ul>
-            <div className="progress-details">
-              <div>当前阶段: {stageLabel(progress?.current_stage)}</div>
+        <section className="commit-pipeline" aria-labelledby="commit-pipeline-title">
+          <div className="commit-section-heading">
+            <div>
+              <h2 id="commit-pipeline-title">文件事务流程</h2>
+              <p>每一步完成后才会进入下一阶段。</p>
             </div>
           </div>
+          <ol className="pipeline-steps">
+            {COMMIT_PIPELINE.map((step, index) => {
+              const state = commitPipelineStepState(progress?.current_stage, index);
+              return (
+                <li className={state} key={step.key}>
+                  <StatusIcon name={state === 'done' ? 'check' : 'info'} size={17} />
+                  <span>{step.label}</span>
+                </li>
+              );
+            })}
+          </ol>
+        </section>
 
-          {progress && progress.errors.length > 0 && (
-            <div className="commit-errors">
-              <h3>错误</h3>
-              <ul>
-                {progress.errors.map((item, index) => (
-                  <li key={`${index}-${item}`}>{item}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          <div className="commit-actions">
-            <button className="btn-danger" onClick={handleCancel}>
-              取消
-            </button>
-          </div>
-        </div>
+        {progress && progress.errors.length > 0 && (
+          <StatusBanner tone="danger" title="入库过程中出现错误">
+            {progress.errors.join('；')}
+          </StatusBanner>
+        )}
+        {error && (
+          <StatusBanner tone="danger" title="操作失败">
+            {error}
+          </StatusBanner>
+        )}
       </div>
     );
   }
@@ -583,73 +629,77 @@ export function CommitPage({ onNavigate }: CommitPageProps) {
   const isSuccess = progress?.state === 'completed';
   const isCancelled = progress?.state === 'cancelled';
   const needsRecovery = progress?.state === 'recovery_required';
-  const detectedIncomplete = progress?.state === 'recovery_required';
+  const resultTitle = isSuccess
+    ? '导入已完成'
+    : isCancelled
+      ? '导入已取消'
+      : needsRecovery
+        ? '检测到未完成事务'
+        : '导入出现问题';
 
   return (
-    <div className="commit-page">
-      <h1>提交结果</h1>
+    <div className="commit-page commit-page--m3">
+      <PageHeader
+        title="入库结果"
+        description="结果来自持久化事务状态；需要恢复时不会将任务显示为成功。"
+        actions={<Button onClick={() => onNavigate('dashboard')}>返回工作台</Button>}
+      />
 
-      <div className={`commit-result ${isSuccess ? 'success' : 'partial'}`}>
-        <div className="result-status">
-          {isSuccess
-            ? '导入已完成'
-            : isCancelled
-              ? '导入已取消'
-              : detectedIncomplete
-                ? '检测到未完成事务'
-                : needsRecovery
-                  ? '部分完成，等待恢复'
-                  : '导入出现问题'}
+      <section className={`commit-result ${isSuccess ? 'success' : 'partial'}`}>
+        <StatusIcon name={isSuccess ? 'check' : needsRecovery ? 'warning' : 'error'} size={32} />
+        <div className="commit-result-copy">
+          <h2>{resultTitle}</h2>
+          <p>
+            {isSuccess
+              ? '文件发布、数据库提交与源图集归档均已完成。'
+              : needsRecovery
+                ? '存在需要继续核对的文件事务，请前往恢复页处理。'
+                : isCancelled
+                  ? '任务已停止；源文件处理状态以当前持久化记录为准。'
+                  : '任务没有完成，请查看错误并保留现场。'}
+          </p>
         </div>
         <div className="commit-stats">
-          <div className="stat-card">
-            <div className="stat-value">{progress?.albums_total ?? 0}</div>
-            <div className="stat-label">图集数</div>
+          <div className="plan-stat">
+            <span>图集数</span>
+            <strong>{progress?.albums_total ?? 0}</strong>
           </div>
-          <div className="stat-card success">
-            <div className="stat-value">
+          <div className="plan-stat plan-stat--success">
+            <span>已提交</span>
+            <strong>
               {(progress?.albums_completed ?? 0) -
                 (progress?.albums_skipped ?? 0) -
                 (progress?.albums_failed ?? 0)}
-            </div>
-            <div className="stat-label">已提交</div>
+            </strong>
           </div>
-          <div className="stat-card">
-            <div className="stat-value">{progress?.albums_skipped ?? 0}</div>
-            <div className="stat-label">跳过</div>
+          <div className="plan-stat">
+            <span>跳过</span>
+            <strong>{progress?.albums_skipped ?? 0}</strong>
           </div>
-          <div className="stat-card danger">
-            <div className="stat-value">{progress?.albums_failed ?? 0}</div>
-            <div className="stat-label">失败</div>
+          <div className="plan-stat plan-stat--warning">
+            <span>失败</span>
+            <strong>{progress?.albums_failed ?? 0}</strong>
           </div>
-          <div className="stat-card">
-            <div className="stat-value">{progress?.images_committed ?? 0}</div>
-            <div className="stat-label">图片</div>
+          <div className="plan-stat">
+            <span>图片</span>
+            <strong>{progress?.images_committed ?? 0}</strong>
           </div>
         </div>
-      </div>
+      </section>
 
       {progress && progress.errors.length > 0 && (
-        <div className="commit-errors">
-          <h3>错误</h3>
-          <ul>
-            {progress.errors.map((item, index) => (
-              <li key={`${index}-${item}`}>{item}</li>
-            ))}
-          </ul>
-        </div>
+        <StatusBanner tone="danger" title="错误详情">
+          {progress.errors.join('；')}
+        </StatusBanner>
       )}
 
-      <div className="commit-actions">
-        <button className="btn-primary" onClick={() => onNavigate('dashboard')}>
-          返回工作台
-        </button>
-        {needsRecovery && (
-          <button className="btn-secondary" onClick={() => onNavigate('recovery')}>
+      {needsRecovery && (
+        <div className="commit-result-actions">
+          <Button variant="primary" onClick={() => onNavigate('recovery')}>
             前往恢复
-          </button>
-        )}
-      </div>
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
