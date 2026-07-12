@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import type { CommitProgress } from '../lib/ipc/types';
-import { PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
+import { PLAN_ALBUM_BATCH_SIZE, PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
 import { COMMIT_PIPELINE, commitPipelineStepState, isTerminalProgress } from './CommitPage';
 
 function progress(state: string): CommitProgress {
@@ -47,6 +47,8 @@ describe('commit progress semantics', () => {
   });
 
   test('limits expanded plan albums to a bounded preview batch', () => {
+    expect(PLAN_ALBUM_BATCH_SIZE).toBe(50);
+    expect(PLAN_ALBUM_BATCH_SIZE).toBeLessThan(1000);
     expect(PLAN_IMAGE_BATCH_SIZE).toBe(24);
     expect(PLAN_IMAGE_BATCH_SIZE).toBeLessThan(100);
   });

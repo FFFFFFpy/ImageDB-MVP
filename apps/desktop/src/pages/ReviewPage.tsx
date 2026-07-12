@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
-import { PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
+import { PLAN_ALBUM_BATCH_SIZE, PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
 import type { Route } from '../hooks/use-router';
 import type {
   ReviewCandidateDetail,
@@ -16,6 +16,7 @@ import {
   AppIcon,
   Button,
   EmptyState,
+  ImagePreviewDialog,
   PageHeader,
   Skeleton,
   StatusBadge,
@@ -223,6 +224,7 @@ export function ReviewPage({
   const [showPlan, setShowPlan] = useState(initialShowPlan);
   const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
   const [planImageLimits, setPlanImageLimits] = useState<Record<string, number>>({});
+  const [planAlbumLimit, setPlanAlbumLimit] = useState(PLAN_ALBUM_BATCH_SIZE);
   const [planEditError, setPlanEditError] = useState<string | null>(null);
   const [planEditPending, setPlanEditPending] = useState(false);
   const [previewModal, setPreviewModal] = useState<{
@@ -653,7 +655,7 @@ export function ReviewPage({
               </StatusBadge>
             </div>
             <div className="import-plan-albums">
-              {albumGroups.map((album) => {
+              {albumGroups.slice(0, planAlbumLimit).map((album) => {
                 const isOpen = openPlanAlbums.has(album.albumId);
                 return (
                   <details
@@ -760,20 +762,25 @@ export function ReviewPage({
                   </details>
                 );
               })}
+              {albumGroups.length > planAlbumLimit && (
+                <Button
+                  variant="quiet"
+                  className="plan-load-more"
+                  onClick={() => setPlanAlbumLimit((current) => current + PLAN_ALBUM_BATCH_SIZE)}
+                >
+                  再显示 {PLAN_ALBUM_BATCH_SIZE} 个图集（剩余 {albumGroups.length - planAlbumLimit}{' '}
+                  个）
+                </Button>
+              )}
             </div>
           </div>
         </div>
         {previewModal && (
-          <div className="image-preview-modal" onClick={() => setPreviewModal(null)}>
-            <div className="image-preview-dialog" onClick={(event) => event.stopPropagation()}>
-              {previewModal.dataUrl ? (
-                <img src={previewModal.dataUrl} alt={previewModal.image.relative_path} />
-              ) : (
-                <div className="image-preview-loading">正在加载预览...</div>
-              )}
-              <div className="mono">{previewModal.image.relative_path}</div>
-            </div>
-          </div>
+          <ImagePreviewDialog
+            dataUrl={previewModal.dataUrl}
+            path={previewModal.image.relative_path}
+            onClose={() => setPreviewModal(null)}
+          />
         )}
       </div>
     );

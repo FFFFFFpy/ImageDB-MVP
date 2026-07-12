@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`codex/mvp3-ui-redesign`
 
-当前实施阶段：M3.7，统一收尾、可访问性/性能审计与真实环境发布门禁；M3.0–M3.6 的视觉基线、设计系统及全部生产页面迁移已完成。
+当前实施阶段：M3 已完成并封板；M3.0–M3.7 的视觉系统、全部生产页面迁移、可访问性/性能审计、真实数据库/文件系统主链及 Tauri release 运行验证均已完成。后续默认回到 Debug、实战测试和 release gate 工作。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。M3 不修改 frozen plan、Commit、Recovery、数据库 migration 或匹配算法语义。
 
@@ -56,6 +56,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 单项测试、Clippy、Release 构建与本地 install-gate：已记录通过。
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
+- MVP3 UI 重设计：已完成；不等同于 clean Windows 完整 release publication 签字。
 
 ## 文档入口
 

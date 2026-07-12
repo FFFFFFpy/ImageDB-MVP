@@ -1091,46 +1091,6 @@ textarea {
   white-space: nowrap;
 }
 
-.image-preview-modal {
-  position: fixed;
-  inset: 0;
-  z-index: 30;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-  background: rgb(15 23 42 / 72%);
-}
-
-.image-preview-dialog {
-  max-width: min(92vw, 1100px);
-  max-height: 88vh;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  color: #f8fafc;
-}
-
-.image-preview-dialog img {
-  max-width: 100%;
-  max-height: calc(88vh - 40px);
-  object-fit: contain;
-  border-radius: 8px;
-  background: #0f172a;
-}
-
-.image-preview-loading {
-  min-width: 280px;
-  min-height: 180px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid #475569;
-  border-radius: 8px;
-  background: #0f172a;
-  color: #cbd5e1;
-}
-
 .import-plan-table {
   width: 100%;
   border-collapse: collapse;

@@ -5,6 +5,7 @@ export type { ButtonProps, ButtonVariant } from './Button';
 export { EmptyState } from './EmptyState';
 export { IconButton } from './IconButton';
 export type { IconButtonProps } from './IconButton';
+export { ImagePreviewDialog } from './ImagePreviewDialog';
 export { PageHeader } from './PageHeader';
 export { Progress } from './Progress';
 export { Skeleton } from './Skeleton';

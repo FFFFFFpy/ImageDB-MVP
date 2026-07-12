@@ -70,4 +70,12 @@ M3 启动时的生产界面具有以下可复核特征：
 - Vitest：依赖需经 Vite inline transform，包内 CSS Module 才能在 jsdom 测试加载。
 - Vite 6：生产构建通过，字体与 SVG/WebP 资源离线输出。
 - 当前资源成本：组件 CSS 约 125 KB；三份简体中文字库合计约 3.47 MB；其余拉丁字体和装饰资源约 0.2 MB。
-- Tauri 2：Web 产物兼容；真实窗口和安装包验证留在 M3.7。
+- Tauri 2：release 可执行文件与 NSIS 安装包构建、产物校验通过；隔离用户目录下进程保持响应，WebView2 CDP 确认 `tauri.localhost`、Tauri IPC 与设置导航可用。
+
+## M3.7 最终取证
+
+- 补查 1280×720 审核与 720×720 计划页面，关键 CTA、决策区和纵向滚动可用，控制台零错误。
+- 960×720 在 125% 与 150% device scale factor 下无横向溢出，三个核心审核决策按钮均可达。
+- `prefers-reduced-motion: reduce` 下等待 300ms 后运行中动画数为 0。
+- 图片预览对话框具备 `role="dialog"`、`aria-modal`、焦点锁定、Escape 关闭和焦点归还；单测与真实浏览器交互均通过。
+- frozen plan 首屏夹具 DOM 为 181 个节点、6 个图集，导航完成约 40ms；生产实现最多同时新增 50 个图集，每个展开图集最多新增 24 张图片预览。
