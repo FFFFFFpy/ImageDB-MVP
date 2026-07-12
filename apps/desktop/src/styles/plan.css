@@ -75,14 +75,16 @@
 }
 
 .plan-page--m3 .import-plan-album {
+  position: relative;
   border-color: var(--color-border);
   border-radius: var(--radius-control);
   background: var(--color-surface);
 }
 
 .plan-page--m3 .import-plan-album summary {
+  grid-template-columns: minmax(0, 1fr) auto;
   min-height: 52px;
-  padding: var(--space-3) var(--space-4);
+  padding: var(--space-3) 92px var(--space-3) var(--space-4);
 }
 
 .plan-page--m3 .import-plan-album summary:hover {
@@ -120,6 +122,13 @@
   border-color: var(--color-danger-border);
   background: var(--color-danger-soft);
   color: var(--color-danger-ink);
+}
+
+.plan-page--m3 .plan-album-toggle {
+  position: absolute;
+  top: 11px;
+  right: var(--space-4);
+  z-index: 1;
 }
 
 .plan-page--m3 .import-plan-image-row {

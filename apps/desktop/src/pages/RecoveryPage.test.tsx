@@ -1,7 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
-import { RecoveryPage, recoveryDisposition } from './RecoveryPage';
+import {
+  invalidateRecoveryWorkflowQueries,
+  RecoveryPage,
+  recoveryDisposition,
+} from './RecoveryPage';
 
 const mockApi = vi.hoisted(() => ({
   scanRecoverableTransactions: vi.fn(),
@@ -60,5 +64,21 @@ describe('RecoveryPage transaction disposition', () => {
     expect(recoveryDisposition('cancelled')).toBe('terminal');
     expect(recoveryDisposition('cleanup_required')).toBe('recoverable');
     expect(recoveryDisposition('staging')).toBe('recoverable');
+  });
+
+  test('refreshes recovery, navigation counts, and dashboard state together', () => {
+    const queryClient = { invalidateQueries: vi.fn() };
+
+    invalidateRecoveryWorkflowQueries(queryClient);
+
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['recoverableTransactions'],
+    });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['database-info-dashboard'],
+    });
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['import-runs-dashboard'],
+    });
   });
 });

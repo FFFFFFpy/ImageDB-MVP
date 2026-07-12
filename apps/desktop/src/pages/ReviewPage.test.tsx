@@ -1,10 +1,25 @@
-import { describe, expect, test, vi } from 'vitest';
-import type { ImportPlanImage } from '../lib/ipc/types';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, test, vi } from 'vitest';
+import { api } from '../lib/ipc/api';
+import { importPlanFixture } from '../components/fixtures/importPlanFixture';
+import type {
+  ImportPlanImage,
+  ReviewCandidateDetail,
+  ReviewCandidateSummary,
+  ReviewProgress,
+} from '../lib/ipc/types';
 import {
   groupImportPlanImagesByAlbum,
   invalidateReviewWorkflowQueries,
   REVIEW_DECISION_OPTIONS,
+  ReviewPage,
 } from './ReviewPage';
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function image(overrides: Partial<ImportPlanImage>): ImportPlanImage {
   return {
@@ -83,5 +98,115 @@ describe('REVIEW_DECISION_OPTIONS', () => {
       { decision: 'keep_candidate', shortcut: '2', label: '保留候选图片' },
       { decision: 'keep_all', shortcut: '3', label: '全部保留' },
     ]);
+  });
+
+  test('submits the source decision from keyboard shortcut 1', async () => {
+    const importRunId = 'keyboard-run';
+    const candidate: ReviewCandidateSummary = {
+      candidate_id: 'candidate-1',
+      source_image_id: 'source-1',
+      candidate_source_image_id: 'source-2',
+      candidate_library_image_id: null,
+      scope: 'intra_album',
+      match_type: 'perceptual_near',
+      transform_type: 'identity',
+      confidence: 0.9,
+      album_name: '键盘图集',
+      has_decision: false,
+    };
+    const detail: ReviewCandidateDetail = {
+      candidate_id: candidate.candidate_id,
+      source_image_id: candidate.source_image_id,
+      source_image_path: 'D:/键盘图集/源图片.jpg',
+      source_image_file_size: 100,
+      source_image_width: 100,
+      source_image_height: 100,
+      candidate_source_image_id: candidate.candidate_source_image_id,
+      candidate_source_image_path: 'D:/键盘图集/候选图片.jpg',
+      candidate_source_image_file_size: 100,
+      candidate_source_image_width: 100,
+      candidate_source_image_height: 100,
+      candidate_library_image_id: null,
+      candidate_library_image_path: null,
+      candidate_library_image_file_size: null,
+      candidate_library_image_width: null,
+      candidate_library_image_height: null,
+      scope: candidate.scope,
+      match_type: candidate.match_type,
+      blake3_equal: false,
+      pixel_hash_equal: false,
+      gradient_distance: 2,
+      block_distance: 3,
+      median_distance: 2,
+      transform_type: 'identity',
+      confidence: 0.9,
+      album_name: candidate.album_name,
+      album_id: 'keyboard-album',
+      existing_decision: null,
+    };
+    const progress: ReviewProgress = {
+      import_run_id: importRunId,
+      total_review_candidates: 1,
+      decided_count: 0,
+      remaining_count: 1,
+      all_decided: false,
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData(['reviewQueue', importRunId], [candidate]);
+    client.setQueryData(['reviewProgress', importRunId], progress);
+    client.setQueryData(['reviewDetail', candidate.candidate_id], detail);
+    client.setQueryData(['reviewFrozenImportPlanSummary', importRunId], null);
+    const submit = vi.spyOn(api, 'submitReviewDecision').mockResolvedValue(undefined);
+
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewPage
+          initialImportRunId={importRunId}
+          initialPreviews={{
+            left: 'data:image/png;base64,AA==',
+            right: 'data:image/png;base64,AA==',
+          }}
+          enablePolling={false}
+          onNavigate={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole('button', { name: /保留源图片/ })).toBeEnabled();
+    fireEvent.keyDown(window, { key: '1' });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith(candidate.candidate_id, 'keep_source'));
+  });
+
+  test('shows a frozen import plan when the run has no review candidates', async () => {
+    const importRunId = importPlanFixture.import_run_id;
+    const progress: ReviewProgress = {
+      import_run_id: importRunId,
+      total_review_candidates: 0,
+      decided_count: 0,
+      remaining_count: 0,
+      all_decided: true,
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData(['reviewQueue', importRunId], []);
+    client.setQueryData(['reviewProgress', importRunId], progress);
+
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewPage
+          initialImportRunId={importRunId}
+          initialPlan={importPlanFixture}
+          initialShowPlan
+          enablePolling={false}
+          onNavigate={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: '导入计划' })).toBeVisible();
+    expect(screen.queryByText('没有待审核候选')).not.toBeInTheDocument();
   });
 });

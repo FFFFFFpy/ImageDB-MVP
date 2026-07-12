@@ -578,7 +578,7 @@ export function ReviewPage({
     (progress?.all_decided ?? false) ||
     (queueQuery.isSuccess && undecidedQueue.length === 0 && totalCandidates > 0);
 
-  if (totalCandidates === 0) {
+  if (totalCandidates === 0 && !(showPlan && importPlan)) {
     return (
       <div className="review-page review-page--m3">
         <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
@@ -688,19 +688,15 @@ export function ReviewPage({
                         导入 {album.imageCount} 张 / 跳过 {album.skippedImageCount} 张 ·{' '}
                         {formatFileSize(album.totalSize)}
                       </span>
-                      <button
-                        type="button"
-                        className={`plan-toggle ${album.included ? 'is-on' : 'is-off'}`}
-                        disabled={planEditPending}
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          togglePlanAlbum(album);
-                        }}
-                      >
-                        {album.included ? '导入' : '跳过'}
-                      </button>
                     </summary>
+                    <button
+                      type="button"
+                      className={`plan-toggle plan-album-toggle ${album.included ? 'is-on' : 'is-off'}`}
+                      disabled={planEditPending}
+                      onClick={() => togglePlanAlbum(album)}
+                    >
+                      {album.included ? '导入' : '跳过'}
+                    </button>
                     {isOpen && (
                       <div className="import-plan-image-list">
                         {album.images

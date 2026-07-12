@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`codex/mvp3-ui-redesign`
 
-当前实施阶段：M3 已完成并封板；M3.0–M3.7 的视觉系统、全部生产页面迁移、可访问性/性能审计、真实数据库/文件系统主链及 Tauri release 运行验证均已完成。后续默认回到 Debug、实战测试和 release gate 工作。
+当前实施阶段：M3.7 最终人工缩放签字。M3.0–M3.6 的视觉系统与全部生产页面迁移已经完成；自动门禁、1,000 图集/10,000 图片压力场景、真实 Tauri UI 完整主链、分析中断续跑和 Commit 中断恢复均已通过。当前 Windows 真实系统缩放为 125%，100% 与 150% 仍需人工切换系统设置签字，因此尚不能定性 M3 全部完成。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。M3 不修改 frozen plan、Commit、Recovery、数据库 migration 或匹配算法语义。
 
@@ -56,7 +56,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 单项测试、Clippy、Release 构建与本地 install-gate：已记录通过。
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
-- MVP3 UI 重设计：已完成；不等同于 clean Windows 完整 release publication 签字。
+- MVP3 UI 重设计：M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。
 
 ## 文档入口
 

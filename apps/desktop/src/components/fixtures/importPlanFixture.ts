@@ -25,6 +25,32 @@ function albumImages(albumId: string, albumName: string, count: number): ImportP
   });
 }
 
+export function createLargeImportPlanFixture(albumCount = 1_000, imagesPerAlbum = 10): ImportPlan {
+  const largeAlbums: ImportPlanAlbum[] = Array.from({ length: albumCount }, (_, albumIndex) => {
+    const albumId = `stress-album-${String(albumIndex + 1).padStart(4, '0')}`;
+    const albumName = `压力测试图集 ${String(albumIndex + 1).padStart(4, '0')}（中文 长路径）`;
+    const images = albumImages(albumId, albumName, imagesPerAlbum);
+    return {
+      album_id: albumId,
+      album_name: albumName,
+      included: true,
+      image_count: images.length,
+      total_size: images.reduce((sum, image) => sum + image.file_size, 0),
+      images,
+    };
+  });
+
+  return {
+    import_run_id: 'fixture-run-stress-plan',
+    total_albums: albumCount,
+    total_images: albumCount * imagesPerAlbum,
+    kept_images: largeAlbums.flatMap((album) => album.images),
+    excluded_count: 0,
+    skipped_albums: [],
+    albums: largeAlbums,
+  };
+}
+
 const albums: ImportPlanAlbum[] = albumDefinitions.map(([albumId, albumName, count]) => {
   const images = albumImages(albumId, albumName, count);
   return {

@@ -483,7 +483,7 @@ export function SettingsPage({
           {testExt.isPending ? '测试中…' : '测试连接'}
         </button>
         <button
-          className="btn-primary"
+          className="settings-primary-action"
           onClick={() => initExternal.mutate()}
           disabled={initExternal.isPending}
         >

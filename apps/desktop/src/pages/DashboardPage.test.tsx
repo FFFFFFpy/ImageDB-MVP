@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import type { DatabaseInfoDashboard, DatabaseState } from '../lib/ipc/types';
 import { DashboardPage, getNextActionPresentation } from './DashboardPage';
@@ -97,6 +97,7 @@ function renderDashboard(
     defaultOptions: { queries: { retry: false } },
   });
   return {
+    client,
     onGoScan,
     onGoReview,
     onGoCommit,
@@ -161,6 +162,21 @@ describe('DashboardPage database info', () => {
     expect(screen.getByText('待审核')).toBeInTheDocument();
     expect(screen.getByText('失败')).toBeInTheDocument();
     expect(await screen.findByText('120')).toBeInTheDocument();
+  });
+
+  test('preserves keyboard focus when a polling refetch returns updated data', async () => {
+    const { client } = renderDashboard();
+    const action = await screen.findByRole('button', { name: '继续分析' });
+    action.focus();
+
+    mockState.databaseInfo = {
+      ...mockState.databaseInfo,
+      library: { ...mockState.databaseInfo.library, library_image_count: 121 },
+    };
+    await client.refetchQueries({ queryKey: ['database-info-dashboard'] });
+
+    await waitFor(() => expect(screen.getByText('121')).toBeInTheDocument());
+    expect(action).toHaveFocus();
   });
 
   test('passes the resumable run id when continuing analysis', async () => {

@@ -11,6 +11,7 @@ import { RecoveryFixture } from './components/fixtures/RecoveryFixture';
 import { SettingsFixture } from './components/fixtures/SettingsFixture';
 import { OnboardingFixture } from './components/fixtures/OnboardingFixture';
 import { ProbesFixture } from './components/fixtures/ProbesFixture';
+import { StressPlanFixture } from './components/fixtures/StressPlanFixture';
 import { UiShowcase } from './components/ui';
 import 'animal-island-ui/style';
 import './styles/tokens.css';
@@ -52,6 +53,9 @@ const showM3OnboardingFixture =
   new URLSearchParams(window.location.search).get('m3-fixture') === 'onboarding';
 const showM3ProbesFixture =
   import.meta.env.DEV && new URLSearchParams(window.location.search).get('m3-fixture') === 'probes';
+const showM3StressPlanFixture =
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get('m3-fixture') === 'stress-plan';
 const commitFixtureState =
   (new URLSearchParams(window.location.search).get('m3-state') as CommitFixtureState | null) ??
   'confirm';
@@ -78,6 +82,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       <OnboardingFixture />
     ) : showM3ProbesFixture ? (
       <ProbesFixture />
+    ) : showM3StressPlanFixture ? (
+      <StressPlanFixture />
     ) : (
       <QueryClientProvider client={queryClient}>
         <App />

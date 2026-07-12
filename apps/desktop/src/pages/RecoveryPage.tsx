@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { type QueryClient, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { Route } from '../hooks/use-router';
 import type { RecoveryDiagnostic, RecoveryOutcome, ReverifyResult } from '../lib/ipc/types';
@@ -24,6 +24,14 @@ export function recoveryDisposition(state: string): RecoveryDisposition {
   if (state === 'conflict') return 'conflict';
   if (state === 'failed' || state === 'cancelled') return 'terminal';
   return 'recoverable';
+}
+
+export function invalidateRecoveryWorkflowQueries(
+  queryClient: Pick<QueryClient, 'invalidateQueries'>,
+) {
+  queryClient.invalidateQueries({ queryKey: ['recoverableTransactions'] });
+  queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] });
+  queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] });
 }
 
 function formatState(state: string): string {
@@ -72,7 +80,7 @@ export function RecoveryPage({
   }, [diagnosticsQuery.data]);
 
   const refresh = useCallback(() => {
-    queryClient.invalidateQueries({ queryKey: ['recoverableTransactions'] });
+    invalidateRecoveryWorkflowQueries(queryClient);
   }, [queryClient]);
 
   const handleRecover = useCallback(
