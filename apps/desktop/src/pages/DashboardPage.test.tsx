@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import type { DatabaseInfoDashboard, DatabaseState } from '../lib/ipc/types';
-import { DashboardPage } from './DashboardPage';
+import { DashboardPage, getNextActionPresentation } from './DashboardPage';
 
 const mockState = vi.hoisted(() => ({
   databaseStatus: {
@@ -153,16 +153,14 @@ describe('DashboardPage database info', () => {
   test('renders the database info dashboard counts', async () => {
     renderDashboard();
 
-    expect(await screen.findByText('数据库概览')).toBeInTheDocument();
-    expect(screen.getByText('图库根目录')).toBeInTheDocument();
-    expect(screen.getByText('已入库图集')).toBeInTheDocument();
-    expect(screen.getByText('已入库图片')).toBeInTheDocument();
-    expect(screen.getByText('导入任务')).toBeInTheDocument();
+    expect(await screen.findByText('图库概览')).toBeInTheDocument();
+    expect(screen.getByText('图集')).toBeInTheDocument();
+    expect(screen.getByText('图片')).toBeInTheDocument();
+    expect(screen.getByText('位置')).toBeInTheDocument();
+    expect(screen.getByText('导入任务进度')).toBeInTheDocument();
     expect(screen.getByText('待审核')).toBeInTheDocument();
-    expect(screen.getByText('失败图集')).toBeInTheDocument();
-    expect(screen.getByText('冻结计划')).toBeInTheDocument();
+    expect(screen.getByText('失败')).toBeInTheDocument();
     expect(await screen.findByText('120')).toBeInTheDocument();
-    expect(await screen.findByText('260')).toBeInTheDocument();
   });
 
   test('passes the resumable run id when continuing analysis', async () => {
@@ -333,5 +331,20 @@ describe('DashboardPage database info', () => {
     fireEvent.click(await screen.findByRole('button', { name: '处理失败事务' }));
     expect(onGoRecovery).toHaveBeenCalledOnce();
     expect(screen.queryByRole('button', { name: '前往恢复' })).not.toBeInTheDocument();
+  });
+});
+
+describe('DashboardPage next_action presentation', () => {
+  test.each([
+    ['recover', '前往恢复'],
+    ['inspect_transaction_failure', '处理失败事务'],
+    ['review', '继续审核'],
+    ['generate_plan', '前往入库审核'],
+    ['resume_analysis', '继续分析'],
+    ['inspect_failed', '查看失败图集'],
+    ['resume_commit', '继续入库'],
+    ['new_import', '开始导入'],
+  ] as const)('maps backend action %s to %s', (action, label) => {
+    expect(getNextActionPresentation(action).label).toBe(label);
   });
 });

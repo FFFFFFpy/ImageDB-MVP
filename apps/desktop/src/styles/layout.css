@@ -1,0 +1,210 @@
+.app-shell {
+  display: grid;
+  grid-template-columns: 216px minmax(0, 1fr);
+  min-height: 100vh;
+  background: var(--color-canvas);
+}
+
+.app-sidebar {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  flex-direction: column;
+  width: 216px;
+  height: 100vh;
+  padding: var(--space-4) var(--space-3);
+  border-right: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.app-brand {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+  width: 100%;
+  min-height: 52px;
+  padding: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-ink);
+  cursor: pointer;
+  text-align: left;
+}
+
+.app-brand:hover {
+  background: var(--color-surface-soft);
+}
+
+.app-brand:focus-visible,
+.app-nav__item:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.app-brand__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  border-radius: 13px;
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+  box-shadow: 0 3px 0 var(--color-primary-pressed);
+}
+
+.app-brand__name {
+  font-size: 19px;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+}
+
+.app-nav {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-5);
+}
+
+.app-nav__item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: var(--space-3);
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 var(--space-3);
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-ink-muted);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+  text-align: left;
+  transition:
+    color var(--motion-fast) var(--ease-out),
+    background-color var(--motion-fast) var(--ease-out),
+    border-color var(--motion-fast) var(--ease-out);
+}
+
+.app-nav__item:hover {
+  background: var(--color-surface-soft);
+  color: var(--color-ink);
+}
+
+.app-nav__item.is-active {
+  border-color: var(--color-success-border);
+  background: var(--color-primary-soft);
+  color: var(--color-primary-pressed);
+}
+
+.app-nav__item svg {
+  justify-self: center;
+}
+
+.app-nav__badge {
+  min-width: 21px;
+  padding: 2px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-warning-soft);
+  color: var(--color-warning-ink);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 17px;
+  text-align: center;
+}
+
+.app-sidebar__footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.app-sidebar__privacy {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin: 0;
+  padding: 0 var(--space-3);
+  color: var(--color-ink-subtle);
+  font-size: 11px;
+}
+
+.app-sidebar__privacy span:first-child {
+  color: var(--color-primary);
+  font-size: 8px;
+}
+
+.app-main {
+  min-width: 0;
+  padding: var(--space-8);
+  overflow: auto;
+  background: var(--color-canvas);
+}
+
+@media (max-width: 959px) {
+  .app-shell {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+
+  .app-sidebar {
+    width: 72px;
+    padding-inline: var(--space-2);
+  }
+
+  .app-brand {
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .app-brand__name,
+  .app-nav__label,
+  .app-sidebar__privacy span:last-child {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .app-nav__item {
+    display: flex;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .app-nav__badge {
+    position: absolute;
+    top: 3px;
+    right: 2px;
+    min-width: 17px;
+    padding: 0 4px;
+    font-size: 9px;
+    line-height: 17px;
+  }
+
+  .app-sidebar__privacy {
+    justify-content: center;
+    padding: 0;
+  }
+
+  .app-main {
+    padding: var(--space-6);
+  }
+}
+
+@media (max-width: 719px) {
+  .app-main {
+    padding: var(--space-4);
+  }
+}

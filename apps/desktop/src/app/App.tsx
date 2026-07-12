@@ -77,7 +77,7 @@ export function App() {
           {route === 'review' && <ReviewPage onNavigate={navigate} />}
           {route === 'commit' && <CommitPage onNavigate={navigate} />}
           {route === 'recovery' && <RecoveryPage onNavigate={navigate} />}
-          {route === 'settings' && <SettingsPage />}
+          {route === 'settings' && <SettingsPage onOpenProbes={() => navigate('probes')} />}
           {route === 'probes' && <ProbesPage />}
         </Layout>
       )}

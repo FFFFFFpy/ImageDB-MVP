@@ -1,4 +1,6 @@
 export { Button } from './Button';
+export { AppIcon } from './AppIcon';
+export type { AppIconName } from './AppIcon';
 export type { ButtonProps, ButtonVariant } from './Button';
 export { EmptyState } from './EmptyState';
 export { IconButton } from './IconButton';

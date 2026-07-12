@@ -174,7 +174,10 @@ test('renders sidebar navigation', async () => {
   expect(await screen.findByRole('button', { name: '工作台' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '新建导入' })).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '设置' })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: '技术探针' })).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '技术探针' })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: '设置' }));
+  expect(await screen.findByRole('button', { name: '打开技术探针' })).toBeInTheDocument();
 });
 
 test('sidebar new import clears a run selected from the dashboard', async () => {
@@ -257,11 +260,11 @@ test('renders ImageDB brand in sidebar', async () => {
   expect(await screen.findByText('ImageDB')).toBeInTheDocument();
 });
 
-test('renders status cards section', async () => {
+test('renders compact system health section', async () => {
   renderApp();
-  expect(await screen.findByText('数据库')).toBeInTheDocument();
-  expect(screen.getByText('pgvector')).toBeInTheDocument();
-  expect(screen.getByText('迁移')).toBeInTheDocument();
+  expect(await screen.findByRole('region', { name: '系统健康' })).toBeInTheDocument();
+  expect(screen.getByText('pgvector 可用')).toBeInTheDocument();
+  expect(screen.getByText(/迁移 0002_indexes/)).toBeInTheDocument();
 });
 
 test('does not present a local managed path as active before database mode is selected', async () => {
@@ -281,7 +284,7 @@ test('does not present a local managed path as active before database mode is se
 
   renderApp();
 
-  expect(await screen.findByText('未初始化')).toBeInTheDocument();
+  expect((await screen.findAllByText('未初始化')).length).toBeGreaterThan(0);
   expect(screen.getByText('尚未选择数据库模式')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: '选择数据库模式' })).toBeInTheDocument();
   expect(screen.queryByText(/postgres_data : 0/)).not.toBeInTheDocument();
@@ -313,7 +316,7 @@ test('routes unresolved database mode from dashboard to settings instead of onbo
 
 test('renders tagged database status objects without crashing', async () => {
   renderApp();
-  expect(await screen.findByText(/缺少 PostgreSQL 运行文件/)).toBeInTheDocument();
+  expect((await screen.findAllByText(/缺少 PostgreSQL 运行文件/)).length).toBeGreaterThan(0);
 });
 
 test('shows managed PostgreSQL startup retries as recovering', async () => {

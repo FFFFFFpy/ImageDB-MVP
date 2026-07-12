@@ -97,7 +97,7 @@ function DbActivationResult({
   );
 }
 
-export function SettingsPage() {
+export function SettingsPage({ onOpenProbes }: { onOpenProbes?: () => void }) {
   const queryClient = useQueryClient();
 
   const settings = useQuery({
@@ -628,6 +628,19 @@ export function SettingsPage() {
         {probeStorage.data && <StorageCapabilityReport capabilities={probeStorage.data} />}
         {probeStorage.isError && <pre className="status-err">{String(probeStorage.error)}</pre>}
       </section>
+
+      {onOpenProbes && (
+        <section className="settings-section">
+          <h2>诊断</h2>
+          <p className="settings-help">
+            运行
+            PostgreSQL、图片指纹和文件事务技术探针。这里的工具用于排查环境问题，不属于日常导入流程。
+          </p>
+          <button type="button" onClick={onOpenProbes}>
+            打开技术探针
+          </button>
+        </section>
+      )}
     </div>
   );
 }

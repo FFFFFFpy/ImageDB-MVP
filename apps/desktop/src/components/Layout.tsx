@@ -1,42 +1,99 @@
+import { useQuery } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import type { Route } from '../hooks/use-router';
+import { api } from '../lib/ipc/api';
+import { AppIcon, type AppIconName } from './ui';
 
 interface LayoutProps {
   children: ReactNode;
   currentRoute: Route;
   onNavigate: (route: Route) => void;
+  enablePolling?: boolean;
 }
 
-const NAV_ITEMS: { route: Route; label: string }[] = [
-  { route: 'dashboard', label: '工作台' },
-  { route: 'scan', label: '新建导入' },
-  { route: 'review', label: '审核' },
-  { route: 'commit', label: '入库' },
-  { route: 'recovery', label: '恢复' },
-  { route: 'settings', label: '设置' },
-  { route: 'probes', label: '技术探针' },
+const NAV_ITEMS: { route: Route; label: string; icon: AppIconName }[] = [
+  { route: 'dashboard', label: '工作台', icon: 'dashboard' },
+  { route: 'scan', label: '新建导入', icon: 'import' },
+  { route: 'review', label: '审核', icon: 'review' },
+  { route: 'commit', label: '入库', icon: 'commit' },
+  { route: 'recovery', label: '恢复', icon: 'recovery' },
 ];
 
-export function Layout({ children, currentRoute, onNavigate }: LayoutProps) {
+export function Layout({ children, currentRoute, onNavigate, enablePolling = true }: LayoutProps) {
+  const databaseInfo = useQuery({
+    queryKey: ['database-info-dashboard'],
+    queryFn: api.getDatabaseInfoDashboard,
+    refetchInterval: enablePolling ? 3000 : false,
+  });
+
+  const counts: Partial<Record<Route, number>> = {
+    scan: databaseInfo.data?.imports.failed_album_count ?? 0,
+    review: databaseInfo.data?.imports.pending_review_count ?? 0,
+    recovery: databaseInfo.data?.imports.recovery_required_run_count ?? 0,
+  };
+
   return (
-    <div className="layout">
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <h2>ImageDB</h2>
-        </div>
-        <nav className="sidebar-nav">
-          {NAV_ITEMS.map((item) => (
-            <button
-              key={item.route}
-              className={`nav-item ${currentRoute === item.route ? 'active' : ''}`}
-              onClick={() => onNavigate(item.route)}
-            >
-              {item.label}
-            </button>
-          ))}
+    <div className="app-shell">
+      <aside className="app-sidebar" aria-label="主导航">
+        <button
+          className="app-brand"
+          type="button"
+          aria-label="ImageDB 工作台"
+          onClick={() => onNavigate('dashboard')}
+        >
+          <span className="app-brand__mark">
+            <AppIcon name="brand" size={24} />
+          </span>
+          <span className="app-brand__name">ImageDB</span>
+        </button>
+
+        <nav className="app-nav">
+          {NAV_ITEMS.map((item) => {
+            const isActive = currentRoute === item.route;
+            const count = counts[item.route] ?? 0;
+            return (
+              <button
+                key={item.route}
+                type="button"
+                className={`app-nav__item ${isActive ? 'is-active' : ''}`}
+                aria-current={isActive ? 'page' : undefined}
+                aria-label={item.label}
+                title={item.label}
+                onClick={() => onNavigate(item.route)}
+              >
+                <AppIcon name={item.icon} />
+                <span className="app-nav__label">{item.label}</span>
+                {count > 0 && (
+                  <span className="app-nav__badge" aria-hidden="true">
+                    {count > 99 ? '99+' : count}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </nav>
+
+        <div className="app-sidebar__footer">
+          <button
+            type="button"
+            className={`app-nav__item ${currentRoute === 'settings' || currentRoute === 'probes' ? 'is-active' : ''}`}
+            aria-current={
+              currentRoute === 'settings' || currentRoute === 'probes' ? 'page' : undefined
+            }
+            aria-label="设置"
+            title="设置"
+            onClick={() => onNavigate('settings')}
+          >
+            <AppIcon name="settings" />
+            <span className="app-nav__label">设置</span>
+          </button>
+          <p className="app-sidebar__privacy">
+            <span aria-hidden="true">●</span>
+            <span>本地处理</span>
+          </p>
+        </div>
       </aside>
-      <main className="main-content">{children}</main>
+      <main className="app-main">{children}</main>
     </div>
   );
 }

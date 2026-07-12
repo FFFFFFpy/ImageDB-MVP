@@ -1,6 +1,16 @@
 import { useQuery } from '@tanstack/react-query';
-import { api } from '../lib/ipc/api';
+import {
+  AppIcon,
+  Button,
+  EmptyState,
+  PageHeader,
+  Progress,
+  Skeleton,
+  StatusBadge,
+} from '../components/ui';
 import { formatTaggedStatus, taggedStatusCode } from '../lib/format';
+import { api } from '../lib/ipc/api';
+import type { DashboardNextAction } from '../lib/ipc/types';
 
 interface DashboardPageProps {
   needsOnboarding: boolean;
@@ -9,12 +19,105 @@ interface DashboardPageProps {
   onGoReview: () => void;
   onGoCommit: () => void;
   onGoRecovery: () => void;
+  enablePolling?: boolean;
+}
+
+interface NextActionPresentation {
+  title: string;
+  description: string;
+  label: string;
+  tone: 'default' | 'warning' | 'danger';
+}
+
+export function getNextActionPresentation(action: DashboardNextAction): NextActionPresentation {
+  switch (action) {
+    case 'recover':
+      return {
+        title: '继续未完成的入库事务',
+        description: '入库事务需要按已有证据继续恢复，完成前不会归档源图集。',
+        label: '前往恢复',
+        tone: 'warning',
+      };
+    case 'inspect_transaction_failure':
+      return {
+        title: '处理失败事务',
+        description: '事务已进入需要人工处置的终态，请先检查证据与文件状态。',
+        label: '处理失败事务',
+        tone: 'danger',
+      };
+    case 'review':
+      return {
+        title: '完成图片审核',
+        description: '有候选图片等待确认；审核决定会写入后续导入计划。',
+        label: '继续审核',
+        tone: 'default',
+      };
+    case 'generate_plan':
+      return {
+        title: '生成导入计划',
+        description: '审核已经完成，下一步将生成并检查可冻结的导入计划。',
+        label: '前往入库审核',
+        tone: 'default',
+      };
+    case 'resume_analysis':
+      return {
+        title: '继续分析图片',
+        description: '继续上次明确保存的导入任务，不会创建重复任务。',
+        label: '继续分析',
+        tone: 'default',
+      };
+    case 'inspect_failed':
+      return {
+        title: '检查失败图集',
+        description: '部分图集分析失败；先定位原因，再决定是否单独重试。',
+        label: '查看失败图集',
+        tone: 'warning',
+      };
+    case 'resume_commit':
+      return {
+        title: '继续执行入库',
+        description: '已有 frozen plan 等待执行，入库仍将严格读取该计划。',
+        label: '继续入库',
+        tone: 'default',
+      };
+    case 'new_import':
+      return {
+        title: '导入一批新图片',
+        description: '选择包含图集的目录，ImageDB 会先分析，不会修改源文件。',
+        label: '开始导入',
+        tone: 'default',
+      };
+  }
 }
 
 function formatDatabaseMode(mode: 'managed_local' | 'external' | null | undefined): string {
   if (mode === 'managed_local') return '托管本地 PostgreSQL';
   if (mode === 'external') return '外部 PostgreSQL';
   return '未配置';
+}
+
+function runStateLabel(state: string): string {
+  const labels: Record<string, string> = {
+    pending: '等待分析',
+    analyzing: '正在分析',
+    review_required: '等待审核',
+    ready_to_commit: '可以生成计划',
+    committing: '正在入库',
+    recovery_required: '需要恢复',
+    completed: '已完成',
+    abandoned: '已放弃',
+    failed: '失败',
+    cancelled: '已取消',
+  };
+  return labels[state] ?? state;
+}
+
+function stateTone(state: string): 'neutral' | 'info' | 'success' | 'warning' | 'danger' {
+  if (state === 'completed') return 'success';
+  if (state === 'failed' || state === 'recovery_required') return 'danger';
+  if (state === 'review_required' || state === 'cancelled') return 'warning';
+  if (state === 'analyzing' || state === 'committing') return 'info';
+  return 'neutral';
 }
 
 export function DashboardPage({
@@ -24,29 +127,32 @@ export function DashboardPage({
   onGoReview,
   onGoCommit,
   onGoRecovery,
+  enablePolling = true,
 }: DashboardPageProps) {
   const dbStatus = useQuery({
     queryKey: ['database-status'],
     queryFn: api.getDatabaseStatus,
-    refetchInterval: 5000,
+    refetchInterval: enablePolling ? 5000 : false,
   });
   const databaseInfo = useQuery({
     queryKey: ['database-info-dashboard'],
     queryFn: api.getDatabaseInfoDashboard,
-    refetchInterval: 3000,
+    refetchInterval: enablePolling ? 3000 : false,
     enabled: !needsOnboarding,
   });
 
   if (needsOnboarding) {
     return (
-      <div className="dashboard-page">
-        <div className="empty-state">
-          <h1>欢迎使用 ImageDB</h1>
-          <p>数据库尚未配置。请先完成初始化设置。</p>
-          <button className="btn-primary" onClick={onConfigureDatabase}>
-            开始设置
-          </button>
-        </div>
+      <div className="dashboard-page dashboard-page--empty">
+        <EmptyState
+          title="欢迎使用 ImageDB"
+          description="先完成本地数据库配置，之后所有图片分析与入库都在你的设备上进行。"
+          action={
+            <Button variant="primary" onClick={onConfigureDatabase}>
+              开始设置
+            </Button>
+          }
+        />
       </div>
     );
   }
@@ -65,162 +171,191 @@ export function DashboardPage({
   const databaseStatusLabel = isDatabaseRecovering
     ? '托管 PostgreSQL 正在启动 / 恢复中'
     : isConnected
-      ? '已连接'
+      ? '数据库已连接'
       : statusText;
   const databaseDetail =
     dbStatus.data?.mode === 'external' && dbStatus.data.external_config
-      ? `外部 PostgreSQL：${dbStatus.data.external_config.host}:${dbStatus.data.external_config.port}/${dbStatus.data.external_config.database}`
+      ? `${dbStatus.data.external_config.host}:${dbStatus.data.external_config.port}/${dbStatus.data.external_config.database}`
       : dbStatus.data?.mode === 'managed_local' && dbStatus.data.managed_config
-        ? `托管库：${dbStatus.data.managed_config.data_dir} : ${dbStatus.data.managed_config.port}`
+        ? `${dbStatus.data.managed_config.data_dir} : ${dbStatus.data.managed_config.port}`
         : dbStatus.data?.mode === null
           ? '尚未选择数据库模式'
           : null;
+
   const latestRun = info?.latest_run ?? null;
   const actionableRun = info?.latest_actionable_run ?? null;
-  const pendingReviews = info?.imports.pending_review_count ?? 0;
-  const failedAlbums = info?.imports.failed_album_count ?? 0;
-  const recoveryRequiredRuns = info?.imports.recovery_required_run_count ?? 0;
-  const hasRecoveryTask = info?.next_action === 'recover';
-  const nextAction = (() => {
-    switch (info?.next_action) {
+  const nextActionCode = info?.next_action ?? 'new_import';
+  const nextAction = getNextActionPresentation(nextActionCode);
+  const nextActionClick = () => {
+    switch (nextActionCode) {
       case 'recover':
-        return { label: '前往恢复', onClick: onGoRecovery };
       case 'inspect_transaction_failure':
-        return { label: '处理失败事务', onClick: onGoRecovery };
+        onGoRecovery();
+        return;
       case 'review':
-        return { label: '继续审核', onClick: onGoReview };
       case 'generate_plan':
-        return { label: '前往入库审核', onClick: onGoReview };
+        onGoReview();
+        return;
       case 'resume_analysis':
-        return {
-          label: '继续分析',
-          onClick: () => onGoScan(actionableRun?.import_run_id ?? null),
-        };
       case 'inspect_failed':
-        return {
-          label: '查看失败图集',
-          onClick: () => onGoScan(actionableRun?.import_run_id ?? null),
-        };
+        onGoScan(actionableRun?.import_run_id ?? null);
+        return;
       case 'resume_commit':
-        return { label: '继续入库', onClick: onGoCommit };
-      default:
-        return { label: '开始导入', onClick: () => onGoScan(null) };
+        onGoCommit();
+        return;
+      case 'new_import':
+        onGoScan(null);
     }
-  })();
+  };
+  const processedAlbums = latestRun
+    ? latestRun.analyzed_albums + latestRun.review_required_albums + latestRun.failed_albums
+    : 0;
 
   return (
     <div className="dashboard-page">
-      <h1>工作台</h1>
+      <PageHeader
+        title="工作台"
+        description="图片留在本地，按当前任务一步一步完成整理与入库。"
+        actions={
+          <StatusBadge tone={isConnected ? 'success' : isDatabaseRecovering ? 'info' : 'warning'}>
+            {databaseStatusLabel}
+          </StatusBadge>
+        }
+      />
 
-      <div className="status-cards">
-        <div className={`status-card-dashboard ${isConnected ? 'ok' : 'warn'}`}>
-          <h3>数据库</h3>
-          <p className={isConnected ? 'status-ok' : 'status-warn'}>{databaseStatusLabel}</p>
-          {databaseDetail && <p className="status-card-detail">{databaseDetail}</p>}
+      {databaseInfo.isLoading && !info ? (
+        <div className="dashboard-skeleton" aria-label="正在加载工作台" role="status">
+          <Skeleton height={180} />
+          <Skeleton height={140} />
         </div>
-
-        <div
-          className={`status-card-dashboard ${dbStatus.data?.pgvector_available ? 'ok' : 'warn'}`}
-        >
-          <h3>pgvector</h3>
-          <p>{dbStatus.data?.pgvector_available ? '可用' : '不可用'}</p>
-        </div>
-
-        <div
-          className={`status-card-dashboard ${dbStatus.data?.migration_version ? 'ok' : 'warn'}`}
-        >
-          <h3>迁移</h3>
-          <p className="mono">{dbStatus.data?.migration_version ?? '未执行'}</p>
-        </div>
-      </div>
-
-      <section className="scan-progress-section">
-        <h2>数据库概览</h2>
-        <div className="database-info-grid">
-          <div className="scan-progress-card">
-            <h3>数据库模式</h3>
-            <p>{formatDatabaseMode(info?.database.mode ?? dbStatus.data?.mode)}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>图库根目录</h3>
-            <p>{info?.library.library_root_count ?? 0}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>已入库图集</h3>
-            <p>{info?.library.library_album_count ?? 0}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>已入库图片</h3>
-            <p>{info?.library.library_image_count ?? 0}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>导入任务</h3>
-            <p>{info?.imports.import_run_count ?? 0}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>导入图集</h3>
-            <p>{info?.imports.import_album_count ?? 0}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>导入图片</h3>
-            <p>{info?.imports.import_image_count ?? 0}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>待审核</h3>
-            <p className={pendingReviews > 0 ? 'status-warn' : ''}>{pendingReviews}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>失败图集</h3>
-            <p className={failedAlbums > 0 ? 'status-error' : ''}>{failedAlbums}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>需要恢复</h3>
-            <p className={hasRecoveryTask ? 'status-error' : 'status-ok'}>{recoveryRequiredRuns}</p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>失败任务</h3>
-            <p className={(info?.imports.failed_run_count ?? 0) > 0 ? 'status-error' : ''}>
-              {info?.imports.failed_run_count ?? 0}
-            </p>
-          </div>
-          <div className="scan-progress-card">
-            <h3>冻结计划</h3>
-            <p>{info?.imports.frozen_plan_count ?? 0}</p>
-          </div>
-        </div>
-        {latestRun && (
-          <p className="status-card-detail">
-            最近任务：{latestRun.total_albums} 个图集，已分析 {latestRun.analyzed_albums}，待审核{' '}
-            {latestRun.review_required_albums}，失败 {latestRun.failed_albums}
-            {latestRun.state === 'abandoned' ? '，已放弃' : ''}
-          </p>
-        )}
-      </section>
-
-      <section className="scan-action-section">
-        {isConnected ? (
-          <>
-            <h2>下一步</h2>
-            <p>从当前数据库状态继续处理，或开始一次新的源目录导入。</p>
-            <div className="toolbar">
-              <button className="btn-primary" onClick={nextAction.onClick}>
-                {nextAction.label}
-              </button>
-              <button className="btn-secondary" onClick={() => onGoScan(null)}>
-                新建导入
-              </button>
+      ) : (
+        <>
+          <section
+            className={`next-task next-task--${nextAction.tone}`}
+            aria-labelledby="next-task-title"
+          >
+            <div className="next-task__icon" aria-hidden="true">
+              <AppIcon name={nextActionCode === 'new_import' ? 'import' : 'arrow'} size={24} />
             </div>
-          </>
-        ) : (
-          <>
-            <h2>选择数据库模式</h2>
-            <p>先初始化托管库，或连接外部 PostgreSQL。数据库就绪后才能开始导入。</p>
-            <button className="btn-primary" onClick={onConfigureDatabase}>
-              选择数据库模式
-            </button>
-          </>
-        )}
-      </section>
+            <div className="next-task__copy">
+              <span className="next-task__eyebrow">下一步</span>
+              <h2 id="next-task-title">{isConnected ? nextAction.title : '先连接数据库'}</h2>
+              <p>
+                {isConnected
+                  ? nextAction.description
+                  : '初始化托管库，或连接外部 PostgreSQL；数据库就绪后才能开始导入。'}
+              </p>
+              {actionableRun && isConnected && nextActionCode !== 'new_import' && (
+                <p className="next-task__context mono" title={actionableRun.source_root}>
+                  {actionableRun.source_root}
+                </p>
+              )}
+            </div>
+            <div className="next-task__actions">
+              <Button
+                variant="primary"
+                aria-label={isConnected ? nextAction.label : '选择数据库模式'}
+                onClick={isConnected ? nextActionClick : onConfigureDatabase}
+              >
+                {isConnected ? nextAction.label : '选择数据库模式'}
+                <AppIcon name="arrow" size={18} />
+              </Button>
+              {isConnected && nextActionCode !== 'new_import' && (
+                <Button variant="quiet" onClick={() => onGoScan(null)}>
+                  新建导入
+                </Button>
+              )}
+            </div>
+          </section>
+
+          <div className="dashboard-grid">
+            <section
+              className="dashboard-panel dashboard-panel--recent"
+              aria-labelledby="recent-run-title"
+            >
+              <div className="dashboard-panel__header">
+                <div>
+                  <span className="section-kicker">最近任务</span>
+                  <h2 id="recent-run-title">{latestRun ? '导入任务进度' : '还没有导入任务'}</h2>
+                </div>
+                {latestRun && (
+                  <StatusBadge tone={stateTone(latestRun.state)}>
+                    {runStateLabel(latestRun.state)}
+                  </StatusBadge>
+                )}
+              </div>
+              {latestRun ? (
+                <>
+                  <p className="dashboard-path mono" title={latestRun.source_root}>
+                    {latestRun.source_root}
+                  </p>
+                  <Progress
+                    label="图集处理"
+                    value={processedAlbums}
+                    max={Math.max(latestRun.total_albums, 1)}
+                    detail={`${latestRun.total_albums} 个图集 · ${latestRun.total_images} 张图片`}
+                  />
+                  <div className="run-facts">
+                    <span>
+                      已分析 <strong>{latestRun.analyzed_albums}</strong>
+                    </span>
+                    <span>
+                      待审核 <strong>{latestRun.review_required_albums}</strong>
+                    </span>
+                    <span>
+                      失败 <strong>{latestRun.failed_albums}</strong>
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <p className="dashboard-panel__empty">首次导入会在这里显示分析和审核进度。</p>
+              )}
+            </section>
+
+            <section className="dashboard-panel" aria-labelledby="library-title">
+              <div className="dashboard-panel__header">
+                <div>
+                  <span className="section-kicker">本地图库</span>
+                  <h2 id="library-title">图库概览</h2>
+                </div>
+                <AppIcon name="commit" />
+              </div>
+              <div className="library-stats">
+                <div>
+                  <strong>{info?.library.library_album_count ?? 0}</strong>
+                  <span>图集</span>
+                </div>
+                <div>
+                  <strong>{info?.library.library_image_count ?? 0}</strong>
+                  <span>图片</span>
+                </div>
+                <div>
+                  <strong>{info?.library.library_root_count ?? 0}</strong>
+                  <span>位置</span>
+                </div>
+              </div>
+              <p className="dashboard-panel__hint">
+                {formatDatabaseMode(info?.database.mode ?? dbStatus.data?.mode)}
+              </p>
+            </section>
+          </div>
+
+          <section className="system-health" aria-label="系统健康">
+            <div className="system-health__summary">
+              <span className={`health-dot ${isConnected ? 'is-ok' : 'is-warning'}`} />
+              <strong>{isConnected ? '系统就绪' : databaseStatusLabel}</strong>
+              <span>{dbStatus.data?.pgvector_available ? 'pgvector 可用' : 'pgvector 不可用'}</span>
+              <span>迁移 {dbStatus.data?.migration_version ?? '未执行'}</span>
+            </div>
+            {databaseDetail && (
+              <details>
+                <summary>连接详情</summary>
+                <p className="mono">{databaseDetail}</p>
+              </details>
+            )}
+          </section>
+        </>
+      )}
     </div>
   );
 }
