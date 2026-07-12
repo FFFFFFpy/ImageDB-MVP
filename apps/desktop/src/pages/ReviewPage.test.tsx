@@ -1,6 +1,10 @@
 import { describe, expect, test, vi } from 'vitest';
 import type { ImportPlanImage } from '../lib/ipc/types';
-import { groupImportPlanImagesByAlbum, invalidateReviewWorkflowQueries } from './ReviewPage';
+import {
+  groupImportPlanImagesByAlbum,
+  invalidateReviewWorkflowQueries,
+  REVIEW_DECISION_OPTIONS,
+} from './ReviewPage';
 
 function image(overrides: Partial<ImportPlanImage>): ImportPlanImage {
   return {
@@ -69,5 +73,15 @@ describe('invalidateReviewWorkflowQueries', () => {
       queryKey: ['database-info-dashboard'],
     });
     expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['import-run-albums'] });
+  });
+});
+
+describe('REVIEW_DECISION_OPTIONS', () => {
+  test('keeps left, right, and keep-all actions bound to the frozen review semantics', () => {
+    expect(REVIEW_DECISION_OPTIONS).toEqual([
+      { decision: 'keep_source', shortcut: '1', label: '保留源图片' },
+      { decision: 'keep_candidate', shortcut: '2', label: '保留候选图片' },
+      { decision: 'keep_all', shortcut: '3', label: '全部保留' },
+    ]);
   });
 });

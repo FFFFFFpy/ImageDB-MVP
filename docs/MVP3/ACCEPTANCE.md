@@ -32,7 +32,7 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] 全局导航和应用壳完成 M3 迁移。
 - [x] 工作台完成 M3 迁移。
 - [x] 新建导入与分析进度完成 M3 迁移。
-- [ ] 审核工作台完成 M3 迁移。
+- [x] 审核工作台完成 M3 迁移。
 - [ ] 导入计划完成 M3 迁移。
 - [ ] 入库执行与结果完成 M3 迁移。
 - [ ] Recovery 完成 M3 迁移。
@@ -46,7 +46,7 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] 普通开始创建新 run；resume 只对显式 run id 生效。
 - [x] abandoned run 只作为历史证据展示，不重新进入当前工作流。
 - [x] pending、analyzing、analyzed、review_required、failed 的图集状态区分清楚。
-- [ ] 审核左右布局或排序变化不改变最终 selected image 语义。
+- [x] 审核左右布局或排序变化不改变最终 selected image 语义。
 - [ ] 生成/冻结计划与执行 Commit 是两个清楚的步骤。
 - [ ] Commit 展示与读取的 frozen plan 一致，不临场重算。
 - [ ] recover、resume_commit、inspect_transaction_failure 入口语义准确。
