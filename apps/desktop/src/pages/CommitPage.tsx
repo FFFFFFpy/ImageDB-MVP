@@ -233,7 +233,10 @@ export function CommitPage({
     enabled: !initialImportRunId,
   });
 
-  const committableRunId = latestRun.data ?? importRunId;
+  // An explicit workflow selection is authoritative. A disabled React Query
+  // can still expose stale cached data, so the latest-run fallback must never
+  // be read before the run carried by Dashboard / Review.
+  const committableRunId = importRunId ?? (!latestRun.isError ? (latestRun.data ?? null) : null);
 
   const planQuery = useQuery({
     queryKey: ['frozenImportPlanSummary', committableRunId],
@@ -308,9 +311,12 @@ export function CommitPage({
     },
   });
 
+  const navigationBlocked =
+    commitMutation.isPending || phase === 'committing' || abandonWorkflowMutation.isPending;
+
   useEffect(() => {
-    onNavigationBlockedChange?.(abandonWorkflowMutation.isPending);
-  }, [abandonWorkflowMutation.isPending, onNavigationBlockedChange]);
+    onNavigationBlockedChange?.(navigationBlocked);
+  }, [navigationBlocked, onNavigationBlockedChange]);
 
   useEffect(
     () => () => {
@@ -447,34 +453,47 @@ export function CommitPage({
           </StatusBanner>
         )}
 
-        {latestRun.isLoading && !plan && (
+        {!importRunId && latestRun.isLoading && !plan && (
           <div className="commit-loading" role="status" aria-label="正在加载可提交的导入任务">
             <Skeleton height={96} radius="var(--radius-panel)" />
           </div>
         )}
-        {!committableRunId && !latestRun.isLoading && !plan && (
-          <EmptyState
-            title="没有可提交的计划"
-            description="当前没有已冻结计划的可提交任务。请先完成审核并生成导入计划。"
-            action={
-              <div className="commit-empty-actions">
-                <Button
-                  variant="primary"
-                  onClick={() =>
-                    committableRunId && onGoReview
-                      ? onGoReview(committableRunId)
-                      : onNavigate('review')
-                  }
-                >
-                  前往审核 / 生成计划
-                </Button>
-                <Button variant="quiet" onClick={() => onNavigate('scan')}>
-                  前往扫描
-                </Button>
-              </div>
-            }
-          />
+        {!importRunId && latestRun.isError && !plan && (
+          <StatusBanner
+            tone="danger"
+            title="无法查询可提交任务"
+            actions={<Button onClick={() => latestRun.refetch()}>重新加载</Button>}
+          >
+            {String(latestRun.error)}
+          </StatusBanner>
         )}
+        {!importRunId &&
+          !latestRun.isLoading &&
+          !latestRun.isError &&
+          !committableRunId &&
+          !plan && (
+            <EmptyState
+              title="没有可提交的计划"
+              description="当前没有已冻结计划的可提交任务。请先完成审核并生成导入计划。"
+              action={
+                <div className="commit-empty-actions">
+                  <Button
+                    variant="primary"
+                    onClick={() =>
+                      committableRunId && onGoReview
+                        ? onGoReview(committableRunId)
+                        : onNavigate('review')
+                    }
+                  >
+                    前往审核 / 生成计划
+                  </Button>
+                  <Button variant="quiet" onClick={() => onNavigate('scan')}>
+                    前往扫描
+                  </Button>
+                </div>
+              }
+            />
+          )}
 
         {planQuery.isLoading && !plan && (
           <div className="commit-loading" role="status" aria-label="正在读取 frozen plan">

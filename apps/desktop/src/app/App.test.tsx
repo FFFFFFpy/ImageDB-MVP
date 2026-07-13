@@ -41,6 +41,18 @@ const mockState = vi.hoisted(() => ({
   requestedPlanRunIds: [] as string[],
   commitRequests: [] as Array<Record<string, unknown>>,
   abandonedWorkflowRunIds: [] as string[],
+  commitProgress: {
+    state: 'completed',
+    import_run_id: 'run-older-a',
+    current_stage: 'done',
+    current_album: null,
+    albums_total: 1,
+    albums_completed: 1,
+    albums_skipped: 0,
+    albums_failed: 0,
+    images_committed: 1,
+    errors: [],
+  } as Record<string, unknown>,
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
@@ -141,6 +153,9 @@ vi.mock('@tauri-apps/api/core', () => ({
     if (cmd === 'start_import_commit') {
       mockState.commitRequests.push(args ?? {});
       return Promise.resolve('commit started');
+    }
+    if (cmd === 'get_commit_progress') {
+      return Promise.resolve(mockState.commitProgress);
     }
     if (cmd === 'abandon_frozen_import_workflow') {
       const importRunId = String(args?.importRunId);
@@ -249,6 +264,18 @@ beforeEach(() => {
   mockState.requestedPlanRunIds = [];
   mockState.commitRequests = [];
   mockState.abandonedWorkflowRunIds = [];
+  mockState.commitProgress = {
+    state: 'completed',
+    import_run_id: 'run-older-a',
+    current_stage: 'done',
+    current_album: null,
+    albums_total: 1,
+    albums_completed: 1,
+    albums_skipped: 0,
+    albums_failed: 0,
+    images_committed: 1,
+    errors: [],
+  };
 });
 
 afterEach(() => cleanup());
@@ -340,6 +367,27 @@ test('keeps the dashboard-selected commit run when a newer second run exists', a
       expectedPlanHash: 'hash-run-older-a',
     }),
   );
+});
+
+test('disables every sidebar destination while commit is running and restores it at terminal state', async () => {
+  setActionableDashboard('resume_commit', 'run-older-a');
+  renderApp();
+
+  fireEvent.click(await screen.findByRole('button', { name: '继续入库' }));
+  await screen.findByText('计划哈希：hash-run-older-a');
+  fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
+
+  expect(await screen.findByRole('heading', { name: '正在入库' })).toBeVisible();
+  for (const name of ['工作台', '新建导入', '审核', '入库', '恢复', '设置']) {
+    expect(screen.getByRole('button', { name })).toBeDisabled();
+  }
+
+  expect(await screen.findByRole('heading', { name: '入库结果' }, { timeout: 2500 })).toBeVisible();
+  await waitFor(() => {
+    for (const name of ['工作台', '新建导入', '审核', '入库', '恢复', '设置']) {
+      expect(screen.getByRole('button', { name })).toBeEnabled();
+    }
+  });
 });
 
 test('abandoning a frozen workflow clears its context and returns to new import', async () => {
