@@ -2,7 +2,7 @@ use crate::infrastructure::settings::AppSettings;
 use crate::infrastructure::storage_capabilities::{
     probe_storage_capabilities as run_storage_capability_probe, StorageCapabilities,
 };
-use crate::state::AppState;
+use crate::state::{AppState, CriticalOperationKind};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::State;
@@ -64,6 +64,13 @@ pub(crate) async fn update_settings_for_state(
     state: &AppState,
     settings: SettingsDto,
 ) -> Result<SettingsDto, String> {
+    // SettingsDto currently consists entirely of database profile, library
+    // root, and onboarding fields. Serialize the whole update with database
+    // lifecycle changes so a full-form save cannot overwrite a critical field
+    // after a stale pre-check.
+    let _operation = state
+        .critical_operation_guard
+        .begin_operation(CriticalOperationKind::UpdateCriticalSettings)?;
     let mut store = state.settings.lock().await;
     let app_settings = AppSettings {
         database_mode: settings.database_mode,
@@ -92,4 +99,76 @@ pub async fn probe_storage_capabilities(path: String) -> Result<StorageCapabilit
     }
 
     Ok(run_storage_capability_probe(PathBuf::from(path)))
+}
+
+#[cfg(test)]
+mod critical_settings_tests {
+    use super::*;
+    use crate::state::CriticalTaskKind;
+    use tempfile::TempDir;
+
+    fn settings(library_root: &str) -> SettingsDto {
+        SettingsDto {
+            database_mode: Some("managed_local".to_string()),
+            library_root: Some(library_root.to_string()),
+            external_host: None,
+            external_port: None,
+            external_database: None,
+            external_username: None,
+            external_tls_mode: None,
+            external_ca_cert_path: None,
+            external_client_cert_path: None,
+            external_client_key_path: None,
+            external_connect_timeout_secs: None,
+            external_query_timeout_secs: None,
+            external_profile_name: None,
+            first_run_completed: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn active_commit_rejects_library_root_update_without_losing_existing_setting() {
+        let temp = TempDir::new().unwrap();
+        let state = AppState::new(temp.path(), temp.path().join("fixtures")).unwrap();
+        state
+            .settings
+            .lock()
+            .await
+            .update(AppSettings {
+                database_mode: Some("managed_local".to_string()),
+                library_root: Some("C:/library/original".to_string()),
+                first_run_completed: true,
+                ..AppSettings::default()
+            })
+            .unwrap();
+        let commit = state
+            .critical_operation_guard
+            .begin_task(CriticalTaskKind::Commit)
+            .unwrap();
+
+        let error = update_settings_for_state(&state, settings("C:/library/replacement"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "cannot change database or library settings while import commit is running"
+        );
+        assert_eq!(
+            state.settings.lock().await.get().library_root.as_deref(),
+            Some("C:/library/original")
+        );
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_task_kinds,
+            vec!["commit"]
+        );
+
+        drop(commit);
+        let updated = update_settings_for_state(&state, settings("C:/library/replacement"))
+            .await
+            .expect("settings update must work after commit completion");
+        assert_eq!(
+            updated.library_root.as_deref(),
+            Some("C:/library/replacement")
+        );
+    }
 }

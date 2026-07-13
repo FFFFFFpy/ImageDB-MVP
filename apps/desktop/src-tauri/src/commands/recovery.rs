@@ -8,7 +8,7 @@ use crate::services::commit_service::{
     validate_and_hash_frozen_plan, verify_complete_evidence, IdempotencyVerdict,
 };
 use crate::services::recovery_service;
-use crate::state::AppState;
+use crate::state::{AppState, CriticalTaskKind};
 use serde::Serialize;
 use std::path::PathBuf;
 use tauri::State;
@@ -106,6 +106,9 @@ pub(crate) async fn recover_transaction_for_state(
     transaction_id: String,
 ) -> Result<RecoveryOutcomeDto, String> {
     let tx_id = Uuid::parse_str(&transaction_id).map_err(|e| format!("invalid UUID: {e}"))?;
+    let _recovery_lease = state
+        .critical_operation_guard
+        .begin_task(CriticalTaskKind::Recovery)?;
     let pg = state.postgres_manager.clone();
     let outcome = recovery_service::recover_transaction(pg, tx_id)
         .await
@@ -134,6 +137,9 @@ pub(crate) async fn reverify_transaction_for_state(
     transaction_id: String,
 ) -> Result<ReverifyResultDto, String> {
     let tx_id = Uuid::parse_str(&transaction_id).map_err(|e| format!("invalid UUID: {e}"))?;
+    let _recovery_lease = state
+        .critical_operation_guard
+        .begin_task(CriticalTaskKind::Recovery)?;
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
         mgr.connect().await.map_err(|e| format!("{e}"))?

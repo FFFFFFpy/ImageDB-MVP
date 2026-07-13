@@ -5,7 +5,9 @@ use crate::domain::{
 use crate::repositories::import_repository::{
     DatabaseInfoDashboard, DatabaseInfoDatabaseSection, ImportRepository,
 };
-use crate::state::AppState;
+use crate::state::{
+    AppState, CriticalOperationGuardSnapshot, CriticalOperationKind, CriticalTaskKind,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use tauri::State;
@@ -24,6 +26,25 @@ pub struct ExternalConnectionDto {
     pub connect_timeout_secs: Option<u64>,
     pub query_timeout_secs: Option<u64>,
     pub profile_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CriticalOperationGuardStatusDto {
+    pub is_blocked: bool,
+    pub blocking_reason: Option<String>,
+    pub active_task_kinds: Vec<String>,
+    pub active_operation: Option<String>,
+}
+
+impl From<CriticalOperationGuardSnapshot> for CriticalOperationGuardStatusDto {
+    fn from(snapshot: CriticalOperationGuardSnapshot) -> Self {
+        Self {
+            is_blocked: snapshot.is_blocked,
+            blocking_reason: snapshot.blocking_reason,
+            active_task_kinds: snapshot.active_task_kinds,
+            active_operation: snapshot.active_operation,
+        }
+    }
 }
 
 impl From<ExternalConnectionDto> for ConnectionConfig {
@@ -53,6 +74,13 @@ impl From<ExternalConnectionDto> for ConnectionConfig {
 pub async fn get_database_status(state: State<'_, AppState>) -> Result<DatabaseState, String> {
     let service = &state.database_service;
     Ok(service.get_state().await)
+}
+
+#[tauri::command]
+pub async fn get_critical_operation_guard_status(
+    state: State<'_, AppState>,
+) -> Result<CriticalOperationGuardStatusDto, String> {
+    Ok(state.critical_operation_guard.snapshot().into())
 }
 
 #[tauri::command]
@@ -94,6 +122,9 @@ pub async fn initialize_managed_database(
 pub(crate) async fn initialize_managed_database_for_state(
     state: &AppState,
 ) -> Result<DatabaseState, String> {
+    let _operation = state
+        .critical_operation_guard
+        .begin_operation(CriticalOperationKind::InitializeManagedDatabase)?;
     let service = &state.database_service;
     service
         .initialize_managed()
@@ -105,6 +136,15 @@ pub(crate) async fn initialize_managed_database_for_state(
 pub async fn switch_to_managed_database(
     state: State<'_, AppState>,
 ) -> Result<DatabaseState, String> {
+    switch_to_managed_database_for_state(&state).await
+}
+
+pub(crate) async fn switch_to_managed_database_for_state(
+    state: &AppState,
+) -> Result<DatabaseState, String> {
+    let _operation = state
+        .critical_operation_guard
+        .begin_operation(CriticalOperationKind::SwitchToManagedDatabase)?;
     let service = &state.database_service;
     service
         .switch_to_managed()
@@ -130,6 +170,16 @@ pub async fn initialize_external_database(
     state: State<'_, AppState>,
     config: ExternalConnectionDto,
 ) -> Result<DatabaseState, String> {
+    initialize_external_database_for_state(&state, config).await
+}
+
+pub(crate) async fn initialize_external_database_for_state(
+    state: &AppState,
+    config: ExternalConnectionDto,
+) -> Result<DatabaseState, String> {
+    let _operation = state
+        .critical_operation_guard
+        .begin_operation(CriticalOperationKind::InitializeExternalDatabase)?;
     let service = &state.database_service;
     let conn_config: ConnectionConfig = config.into();
     service
@@ -143,6 +193,16 @@ pub async fn migrate_managed_to_external_database(
     state: State<'_, AppState>,
     config: ExternalConnectionDto,
 ) -> Result<ExternalMigrationResult, String> {
+    migrate_managed_to_external_database_for_state(&state, config).await
+}
+
+pub(crate) async fn migrate_managed_to_external_database_for_state(
+    state: &AppState,
+    config: ExternalConnectionDto,
+) -> Result<ExternalMigrationResult, String> {
+    let _migration = state
+        .critical_operation_guard
+        .begin_task(CriticalTaskKind::ExternalMigration)?;
     let service = &state.database_service;
     let conn_config: ConnectionConfig = config.into();
     service
@@ -156,6 +216,9 @@ pub async fn start_managed_to_external_migration(
     state: State<'_, AppState>,
     config: ExternalConnectionDto,
 ) -> Result<String, String> {
+    let migration_lease = state
+        .critical_operation_guard
+        .begin_task(CriticalTaskKind::ExternalMigration)?;
     let conn_config: ConnectionConfig = config.into();
     let mut migration_state = state.external_migration_state.lock().await;
 
@@ -185,6 +248,7 @@ pub async fn start_managed_to_external_migration(
     let cancelled_clone = cancelled.clone();
     let tracker_clone = progress_tracker.clone();
     let task = tokio::spawn(async move {
+        let _migration_lease = migration_lease;
         let result = service
             .migrate_managed_to_external_with_control(
                 &conn_config,
@@ -280,6 +344,186 @@ pub async fn get_external_migration_progress(
 
 #[tauri::command]
 pub async fn shutdown_database(state: State<'_, AppState>) -> Result<(), String> {
+    shutdown_database_for_state(&state).await
+}
+
+pub(crate) async fn shutdown_database_for_state(state: &AppState) -> Result<(), String> {
+    let _operation = state
+        .critical_operation_guard
+        .begin_operation(CriticalOperationKind::ShutdownDatabase)?;
     let mut mgr = state.postgres_manager.lock().await;
     mgr.shutdown().await.map_err(|e| format!("{e}"))
+}
+
+#[cfg(test)]
+mod critical_lifecycle_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn app_state(temp: &TempDir) -> AppState {
+        AppState::new(temp.path(), temp.path().join("fixtures")).unwrap()
+    }
+
+    fn external_config() -> ExternalConnectionDto {
+        ExternalConnectionDto {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            database: "imagedb".to_string(),
+            username: "imagedb".to_string(),
+            password: None,
+            tls_mode: Some("disable".to_string()),
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            connect_timeout_secs: Some(1),
+            query_timeout_secs: Some(1),
+            profile_name: Some("blocked-test".to_string()),
+        }
+    }
+
+    async fn database_mode(state: &AppState) -> Option<String> {
+        state.settings.lock().await.get().database_mode.clone()
+    }
+
+    #[tokio::test]
+    async fn active_commit_rejects_lifecycle_commands_without_changing_database_mode() {
+        let temp = TempDir::new().unwrap();
+        let state = app_state(&temp);
+        state
+            .settings
+            .lock()
+            .await
+            .set_database_mode("external")
+            .unwrap();
+        let commit = state
+            .critical_operation_guard
+            .begin_task(CriticalTaskKind::Commit)
+            .unwrap();
+
+        let shutdown_error = shutdown_database_for_state(&state).await.unwrap_err();
+        assert_eq!(
+            shutdown_error,
+            "cannot stop database while import commit is running"
+        );
+        let switch_error = switch_to_managed_database_for_state(&state)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            switch_error,
+            "cannot switch database while import commit is running"
+        );
+        let initialize_managed_error = initialize_managed_database_for_state(&state)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            initialize_managed_error,
+            "cannot initialize managed database while import commit is running"
+        );
+        let initialize_external_error =
+            initialize_external_database_for_state(&state, external_config())
+                .await
+                .unwrap_err();
+        assert_eq!(
+            initialize_external_error,
+            "cannot initialize external database while import commit is running"
+        );
+
+        assert_eq!(database_mode(&state).await.as_deref(), Some("external"));
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_task_kinds,
+            vec!["commit"]
+        );
+
+        drop(commit);
+        shutdown_database_for_state(&state)
+            .await
+            .expect("shutdown must work after commit completion");
+    }
+
+    #[tokio::test]
+    async fn active_scan_rejects_database_switch_and_preserves_task() {
+        let temp = TempDir::new().unwrap();
+        let state = app_state(&temp);
+        let scan = state
+            .critical_operation_guard
+            .begin_task(CriticalTaskKind::Scan)
+            .unwrap();
+
+        let error = switch_to_managed_database_for_state(&state)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "cannot switch database while import scan is running");
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_task_kinds,
+            vec!["scan"]
+        );
+        drop(scan);
+    }
+
+    #[tokio::test]
+    async fn active_migration_rejects_switch_and_shutdown() {
+        let temp = TempDir::new().unwrap();
+        let state = app_state(&temp);
+        let migration = state
+            .critical_operation_guard
+            .begin_task(CriticalTaskKind::ExternalMigration)
+            .unwrap();
+
+        let switch_error = switch_to_managed_database_for_state(&state)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            switch_error,
+            "cannot switch database while external database migration is running"
+        );
+        let shutdown_error = shutdown_database_for_state(&state).await.unwrap_err();
+        assert_eq!(
+            shutdown_error,
+            "cannot stop database while external database migration is running"
+        );
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_task_kinds,
+            vec!["external_migration"]
+        );
+        drop(migration);
+    }
+
+    #[tokio::test]
+    async fn active_recovery_rejects_database_shutdown() {
+        let temp = TempDir::new().unwrap();
+        let state = app_state(&temp);
+        let recovery = state
+            .critical_operation_guard
+            .begin_task(CriticalTaskKind::Recovery)
+            .unwrap();
+
+        let error = shutdown_database_for_state(&state).await.unwrap_err();
+        assert_eq!(
+            error,
+            "cannot stop database while transaction recovery is running"
+        );
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_task_kinds,
+            vec!["recovery"]
+        );
+        drop(recovery);
+    }
+
+    #[test]
+    fn guard_status_dto_exposes_backend_blocking_reason_and_task_kinds() {
+        let guard = crate::state::CriticalOperationGuard::default();
+        let recovery = guard.begin_task(CriticalTaskKind::Recovery).unwrap();
+
+        let status = CriticalOperationGuardStatusDto::from(guard.snapshot());
+        assert!(status.is_blocked);
+        assert_eq!(status.active_task_kinds, vec!["recovery"]);
+        assert_eq!(status.active_operation, None);
+        assert!(status
+            .blocking_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("transaction recovery")));
+
+        drop(recovery);
+        assert!(!CriticalOperationGuardStatusDto::from(guard.snapshot()).is_blocked);
+    }
 }

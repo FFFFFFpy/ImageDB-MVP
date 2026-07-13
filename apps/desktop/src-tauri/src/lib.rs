@@ -509,6 +509,7 @@ pub fn run() {
             commands::probe_file_transaction,
             commands::run_all_probes,
             commands::get_database_status,
+            commands::get_critical_operation_guard_status,
             commands::get_database_info_dashboard,
             commands::get_library_albums,
             commands::get_library_images,

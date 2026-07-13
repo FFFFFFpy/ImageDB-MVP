@@ -3,7 +3,7 @@ use crate::repositories::import_repository::{
     ImportAlbumStatus, ImportRepository, ImportRunDashboard,
 };
 use crate::services::scan_service;
-use crate::state::AppState;
+use crate::state::{AppState, CriticalTaskKind, CriticalTaskLease};
 use std::sync::atomic::Ordering;
 use tauri::{Emitter, Runtime, State};
 use uuid::Uuid;
@@ -46,15 +46,22 @@ pub(crate) async fn start_scan_for_state(
     state: &AppState,
     source_root: String,
 ) -> Result<String, String> {
-    start_scan_for_state_inner(state, source_root, None).await
+    start_scan_for_state_inner(state, source_root, None, None).await
 }
 
 async fn start_scan_for_state_inner(
     state: &AppState,
     source_root: String,
     import_run_id: Option<Uuid>,
+    scan_lease: Option<CriticalTaskLease>,
 ) -> Result<String, String> {
     tracing::info!(source_root = %source_root, "start_scan command received");
+    let scan_lease = match scan_lease {
+        Some(lease) => lease,
+        None => state
+            .critical_operation_guard
+            .begin_task(CriticalTaskKind::Scan)?,
+    };
     let mut scan_state = state.scan_state.lock().await;
 
     if scan_state
@@ -95,6 +102,7 @@ async fn start_scan_for_state_inner(
     let tracker_clone = progress_tracker.clone();
 
     let task = tokio::spawn(async move {
+        let _scan_lease = scan_lease;
         let result = if let Some(import_run_id) = import_run_id {
             scan_service::run_scan_for_import_run(
                 postgres_manager,
@@ -329,6 +337,9 @@ pub async fn resume_import_run<R: Runtime>(
     app_handle: tauri::AppHandle<R>,
 ) -> Result<String, String> {
     let run_id = parse_uuid(&import_run_id)?;
+    let scan_lease = state
+        .critical_operation_guard
+        .begin_task(CriticalTaskKind::Scan)?;
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
         mgr.connect().await.map_err(|e| format!("{e}"))?
@@ -354,7 +365,8 @@ pub async fn resume_import_run<R: Runtime>(
     .map_err(|e| format!("{e}"));
     handle.abort();
     let source_root = result?;
-    let result = start_scan_for_state_inner(&state, source_root, Some(run_id)).await?;
+    let result =
+        start_scan_for_state_inner(&state, source_root, Some(run_id), Some(scan_lease)).await?;
     let event_tracker = {
         let scan_state = state.scan_state.lock().await;
         scan_state.progress_tracker.clone()

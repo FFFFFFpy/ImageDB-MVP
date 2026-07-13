@@ -161,6 +161,11 @@ impl DatabaseService {
             first_run_completed: true,
             ..current
         })?;
+        // Do not hold the settings mutex while waiting for the PostgreSQL
+        // manager. `get_state` intentionally reads those locks in the opposite
+        // phase (manager, then settings), so releasing here keeps lifecycle
+        // calls free of an async lock-order cycle.
+        drop(settings);
 
         let mut mgr = self.postgres_manager.lock().await;
         mgr.use_external_profile(config.clone());

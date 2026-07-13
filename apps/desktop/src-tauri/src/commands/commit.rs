@@ -1,6 +1,6 @@
 use crate::domain::import_state::CommitProgress;
 use crate::services::commit_service;
-use crate::state::AppState;
+use crate::state::{AppState, CriticalTaskKind};
 use std::sync::atomic::Ordering;
 use tauri::State;
 
@@ -33,6 +33,9 @@ pub(crate) async fn start_import_commit_for_state_with_expected_hash(
 ) -> Result<String, String> {
     tracing::info!(import_run_id = %import_run_id, "start_import_commit command received");
     let run_id = uuid::Uuid::parse_str(&import_run_id).map_err(|e| format!("invalid UUID: {e}"))?;
+    let commit_lease = state
+        .critical_operation_guard
+        .begin_task(CriticalTaskKind::Commit)?;
 
     let mut commit_state = state.commit_state.lock().await;
 
@@ -73,6 +76,7 @@ pub(crate) async fn start_import_commit_for_state_with_expected_hash(
     let tracker_clone = progress_tracker.clone();
 
     let task = tokio::spawn(async move {
+        let _commit_lease = commit_lease;
         let result = commit_service::run_import_commit_with_expected_plan_hash(
             postgres_manager,
             library_root,
