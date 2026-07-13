@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
 import { useEffect, useState } from 'react';
-import { Button, PageHeader, StatusBadge } from '../components/ui';
+import { Button, PageHeader, StatusBadge, StatusBanner } from '../components/ui';
 import type {
   CapabilityProbe,
   DatabaseState,
@@ -118,6 +118,13 @@ export function SettingsPage({
     refetchInterval: enablePolling ? 5000 : false,
   });
 
+  const criticalGuardStatus = useQuery({
+    queryKey: ['critical-operation-guard-status'],
+    queryFn: api.getCriticalOperationGuardStatus,
+    refetchInterval: enablePolling ? 1000 : false,
+    retry: false,
+  });
+
   const [extHost, setExtHost] = useState('');
   const [extPort, setExtPort] = useState('5432');
   const [extDb, setExtDb] = useState('imagedb');
@@ -157,7 +164,12 @@ export function SettingsPage({
 
   const saveSettings = useMutation({
     mutationFn: api.updateSettings,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['settings'] }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['settings'] }),
+        queryClient.invalidateQueries({ queryKey: ['critical-operation-guard-status'] }),
+      ]);
+    },
   });
 
   const testExt = useMutation({
@@ -170,6 +182,7 @@ export function SettingsPage({
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['settings'] }),
         queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['critical-operation-guard-status'] }),
       ]);
       await Promise.all([
         queryClient.refetchQueries({ queryKey: ['settings'], type: 'active' }),
@@ -191,13 +204,19 @@ export function SettingsPage({
         queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] }),
         queryClient.invalidateQueries({ queryKey: ['database-status'] }),
         queryClient.invalidateQueries({ queryKey: ['settings'] }),
+        queryClient.invalidateQueries({ queryKey: ['critical-operation-guard-status'] }),
       ]);
     },
   });
 
   const cancelMigration = useMutation({
     mutationFn: api.cancelExternalMigration,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['external-migration-progress'] }),
+        queryClient.invalidateQueries({ queryKey: ['critical-operation-guard-status'] }),
+      ]);
+    },
   });
 
   const probeStorage = useMutation({
@@ -223,7 +242,12 @@ export function SettingsPage({
 
   const shutdown = useMutation({
     mutationFn: api.shutdownDatabase,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['critical-operation-guard-status'] }),
+      ]);
+    },
   });
 
   const switchManaged = useMutation({
@@ -232,6 +256,7 @@ export function SettingsPage({
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['settings'] }),
         queryClient.invalidateQueries({ queryKey: ['database-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['critical-operation-guard-status'] }),
       ]);
       await Promise.all([
         queryClient.refetchQueries({ queryKey: ['settings'], type: 'active' }),
@@ -246,6 +271,16 @@ export function SettingsPage({
 
   const migration = migrationProgress.data;
   const migrationRunning = migration?.state === 'running' || startMigration.isPending;
+  const criticalSettingsDisabled = criticalGuardStatus.data?.is_blocked !== false;
+  const activeTaskLabels = criticalGuardStatus.data?.active_task_kinds.map((kind) => {
+    const labels: Record<string, string> = {
+      scan: '扫描 / 分析',
+      commit: '提交入库',
+      recovery: '事务恢复',
+      external_migration: '外部数据库迁移',
+    };
+    return labels[kind] ?? kind;
+  });
   const effectiveLibraryRoot = formInitialized ? libRoot : '';
   const currentDbMode = dbStatus.data?.mode;
   const externalConfig = dbStatus.data?.external_config;
@@ -273,6 +308,33 @@ export function SettingsPage({
           ) : undefined
         }
       />
+
+      {criticalGuardStatus.isLoading && (
+        <StatusBanner tone="info" title="正在确认任务状态">
+          数据库与图库设置会在安全状态确认后开放。
+        </StatusBanner>
+      )}
+      {criticalGuardStatus.isError && (
+        <StatusBanner
+          tone="danger"
+          title="无法确认任务状态，关键设置已锁定"
+          actions={
+            <Button variant="quiet" onClick={() => void criticalGuardStatus.refetch()}>
+              重试
+            </Button>
+          }
+        >
+          {String(criticalGuardStatus.error)}
+        </StatusBanner>
+      )}
+      {criticalGuardStatus.data?.is_blocked && (
+        <StatusBanner tone="warning" title="当前任务运行期间已锁定数据库与图库设置">
+          <p>{criticalGuardStatus.data.blocking_reason ?? '请等待当前任务结束后再修改。'}</p>
+          {activeTaskLabels && activeTaskLabels.length > 0 && (
+            <p>正在运行：{activeTaskLabels.join('、')}</p>
+          )}
+        </StatusBanner>
+      )}
 
       <section className="settings-section">
         <div className="settings-section-heading">
@@ -372,11 +434,14 @@ export function SettingsPage({
             <button
               className="settings-danger-action"
               onClick={() => shutdown.mutate()}
-              disabled={shutdown.isPending}
+              disabled={criticalSettingsDisabled || shutdown.isPending}
             >
               {shutdown.isPending ? '停止中…' : '停止数据库'}
             </button>
-            <button onClick={() => switchManaged.mutate()} disabled={switchManaged.isPending}>
+            <button
+              onClick={() => switchManaged.mutate()}
+              disabled={criticalSettingsDisabled || switchManaged.isPending}
+            >
               {switchManaged.isPending
                 ? '初始化中…'
                 : currentDbMode
@@ -392,6 +457,7 @@ export function SettingsPage({
             {switchManaged.isError && (
               <pre className="status-err">{String(switchManaged.error)}</pre>
             )}
+            {shutdown.isError && <pre className="status-err">{String(shutdown.error)}</pre>}
             {switchManaged.data && (
               <DbActivationResult
                 state={switchManaged.data}
@@ -507,14 +573,14 @@ export function SettingsPage({
         <button
           className="settings-primary-action"
           onClick={() => initExternal.mutate()}
-          disabled={!formInitialized || initExternal.isPending}
+          disabled={!formInitialized || criticalSettingsDisabled || initExternal.isPending}
         >
           {initExternal.isPending ? '连接中…' : '连接并初始化外部库'}
         </button>
         <button
           className="settings-secondary-action"
           onClick={() => startMigration.mutate()}
-          disabled={!formInitialized || migrationRunning}
+          disabled={!formInitialized || criticalSettingsDisabled || migrationRunning}
         >
           {migrationRunning ? '迁移中…' : '从托管库迁移'}
         </button>
@@ -687,10 +753,16 @@ export function SettingsPage({
               });
             }
           }}
-          disabled={!formInitialized || settings.isLoading || saveSettings.isPending}
+          disabled={
+            !formInitialized ||
+            settings.isLoading ||
+            criticalSettingsDisabled ||
+            saveSettings.isPending
+          }
         >
           保存
         </button>
+        {saveSettings.isError && <pre className="status-err">{String(saveSettings.error)}</pre>}
         <button
           onClick={() => probeStorage.mutate()}
           disabled={!formInitialized || probeStorage.isPending || !effectiveLibraryRoot}

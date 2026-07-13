@@ -11,6 +11,13 @@ export interface DatabaseState {
   diagnostics: DiagnosticItem[];
 }
 
+export interface CriticalOperationGuardStatus {
+  is_blocked: boolean;
+  blocking_reason: string | null;
+  active_task_kinds: string[];
+  active_operation: string | null;
+}
+
 export interface DiagnosticsExportResult {
   path: string;
   generated_at: string;

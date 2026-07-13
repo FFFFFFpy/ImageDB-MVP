@@ -98,6 +98,14 @@ vi.mock('@tauri-apps/api/core', () => ({
         next_cursor: null,
       });
     }
+    if (cmd === 'get_critical_operation_guard_status') {
+      return Promise.resolve({
+        is_blocked: false,
+        blocking_reason: null,
+        active_task_kinds: [],
+        active_operation: null,
+      });
+    }
     if (cmd === 'get_import_runs_dashboard') {
       return Promise.resolve(mockState.databaseInfo ? [mockState.databaseInfo.latest_run] : []);
     }

@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AppSettings,
   DatabaseState,
+  CriticalOperationGuardStatus,
   DatabaseInfoDashboard,
   DiagnosticsExportResult,
   ExternalCheckResult,
@@ -35,6 +36,9 @@ export const api = {
   getAppStatus: () => invoke<string>('get_app_status'),
 
   getDatabaseStatus: () => invoke<DatabaseState>('get_database_status'),
+
+  getCriticalOperationGuardStatus: () =>
+    invoke<CriticalOperationGuardStatus>('get_critical_operation_guard_status'),
 
   getDatabaseInfoDashboard: () => invoke<DatabaseInfoDashboard>('get_database_info_dashboard'),
 

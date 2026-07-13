@@ -8,6 +8,7 @@ vi.mock('../lib/ipc/api', () => ({
   api: {
     getSettings: vi.fn(),
     getDatabaseStatus: vi.fn(),
+    getCriticalOperationGuardStatus: vi.fn(),
     getExternalMigrationProgress: vi.fn(),
     testExternalConnection: vi.fn(),
     initializeExternalDatabase: vi.fn(),
@@ -56,6 +57,12 @@ beforeEach(() => {
     pgvector_available: true,
     migration_version: '0010_library_root_leases',
     diagnostics: ['managed database ready'],
+  });
+  mockedApi.getCriticalOperationGuardStatus.mockResolvedValue({
+    is_blocked: false,
+    blocking_reason: null,
+    active_task_kinds: [],
+    active_operation: null,
   });
   mockedApi.getExternalMigrationProgress.mockResolvedValue({
     state: 'idle',
@@ -268,6 +275,12 @@ describe('SettingsPage external PostgreSQL GUI', () => {
   });
 
   test('renders migration progress, backup, row counts, diagnostics, errors, and cancel state', async () => {
+    mockedApi.getCriticalOperationGuardStatus.mockResolvedValue({
+      is_blocked: true,
+      blocking_reason: 'critical settings are blocked while external_migration is active',
+      active_task_kinds: ['external_migration'],
+      active_operation: null,
+    });
     mockedApi.getExternalMigrationProgress.mockResolvedValue({
       state: 'running',
       current_stage: 'verify',
@@ -308,6 +321,48 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: '取消迁移' })).toBeEnabled();
     });
+    expect(screen.getByRole('button', { name: '迁移中…' })).toBeDisabled();
+  });
+
+  test('locks destructive database and library settings while a commit is active', async () => {
+    mockedApi.getCriticalOperationGuardStatus.mockResolvedValue({
+      is_blocked: true,
+      blocking_reason: 'critical settings are blocked while commit is active',
+      active_task_kinds: ['commit'],
+      active_operation: null,
+    });
+
+    renderSettingsPage();
+
+    expect(await screen.findByText('当前任务运行期间已锁定数据库与图库设置')).toBeVisible();
+    expect(screen.getByText('正在运行：提交入库')).toBeVisible();
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止数据库' })).toBeDisabled());
+    expect(screen.getByRole('button', { name: '切回托管库' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '连接并初始化外部库' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '从托管库迁移' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '测试连接' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '导出诊断' })).toBeEnabled();
+  });
+
+  test('fails closed and offers retry when task guard status cannot be loaded', async () => {
+    mockedApi.getCriticalOperationGuardStatus.mockRejectedValueOnce(new Error('guard offline'));
+
+    renderSettingsPage();
+
+    expect(await screen.findByText('无法确认任务状态，关键设置已锁定')).toBeVisible();
+    expect(screen.getByRole('button', { name: '停止数据库' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存' })).toBeDisabled();
+
+    mockedApi.getCriticalOperationGuardStatus.mockResolvedValue({
+      is_blocked: false,
+      blocking_reason: null,
+      active_task_kinds: [],
+      active_operation: null,
+    });
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止数据库' })).toBeEnabled());
   });
 
   test('renders mounted storage capability report after probing the library root', async () => {
