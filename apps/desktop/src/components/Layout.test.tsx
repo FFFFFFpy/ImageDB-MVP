@@ -34,10 +34,18 @@ function renderLayout(currentRoute: Route) {
     next_action: 'new_import',
   });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const pageTitle =
+    currentRoute === 'library'
+      ? '图库明细'
+      : currentRoute === 'probes'
+        ? '技术探针'
+        : currentRoute === 'settings'
+          ? '设置'
+          : '测试页面';
   render(
     <QueryClientProvider client={client}>
       <Layout currentRoute={currentRoute} onNavigate={vi.fn()} enablePolling={false}>
-        <h1>{currentRoute === 'library' ? '图库明细' : '测试页面'}</h1>
+        <h1>{pageTitle}</h1>
       </Layout>
     </QueryClientProvider>,
   );
@@ -65,5 +73,23 @@ describe('Layout navigation semantics', () => {
     expect(screen.getByRole('button', { name: '审核' })).toHaveAttribute('aria-current', 'page');
     expect(screen.getByRole('button', { name: '工作台' })).not.toHaveAttribute('aria-current');
     expect(screen.getByRole('button', { name: '工作台' })).not.toHaveClass('is-active');
+  });
+
+  test('marks settings as current only on the settings page', () => {
+    renderLayout('settings');
+
+    const settings = screen.getByRole('button', { name: '设置' });
+    expect(settings).toHaveClass('is-active');
+    expect(settings).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('heading', { level: 1, name: '设置' })).toBeVisible();
+  });
+
+  test('keeps probes visually under settings without announcing settings as current', () => {
+    renderLayout('probes');
+
+    const settings = screen.getByRole('button', { name: '设置' });
+    expect(settings).toHaveClass('is-active');
+    expect(settings).not.toHaveAttribute('aria-current');
+    expect(screen.getByRole('heading', { level: 1, name: '技术探针' })).toBeVisible();
   });
 });

@@ -3,30 +3,53 @@ use crate::infrastructure::file_transaction::FileTransactionProbeResult;
 use crate::infrastructure::image_fingerprint;
 use crate::infrastructure::image_fingerprint::ImageFingerprintProbeResult;
 use crate::infrastructure::postgres::PostgresProbeResult;
-use crate::state::AppState;
+use crate::state::{AppState, CriticalOperationGuard, CriticalOperationKind};
 use serde::Serialize;
+use std::future::Future;
+use std::path::Path;
 use tauri::State;
 
 #[tauri::command]
 pub async fn probe_postgres(state: State<'_, AppState>) -> Result<PostgresProbeResult, String> {
-    let mut mgr = state.postgres_manager.lock().await;
-    mgr.initialize().await.map_err(|e| format!("{e}"))
+    probe_postgres_for_state(&state).await
+}
+
+async fn probe_postgres_for_state(state: &AppState) -> Result<PostgresProbeResult, String> {
+    run_postgres_probe_with_guard(&state.critical_operation_guard, || async {
+        let mut mgr = state.postgres_manager.lock().await;
+        mgr.initialize().await.map_err(|e| format!("{e}"))
+    })
+    .await
+}
+
+async fn run_postgres_probe_with_guard<T, F, Fut>(
+    guard: &CriticalOperationGuard,
+    probe: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let _operation = guard.begin_operation(CriticalOperationKind::ProbeManagedDatabase)?;
+    probe().await
 }
 
 #[tauri::command]
 pub async fn probe_image_fingerprint(
     state: State<'_, AppState>,
 ) -> Result<ImageFingerprintProbeResult, String> {
-    let fixture_dir = state.fixture_dir.clone();
+    run_image_fingerprint_probe(&state.fixture_dir)
+}
 
+fn run_image_fingerprint_probe(fixture_dir: &Path) -> Result<ImageFingerprintProbeResult, String> {
     if !fixture_dir.exists() {
-        std::fs::create_dir_all(&fixture_dir)
+        std::fs::create_dir_all(fixture_dir)
             .map_err(|e| format!("Cannot create fixture dir: {e}"))?;
     }
 
     let needs_samples = !fixture_dir.join("test-sample.png").exists();
     if needs_samples {
-        match image_fingerprint::generate_test_samples(&fixture_dir) {
+        match image_fingerprint::generate_test_samples(fixture_dir) {
             Ok(created) => {
                 tracing::info!("Generated test samples: {created:?}");
             }
@@ -40,14 +63,17 @@ pub async fn probe_image_fingerprint(
         }
     }
 
-    Ok(image_fingerprint::run_probe(&fixture_dir))
+    Ok(image_fingerprint::run_probe(fixture_dir))
 }
 
 #[tauri::command]
 pub async fn probe_file_transaction(
     state: State<'_, AppState>,
 ) -> Result<FileTransactionProbeResult, String> {
-    let fixture_dir = state.fixture_dir.clone();
+    run_file_transaction_probe(&state.fixture_dir)
+}
+
+fn run_file_transaction_probe(fixture_dir: &Path) -> Result<FileTransactionProbeResult, String> {
     let source_dir = fixture_dir.join("tx-source");
 
     if !source_dir.exists() {
@@ -84,12 +110,131 @@ pub struct AllProbeResults {
 
 #[tauri::command]
 pub async fn run_all_probes(state: State<'_, AppState>) -> Result<AllProbeResults, String> {
-    let pg = probe_postgres(state.clone()).await?;
-    let fp = probe_image_fingerprint(state.clone()).await?;
-    let ft = probe_file_transaction(state.clone()).await?;
+    run_all_probes_for_state(&state).await
+}
+
+async fn run_all_probes_for_state(state: &AppState) -> Result<AllProbeResults, String> {
+    let pg = probe_postgres_for_state(state).await?;
+    let fp = run_image_fingerprint_probe(&state.fixture_dir)?;
+    let ft = run_file_transaction_probe(&state.fixture_dir)?;
     Ok(AllProbeResults {
         postgres: pg,
         fingerprint: fp,
         file_transaction: ft,
     })
+}
+
+#[cfg(test)]
+mod critical_probe_tests {
+    use super::*;
+    use crate::state::CriticalTaskKind;
+    use tempfile::TempDir;
+
+    fn app_state(temp: &TempDir) -> AppState {
+        AppState::new(temp.path(), temp.path().join("fixtures")).unwrap()
+    }
+
+    async fn assert_postgres_probe_rejected(task_kind: CriticalTaskKind, expected_error: &str) {
+        let temp = TempDir::new().unwrap();
+        let state = app_state(&temp);
+        let task = state
+            .critical_operation_guard
+            .begin_task(task_kind)
+            .unwrap();
+
+        let error = probe_postgres_for_state(&state).await.unwrap_err();
+        assert_eq!(error, expected_error);
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_task_kinds,
+            vec![task_kind.as_str()]
+        );
+
+        drop(task);
+        assert!(!state.critical_operation_guard.snapshot().is_blocked);
+    }
+
+    #[tokio::test]
+    async fn active_commit_rejects_postgres_probe_and_preserves_task() {
+        assert_postgres_probe_rejected(
+            CriticalTaskKind::Commit,
+            "cannot probe managed database while import commit is running",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_scan_rejects_postgres_probe_and_preserves_task() {
+        assert_postgres_probe_rejected(
+            CriticalTaskKind::Scan,
+            "cannot probe managed database while import scan is running",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_recovery_rejects_postgres_probe_and_preserves_task() {
+        assert_postgres_probe_rejected(
+            CriticalTaskKind::Recovery,
+            "cannot probe managed database while transaction recovery is running",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_external_migration_rejects_postgres_probe_and_preserves_task() {
+        assert_postgres_probe_rejected(
+            CriticalTaskKind::ExternalMigration,
+            "cannot probe managed database while external database migration is running",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn active_task_rejects_run_all_probes_before_other_probes_run() {
+        let temp = TempDir::new().unwrap();
+        let state = app_state(&temp);
+        let commit = state
+            .critical_operation_guard
+            .begin_task(CriticalTaskKind::Commit)
+            .unwrap();
+
+        let error = run_all_probes_for_state(&state).await.unwrap_err();
+        assert_eq!(
+            error,
+            "cannot probe managed database while import commit is running"
+        );
+        assert!(!state.fixture_dir.exists());
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_task_kinds,
+            vec!["commit"]
+        );
+
+        drop(commit);
+    }
+
+    #[tokio::test]
+    async fn postgres_probe_guard_runs_probe_without_active_tasks() {
+        let guard = CriticalOperationGuard::default();
+        let guard_during_probe = guard.clone();
+
+        let result = run_postgres_probe_with_guard(&guard, || async move {
+            assert_eq!(
+                guard_during_probe.snapshot().active_operation.as_deref(),
+                Some("probe_managed_database")
+            );
+            let error = guard_during_probe
+                .begin_task(CriticalTaskKind::Scan)
+                .expect_err("tasks must not start while the database probe is running");
+            assert_eq!(
+                error,
+                "cannot start import scan while managed database probe is running"
+            );
+            Ok::<_, String>("probe completed")
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, "probe completed");
+        assert!(!guard.snapshot().is_blocked);
+    }
 }

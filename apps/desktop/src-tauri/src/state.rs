@@ -41,6 +41,7 @@ impl CriticalTaskKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CriticalOperationKind {
     InitializeManagedDatabase,
+    ProbeManagedDatabase,
     SwitchToManagedDatabase,
     InitializeExternalDatabase,
     ShutdownDatabase,
@@ -51,6 +52,7 @@ impl CriticalOperationKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InitializeManagedDatabase => "initialize_managed_database",
+            Self::ProbeManagedDatabase => "probe_managed_database",
             Self::SwitchToManagedDatabase => "switch_to_managed_database",
             Self::InitializeExternalDatabase => "initialize_external_database",
             Self::ShutdownDatabase => "shutdown_database",
@@ -61,6 +63,7 @@ impl CriticalOperationKind {
     const fn action(self) -> &'static str {
         match self {
             Self::InitializeManagedDatabase => "initialize managed database",
+            Self::ProbeManagedDatabase => "probe managed database",
             Self::SwitchToManagedDatabase => "switch database",
             Self::InitializeExternalDatabase => "initialize external database",
             Self::ShutdownDatabase => "stop database",
@@ -71,6 +74,7 @@ impl CriticalOperationKind {
     const fn display_name(self) -> &'static str {
         match self {
             Self::InitializeManagedDatabase => "managed database initialization",
+            Self::ProbeManagedDatabase => "managed database probe",
             Self::SwitchToManagedDatabase => "database switch",
             Self::InitializeExternalDatabase => "external database initialization",
             Self::ShutdownDatabase => "database shutdown",

@@ -27,6 +27,8 @@ export function Layout({
   enablePolling = true,
   navigationDisabled = false,
 }: LayoutProps) {
+  const isSettingsPage = currentRoute === 'settings';
+  const isSettingsSection = isSettingsPage || currentRoute === 'probes';
   const databaseInfo = useQuery({
     queryKey: ['database-info-dashboard'],
     queryFn: api.getDatabaseInfoDashboard,
@@ -87,10 +89,8 @@ export function Layout({
         <div className="app-sidebar__footer">
           <button
             type="button"
-            className={`app-nav__item ${currentRoute === 'settings' || currentRoute === 'probes' ? 'is-active' : ''}`}
-            aria-current={
-              currentRoute === 'settings' || currentRoute === 'probes' ? 'page' : undefined
-            }
+            className={`app-nav__item ${isSettingsSection ? 'is-active' : ''}`}
+            aria-current={isSettingsPage ? 'page' : undefined}
             aria-label="设置"
             title="设置"
             disabled={navigationDisabled}

@@ -1,4 +1,4 @@
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { useState } from 'react';
 import { formatDiagnostic } from '../lib/format';
@@ -9,7 +9,7 @@ import type {
   FileTransactionProbeResult,
   AllProbeResults,
 } from '../lib/ipc/types';
-import { Button, PageHeader, StatusBadge } from '../components/ui';
+import { Button, PageHeader, StatusBadge, StatusBanner } from '../components/ui';
 
 type TabKey = 'postgres' | 'fingerprint' | 'file_tx';
 
@@ -33,11 +33,18 @@ function formatFileTransactionState(state: string): string {
   return map[state.toLowerCase()] ?? state;
 }
 
-export function ProbesPage() {
+export function ProbesPage({ enablePolling = true }: { enablePolling?: boolean } = {}) {
   const [tab, setTab] = useState<TabKey>('postgres');
   const [pgResult, setPgResult] = useState<PostgresProbeResult | null>(null);
   const [fpResult, setFpResult] = useState<ImageFingerprintProbeResult | null>(null);
   const [ftResult, setFtResult] = useState<FileTransactionProbeResult | null>(null);
+
+  const criticalGuardStatus = useQuery({
+    queryKey: ['critical-operation-guard-status'],
+    queryFn: api.getCriticalOperationGuardStatus,
+    refetchInterval: enablePolling ? 1000 : false,
+    retry: false,
+  });
 
   const connectionStatus = useMutation({
     mutationFn: api.getAppStatus,
@@ -69,6 +76,7 @@ export function ProbesPage() {
 
   const runAll = () => allProbes.mutate();
   const isRunning = allProbes.isPending;
+  const postgresProbeLocked = criticalGuardStatus.data?.is_blocked !== false;
 
   return (
     <div className="probes-page probes-page--m3">
@@ -77,11 +85,46 @@ export function ProbesPage() {
         description="面向环境诊断的开发工具，不属于日常导入流程。运行文件事务探针会使用隔离测试目录。"
         meta={<StatusBadge tone="warning">高级诊断</StatusBadge>}
         actions={
-          <Button variant="primary" onClick={runAll} loading={isRunning} loadingLabel="运行中…">
+          <Button
+            variant="primary"
+            onClick={runAll}
+            loading={isRunning}
+            loadingLabel="运行中…"
+            disabled={postgresProbeLocked}
+          >
             运行全部探针
           </Button>
         }
       />
+
+      {criticalGuardStatus.isLoading && (
+        <StatusBanner tone="info" title="正在确认任务状态">
+          数据库探针会在安全状态确认后开放。
+        </StatusBanner>
+      )}
+      {criticalGuardStatus.isError && (
+        <StatusBanner
+          tone="danger"
+          title="无法确认任务状态，数据库探针已锁定"
+          actions={
+            <Button variant="quiet" onClick={() => void criticalGuardStatus.refetch()}>
+              重试
+            </Button>
+          }
+        >
+          {String(criticalGuardStatus.error)}
+        </StatusBanner>
+      )}
+      {criticalGuardStatus.data?.is_blocked && (
+        <StatusBanner tone="warning" title="当前任务运行期间已锁定数据库探针">
+          {criticalGuardStatus.data.blocking_reason ?? '请等待当前任务结束后再运行。'}
+        </StatusBanner>
+      )}
+      {allProbes.isError && (
+        <StatusBanner tone="danger" title="无法运行全部探针">
+          {String(allProbes.error)}
+        </StatusBanner>
+      )}
 
       <div className="toolbar">
         <Button
@@ -114,7 +157,10 @@ export function ProbesPage() {
 
       {tab === 'postgres' && (
         <div className="probe-panel">
-          <button onClick={() => postgresProbe.mutate()} disabled={postgresProbe.isPending}>
+          <button
+            onClick={() => postgresProbe.mutate()}
+            disabled={postgresProbe.isPending || postgresProbeLocked}
+          >
             {postgresProbe.isPending ? '检测中…' : '运行数据库探针'}
           </button>
           {pgResult && <PgResultView result={pgResult} />}
