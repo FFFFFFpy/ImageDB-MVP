@@ -1,4 +1,4 @@
-# M3.7 最终验证记录
+# M3 验证记录（按执行批次）
 
 验证日期：2026-07-14
 
@@ -6,11 +6,30 @@
 
 ## 当前结论
 
-M3.0–M3.6 与用户授权扩展 M3.8 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。初始 UI 重设计未改后端；本轮静态审查随后发现“用户确认的计划”和“真正提交的计划”之间缺少哈希契约，因此以独立契约修复补充 Rust command/service/repository 的 `plan_hash` 返回与行锁内校验。M3.8 进一步增加文件事务开始前撤销整条未入库导入工作流，以及已提交图库的只读明细查询；没有修改 schema、migration、匹配算法或文件事务发布/恢复顺序。
+M3.0–M3.6 与用户授权扩展 M3.8 已落地。Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。初始 UI 重设计未改后端；静态审查随后发现“用户确认的计划”和“真正提交的计划”之间缺少哈希契约，因此以独立契约修复补充 Rust command/service/repository 的 `plan_hash` 返回与行锁内校验。M3.8 进一步增加文件事务开始前撤销整条未入库导入工作流，以及已提交图库的只读明细查询；`abandoned` / `invalidated` 是 M3.8 唯一授权的状态语义扩展，除此之外没有修改 schema、migration、匹配算法、原工作流或文件事务发布/恢复顺序。
 
-2026-07-13 的完成性反证审计随后补齐了 1,000 图集/10,000 图片压力、键盘与焦点、全页 WCAG、真实 Tauri UI 主链、分析中断续跑和 Commit 中断恢复证据。当前机器通过 Win32 `GetDpiForSystem` 测得 120 DPI，即真实 Windows 125% 缩放；100% 与 150% 仍不能由 WebView device scale factor 代替。
+2026-07-13 的完成性反证审计随后补齐了 1,000 图集/10,000 图片压力、键盘与焦点、全页 WCAG、真实 Tauri UI 主链、分析中断续跑和 Commit 中断恢复证据。当前机器通过 Win32 `GetDpiForSystem` 测得 120 DPI，即真实 Windows 125% 缩放；100% 与 150% 仍不能由 WebView device scale factor 代替，但不属于本轮 M3.8 审查修复完成门禁，也不再作为阻塞项。
 
-## 自动门禁
+## 本轮审查修复验证
+
+2026-07-14 在本分支实际执行以下门禁；这些结果只对应本轮审查修复，不借用下方历史批次：
+
+| 命令                                       | 本轮实际结果                                               |
+| ------------------------------------------ | ---------------------------------------------------------- |
+| `pnpm format:check`                        | 通过，Prettier 与 `cargo fmt --check` 均无差异             |
+| `pnpm typecheck`                           | 通过，`tsc --noEmit` 无错误                                |
+| `pnpm test:unit`                           | 14 个文件、130 项通过，0 失败                              |
+| `pnpm --filter @imagedb/desktop build:web` | 通过，231 modules；JS 379.69 KB，CSS 174.03 KB             |
+| `pnpm rust:test`                           | 226 通过、0 失败、3 个 real test 按设计忽略                |
+| `pnpm rust:clippy`                         | 通过，`--all-targets --all-features -D warnings`           |
+| `pnpm rust:test:real`                      | 102 项真实 PostgreSQL / 文件系统测试通过，0 失败，573.8 秒 |
+| `pnpm check`                               | 通过，完整串行复验类型、单测、格式、Clippy 与 Rust 单测    |
+
+真实浏览器复验使用本地 Vite Review fixture 和浏览器原生滚轮事件：左图、右图与叠加模式均围绕各自指针位置缩放，滚轮时页面 `window.scrollY` 与 `.app-main.scrollTop` 保持不变；图片区域外滚轮仍可滚动页面。控制台无运行错误，验证结束后已关闭页面并停止临时 Vite 服务。
+
+本轮没有新增 schema migration；图库明细继续使用现有索引与不透明 keyset cursor。未重新执行 release exe / NSIS 安装包构建，也未切换 Windows 100% / 150% 系统缩放；两项均不作为本轮审查修复完成门禁，且不沿用历史产物宣称已复验。
+
+## 历史自动门禁（此前执行批次）
 
 | 命令                                       | 结果                                                     |
 | ------------------------------------------ | -------------------------------------------------------- |
@@ -113,11 +132,8 @@ M3.0–M3.6 与用户授权扩展 M3.8 已完成，M3.7 仅剩 Windows 100% / 15
 - 实测发现并修复两个呈现层缺陷：零审核候选时 frozen plan 被空状态遮挡，以及 Recovery 完成后导航计数/工作台缓存未同步；均有回归测试；
 - NSIS 产物：`ImageDB_0.1.0_x64-setup.exe`。
 
-## 尚待完成的门禁
-
-- 将 Windows 系统缩放切换为 100% 和 150%，分别重启 release 应用并对工作台、新建导入、审核、计划、入库、恢复、设置进行人工视觉签字。125% 已通过；device scale factor 仅保留为辅助证据。
-
 ## 非 M3 门禁边界
 
 - clean Windows 全量安装发布门禁和正式发布仍属于 MVP1 release gate，不纳入 M3 UI 实现结论。
 - 浏览器视觉截图位于忽略版本控制的 `output/playwright/`，不进入分发产物。
+- Windows 100% / 150% 系统缩放可作为后续兼容性抽样，但不属于本轮 M3.8 审查修复的完成门禁，也不列为 M3 阻塞项。

@@ -16,9 +16,9 @@ MVP1 已定性为：
 
 当前工作分支：`codex/mvp3-ui-redesign`
 
-当前实施阶段：M3.7 最终人工缩放签字。M3.0–M3.6 的视觉系统与全部生产页面迁移已经完成；自动门禁、1,000 图集/10,000 图片压力场景、真实 Tauri UI 完整主链、分析中断续跑和 Commit 中断恢复均已通过。当前 Windows 真实系统缩放为 125%，100% 与 150% 仍需人工切换系统设置签字，因此尚不能定性 M3 全部完成。
+当前实施阶段：M3.8 审查修复与验证收口。M3.0–M3.6 的视觉系统与全部生产页面迁移已经完成；用户授权的 M3.8 保留“只读图库明细”和“文件事务创建前撤销整次未入库工作流”。`abandoned` import run 与 `invalidated` frozen plan 是 M3.8 唯一授权的状态语义扩展，扫描、审核、计划、Commit、文件事务与 Recovery 的其余语义保持不变。本轮验证结果只在命令实际执行后记录；Windows 100% / 150% 系统缩放不属于本轮完成门禁，也不再作为 M3 阻塞项。
 
-M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。M3 不修改 frozen plan、Commit、Recovery、数据库 migration 或匹配算法语义。
+M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。除 M3.8 明确授权的 `abandoned` / `invalidated` 外，M3 不修改 frozen plan、Commit、Recovery、数据库 migration、匹配算法或文件事务语义。
 
 MVP2 图集级断点续跑、异步审核入口和数据状态可见已经作为 M3 的业务基线保留；其 canonical 文档仍为 [`docs/MVP2/README.md`](docs/MVP2/README.md)。
 
@@ -46,6 +46,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - release gate / install gate 修正。
 - clean Windows 发布验收补强。
 - 不改变业务语义的呈现层、交互层和设计系统迁移。
+- 用户授权的 M3.8 受限扩展：只读图库明细，以及文件事务创建前撤销整次未入库工作流并保留审计证据。
 
 例外：用户明确要求的 MVP2 / MVP3 任务在独立 feature 分支上执行，仍必须保持 frozen plan / commit / recovery 文件事务安全边界。
 
@@ -56,7 +57,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 单项测试、Clippy、Release 构建与本地 install-gate：已记录通过。
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
-- MVP3 UI 重设计：M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。
+- MVP3 UI 重设计：M3.0–M3.8 已进入审查修复与验证收口；Windows 100% / 150% 系统缩放不是本轮完成门禁或阻塞项。
 
 ## 文档入口
 
