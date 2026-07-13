@@ -362,43 +362,44 @@ pub async fn get_frozen_plan_summary(
     finish_plan_transaction(client, result, "frozen plan read").await
 }
 
-/// Withdraw a frozen plan before any file transaction has been created.
+/// Abandon the entire pending import workflow before any file transaction has
+/// been created.
 ///
 /// The persisted plan is retained as `invalidated` audit evidence; review
-/// decisions and source snapshots remain untouched so the user can generate
-/// a new plan. The same import-run row lock used by plan edits and Commit
-/// closes the race with transaction prewrite.
-pub async fn withdraw_frozen_import_plan(
+/// decisions, analysis results, and source snapshots remain untouched as
+/// history, while the run becomes `abandoned` and can no longer resume. The
+/// same import-run row lock used by plan edits and Commit closes the race with
+/// transaction prewrite.
+pub async fn abandon_frozen_import_workflow(
     client: &Client,
     import_run_id: Uuid,
 ) -> Result<(), AppError> {
     client
         .batch_execute("BEGIN")
         .await
-        .map_err(|e| AppError::Internal(format!("failed to begin plan withdrawal: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to begin workflow abandon: {e}")))?;
 
     let result = async {
-        let run_state = ensure_plan_editable(client, import_run_id).await?;
+        let run_state =
+            ensure_plan_mutation_allowed(client, import_run_id, "abandon import workflow").await?;
         let frozen = require_frozen_plan(client, import_run_id).await?;
+        let next =
+            crate::domain::state_machine::next_import_run_state(&run_state, "abandon_workflow")?;
+        let next_state = ImportRunState::from_str_opt(next).ok_or_else(|| {
+            AppError::Internal(format!(
+                "unknown import run state after workflow abandon: {next}"
+            ))
+        })?;
+
         ImportRepository::update_import_plan_state(client, frozen.plan_id, &PlanState::Invalidated)
             .await?;
-
-        if run_state == ImportRunState::Cancelled.to_string() {
-            let next =
-                crate::domain::state_machine::next_import_run_state(&run_state, "reopen_plan")?;
-            let next_state = ImportRunState::from_str_opt(next).ok_or_else(|| {
-                AppError::Internal(format!(
-                    "unknown import run state after plan withdrawal: {next}"
-                ))
-            })?;
-            ImportRepository::update_import_run_state(client, import_run_id, &next_state).await?;
-        }
+        ImportRepository::update_import_run_state(client, import_run_id, &next_state).await?;
 
         Ok(())
     }
     .await;
 
-    finish_plan_transaction(client, result, "plan withdrawal").await
+    finish_plan_transaction(client, result, "workflow abandon").await
 }
 
 pub async fn set_plan_album_included(
@@ -413,7 +414,7 @@ pub async fn set_plan_album_included(
         .map_err(|e| AppError::Internal(format!("failed to begin plan edit: {e}")))?;
 
     let result = async {
-        ensure_plan_editable(client, import_run_id).await?;
+        ensure_plan_mutation_allowed(client, import_run_id, "edit import plan").await?;
         let frozen = require_frozen_plan(client, import_run_id).await?;
         if included {
             include_album_images(client, frozen.plan_id, album_id).await?;
@@ -449,7 +450,7 @@ pub async fn set_plan_image_included(
         .map_err(|e| AppError::Internal(format!("failed to begin plan edit: {e}")))?;
 
     let result = async {
-        ensure_plan_editable(client, import_run_id).await?;
+        ensure_plan_mutation_allowed(client, import_run_id, "edit import plan").await?;
         let frozen = require_frozen_plan(client, import_run_id).await?;
         if included {
             include_image_in_album(client, frozen.plan_id, image_id, target_album_id).await?;
@@ -475,7 +476,11 @@ pub async fn set_plan_image_included(
         .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
 }
 
-async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<String, AppError> {
+async fn ensure_plan_mutation_allowed(
+    client: &Client,
+    import_run_id: Uuid,
+    operation: &str,
+) -> Result<String, AppError> {
     // Every plan editor calls this after BEGIN. The row lock is the per-run
     // serialization point shared with Commit's short plan-capture
     // transaction, closing the load/hash/prewrite TOCTOU window.
@@ -485,12 +490,12 @@ async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<St
             &[&import_run_id],
         )
         .await
-        .map_err(|e| AppError::Internal(format!("failed to lock import run for plan edit: {e}")))?
+        .map_err(|e| AppError::Internal(format!("failed to lock import run to {operation}: {e}")))?
         .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
     let run_state: String = row.get("state");
     if !matches!(run_state.as_str(), "ready_to_commit" | "cancelled") {
         return Err(AppError::Internal(format!(
-            "cannot edit import plan while run is in state '{run_state}'"
+            "cannot {operation} while run is in state '{run_state}'"
         )));
     }
 
@@ -503,9 +508,9 @@ async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<St
         .map_err(|e| AppError::Internal(format!("failed to check plan transactions: {e}")))?
         .get(0);
     if active_transactions > 0 {
-        return Err(AppError::Internal(
-            "cannot edit import plan after commit transactions have been created".to_string(),
-        ));
+        return Err(AppError::Internal(format!(
+            "cannot {operation} after commit transactions have been created"
+        )));
     }
     require_frozen_plan(client, import_run_id).await?;
     Ok(run_state)

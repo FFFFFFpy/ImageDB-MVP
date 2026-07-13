@@ -359,9 +359,10 @@ describe('review workflow hardening', () => {
     });
   });
 
-  test('requires confirmation and withdraws a frozen plan without losing review context', async () => {
+  test('requires confirmation and abandons the whole pending import workflow', async () => {
     const importRunId = importPlanFixture.import_run_id;
-    const withdraw = vi.spyOn(api, 'withdrawFrozenImportPlan').mockResolvedValue(undefined);
+    const abandon = vi.spyOn(api, 'abandonFrozenImportWorkflow').mockResolvedValue(undefined);
+    const onWorkflowAbandoned = vi.fn();
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false, staleTime: Infinity } },
     });
@@ -384,18 +385,19 @@ describe('review workflow hardening', () => {
           initialShowPlan
           enablePolling={false}
           onNavigate={vi.fn()}
+          onWorkflowAbandoned={onWorkflowAbandoned}
         />
       </QueryClientProvider>,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: '撤销计划' }));
-    expect(withdraw).not.toHaveBeenCalled();
-    expect(screen.getByText('确认撤销这份导入计划？')).toBeVisible();
+    fireEvent.click(await screen.findByRole('button', { name: '撤销这次导入' }));
+    expect(abandon).not.toHaveBeenCalled();
+    expect(screen.getByText('确认撤销这次导入任务？')).toBeVisible();
     expect(screen.getByRole('button', { name: '前往提交确认' })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole('button', { name: '确认撤销' }));
-    await waitFor(() => expect(withdraw).toHaveBeenCalledWith(importRunId));
-    expect(await screen.findByText('所有候选已审核')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '撤销并返回工作台' }));
+    await waitFor(() => expect(abandon).toHaveBeenCalledWith(importRunId));
+    await waitFor(() => expect(onWorkflowAbandoned).toHaveBeenCalledOnce());
     expect(client.getQueryData(['reviewFrozenImportPlanSummary', importRunId])).toBeNull();
     expect(client.getQueryData(['frozenImportPlanSummary', importRunId])).toBeNull();
   });

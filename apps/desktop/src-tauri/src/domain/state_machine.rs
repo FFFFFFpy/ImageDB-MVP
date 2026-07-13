@@ -234,9 +234,10 @@ pub fn next_import_run_state(current: &str, action: &str) -> Result<&'static str
         ("review_required", "finalize") => Ok("ready_to_commit"),
         // ReadyToCommit → Committing (start commit)
         ("ready_to_commit", "commit") => Ok("committing"),
-        // A commit cancelled before transaction prewrite may return to the
-        // planning boundary after its frozen plan is explicitly withdrawn.
-        ("cancelled", "reopen_plan") => Ok("ready_to_commit"),
+        // A frozen workflow may be abandoned only before transaction
+        // prewrite. The service validates the frozen plan and transaction
+        // boundary before applying this terminal transition.
+        ("ready_to_commit" | "cancelled", "abandon_workflow") => Ok("abandoned"),
         // Committing → RecoveryRequired (interrupted)
         ("committing", "recover") => Ok("recovery_required"),
         // Committing → Completed (all done)
@@ -357,8 +358,12 @@ mod tests {
             "completed"
         );
         assert_eq!(
-            next_import_run_state("cancelled", "reopen_plan").unwrap(),
-            "ready_to_commit"
+            next_import_run_state("ready_to_commit", "abandon_workflow").unwrap(),
+            "abandoned"
+        );
+        assert_eq!(
+            next_import_run_state("cancelled", "abandon_workflow").unwrap(),
+            "abandoned"
         );
     }
 

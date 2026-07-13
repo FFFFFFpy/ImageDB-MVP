@@ -624,7 +624,7 @@ async fn real_protocol_library_catalog_returns_album_and_image_pages() {
 
 #[tokio::test]
 #[ignore]
-async fn real_protocol_frozen_plan_withdrawal_is_auditable_and_stops_at_transaction_boundary() {
+async fn real_protocol_frozen_workflow_abandon_is_auditable_and_stops_at_transaction_boundary() {
     let (_tmp, mgr) = fresh_db().await;
     let (client, handle) = mgr.lock().await.connect().await.unwrap();
     let root_id = uuid::Uuid::new_v4();
@@ -681,9 +681,9 @@ async fn real_protocol_frozen_plan_withdrawal_is_auditable_and_stops_at_transact
             .unwrap();
     }
 
-    review_service::withdraw_frozen_import_plan(&client, ready_run_id)
+    review_service::abandon_frozen_import_workflow(&client, ready_run_id)
         .await
-        .expect("a plan with no transaction should be withdrawable");
+        .expect("a frozen workflow with no transaction should be abandonable");
     let ready_row = client
         .query_one(
             "SELECT r.state AS run_state, p.state AS plan_state
@@ -693,8 +693,23 @@ async fn real_protocol_frozen_plan_withdrawal_is_auditable_and_stops_at_transact
         )
         .await
         .unwrap();
-    assert_eq!(ready_row.get::<_, String>("run_state"), "ready_to_commit");
+    assert_eq!(ready_row.get::<_, String>("run_state"), "abandoned");
     assert_eq!(ready_row.get::<_, String>("plan_state"), "invalidated");
+    let preserved_album_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM import_albums WHERE import_run_id = $1",
+            &[&ready_run_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(preserved_album_count, 1);
+    assert_eq!(
+        ImportRepository::get_latest_reviewable_run(&client)
+            .await
+            .unwrap(),
+        Some(blocked_run_id)
+    );
 
     client
         .execute(
@@ -710,21 +725,23 @@ async fn real_protocol_frozen_plan_withdrawal_is_auditable_and_stops_at_transact
         )
         .await
         .unwrap();
-    let error = review_service::withdraw_frozen_import_plan(&client, blocked_run_id)
+    let error = review_service::abandon_frozen_import_workflow(&client, blocked_run_id)
         .await
-        .expect_err("transaction evidence must make withdrawal fail closed");
+        .expect_err("transaction evidence must make workflow abandon fail closed");
     assert!(error
         .to_string()
         .contains("after commit transactions have been created"));
-    let blocked_plan_state: String = client
+    let blocked_row = client
         .query_one(
-            "SELECT state FROM import_plans WHERE id = $1",
+            "SELECT r.state AS run_state, p.state AS plan_state
+             FROM import_runs r JOIN import_plans p ON p.import_run_id = r.id
+             WHERE p.id = $1",
             &[&blocked_plan_id],
         )
         .await
-        .unwrap()
-        .get(0);
-    assert_eq!(blocked_plan_state, "frozen");
+        .unwrap();
+    assert_eq!(blocked_row.get::<_, String>("run_state"), "ready_to_commit");
+    assert_eq!(blocked_row.get::<_, String>("plan_state"), "frozen");
 
     drop(client);
     handle.abort();

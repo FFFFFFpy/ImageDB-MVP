@@ -35,11 +35,12 @@ const mockState = vi.hoisted(() => ({
     diagnostics: [],
   } as Record<string, unknown>,
   databaseInfo: null as Record<string, unknown> | null,
-  latestReviewableRunId: 'run-newer-b',
-  latestCommittableRunId: 'run-newer-b',
+  latestReviewableRunId: 'run-newer-b' as string | null,
+  latestCommittableRunId: 'run-newer-b' as string | null,
   requestedReviewRunIds: [] as string[],
   requestedPlanRunIds: [] as string[],
   commitRequests: [] as Array<Record<string, unknown>>,
+  abandonedWorkflowRunIds: [] as string[],
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
@@ -141,6 +142,25 @@ vi.mock('@tauri-apps/api/core', () => ({
       mockState.commitRequests.push(args ?? {});
       return Promise.resolve('commit started');
     }
+    if (cmd === 'abandon_frozen_import_workflow') {
+      const importRunId = String(args?.importRunId);
+      mockState.abandonedWorkflowRunIds.push(importRunId);
+      if (mockState.databaseInfo) {
+        mockState.databaseInfo = {
+          ...mockState.databaseInfo,
+          latest_run: {
+            ...(mockState.databaseInfo.latest_run as Record<string, unknown>),
+            import_run_id: importRunId,
+            state: 'abandoned',
+          },
+          latest_actionable_run: null,
+          next_action: 'new_import',
+        };
+      }
+      mockState.latestReviewableRunId = null;
+      mockState.latestCommittableRunId = null;
+      return Promise.resolve();
+    }
     if (cmd === 'get_scan_progress') {
       return Promise.resolve({
         state: 'idle',
@@ -228,6 +248,7 @@ beforeEach(() => {
   mockState.requestedReviewRunIds = [];
   mockState.requestedPlanRunIds = [];
   mockState.commitRequests = [];
+  mockState.abandonedWorkflowRunIds = [];
 });
 
 afterEach(() => cleanup());
@@ -319,6 +340,21 @@ test('keeps the dashboard-selected commit run when a newer second run exists', a
       expectedPlanHash: 'hash-run-older-a',
     }),
   );
+});
+
+test('abandoning a frozen workflow clears its context and returns to new import', async () => {
+  setActionableDashboard('resume_commit', 'run-older-a');
+  renderApp();
+
+  fireEvent.click(await screen.findByRole('button', { name: '继续入库' }));
+  await screen.findByText('计划哈希：hash-run-older-a');
+
+  fireEvent.click(screen.getByRole('button', { name: '撤销这次导入' }));
+  fireEvent.click(screen.getByRole('button', { name: '撤销并返回工作台' }));
+
+  await waitFor(() => expect(mockState.abandonedWorkflowRunIds).toContain('run-older-a'));
+  expect(await screen.findByRole('heading', { name: '工作台' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '开始导入' })).toBeEnabled();
 });
 
 test('renders dashboard page with title', async () => {

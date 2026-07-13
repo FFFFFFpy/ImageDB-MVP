@@ -26,6 +26,7 @@ import {
 interface ReviewPageProps {
   onNavigate: (route: Route) => void;
   onGoCommit?: (importRunId: string) => void;
+  onWorkflowAbandoned?: () => void;
   onPlanEditPendingChange?: (pending: boolean) => void;
   initialImportRunId?: string | null;
   initialPreviews?: { left: string; right: string } | null;
@@ -248,6 +249,7 @@ function formatTransform(t: string | null): string {
 export function ReviewPage({
   onNavigate,
   onGoCommit,
+  onWorkflowAbandoned,
   onPlanEditPendingChange,
   initialImportRunId = null,
   initialPreviews = null,
@@ -280,13 +282,13 @@ export function ReviewPage({
   const [submitting, setSubmitting] = useState(false);
   const [planGenerationPending, setPlanGenerationPending] = useState(false);
   const [planGenerationError, setPlanGenerationError] = useState<string | null>(null);
-  const [planWithdrawalConfirm, setPlanWithdrawalConfirm] = useState(false);
-  const [planWithdrawalPending, setPlanWithdrawalPending] = useState(false);
-  const [planWithdrawalError, setPlanWithdrawalError] = useState<string | null>(null);
+  const [workflowAbandonConfirm, setWorkflowAbandonConfirm] = useState(false);
+  const [workflowAbandonPending, setWorkflowAbandonPending] = useState(false);
+  const [workflowAbandonError, setWorkflowAbandonError] = useState<string | null>(null);
 
   useEffect(() => {
-    onPlanEditPendingChange?.(planEditPending || planGenerationPending || planWithdrawalPending);
-  }, [onPlanEditPendingChange, planEditPending, planGenerationPending, planWithdrawalPending]);
+    onPlanEditPendingChange?.(planEditPending || planGenerationPending || workflowAbandonPending);
+  }, [onPlanEditPendingChange, planEditPending, planGenerationPending, workflowAbandonPending]);
 
   useEffect(
     () => () => {
@@ -494,32 +496,44 @@ export function ReviewPage({
     [planEditPending, queryClient],
   );
 
-  const handleWithdrawPlan = useCallback(async () => {
-    if (!importPlan || planEditPending || planWithdrawalPending) return;
+  const handleAbandonWorkflow = useCallback(async () => {
+    if (!importPlan || planEditPending || workflowAbandonPending) return;
     const runId = importPlan.import_run_id;
-    setPlanWithdrawalPending(true);
-    setPlanWithdrawalError(null);
+    setWorkflowAbandonPending(true);
+    setWorkflowAbandonError(null);
     try {
-      await api.withdrawFrozenImportPlan(runId);
+      await api.abandonFrozenImportWorkflow(runId);
       queryClient.setQueryData(['reviewFrozenImportPlanSummary', runId], null);
       queryClient.setQueryData(['frozenImportPlanSummary', runId], null);
       setImportPlan(null);
       setShowPlan(false);
-      setPlanWithdrawalConfirm(false);
+      setWorkflowAbandonConfirm(false);
       setOpenPlanAlbums(new Set());
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['reviewFrozenImportPlanSummary', runId] }),
         queryClient.invalidateQueries({ queryKey: ['frozenImportPlanSummary', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['reviewQueue', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['reviewProgress', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['latestReviewableImportRun'] }),
         queryClient.invalidateQueries({ queryKey: ['latestCommittableImportRun'] }),
         queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
         queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
       ]);
+      if (onWorkflowAbandoned) onWorkflowAbandoned();
+      else onNavigate('dashboard');
     } catch (error) {
-      setPlanWithdrawalError(String(error));
+      setWorkflowAbandonError(String(error));
     } finally {
-      setPlanWithdrawalPending(false);
+      setWorkflowAbandonPending(false);
     }
-  }, [importPlan, planEditPending, planWithdrawalPending, queryClient]);
+  }, [
+    importPlan,
+    onNavigate,
+    onWorkflowAbandoned,
+    planEditPending,
+    queryClient,
+    workflowAbandonPending,
+  ]);
 
   const togglePlanAlbum = useCallback(
     (album: ImportPlanAlbumGroup) => {
@@ -691,21 +705,21 @@ export function ReviewPage({
             <>
               <Button
                 variant="danger"
-                disabled={planEditPending || planWithdrawalPending}
-                onClick={() => setPlanWithdrawalConfirm(true)}
+                disabled={planEditPending || workflowAbandonPending}
+                onClick={() => setWorkflowAbandonConfirm(true)}
               >
-                撤销计划
+                撤销这次导入
               </Button>
               <Button
                 variant="quiet"
-                disabled={planEditPending || planWithdrawalPending}
+                disabled={planEditPending || workflowAbandonPending}
                 onClick={() => setShowPlan(false)}
               >
                 返回审核
               </Button>
               <Button
                 variant="primary"
-                disabled={planEditPending || planWithdrawalPending || planWithdrawalConfirm}
+                disabled={planEditPending || workflowAbandonPending || workflowAbandonConfirm}
                 loading={planEditPending}
                 loadingLabel="正在保存计划…"
                 onClick={() =>
@@ -720,37 +734,36 @@ export function ReviewPage({
         <StatusBanner tone="info" title="计划与入库是两个步骤">
           此页只调整并保存计划；下一页会重新读取这份 frozen plan，再由你确认开始文件事务。
         </StatusBanner>
-        {planWithdrawalConfirm && (
+        {workflowAbandonConfirm && (
           <StatusBanner
             tone="warning"
-            title="确认撤销这份导入计划？"
+            title="确认撤销这次导入任务？"
             actions={
               <>
                 <Button
                   variant="danger"
-                  loading={planWithdrawalPending}
-                  loadingLabel="正在撤销…"
-                  onClick={handleWithdrawPlan}
+                  loading={workflowAbandonPending}
+                  loadingLabel="正在撤销任务…"
+                  onClick={handleAbandonWorkflow}
                 >
-                  确认撤销
+                  撤销并返回工作台
                 </Button>
                 <Button
                   variant="quiet"
-                  disabled={planWithdrawalPending}
-                  onClick={() => setPlanWithdrawalConfirm(false)}
+                  disabled={workflowAbandonPending}
+                  onClick={() => setWorkflowAbandonConfirm(false)}
                 >
-                  保留计划
+                  继续保留任务
                 </Button>
               </>
             }
           >
-            只会将当前 frozen plan
-            标记为已失效；审核决定、源图片和图库内容都不会被删除，之后可以重新生成计划。
+            这会结束当前导入任务并回到可新建导入的状态。已经完成的扫描、审核和计划将不再继续；源图片和图库内容不会被删除，任务记录仍会保留用于审计。
           </StatusBanner>
         )}
-        {planWithdrawalError && (
-          <StatusBanner tone="danger" title="撤销导入计划失败">
-            {planWithdrawalError}
+        {workflowAbandonError && (
+          <StatusBanner tone="danger" title="撤销导入任务失败">
+            {workflowAbandonError}
           </StatusBanner>
         )}
         <div className="import-plan-summary">
@@ -815,7 +828,7 @@ export function ReviewPage({
                     <button
                       type="button"
                       className={`plan-toggle plan-album-toggle ${album.included ? 'is-on' : 'is-off'}`}
-                      disabled={planEditPending || planWithdrawalPending || planWithdrawalConfirm}
+                      disabled={planEditPending || workflowAbandonPending || workflowAbandonConfirm}
                       onClick={() => togglePlanAlbum(album)}
                     >
                       {album.included ? '导入' : '跳过'}
@@ -846,7 +859,9 @@ export function ReviewPage({
                                 type="button"
                                 className={`plan-toggle ${img.included ? 'is-on' : 'is-off'}`}
                                 disabled={
-                                  planEditPending || planWithdrawalPending || planWithdrawalConfirm
+                                  planEditPending ||
+                                  workflowAbandonPending ||
+                                  workflowAbandonConfirm
                                 }
                                 onClick={() => togglePlanImage(album, img)}
                               >

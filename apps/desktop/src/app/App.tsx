@@ -35,6 +35,12 @@ export function App() {
     navigate(nextRoute);
   };
 
+  const handleWorkflowAbandoned = () => {
+    setWorkflowImportRunId(null);
+    setWorkflowNavigationBlocked(false);
+    navigate('dashboard');
+  };
+
   const handleOnboardingComplete = async () => {
     const currentSettings = await api.getSettings();
     if (!currentSettings.first_run_completed) {
@@ -105,6 +111,7 @@ export function App() {
                 setWorkflowImportRunId(importRunId);
                 navigate('commit');
               }}
+              onWorkflowAbandoned={handleWorkflowAbandoned}
               onPlanEditPendingChange={setWorkflowNavigationBlocked}
             />
           )}
@@ -116,6 +123,8 @@ export function App() {
                 setWorkflowImportRunId(importRunId);
                 navigate('review');
               }}
+              onWorkflowAbandoned={handleWorkflowAbandoned}
+              onNavigationBlockedChange={setWorkflowNavigationBlocked}
             />
           )}
           {route === 'recovery' && <RecoveryPage onNavigate={navigate} />}

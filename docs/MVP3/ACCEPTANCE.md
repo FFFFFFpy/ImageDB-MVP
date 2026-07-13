@@ -54,8 +54,9 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] Commit 展示与读取的 frozen plan 一致，不临场重算。
 - [x] 计划编辑期间所有离开计划页的入口均禁用；编辑结果会刷新计划与 Dashboard 缓存。
 - [x] Commit 展示确认的 `plan_hash`，启动提交时后端在行锁内拒绝已变化的计划。
-- [x] 未创建文件事务的 frozen plan 可从 Review / Commit 撤销，并保留为 `invalidated` 审计记录。
-- [x] 计划撤销保留审核决定与源快照；一旦存在文件事务证据即 fail closed，不绕过 Recovery。
+- [x] 未创建文件事务的整条导入任务可从 Review / Commit 撤销；import run 进入 `abandoned`，frozen plan 保留为 `invalidated` 审计记录。
+- [x] 撤销成功后清空 workflow run 上下文并返回工作台“开始导入”，原任务不再显示为可审核、可生成计划或可提交。
+- [x] 工作流撤销保留审核决定与源快照；一旦存在文件事务证据即 fail closed，不绕过 Recovery。
 - [x] recover、resume_commit、inspect_transaction_failure 入口语义准确。
 - [x] conflict、证据不完整和终态失败保持 fail closed。
 

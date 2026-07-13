@@ -110,17 +110,18 @@ codex/mvp3-ui-redesign
 
 门禁：[`ACCEPTANCE.md`](ACCEPTANCE.md) 全部必需项签字后才可定性 M3 完成。
 
-### M3.8 安全撤销计划与图库明细（用户授权扩展）
+### M3.8 安全撤销未入库工作流与图库明细（用户授权扩展）
 
 交付：
 
-- Review 与 Commit 确认页提供 frozen plan 撤销入口，保留 `invalidated` 审计与既有审核决定。
+- Review 与 Commit 确认页提供“撤销这次导入”入口；成功后 import run 进入 `abandoned`、frozen plan 进入 `invalidated`，保留既有审核决定与源快照审计。
+- 撤销成功后清空前端 workflow run 上下文、刷新 Dashboard 状态并返回工作台“开始导入”，原任务不再可恢复为审核、计划或提交。
 - 撤销与 Commit capture 共用 import run 行锁；任何文件事务创建后拒绝撤销，不改变 Recovery 语义。
 - 工作台图库概览进入只读图库明细，分页列出已提交图集，并在展开时分页读取图片元数据。
 - 图库查询遵循 command → service → repository 边界，React 只消费 DTO；不增加 schema 或 migration。
 - 覆盖确认交互、缓存失效、事务边界、图库分页和 loading / error / empty 回归测试。
 
-门禁：真实 PostgreSQL 证明撤销在事务创建前可审计、事务创建后 fail closed；图库查询只返回 committed 数据并保持分页总数一致。
+门禁：真实 PostgreSQL 证明整条工作流撤销在事务创建前可审计且不再 actionable、事务创建后 fail closed；前端证明单任务撤销后 Dashboard 回到新建导入；图库查询只返回 committed 数据并保持分页总数一致。
 
 ## 4. 预计主要修改范围
 
@@ -144,7 +145,7 @@ apps/desktop/src-tauri/migrations/
 
 若实施中确需修改默认不应修改的范围，必须拆成独立、可解释的契约修复，并证明不是前端自行重写业务语义。
 
-M3.8 的 Rust 改动属于用户明确授权的受限业务契约扩展：复用既有 `invalidated` 计划状态、行锁与事务证据，不修改 schema、文件发布顺序或 Recovery 状态机；图库部分只新增只读查询。
+M3.8 的 Rust 改动属于用户明确授权的受限业务契约扩展：复用既有 `abandoned` run 状态、`invalidated` 计划状态、行锁与事务证据，不修改 schema、文件发布顺序或 Recovery 状态机；图库部分只新增只读查询。
 
 ## 5. 每个任务包的验证
 

@@ -190,10 +190,10 @@ pub(crate) async fn get_frozen_import_plan_summary_for_state(
     result
 }
 
-/// Invalidate a frozen plan only while the run is still before transaction
-/// prewrite. The service owns the row lock and safety checks.
+/// Abandon the entire frozen import workflow only while it is still before
+/// transaction prewrite. The service owns the row lock and safety checks.
 #[tauri::command]
-pub async fn withdraw_frozen_import_plan(
+pub async fn abandon_frozen_import_workflow(
     state: State<'_, AppState>,
     import_run_id: String,
 ) -> Result<(), String> {
@@ -202,7 +202,7 @@ pub async fn withdraw_frozen_import_plan(
         let mgr = state.postgres_manager.lock().await;
         mgr.connect().await.map_err(|e| format!("{e}"))?
     };
-    let result = review_service::withdraw_frozen_import_plan(&client, run_id)
+    let result = review_service::abandon_frozen_import_workflow(&client, run_id)
         .await
         .map_err(|e| format!("{e}"));
     handle.abort();

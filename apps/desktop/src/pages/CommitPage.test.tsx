@@ -67,9 +67,9 @@ describe('commit progress semantics', () => {
     expect(PLAN_IMAGE_BATCH_SIZE).toBeLessThan(100);
   });
 
-  test('requires confirmation before withdrawing the plan from commit confirmation', async () => {
-    const withdraw = vi.spyOn(api, 'withdrawFrozenImportPlan').mockResolvedValue(undefined);
-    const onGoReview = vi.fn();
+  test('requires confirmation before abandoning the whole pending import workflow', async () => {
+    const abandon = vi.spyOn(api, 'abandonFrozenImportWorkflow').mockResolvedValue(undefined);
+    const onWorkflowAbandoned = vi.fn();
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
     render(
@@ -79,18 +79,18 @@ describe('commit progress semantics', () => {
           initialImportRunId={importPlanFixture.import_run_id}
           enablePolling={false}
           onNavigate={vi.fn()}
-          onGoReview={onGoReview}
+          onWorkflowAbandoned={onWorkflowAbandoned}
         />
       </QueryClientProvider>,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: '撤销计划' }));
-    expect(withdraw).not.toHaveBeenCalled();
-    expect(screen.getByText('确认撤销这份导入计划？')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '撤销这次导入' }));
+    expect(abandon).not.toHaveBeenCalled();
+    expect(screen.getByText('确认撤销这次导入任务？')).toBeVisible();
     expect(screen.getByRole('button', { name: '确认并开始入库' })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole('button', { name: '确认撤销' }));
-    await waitFor(() => expect(withdraw).toHaveBeenCalledWith(importPlanFixture.import_run_id));
-    await waitFor(() => expect(onGoReview).toHaveBeenCalledWith(importPlanFixture.import_run_id));
+    fireEvent.click(screen.getByRole('button', { name: '撤销并返回工作台' }));
+    await waitFor(() => expect(abandon).toHaveBeenCalledWith(importPlanFixture.import_run_id));
+    await waitFor(() => expect(onWorkflowAbandoned).toHaveBeenCalledOnce());
   });
 });

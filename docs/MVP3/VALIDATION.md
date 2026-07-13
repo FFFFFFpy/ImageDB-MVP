@@ -1,12 +1,12 @@
 # M3.7 最终验证记录
 
-验证日期：2026-07-13
+验证日期：2026-07-14
 
 分支：`codex/mvp3-ui-redesign`
 
 ## 当前结论
 
-M3.0–M3.6 与用户授权扩展 M3.8 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。初始 UI 重设计未改后端；本轮静态审查随后发现“用户确认的计划”和“真正提交的计划”之间缺少哈希契约，因此以独立契约修复补充 Rust command/service/repository 的 `plan_hash` 返回与行锁内校验。M3.8 进一步增加文件事务开始前的 frozen plan 安全撤销，以及已提交图库的只读明细查询；没有修改 schema、migration、匹配算法或文件事务发布/恢复顺序。
+M3.0–M3.6 与用户授权扩展 M3.8 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。初始 UI 重设计未改后端；本轮静态审查随后发现“用户确认的计划”和“真正提交的计划”之间缺少哈希契约，因此以独立契约修复补充 Rust command/service/repository 的 `plan_hash` 返回与行锁内校验。M3.8 进一步增加文件事务开始前撤销整条未入库导入工作流，以及已提交图库的只读明细查询；没有修改 schema、migration、匹配算法或文件事务发布/恢复顺序。
 
 2026-07-13 的完成性反证审计随后补齐了 1,000 图集/10,000 图片压力、键盘与焦点、全页 WCAG、真实 Tauri UI 主链、分析中断续跑和 Commit 中断恢复证据。当前机器通过 Win32 `GetDpiForSystem` 测得 120 DPI，即真实 Windows 125% 缩放；100% 与 150% 仍不能由 WebView device scale factor 代替。
 
@@ -16,11 +16,11 @@ M3.0–M3.6 与用户授权扩展 M3.8 已完成，M3.7 仅剩 Windows 100% / 15
 | ------------------------------------------ | -------------------------------------------------------- |
 | `pnpm format:check`                        | 通过                                                     |
 | `pnpm typecheck`                           | 通过                                                     |
-| `pnpm test:unit`                           | 13 个文件、99 项通过                                     |
-| `pnpm --filter @imagedb/desktop build:web` | 231 modules，JS 372.29 KB，CSS 173.13 KB                 |
+| `pnpm test:unit`                           | 13 个文件、100 项通过                                    |
+| `pnpm --filter @imagedb/desktop build:web` | 231 modules，JS 373.17 KB，CSS 173.13 KB                 |
 | `pnpm rust:test`                           | 214 通过、0 失败、3 个 real test 按设计忽略              |
 | `pnpm rust:clippy`                         | 通过，warnings 作为错误处理                              |
-| `pnpm rust:test:real`                      | 102 项真实 PostgreSQL/文件系统测试通过，0 失败，660.5 秒 |
+| `pnpm rust:test:real`                      | 102 项真实 PostgreSQL/文件系统测试通过，0 失败，580.1 秒 |
 | `pnpm release:performance`                 | 通过，120 张真实图片完整链路 7.956 秒                    |
 | `pnpm --filter @imagedb/desktop build`     | release exe 与 NSIS 安装包构建通过                       |
 | `pnpm release:verify-artifacts`            | exe、安装包与内置 PostgreSQL runtime 均通过              |
@@ -66,17 +66,18 @@ M3.0–M3.6 与用户授权扩展 M3.8 已完成，M3.7 仅剩 Windows 100% / 15
 
 首次直接执行 `pnpm release:gate` 时，`pnpm install` 因无 TTY 拒绝清理 `node_modules`；按 pnpm 提示设置 `CI=true` 后总门禁通过。一次 10 分钟外层时限不足，最终以 20 分钟时限完成，实际耗时 705.7 秒。这两次均为执行环境/时限问题，不是测试断言失败。
 
-## M3.8 安全撤销与图库明细复验
+## M3.8 安全撤销工作流与图库明细复验
 
-2026-07-13 在同一 feature 分支完成两个用户明确授权的受限扩展：
+2026-07-14 在同一 feature 分支完成两个用户明确授权的受限扩展及“整条工作流撤销”语义复验：
 
-- Review 与 Commit 均提供二次确认的“撤销计划”；成功后 frozen plan 标记为 `invalidated`，审核决定、源快照与计划历史保留，界面失效 frozen-plan、Dashboard 和 latest-committable 缓存；
-- 撤销与 Commit capture 共用 import run `FOR UPDATE` 锁。真实 PostgreSQL 用例证明零文件事务时可撤销并重新生成；只要存在任何 `file_transactions` 证据即拒绝撤销，原 frozen plan 保持有效并继续走 Commit / Recovery；
+- Review 与 Commit 均提供二次确认的“撤销这次导入”；成功后 import run 标记为 `abandoned`、frozen plan 标记为 `invalidated`，审核决定、源快照与计划历史保留；前端清空 workflow run 上下文并失效 frozen-plan、Dashboard、latest-reviewable 与 latest-committable 缓存；
+- 撤销与 Commit capture 共用 import run `FOR UPDATE` 锁。真实 PostgreSQL 用例证明零文件事务时整条工作流可撤销并从 actionable 查询中消失；前端双任务与单任务回归证明显式 run ID 不串线，单任务撤销后 Dashboard 回到“开始导入”；
+- 只要存在任何 `file_transactions` 证据即拒绝撤销，原 import run 与 frozen plan 保持可提交状态并继续走 Commit / Recovery；
 - 工作台图库概览进入只读“图库明细”，command → service → repository 只返回 `committed` 图集与图片；图集每批 50 个、展开图片每批 24 张，汇总与分页总数由真实 PostgreSQL 用例校验；
-- 前端回归覆盖 Review 撤销、Commit 撤销、缓存失效、图库图集/图片增量分页、加载错误不伪装为空、真实空图库和工作台路由；
-- `?m3-fixture=library` 在默认桌面视口完成截图检查；720px 视口的 DOM 边界测量无横向溢出，控制台 0 warning / error。
+- 前端回归覆盖 Review 撤销、Commit 撤销、工作台回到新建导入、缓存失效、图库图集/图片增量分页、加载错误不伪装为空、真实空图库和工作台路由；
+- `?m3-fixture=library` 在默认桌面视口完成截图检查；720px 视口的 DOM 边界测量无横向溢出；`?m3-fixture=plan` 与 `?m3-fixture=commit` 实测确认撤销后果、确认动作和离开入口状态，控制台 0 warning / error。
 
-本轮先执行 `pnpm check`，结果为 99 项前端测试、214 项 Rust 测试、格式、类型与 Clippy 全部通过；随后执行 `CI=true pnpm release:gate`，完整结果见上表。测试清单盘点确认 `rust:test:real` 当前 23 个过滤套件合计 102 项真实测试。
+初始 M3.8 扩展执行过 `CI=true pnpm release:gate`，完整结果见上表。2026-07-14 将撤销语义修正为整条工作流后，重新执行 `pnpm check`，结果为 100 项前端测试、214 项 Rust 测试、格式、类型与 Clippy 全部通过；随后重新执行完整 `pnpm rust:test:real`，当前 23 个过滤套件合计 102 项真实测试全部通过，耗时 580.1 秒；`pnpm --filter @imagedb/desktop build:web` 亦通过。本次语义修正未重复构建 release/NSIS 安装包。
 
 ## 视觉、响应式与可访问性
 

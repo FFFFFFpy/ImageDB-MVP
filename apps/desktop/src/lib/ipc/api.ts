@@ -130,8 +130,8 @@ export const api = {
   getFrozenImportPlanSummary: (importRunId: string) =>
     invoke<ImportPlan | null>('get_frozen_import_plan_summary', { importRunId }),
 
-  withdrawFrozenImportPlan: (importRunId: string) =>
-    invoke<void>('withdraw_frozen_import_plan', { importRunId }),
+  abandonFrozenImportWorkflow: (importRunId: string) =>
+    invoke<void>('abandon_frozen_import_workflow', { importRunId }),
 
   setImportPlanAlbumIncluded: (importRunId: string, albumId: string, included: boolean) =>
     invoke<ImportPlan>('set_import_plan_album_included', { importRunId, albumId, included }),

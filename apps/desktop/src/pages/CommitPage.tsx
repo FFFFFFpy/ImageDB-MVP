@@ -24,6 +24,8 @@ import {
 interface CommitPageProps {
   onNavigate: (route: Route) => void;
   onGoReview?: (importRunId: string) => void;
+  onWorkflowAbandoned?: () => void;
+  onNavigationBlockedChange?: (blocked: boolean) => void;
   initialPhase?: Phase;
   initialPlan?: ImportPlan | null;
   initialProgress?: CommitProgress | null;
@@ -197,6 +199,8 @@ function stageLabel(stage: string | undefined): string {
 export function CommitPage({
   onNavigate,
   onGoReview,
+  onWorkflowAbandoned,
+  onNavigationBlockedChange,
   initialPhase = 'confirm',
   initialPlan = null,
   initialProgress = null,
@@ -216,7 +220,7 @@ export function CommitPage({
     image: ImportPlanImage;
     dataUrl: string | null;
   } | null>(null);
-  const [planWithdrawalConfirm, setPlanWithdrawalConfirm] = useState(false);
+  const [workflowAbandonConfirm, setWorkflowAbandonConfirm] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Keep this aligned with ImportRepository::get_latest_committable_run:
@@ -278,28 +282,42 @@ export function CommitPage({
     },
   });
 
-  const withdrawPlanMutation = useMutation({
-    mutationFn: (runId: string) => api.withdrawFrozenImportPlan(runId),
+  const abandonWorkflowMutation = useMutation({
+    mutationFn: (runId: string) => api.abandonFrozenImportWorkflow(runId),
     onSuccess: async (_data, runId) => {
       setError(null);
       setPlan(null);
-      setPlanWithdrawalConfirm(false);
+      setWorkflowAbandonConfirm(false);
       queryClient.setQueryData(['frozenImportPlanSummary', runId], null);
       queryClient.setQueryData(['reviewFrozenImportPlanSummary', runId], null);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['frozenImportPlanSummary', runId] }),
         queryClient.invalidateQueries({ queryKey: ['reviewFrozenImportPlanSummary', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['reviewQueue', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['reviewProgress', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['latestReviewableImportRun'] }),
         queryClient.invalidateQueries({ queryKey: ['latestCommittableImportRun'] }),
         queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
         queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
       ]);
-      if (onGoReview) onGoReview(runId);
-      else onNavigate('review');
+      if (onWorkflowAbandoned) onWorkflowAbandoned();
+      else onNavigate('dashboard');
     },
     onError: (err) => {
       setError(String(err));
     },
   });
+
+  useEffect(() => {
+    onNavigationBlockedChange?.(abandonWorkflowMutation.isPending);
+  }, [abandonWorkflowMutation.isPending, onNavigationBlockedChange]);
+
+  useEffect(
+    () => () => {
+      onNavigationBlockedChange?.(false);
+    },
+    [onNavigationBlockedChange],
+  );
 
   const handleStartCommit = useCallback(() => {
     if (!importRunId || !plan?.plan_hash) return;
@@ -355,14 +373,14 @@ export function CommitPage({
               <>
                 <Button
                   variant="danger"
-                  disabled={commitMutation.isPending || withdrawPlanMutation.isPending}
-                  onClick={() => setPlanWithdrawalConfirm(true)}
+                  disabled={commitMutation.isPending || abandonWorkflowMutation.isPending}
+                  onClick={() => setWorkflowAbandonConfirm(true)}
                 >
-                  撤销计划
+                  撤销这次导入
                 </Button>
                 <Button
                   variant="quiet"
-                  disabled={commitMutation.isPending || withdrawPlanMutation.isPending}
+                  disabled={commitMutation.isPending || abandonWorkflowMutation.isPending}
                   onClick={() =>
                     committableRunId && onGoReview
                       ? onGoReview(committableRunId)
@@ -377,8 +395,8 @@ export function CommitPage({
                   disabled={
                     plan.kept_images.length === 0 ||
                     !plan.plan_hash ||
-                    planWithdrawalConfirm ||
-                    withdrawPlanMutation.isPending
+                    workflowAbandonConfirm ||
+                    abandonWorkflowMutation.isPending
                   }
                   loading={commitMutation.isPending}
                   loadingLabel="正在启动…"
@@ -401,31 +419,31 @@ export function CommitPage({
           </StatusBanner>
         )}
 
-        {plan && planWithdrawalConfirm && (
+        {plan && workflowAbandonConfirm && (
           <StatusBanner
             tone="warning"
-            title="确认撤销这份导入计划？"
+            title="确认撤销这次导入任务？"
             actions={
               <>
                 <Button
                   variant="danger"
-                  loading={withdrawPlanMutation.isPending}
-                  loadingLabel="正在撤销…"
-                  onClick={() => withdrawPlanMutation.mutate(plan.import_run_id)}
+                  loading={abandonWorkflowMutation.isPending}
+                  loadingLabel="正在撤销任务…"
+                  onClick={() => abandonWorkflowMutation.mutate(plan.import_run_id)}
                 >
-                  确认撤销
+                  撤销并返回工作台
                 </Button>
                 <Button
                   variant="quiet"
-                  disabled={withdrawPlanMutation.isPending}
-                  onClick={() => setPlanWithdrawalConfirm(false)}
+                  disabled={abandonWorkflowMutation.isPending}
+                  onClick={() => setWorkflowAbandonConfirm(false)}
                 >
-                  保留计划
+                  继续保留任务
                 </Button>
               </>
             }
           >
-            当前计划会保留为已失效记录；不会删除审核决定、源图片或图库内容，也不会启动任何文件事务。
+            这会结束当前导入任务并回到可新建导入的状态。已经完成的扫描、审核和计划将不再继续；源图片和图库内容不会被删除，任务记录仍会保留用于审计。
           </StatusBanner>
         )}
 
