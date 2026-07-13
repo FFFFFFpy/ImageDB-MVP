@@ -358,4 +358,45 @@ describe('review workflow hardening', () => {
       plan_hash: 'updated-hash',
     });
   });
+
+  test('requires confirmation and withdraws a frozen plan without losing review context', async () => {
+    const importRunId = importPlanFixture.import_run_id;
+    const withdraw = vi.spyOn(api, 'withdrawFrozenImportPlan').mockResolvedValue(undefined);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData(['reviewQueue', importRunId], []);
+    client.setQueryData(['reviewProgress', importRunId], {
+      import_run_id: importRunId,
+      total_review_candidates: 1,
+      decided_count: 1,
+      remaining_count: 0,
+      all_decided: true,
+    });
+    client.setQueryData(['reviewFrozenImportPlanSummary', importRunId], importPlanFixture);
+    client.setQueryData(['frozenImportPlanSummary', importRunId], importPlanFixture);
+
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewPage
+          initialImportRunId={importRunId}
+          initialPlan={importPlanFixture}
+          initialShowPlan
+          enablePolling={false}
+          onNavigate={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '撤销计划' }));
+    expect(withdraw).not.toHaveBeenCalled();
+    expect(screen.getByText('确认撤销这份导入计划？')).toBeVisible();
+    expect(screen.getByRole('button', { name: '前往提交确认' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '确认撤销' }));
+    await waitFor(() => expect(withdraw).toHaveBeenCalledWith(importRunId));
+    expect(await screen.findByText('所有候选已审核')).toBeVisible();
+    expect(client.getQueryData(['reviewFrozenImportPlanSummary', importRunId])).toBeNull();
+    expect(client.getQueryData(['frozenImportPlanSummary', importRunId])).toBeNull();
+  });
 });

@@ -57,7 +57,9 @@ export function Layout({
 
         <nav className="app-nav">
           {NAV_ITEMS.map((item) => {
-            const isActive = currentRoute === item.route;
+            const isActive =
+              currentRoute === item.route ||
+              (currentRoute === 'library' && item.route === 'dashboard');
             const count = counts[item.route] ?? 0;
             return (
               <button

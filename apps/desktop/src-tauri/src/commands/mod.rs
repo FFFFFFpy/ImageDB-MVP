@@ -1,6 +1,7 @@
 mod commit;
 mod database;
 mod diagnostics;
+mod library;
 mod probe;
 mod recovery;
 pub mod review;
@@ -10,6 +11,7 @@ mod settings_cmd;
 pub use commit::*;
 pub use database::*;
 pub use diagnostics::*;
+pub use library::*;
 pub use probe::*;
 pub use recovery::*;
 pub use review::*;

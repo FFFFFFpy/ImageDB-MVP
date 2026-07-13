@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { PLAN_ALBUM_BATCH_SIZE, PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
 import type { Route } from '../hooks/use-router';
@@ -203,6 +203,7 @@ export function CommitPage({
   initialImportRunId = null,
   enablePolling = true,
 }: CommitPageProps) {
+  const queryClient = useQueryClient();
   const [phase, setPhase] = useState<Phase>(initialPhase);
   const [plan, setPlan] = useState<ImportPlan | null>(initialPlan);
   const [progress, setProgress] = useState<CommitProgress | null>(initialProgress);
@@ -215,6 +216,7 @@ export function CommitPage({
     image: ImportPlanImage;
     dataUrl: string | null;
   } | null>(null);
+  const [planWithdrawalConfirm, setPlanWithdrawalConfirm] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Keep this aligned with ImportRepository::get_latest_committable_run:
@@ -276,6 +278,29 @@ export function CommitPage({
     },
   });
 
+  const withdrawPlanMutation = useMutation({
+    mutationFn: (runId: string) => api.withdrawFrozenImportPlan(runId),
+    onSuccess: async (_data, runId) => {
+      setError(null);
+      setPlan(null);
+      setPlanWithdrawalConfirm(false);
+      queryClient.setQueryData(['frozenImportPlanSummary', runId], null);
+      queryClient.setQueryData(['reviewFrozenImportPlanSummary', runId], null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['frozenImportPlanSummary', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['reviewFrozenImportPlanSummary', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['latestCommittableImportRun'] }),
+        queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
+        queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
+      ]);
+      if (onGoReview) onGoReview(runId);
+      else onNavigate('review');
+    },
+    onError: (err) => {
+      setError(String(err));
+    },
+  });
+
   const handleStartCommit = useCallback(() => {
     if (!importRunId || !plan?.plan_hash) return;
     commitMutation.mutate({ runId: importRunId, planHash: plan.plan_hash });
@@ -329,7 +354,15 @@ export function CommitPage({
             plan ? (
               <>
                 <Button
+                  variant="danger"
+                  disabled={commitMutation.isPending || withdrawPlanMutation.isPending}
+                  onClick={() => setPlanWithdrawalConfirm(true)}
+                >
+                  撤销计划
+                </Button>
+                <Button
                   variant="quiet"
+                  disabled={commitMutation.isPending || withdrawPlanMutation.isPending}
                   onClick={() =>
                     committableRunId && onGoReview
                       ? onGoReview(committableRunId)
@@ -341,7 +374,12 @@ export function CommitPage({
                 <Button
                   variant="primary"
                   onClick={handleStartCommit}
-                  disabled={plan.kept_images.length === 0 || !plan.plan_hash}
+                  disabled={
+                    plan.kept_images.length === 0 ||
+                    !plan.plan_hash ||
+                    planWithdrawalConfirm ||
+                    withdrawPlanMutation.isPending
+                  }
                   loading={commitMutation.isPending}
                   loadingLabel="正在启动…"
                 >
@@ -360,6 +398,34 @@ export function CommitPage({
             {plan.plan_hash
               ? `计划哈希：${plan.plan_hash}`
               : '无法确认当前页面展示的计划与后端即将提交的计划一致，提交已阻止。请返回审核页重新生成 frozen plan。'}
+          </StatusBanner>
+        )}
+
+        {plan && planWithdrawalConfirm && (
+          <StatusBanner
+            tone="warning"
+            title="确认撤销这份导入计划？"
+            actions={
+              <>
+                <Button
+                  variant="danger"
+                  loading={withdrawPlanMutation.isPending}
+                  loadingLabel="正在撤销…"
+                  onClick={() => withdrawPlanMutation.mutate(plan.import_run_id)}
+                >
+                  确认撤销
+                </Button>
+                <Button
+                  variant="quiet"
+                  disabled={withdrawPlanMutation.isPending}
+                  onClick={() => setPlanWithdrawalConfirm(false)}
+                >
+                  保留计划
+                </Button>
+              </>
+            }
+          >
+            当前计划会保留为已失效记录；不会删除审核决定、源图片或图库内容，也不会启动任何文件事务。
           </StatusBanner>
         )}
 

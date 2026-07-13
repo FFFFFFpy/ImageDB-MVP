@@ -19,6 +19,7 @@ interface DashboardPageProps {
   onGoReview: (importRunId: string) => void;
   onGoCommit: (importRunId: string) => void;
   onGoRecovery: () => void;
+  onGoLibrary: () => void;
   enablePolling?: boolean;
 }
 
@@ -127,6 +128,7 @@ export function DashboardPage({
   onGoReview,
   onGoCommit,
   onGoRecovery,
+  onGoLibrary,
   enablePolling = true,
 }: DashboardPageProps) {
   const dbStatus = useQuery({
@@ -337,6 +339,10 @@ export function DashboardPage({
               <p className="dashboard-panel__hint">
                 {formatDatabaseMode(info?.database.mode ?? dbStatus.data?.mode)}
               </p>
+              <Button variant="quiet" onClick={onGoLibrary} disabled={!isConnected}>
+                查看图库明细
+                <AppIcon name="arrow" size={16} />
+              </Button>
             </section>
           </div>
 

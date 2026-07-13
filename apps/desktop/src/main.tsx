@@ -12,6 +12,7 @@ import { SettingsFixture } from './components/fixtures/SettingsFixture';
 import { OnboardingFixture } from './components/fixtures/OnboardingFixture';
 import { ProbesFixture } from './components/fixtures/ProbesFixture';
 import { StressPlanFixture } from './components/fixtures/StressPlanFixture';
+import { LibraryFixture } from './components/fixtures/LibraryFixture';
 import { UiShowcase } from './components/ui';
 import 'animal-island-ui/style';
 import './styles/tokens.css';
@@ -19,6 +20,7 @@ import './styles/global.css';
 import './styles/ui.css';
 import './styles/layout.css';
 import './styles/dashboard.css';
+import './styles/library.css';
 import './styles/scan.css';
 import './styles/review.css';
 import './styles/plan.css';
@@ -56,6 +58,9 @@ const showM3ProbesFixture =
 const showM3StressPlanFixture =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get('m3-fixture') === 'stress-plan';
+const showM3LibraryFixture =
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get('m3-fixture') === 'library';
 const commitFixtureState =
   (new URLSearchParams(window.location.search).get('m3-state') as CommitFixtureState | null) ??
   'confirm';
@@ -84,6 +89,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       <ProbesFixture />
     ) : showM3StressPlanFixture ? (
       <StressPlanFixture />
+    ) : showM3LibraryFixture ? (
+      <LibraryFixture />
     ) : (
       <QueryClientProvider client={queryClient}>
         <App />

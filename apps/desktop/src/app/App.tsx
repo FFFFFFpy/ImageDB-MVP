@@ -6,6 +6,7 @@ import { useRouter } from '../hooks/use-router';
 import { api } from '../lib/ipc/api';
 import { CommitPage } from '../pages/CommitPage';
 import { DashboardPage } from '../pages/DashboardPage';
+import { LibraryPage } from '../pages/LibraryPage';
 import { OnboardingPage } from '../pages/OnboardingPage';
 import { ProbesPage } from '../pages/ProbesPage';
 import { RecoveryPage } from '../pages/RecoveryPage';
@@ -82,8 +83,10 @@ export function App() {
                 navigate('commit');
               }}
               onGoRecovery={() => navigate('recovery')}
+              onGoLibrary={() => navigate('library')}
             />
           )}
+          {route === 'library' && <LibraryPage onNavigate={navigate} />}
           {route === 'scan' && (
             <ScanPage
               initialImportRunId={workflowImportRunId}

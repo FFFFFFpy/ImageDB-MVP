@@ -190,6 +190,25 @@ pub(crate) async fn get_frozen_import_plan_summary_for_state(
     result
 }
 
+/// Invalidate a frozen plan only while the run is still before transaction
+/// prewrite. The service owns the row lock and safety checks.
+#[tauri::command]
+pub async fn withdraw_frozen_import_plan(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<(), String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::withdraw_frozen_import_plan(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
 #[tauri::command]
 pub async fn set_import_plan_album_included(
     state: State<'_, AppState>,

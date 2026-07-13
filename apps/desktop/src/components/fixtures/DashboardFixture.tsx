@@ -90,6 +90,7 @@ export function DashboardFixture() {
           onGoReview={() => undefined}
           onGoCommit={() => undefined}
           onGoRecovery={() => undefined}
+          onGoLibrary={() => undefined}
           enablePolling={false}
         />
       </Layout>

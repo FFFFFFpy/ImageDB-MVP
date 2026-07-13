@@ -234,6 +234,9 @@ pub fn next_import_run_state(current: &str, action: &str) -> Result<&'static str
         ("review_required", "finalize") => Ok("ready_to_commit"),
         // ReadyToCommit → Committing (start commit)
         ("ready_to_commit", "commit") => Ok("committing"),
+        // A commit cancelled before transaction prewrite may return to the
+        // planning boundary after its frozen plan is explicitly withdrawn.
+        ("cancelled", "reopen_plan") => Ok("ready_to_commit"),
         // Committing → RecoveryRequired (interrupted)
         ("committing", "recover") => Ok("recovery_required"),
         // Committing → Completed (all done)
@@ -352,6 +355,10 @@ mod tests {
         assert_eq!(
             next_import_run_state("recovery_required", "resolve").unwrap(),
             "completed"
+        );
+        assert_eq!(
+            next_import_run_state("cancelled", "reopen_plan").unwrap(),
+            "ready_to_commit"
         );
     }
 

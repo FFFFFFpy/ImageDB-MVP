@@ -27,6 +27,8 @@ import type {
   ExternalMigrationResult,
   ExternalMigrationProgress,
   StorageCapabilities,
+  LibraryAlbumPage,
+  LibraryImagePage,
 } from './types';
 
 export const api = {
@@ -35,6 +37,12 @@ export const api = {
   getDatabaseStatus: () => invoke<DatabaseState>('get_database_status'),
 
   getDatabaseInfoDashboard: () => invoke<DatabaseInfoDashboard>('get_database_info_dashboard'),
+
+  getLibraryAlbums: (offset: number, limit: number) =>
+    invoke<LibraryAlbumPage>('get_library_albums', { offset, limit }),
+
+  getLibraryImages: (albumId: string, offset: number, limit: number) =>
+    invoke<LibraryImagePage>('get_library_images', { albumId, offset, limit }),
 
   initializeManagedDatabase: () => invoke<DatabaseState>('initialize_managed_database'),
 
@@ -121,6 +129,9 @@ export const api = {
 
   getFrozenImportPlanSummary: (importRunId: string) =>
     invoke<ImportPlan | null>('get_frozen_import_plan_summary', { importRunId }),
+
+  withdrawFrozenImportPlan: (importRunId: string) =>
+    invoke<void>('withdraw_frozen_import_plan', { importRunId }),
 
   setImportPlanAlbumIncluded: (importRunId: string, albumId: string, included: boolean) =>
     invoke<ImportPlan>('set_import_plan_album_included', { importRunId, albumId, included }),

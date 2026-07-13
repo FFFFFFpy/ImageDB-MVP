@@ -67,6 +67,26 @@ vi.mock('@tauri-apps/api/core', () => ({
     if (cmd === 'get_database_info_dashboard') {
       return Promise.resolve(mockState.databaseInfo);
     }
+    if (cmd === 'get_library_albums') {
+      return Promise.resolve({
+        albums: [],
+        total_albums: 0,
+        total_images: 0,
+        total_size: 0,
+        offset: args?.offset ?? 0,
+        limit: args?.limit ?? 50,
+      });
+    }
+    if (cmd === 'get_library_images') {
+      return Promise.resolve({
+        album_id: args?.albumId,
+        images: [],
+        total_images: 0,
+        total_size: 0,
+        offset: args?.offset ?? 0,
+        limit: args?.limit ?? 24,
+      });
+    }
     if (cmd === 'get_import_runs_dashboard') {
       return Promise.resolve(mockState.databaseInfo ? [mockState.databaseInfo.latest_run] : []);
     }
@@ -291,7 +311,7 @@ test('keeps the dashboard-selected commit run when a newer second run exists', a
   expect(await screen.findByRole('heading', { name: '提交入库' })).toBeInTheDocument();
   await waitFor(() => expect(mockState.requestedPlanRunIds).toContain('run-older-a'));
   expect(mockState.requestedPlanRunIds).not.toContain('run-newer-b');
-  expect(screen.getByText('计划哈希：hash-run-older-a')).toBeInTheDocument();
+  expect(await screen.findByText('计划哈希：hash-run-older-a')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
   await waitFor(() =>
     expect(mockState.commitRequests).toContainEqual({
@@ -304,6 +324,15 @@ test('keeps the dashboard-selected commit run when a newer second run exists', a
 test('renders dashboard page with title', async () => {
   renderApp();
   expect(await screen.findByRole('heading', { name: '工作台' })).toBeInTheDocument();
+});
+
+test('opens the read-only library detail page from the dashboard overview', async () => {
+  setActionableDashboard('review', 'run-a');
+  renderApp();
+
+  fireEvent.click(await screen.findByRole('button', { name: '查看图库明细' }));
+  expect(await screen.findByRole('heading', { name: '图库明细' })).toBeInTheDocument();
+  expect(await screen.findByText('图库还是空的')).toBeInTheDocument();
 });
 
 test('renders sidebar navigation', async () => {

@@ -362,6 +362,45 @@ pub async fn get_frozen_plan_summary(
     finish_plan_transaction(client, result, "frozen plan read").await
 }
 
+/// Withdraw a frozen plan before any file transaction has been created.
+///
+/// The persisted plan is retained as `invalidated` audit evidence; review
+/// decisions and source snapshots remain untouched so the user can generate
+/// a new plan. The same import-run row lock used by plan edits and Commit
+/// closes the race with transaction prewrite.
+pub async fn withdraw_frozen_import_plan(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<(), AppError> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin plan withdrawal: {e}")))?;
+
+    let result = async {
+        let run_state = ensure_plan_editable(client, import_run_id).await?;
+        let frozen = require_frozen_plan(client, import_run_id).await?;
+        ImportRepository::update_import_plan_state(client, frozen.plan_id, &PlanState::Invalidated)
+            .await?;
+
+        if run_state == ImportRunState::Cancelled.to_string() {
+            let next =
+                crate::domain::state_machine::next_import_run_state(&run_state, "reopen_plan")?;
+            let next_state = ImportRunState::from_str_opt(next).ok_or_else(|| {
+                AppError::Internal(format!(
+                    "unknown import run state after plan withdrawal: {next}"
+                ))
+            })?;
+            ImportRepository::update_import_run_state(client, import_run_id, &next_state).await?;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    finish_plan_transaction(client, result, "plan withdrawal").await
+}
+
 pub async fn set_plan_album_included(
     client: &Client,
     import_run_id: Uuid,
@@ -436,7 +475,7 @@ pub async fn set_plan_image_included(
         .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
 }
 
-async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<(), AppError> {
+async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<String, AppError> {
     // Every plan editor calls this after BEGIN. The row lock is the per-run
     // serialization point shared with Commit's short plan-capture
     // transaction, closing the load/hash/prewrite TOCTOU window.
@@ -469,7 +508,7 @@ async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<()
         ));
     }
     require_frozen_plan(client, import_run_id).await?;
-    Ok(())
+    Ok(run_state)
 }
 
 async fn require_frozen_plan(

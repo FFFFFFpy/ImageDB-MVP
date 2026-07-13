@@ -488,6 +488,30 @@ pub struct LibraryImageFullRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct LibraryAlbumDetailRow {
+    pub id: Uuid,
+    pub library_root_id: Uuid,
+    pub library_root_path: String,
+    pub display_name: String,
+    pub relative_path: String,
+    pub image_count: i32,
+    pub total_size: i64,
+    pub state: String,
+    pub committed_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LibraryImageDetailRow {
+    pub id: Uuid,
+    pub relative_path: String,
+    pub file_size: i64,
+    pub width: i32,
+    pub height: i32,
+    pub format: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct LibraryRootLeaseRow {
     pub library_root_id: Uuid,
     pub owner_instance_id: String,
@@ -3941,6 +3965,117 @@ impl ImportRepository {
                 file_size: r.get("file_size"),
                 blake3: r.get("blake3"),
                 state: r.get("state"),
+            })
+            .collect())
+    }
+
+    pub async fn get_library_catalog_totals(client: &Client) -> Result<(i64, i64, i64), AppError> {
+        let row = client
+            .query_one(
+                "SELECT
+                    (SELECT COUNT(*) FROM library_albums WHERE state = 'committed')::BIGINT AS total_albums,
+                    (SELECT COUNT(*) FROM library_images WHERE state = 'committed')::BIGINT AS total_images,
+                    (SELECT COALESCE(SUM(file_size), 0) FROM library_images WHERE state = 'committed')::BIGINT AS total_size",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query library catalog totals: {e}"))
+            })?;
+        Ok((
+            row.get("total_albums"),
+            row.get("total_images"),
+            row.get("total_size"),
+        ))
+    }
+
+    pub async fn list_library_albums_page(
+        client: &Client,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<LibraryAlbumDetailRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT la.id, la.library_root_id, lr.path AS library_root_path,
+                        la.display_name, la.relative_path,
+                        COUNT(li.id)::INT AS image_count, la.state,
+                        la.committed_at, COALESCE(SUM(li.file_size), 0)::BIGINT AS total_size
+                 FROM library_albums la
+                 JOIN library_roots lr ON lr.id = la.library_root_id
+                 LEFT JOIN library_images li ON li.album_id = la.id AND li.state = 'committed'
+                 WHERE la.state = 'committed'
+                 GROUP BY la.id, la.library_root_id, lr.path, la.display_name,
+                          la.relative_path, la.state, la.committed_at
+                 ORDER BY la.committed_at DESC, la.display_name, la.id
+                 OFFSET $1 LIMIT $2",
+                &[&offset, &limit],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to list library albums: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| LibraryAlbumDetailRow {
+                id: row.get("id"),
+                library_root_id: row.get("library_root_id"),
+                library_root_path: row.get("library_root_path"),
+                display_name: row.get("display_name"),
+                relative_path: row.get("relative_path"),
+                image_count: row.get("image_count"),
+                total_size: row.get("total_size"),
+                state: row.get("state"),
+                committed_at: row.get("committed_at"),
+            })
+            .collect())
+    }
+
+    pub async fn get_library_album_image_totals(
+        client: &Client,
+        album_id: Uuid,
+    ) -> Result<Option<(i64, i64)>, AppError> {
+        let row = client
+            .query_opt(
+                "SELECT COUNT(li.id)::BIGINT AS total_images,
+                        COALESCE(SUM(li.file_size), 0)::BIGINT AS total_size
+                 FROM library_albums la
+                 LEFT JOIN library_images li ON li.album_id = la.id AND li.state = 'committed'
+                 WHERE la.id = $1 AND la.state = 'committed'
+                 GROUP BY la.id",
+                &[&album_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query library album totals: {e}"))
+            })?;
+        Ok(row.map(|row| (row.get("total_images"), row.get("total_size"))))
+    }
+
+    pub async fn list_library_images_page(
+        client: &Client,
+        album_id: Uuid,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<LibraryImageDetailRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, relative_path, file_size, width, height, format, state
+                 FROM library_images
+                 WHERE album_id = $1 AND state = 'committed'
+                 ORDER BY relative_path, id
+                 OFFSET $2 LIMIT $3",
+                &[&album_id, &offset, &limit],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to list library images: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| LibraryImageDetailRow {
+                id: row.get("id"),
+                relative_path: row.get("relative_path"),
+                file_size: row.get("file_size"),
+                width: row.get("width"),
+                height: row.get("height"),
+                format: row.get("format"),
+                state: row.get("state"),
             })
             .collect())
     }

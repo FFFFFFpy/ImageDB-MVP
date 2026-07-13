@@ -17,6 +17,8 @@ use crate::domain::import_state::ImportRunState;
 use crate::domain::state_machine::{FileOpState, TransactionState};
 use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 use crate::repositories::import_repository::ImportRepository;
+use crate::services::library_service;
+use crate::services::review_service;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -526,6 +528,207 @@ async fn real_protocol_tampered_plan_hash_rejected() {
     );
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_protocol_library_catalog_returns_album_and_image_pages() {
+    let (_tmp, mgr) = fresh_db().await;
+    let (client, handle) = mgr.lock().await.connect().await.unwrap();
+    let root_id = uuid::Uuid::new_v4();
+    let album_ids = [
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    ];
+    let result = async {
+        client
+            .execute(
+                "INSERT INTO library_roots (id, path, display_name) VALUES ($1, '/library', 'default')",
+                &[&root_id],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        for (index, album_id) in album_ids.iter().enumerate() {
+            let display_name = format!("album-{index}");
+            let image_count = if index == 0 { 2 } else { 1 };
+            client
+                .execute(
+                    "INSERT INTO library_albums
+                        (id, library_root_id, display_name, relative_path, manifest_version,
+                         manifest_hash, image_count, committed_at, state)
+                     VALUES ($1, $2, $3, $3, '1', $4, $5,
+                             now(), 'committed')",
+                    &[
+                        album_id,
+                        &root_id,
+                        &display_name,
+                        &vec![index as u8; 32],
+                        &image_count,
+                    ],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            for image_index in 0..image_count {
+                let relative_path = format!("image-{image_index}.jpg");
+                let file_size = 100_i64 + i64::from(image_index);
+                client
+                    .execute(
+                        "INSERT INTO library_images
+                            (id, album_id, relative_path, file_size, width, height, format,
+                             blake3, fingerprint_version, state)
+                         VALUES ($1, $2, $3, $4, 800, 600, 'jpg', $5, '2.0', 'committed')",
+                        &[
+                            &uuid::Uuid::new_v4(),
+                            album_id,
+                            &relative_path,
+                            &file_size,
+                            &vec![image_index as u8; 32],
+                        ],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+
+        let first_page = library_service::list_library_albums(&client, 0, 2)
+            .await
+            .map_err(|error| error.to_string())?;
+        let second_page = library_service::list_library_albums(&client, 2, 2)
+            .await
+            .map_err(|error| error.to_string())?;
+        let image_page = library_service::list_library_images(&client, album_ids[0], 0, 1)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>((first_page, second_page, image_page))
+    }
+    .await;
+
+    drop(client);
+    handle.abort();
+    mgr.lock().await.shutdown().await.unwrap();
+
+    let (first_page, second_page, image_page) = result.unwrap();
+
+    assert_eq!(first_page.albums.len(), 2);
+    assert_eq!(first_page.total_albums, 3);
+    assert_eq!(first_page.total_images, 4);
+    assert_eq!(first_page.total_size, 401);
+    assert_eq!(second_page.albums.len(), 1);
+    assert_eq!(second_page.total_albums, 3);
+    assert_eq!(image_page.images.len(), 1);
+    assert_eq!(image_page.total_images, 2);
+    assert_eq!(image_page.total_size, 201);
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_protocol_frozen_plan_withdrawal_is_auditable_and_stops_at_transaction_boundary() {
+    let (_tmp, mgr) = fresh_db().await;
+    let (client, handle) = mgr.lock().await.connect().await.unwrap();
+    let root_id = uuid::Uuid::new_v4();
+    let ready_run_id = uuid::Uuid::new_v4();
+    let ready_album_id = uuid::Uuid::new_v4();
+    let ready_plan_id = uuid::Uuid::new_v4();
+    let blocked_run_id = uuid::Uuid::new_v4();
+    let blocked_album_id = uuid::Uuid::new_v4();
+    let blocked_plan_id = uuid::Uuid::new_v4();
+
+    client
+        .execute(
+            "INSERT INTO library_roots (id, path, display_name) VALUES ($1, '/library', 'default')",
+            &[&root_id],
+        )
+        .await
+        .unwrap();
+
+    for (run_id, album_id, plan_id, source_name) in [
+        (ready_run_id, ready_album_id, ready_plan_id, "ready_album"),
+        (
+            blocked_run_id,
+            blocked_album_id,
+            blocked_plan_id,
+            "blocked_album",
+        ),
+    ] {
+        client
+            .execute(
+                "INSERT INTO import_runs
+                    (id, source_root, library_root_id, state, policy_version)
+                 VALUES ($1, '/source', $2, 'ready_to_commit', '2.0')",
+                &[&run_id, &root_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_albums
+                    (id, import_run_id, source_path, source_name, state)
+                 VALUES ($1, $2, '/source/album', $3, 'analyzed')",
+                &[&album_id, &run_id, &source_name],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_plans
+                    (id, import_run_id, version, state, policy_version, library_root_id, plan_hash)
+                 VALUES ($1, $2, 1, 'frozen', '2.0', $3, $4)",
+                &[&plan_id, &run_id, &root_id, &vec![0x42u8; 32]],
+            )
+            .await
+            .unwrap();
+    }
+
+    review_service::withdraw_frozen_import_plan(&client, ready_run_id)
+        .await
+        .expect("a plan with no transaction should be withdrawable");
+    let ready_row = client
+        .query_one(
+            "SELECT r.state AS run_state, p.state AS plan_state
+             FROM import_runs r JOIN import_plans p ON p.import_run_id = r.id
+             WHERE r.id = $1",
+            &[&ready_run_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready_row.get::<_, String>("run_state"), "ready_to_commit");
+    assert_eq!(ready_row.get::<_, String>("plan_state"), "invalidated");
+
+    client
+        .execute(
+            "INSERT INTO file_transactions
+                (id, import_run_id, import_album_id, state, plan_hash)
+             VALUES ($1, $2, $3, 'planned', $4)",
+            &[
+                &uuid::Uuid::new_v4(),
+                &blocked_run_id,
+                &blocked_album_id,
+                &vec![0x42u8; 32],
+            ],
+        )
+        .await
+        .unwrap();
+    let error = review_service::withdraw_frozen_import_plan(&client, blocked_run_id)
+        .await
+        .expect_err("transaction evidence must make withdrawal fail closed");
+    assert!(error
+        .to_string()
+        .contains("after commit transactions have been created"));
+    let blocked_plan_state: String = client
+        .query_one(
+            "SELECT state FROM import_plans WHERE id = $1",
+            &[&blocked_plan_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(blocked_plan_state, "frozen");
+
+    drop(client);
+    handle.abort();
+    mgr.lock().await.shutdown().await.unwrap();
 }
 
 /// Phase 8 / 10: cross-album exact duplicates + a historical library image.

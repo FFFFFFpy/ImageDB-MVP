@@ -1,7 +1,21 @@
-import { describe, expect, test } from 'vitest';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, test, vi } from 'vitest';
+import { importPlanFixture } from '../components/fixtures/importPlanFixture';
+import { api } from '../lib/ipc/api';
 import type { CommitProgress } from '../lib/ipc/types';
 import { PLAN_ALBUM_BATCH_SIZE, PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
-import { COMMIT_PIPELINE, commitPipelineStepState, isTerminalProgress } from './CommitPage';
+import {
+  CommitPage,
+  COMMIT_PIPELINE,
+  commitPipelineStepState,
+  isTerminalProgress,
+} from './CommitPage';
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function progress(state: string): CommitProgress {
   return {
@@ -51,5 +65,32 @@ describe('commit progress semantics', () => {
     expect(PLAN_ALBUM_BATCH_SIZE).toBeLessThan(1000);
     expect(PLAN_IMAGE_BATCH_SIZE).toBe(24);
     expect(PLAN_IMAGE_BATCH_SIZE).toBeLessThan(100);
+  });
+
+  test('requires confirmation before withdrawing the plan from commit confirmation', async () => {
+    const withdraw = vi.spyOn(api, 'withdrawFrozenImportPlan').mockResolvedValue(undefined);
+    const onGoReview = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <CommitPage
+          initialPlan={importPlanFixture}
+          initialImportRunId={importPlanFixture.import_run_id}
+          enablePolling={false}
+          onNavigate={vi.fn()}
+          onGoReview={onGoReview}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '撤销计划' }));
+    expect(withdraw).not.toHaveBeenCalled();
+    expect(screen.getByText('确认撤销这份导入计划？')).toBeVisible();
+    expect(screen.getByRole('button', { name: '确认并开始入库' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '确认撤销' }));
+    await waitFor(() => expect(withdraw).toHaveBeenCalledWith(importPlanFixture.import_run_id));
+    await waitFor(() => expect(onGoReview).toHaveBeenCalledWith(importPlanFixture.import_run_id));
   });
 });

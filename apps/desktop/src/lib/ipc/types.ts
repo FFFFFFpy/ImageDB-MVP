@@ -371,6 +371,46 @@ export interface ImportPlan {
   albums: ImportPlanAlbum[];
 }
 
+export interface LibraryAlbumSummary {
+  album_id: string;
+  library_root_id: string;
+  library_root_path: string;
+  display_name: string;
+  relative_path: string;
+  image_count: number;
+  total_size: number;
+  state: string;
+  committed_at: string;
+}
+
+export interface LibraryAlbumPage {
+  albums: LibraryAlbumSummary[];
+  total_albums: number;
+  total_images: number;
+  total_size: number;
+  offset: number;
+  limit: number;
+}
+
+export interface LibraryImageSummary {
+  image_id: string;
+  relative_path: string;
+  file_size: number;
+  width: number;
+  height: number;
+  format: string;
+  state: string;
+}
+
+export interface LibraryImagePage {
+  album_id: string;
+  images: LibraryImageSummary[];
+  total_images: number;
+  total_size: number;
+  offset: number;
+  limit: number;
+}
+
 export interface ImagePreview {
   data_url: string;
 }

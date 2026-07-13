@@ -399,6 +399,50 @@ pub struct ImportPlan {
     pub albums: Vec<ImportPlanAlbum>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LibraryAlbumSummary {
+    pub album_id: String,
+    pub library_root_id: String,
+    pub library_root_path: String,
+    pub display_name: String,
+    pub relative_path: String,
+    pub image_count: u32,
+    pub total_size: i64,
+    pub state: String,
+    pub committed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LibraryAlbumPage {
+    pub albums: Vec<LibraryAlbumSummary>,
+    pub total_albums: u32,
+    pub total_images: u32,
+    pub total_size: i64,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LibraryImageSummary {
+    pub image_id: String,
+    pub relative_path: String,
+    pub file_size: i64,
+    pub width: i32,
+    pub height: i32,
+    pub format: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LibraryImagePage {
+    pub album_id: String,
+    pub images: Vec<LibraryImageSummary>,
+    pub total_images: u32,
+    pub total_size: i64,
+    pub offset: u32,
+    pub limit: u32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MatchingStrategy {
     Strict,

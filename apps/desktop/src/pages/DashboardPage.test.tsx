@@ -92,6 +92,7 @@ function renderDashboard(
   onGoReview = vi.fn(),
   onGoCommit = vi.fn(),
   onGoRecovery = vi.fn(),
+  onGoLibrary = vi.fn(),
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -102,6 +103,7 @@ function renderDashboard(
     onGoReview,
     onGoCommit,
     onGoRecovery,
+    onGoLibrary,
     ...render(
       <QueryClientProvider client={client}>
         <DashboardPage
@@ -111,6 +113,7 @@ function renderDashboard(
           onGoReview={onGoReview}
           onGoCommit={onGoCommit}
           onGoRecovery={onGoRecovery}
+          onGoLibrary={onGoLibrary}
         />
       </QueryClientProvider>,
     ),

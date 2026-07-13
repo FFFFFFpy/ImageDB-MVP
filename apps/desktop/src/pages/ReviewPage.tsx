@@ -280,10 +280,13 @@ export function ReviewPage({
   const [submitting, setSubmitting] = useState(false);
   const [planGenerationPending, setPlanGenerationPending] = useState(false);
   const [planGenerationError, setPlanGenerationError] = useState<string | null>(null);
+  const [planWithdrawalConfirm, setPlanWithdrawalConfirm] = useState(false);
+  const [planWithdrawalPending, setPlanWithdrawalPending] = useState(false);
+  const [planWithdrawalError, setPlanWithdrawalError] = useState<string | null>(null);
 
   useEffect(() => {
-    onPlanEditPendingChange?.(planEditPending || planGenerationPending);
-  }, [onPlanEditPendingChange, planEditPending, planGenerationPending]);
+    onPlanEditPendingChange?.(planEditPending || planGenerationPending || planWithdrawalPending);
+  }, [onPlanEditPendingChange, planEditPending, planGenerationPending, planWithdrawalPending]);
 
   useEffect(
     () => () => {
@@ -491,6 +494,33 @@ export function ReviewPage({
     [planEditPending, queryClient],
   );
 
+  const handleWithdrawPlan = useCallback(async () => {
+    if (!importPlan || planEditPending || planWithdrawalPending) return;
+    const runId = importPlan.import_run_id;
+    setPlanWithdrawalPending(true);
+    setPlanWithdrawalError(null);
+    try {
+      await api.withdrawFrozenImportPlan(runId);
+      queryClient.setQueryData(['reviewFrozenImportPlanSummary', runId], null);
+      queryClient.setQueryData(['frozenImportPlanSummary', runId], null);
+      setImportPlan(null);
+      setShowPlan(false);
+      setPlanWithdrawalConfirm(false);
+      setOpenPlanAlbums(new Set());
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['reviewFrozenImportPlanSummary', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['frozenImportPlanSummary', runId] }),
+        queryClient.invalidateQueries({ queryKey: ['latestCommittableImportRun'] }),
+        queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
+        queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
+      ]);
+    } catch (error) {
+      setPlanWithdrawalError(String(error));
+    } finally {
+      setPlanWithdrawalPending(false);
+    }
+  }, [importPlan, planEditPending, planWithdrawalPending, queryClient]);
+
   const togglePlanAlbum = useCallback(
     (album: ImportPlanAlbumGroup) => {
       if (!importPlan) return;
@@ -659,12 +689,23 @@ export function ReviewPage({
           meta={<StatusBadge tone="success">计划已冻结</StatusBadge>}
           actions={
             <>
-              <Button variant="quiet" disabled={planEditPending} onClick={() => setShowPlan(false)}>
+              <Button
+                variant="danger"
+                disabled={planEditPending || planWithdrawalPending}
+                onClick={() => setPlanWithdrawalConfirm(true)}
+              >
+                撤销计划
+              </Button>
+              <Button
+                variant="quiet"
+                disabled={planEditPending || planWithdrawalPending}
+                onClick={() => setShowPlan(false)}
+              >
                 返回审核
               </Button>
               <Button
                 variant="primary"
-                disabled={planEditPending}
+                disabled={planEditPending || planWithdrawalPending || planWithdrawalConfirm}
                 loading={planEditPending}
                 loadingLabel="正在保存计划…"
                 onClick={() =>
@@ -679,6 +720,39 @@ export function ReviewPage({
         <StatusBanner tone="info" title="计划与入库是两个步骤">
           此页只调整并保存计划；下一页会重新读取这份 frozen plan，再由你确认开始文件事务。
         </StatusBanner>
+        {planWithdrawalConfirm && (
+          <StatusBanner
+            tone="warning"
+            title="确认撤销这份导入计划？"
+            actions={
+              <>
+                <Button
+                  variant="danger"
+                  loading={planWithdrawalPending}
+                  loadingLabel="正在撤销…"
+                  onClick={handleWithdrawPlan}
+                >
+                  确认撤销
+                </Button>
+                <Button
+                  variant="quiet"
+                  disabled={planWithdrawalPending}
+                  onClick={() => setPlanWithdrawalConfirm(false)}
+                >
+                  保留计划
+                </Button>
+              </>
+            }
+          >
+            只会将当前 frozen plan
+            标记为已失效；审核决定、源图片和图库内容都不会被删除，之后可以重新生成计划。
+          </StatusBanner>
+        )}
+        {planWithdrawalError && (
+          <StatusBanner tone="danger" title="撤销导入计划失败">
+            {planWithdrawalError}
+          </StatusBanner>
+        )}
         <div className="import-plan-summary">
           <div className="import-plan-stats">
             <div className="plan-stat">
@@ -741,7 +815,7 @@ export function ReviewPage({
                     <button
                       type="button"
                       className={`plan-toggle plan-album-toggle ${album.included ? 'is-on' : 'is-off'}`}
-                      disabled={planEditPending}
+                      disabled={planEditPending || planWithdrawalPending || planWithdrawalConfirm}
                       onClick={() => togglePlanAlbum(album)}
                     >
                       {album.included ? '导入' : '跳过'}
@@ -771,7 +845,9 @@ export function ReviewPage({
                               <button
                                 type="button"
                                 className={`plan-toggle ${img.included ? 'is-on' : 'is-off'}`}
-                                disabled={planEditPending}
+                                disabled={
+                                  planEditPending || planWithdrawalPending || planWithdrawalConfirm
+                                }
                                 onClick={() => togglePlanImage(album, img)}
                               >
                                 {img.included ? '导入' : '跳过'}
