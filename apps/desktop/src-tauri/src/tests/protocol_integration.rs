@@ -532,15 +532,25 @@ async fn real_protocol_tampered_plan_hash_rejected() {
 
 #[tokio::test]
 #[ignore]
-async fn real_protocol_library_catalog_returns_album_and_image_pages() {
+async fn real_protocol_library_cursor_pagination_is_stable_during_top_inserts() {
     let (_tmp, mgr) = fresh_db().await;
     let (client, handle) = mgr.lock().await.connect().await.unwrap();
     let root_id = uuid::Uuid::new_v4();
-    let album_ids = [
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-        uuid::Uuid::new_v4(),
-    ];
+    let base_committed_at = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let original_album_ids = (0_u128..120)
+        .map(|index| uuid::Uuid::from_u128(1_000 + index))
+        .collect::<Vec<_>>();
+    let image_album_id = original_album_ids[50];
+    let original_image_ids = (0_u128..120)
+        .map(|index| uuid::Uuid::from_u128(10_000 + index))
+        .collect::<Vec<_>>();
+    let top_album_id = uuid::Uuid::from_u128(999_001);
+    let top_image_id = uuid::Uuid::from_u128(999_002);
+    let hidden_album_id = uuid::Uuid::from_u128(999_003);
+    let hidden_album_image_id = uuid::Uuid::from_u128(999_004);
+    let hidden_image_id = uuid::Uuid::from_u128(999_005);
     let result = async {
         client
             .execute(
@@ -550,76 +560,265 @@ async fn real_protocol_library_catalog_returns_album_and_image_pages() {
             .await
             .map_err(|error| error.to_string())?;
 
-        for (index, album_id) in album_ids.iter().enumerate() {
-            let display_name = format!("album-{index}");
-            let image_count = if index == 0 { 2 } else { 1 };
+        for (index, album_id) in original_album_ids.iter().enumerate() {
+            let display_name = if index < 3 {
+                "same-album".to_string()
+            } else {
+                format!("album-{index:03}")
+            };
+            let committed_at = if index < 3 {
+                base_committed_at
+            } else {
+                base_committed_at - chrono::Duration::seconds(index as i64)
+            };
+            let relative_path = format!("album-{index:03}");
+            let image_count = if *album_id == image_album_id { 120 } else { 0 };
             client
                 .execute(
                     "INSERT INTO library_albums
                         (id, library_root_id, display_name, relative_path, manifest_version,
                          manifest_hash, image_count, committed_at, state)
-                     VALUES ($1, $2, $3, $3, '1', $4, $5,
-                             now(), 'committed')",
+                     VALUES ($1, $2, $3, $4, '1', $5, $6, $7, 'committed')",
                     &[
                         album_id,
                         &root_id,
                         &display_name,
-                        &vec![index as u8; 32],
+                        &relative_path,
+                        &vec![(index % 255) as u8; 32],
                         &image_count,
+                        &committed_at,
                     ],
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            for image_index in 0..image_count {
-                let relative_path = format!("image-{image_index}.jpg");
-                let file_size = 100_i64 + i64::from(image_index);
-                client
-                    .execute(
-                        "INSERT INTO library_images
-                            (id, album_id, relative_path, file_size, width, height, format,
-                             blake3, fingerprint_version, state)
-                         VALUES ($1, $2, $3, $4, 800, 600, 'jpg', $5, '2.0', 'committed')",
-                        &[
-                            &uuid::Uuid::new_v4(),
-                            album_id,
-                            &relative_path,
-                            &file_size,
-                            &vec![image_index as u8; 32],
-                        ],
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
         }
 
-        let first_page = library_service::list_library_albums(&client, 0, 2)
+        for (index, image_id) in original_image_ids.iter().enumerate() {
+            let relative_path = format!("image-{index:03}.jpg");
+            let file_size = 100_i64 + index as i64;
+            client
+                .execute(
+                    "INSERT INTO library_images
+                        (id, album_id, relative_path, file_size, width, height, format,
+                         blake3, fingerprint_version, state)
+                     VALUES ($1, $2, $3, $4, 800, 600, 'jpg', $5, '2.0', 'committed')",
+                    &[
+                        image_id,
+                        &image_album_id,
+                        &relative_path,
+                        &file_size,
+                        &vec![(index % 255) as u8; 32],
+                    ],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+
+        client
+            .execute(
+                "INSERT INTO library_images
+                    (id, album_id, relative_path, file_size, width, height, format,
+                     blake3, fingerprint_version, state)
+                 VALUES ($1, $2, 'zzz-hidden.jpg', 1, 1, 1, 'jpg', $3, '2.0', 'pending')",
+                &[&hidden_image_id, &image_album_id, &vec![0x33_u8; 32]],
+            )
             .await
             .map_err(|error| error.to_string())?;
-        let second_page = library_service::list_library_albums(&client, 2, 2)
+
+        client
+            .execute(
+                "INSERT INTO library_albums
+                    (id, library_root_id, display_name, relative_path, manifest_version,
+                     manifest_hash, image_count, committed_at, state)
+                 VALUES ($1, $2, 'hidden-album', 'hidden-album', '1', $3, 1, $4, 'pending')",
+                &[
+                    &hidden_album_id,
+                    &root_id,
+                    &vec![0x44_u8; 32],
+                    &(base_committed_at + chrono::Duration::days(2)),
+                ],
+            )
             .await
             .map_err(|error| error.to_string())?;
-        let image_page = library_service::list_library_images(&client, album_ids[0], 0, 1)
+        client
+            .execute(
+                "INSERT INTO library_images
+                    (id, album_id, relative_path, file_size, width, height, format,
+                     blake3, fingerprint_version, state)
+                 VALUES ($1, $2, 'hidden.jpg', 1, 1, 1, 'jpg', $3, '2.0', 'committed')",
+                &[
+                    &hidden_album_image_id,
+                    &hidden_album_id,
+                    &vec![0x55_u8; 32],
+                ],
+            )
             .await
             .map_err(|error| error.to_string())?;
-        Ok::<_, String>((first_page, second_page, image_page))
+
+        let first_album_page = library_service::list_library_albums(&client, None, 17)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(first_album_page.total_albums, 120);
+        assert_eq!(first_album_page.total_images, 120);
+        assert_eq!(
+            first_album_page
+                .albums
+                .iter()
+                .take(3)
+                .map(|album| album.album_id.clone())
+                .collect::<Vec<_>>(),
+            original_album_ids
+                .iter()
+                .take(3)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            "committed_at/display_name ties must be ordered by id"
+        );
+
+        client
+            .execute(
+                "INSERT INTO library_albums
+                    (id, library_root_id, display_name, relative_path, manifest_version,
+                     manifest_hash, image_count, committed_at, state)
+                 VALUES ($1, $2, 'new-top-album', 'new-top-album', '1', $3, 0, $4, 'committed')",
+                &[
+                    &top_album_id,
+                    &root_id,
+                    &vec![0x66_u8; 32],
+                    &(base_committed_at + chrono::Duration::days(1)),
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let mut seen_album_ids = first_album_page
+            .albums
+            .iter()
+            .map(|album| album.album_id.clone())
+            .collect::<Vec<_>>();
+        let mut album_cursor = first_album_page.next_cursor.clone();
+        while let Some(cursor) = album_cursor {
+            let page = library_service::list_library_albums(&client, Some(cursor), 17)
+                .await
+                .map_err(|error| error.to_string())?;
+            seen_album_ids.extend(page.albums.iter().map(|album| album.album_id.clone()));
+            album_cursor = page.next_cursor;
+        }
+
+        let expected_album_ids = original_album_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<std::collections::HashSet<_>>();
+        let unique_album_ids = seen_album_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(seen_album_ids.len(), 120, "no original album may repeat");
+        assert_eq!(unique_album_ids, expected_album_ids, "no original album may be omitted");
+        assert!(!seen_album_ids.contains(&top_album_id.to_string()));
+        assert!(!seen_album_ids.contains(&hidden_album_id.to_string()));
+
+        let refreshed_album_page = library_service::list_library_albums(&client, None, 17)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            refreshed_album_page.albums[0].album_id,
+            top_album_id.to_string(),
+            "a refresh must reveal a newly committed album at the top"
+        );
+
+        let invalid_album_cursor = library_service::list_library_albums(
+            &client,
+            Some("not-an-opaque-cursor".to_string()),
+            17,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(invalid_album_cursor.contains("invalid library album cursor"));
+
+        let first_image_page =
+            library_service::list_library_images(&client, image_album_id, None, 19)
+                .await
+                .map_err(|error| error.to_string())?;
+        assert_eq!(first_image_page.total_images, 120);
+        assert!(!first_image_page
+            .images
+            .iter()
+            .any(|image| image.image_id == hidden_image_id.to_string()));
+
+        client
+            .execute(
+                "INSERT INTO library_images
+                    (id, album_id, relative_path, file_size, width, height, format,
+                     blake3, fingerprint_version, state)
+                 VALUES ($1, $2, '000-new-top.jpg', 2, 2, 2, 'jpg', $3, '2.0', 'committed')",
+                &[&top_image_id, &image_album_id, &vec![0x77_u8; 32]],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let mut seen_image_ids = first_image_page
+            .images
+            .iter()
+            .map(|image| image.image_id.clone())
+            .collect::<Vec<_>>();
+        let mut image_cursor = first_image_page.next_cursor.clone();
+        while let Some(cursor) = image_cursor {
+            let page = library_service::list_library_images(
+                &client,
+                image_album_id,
+                Some(cursor),
+                19,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            seen_image_ids.extend(page.images.iter().map(|image| image.image_id.clone()));
+            image_cursor = page.next_cursor;
+        }
+
+        let expected_image_ids = original_image_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<std::collections::HashSet<_>>();
+        let unique_image_ids = seen_image_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(seen_image_ids.len(), 120, "no original image may repeat");
+        assert_eq!(unique_image_ids, expected_image_ids, "no original image may be omitted");
+        assert!(!seen_image_ids.contains(&top_image_id.to_string()));
+        assert!(!seen_image_ids.contains(&hidden_image_id.to_string()));
+
+        let refreshed_image_page =
+            library_service::list_library_images(&client, image_album_id, None, 19)
+                .await
+                .map_err(|error| error.to_string())?;
+        assert_eq!(
+            refreshed_image_page.images[0].image_id,
+            top_image_id.to_string(),
+            "a refresh must reveal a newly committed image at the top"
+        );
+
+        let invalid_image_cursor = library_service::list_library_images(
+            &client,
+            image_album_id,
+            Some("not-an-opaque-cursor".to_string()),
+            19,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(invalid_image_cursor.contains("invalid library image cursor"));
+
+        Ok::<_, String>(())
     }
     .await;
 
     drop(client);
     handle.abort();
     mgr.lock().await.shutdown().await.unwrap();
-
-    let (first_page, second_page, image_page) = result.unwrap();
-
-    assert_eq!(first_page.albums.len(), 2);
-    assert_eq!(first_page.total_albums, 3);
-    assert_eq!(first_page.total_images, 4);
-    assert_eq!(first_page.total_size, 401);
-    assert_eq!(second_page.albums.len(), 1);
-    assert_eq!(second_page.total_albums, 3);
-    assert_eq!(image_page.images.len(), 1);
-    assert_eq!(image_page.total_images, 2);
-    assert_eq!(image_page.total_size, 201);
+    result.unwrap();
 }
 
 #[tokio::test]

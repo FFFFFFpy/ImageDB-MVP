@@ -86,8 +86,7 @@ vi.mock('@tauri-apps/api/core', () => ({
         total_albums: 0,
         total_images: 0,
         total_size: 0,
-        offset: args?.offset ?? 0,
-        limit: args?.limit ?? 50,
+        next_cursor: null,
       });
     }
     if (cmd === 'get_library_images') {
@@ -96,8 +95,7 @@ vi.mock('@tauri-apps/api/core', () => ({
         images: [],
         total_images: 0,
         total_size: 0,
-        offset: args?.offset ?? 0,
-        limit: args?.limit ?? 24,
+        next_cursor: null,
       });
     }
     if (cmd === 'get_import_runs_dashboard') {

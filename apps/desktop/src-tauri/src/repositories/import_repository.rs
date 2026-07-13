@@ -501,6 +501,13 @@ pub struct LibraryAlbumDetailRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct LibraryAlbumKeyset {
+    pub committed_at: chrono::DateTime<chrono::Utc>,
+    pub display_name: String,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone)]
 pub struct LibraryImageDetailRow {
     pub id: Uuid,
     pub relative_path: String,
@@ -509,6 +516,12 @@ pub struct LibraryImageDetailRow {
     pub height: i32,
     pub format: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LibraryImageKeyset {
+    pub relative_path: String,
+    pub id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -3974,8 +3987,14 @@ impl ImportRepository {
             .query_one(
                 "SELECT
                     (SELECT COUNT(*) FROM library_albums WHERE state = 'committed')::BIGINT AS total_albums,
-                    (SELECT COUNT(*) FROM library_images WHERE state = 'committed')::BIGINT AS total_images,
-                    (SELECT COALESCE(SUM(file_size), 0) FROM library_images WHERE state = 'committed')::BIGINT AS total_size",
+                    (SELECT COUNT(*)
+                       FROM library_images li
+                       JOIN library_albums la ON la.id = li.album_id
+                      WHERE li.state = 'committed' AND la.state = 'committed')::BIGINT AS total_images,
+                    (SELECT COALESCE(SUM(li.file_size), 0)
+                       FROM library_images li
+                       JOIN library_albums la ON la.id = li.album_id
+                      WHERE li.state = 'committed' AND la.state = 'committed')::BIGINT AS total_size",
                 &[],
             )
             .await
@@ -3991,9 +4010,12 @@ impl ImportRepository {
 
     pub async fn list_library_albums_page(
         client: &Client,
-        offset: i64,
+        cursor: Option<&LibraryAlbumKeyset>,
         limit: i64,
     ) -> Result<Vec<LibraryAlbumDetailRow>, AppError> {
+        let cursor_committed_at = cursor.map(|value| value.committed_at);
+        let cursor_display_name = cursor.map(|value| value.display_name.clone());
+        let cursor_id = cursor.map(|value| value.id);
         let rows = client
             .query(
                 "SELECT la.id, la.library_root_id, lr.path AS library_root_path,
@@ -4004,11 +4026,22 @@ impl ImportRepository {
                  JOIN library_roots lr ON lr.id = la.library_root_id
                  LEFT JOIN library_images li ON li.album_id = la.id AND li.state = 'committed'
                  WHERE la.state = 'committed'
+                   AND (
+                       $1::TIMESTAMPTZ IS NULL
+                       OR la.committed_at < $1
+                       OR (la.committed_at = $1 AND la.display_name > $2)
+                       OR (la.committed_at = $1 AND la.display_name = $2 AND la.id > $3)
+                   )
                  GROUP BY la.id, la.library_root_id, lr.path, la.display_name,
                           la.relative_path, la.state, la.committed_at
                  ORDER BY la.committed_at DESC, la.display_name, la.id
-                 OFFSET $1 LIMIT $2",
-                &[&offset, &limit],
+                 LIMIT $4",
+                &[
+                    &cursor_committed_at,
+                    &cursor_display_name,
+                    &cursor_id,
+                    &limit,
+                ],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to list library albums: {e}")))?;
@@ -4052,17 +4085,24 @@ impl ImportRepository {
     pub async fn list_library_images_page(
         client: &Client,
         album_id: Uuid,
-        offset: i64,
+        cursor: Option<&LibraryImageKeyset>,
         limit: i64,
     ) -> Result<Vec<LibraryImageDetailRow>, AppError> {
+        let cursor_relative_path = cursor.map(|value| value.relative_path.clone());
+        let cursor_id = cursor.map(|value| value.id);
         let rows = client
             .query(
                 "SELECT id, relative_path, file_size, width, height, format, state
                  FROM library_images
                  WHERE album_id = $1 AND state = 'committed'
+                   AND (
+                       $2::TEXT IS NULL
+                       OR relative_path > $2
+                       OR (relative_path = $2 AND id > $3)
+                   )
                  ORDER BY relative_path, id
-                 OFFSET $2 LIMIT $3",
-                &[&album_id, &offset, &limit],
+                 LIMIT $4",
+                &[&album_id, &cursor_relative_path, &cursor_id, &limit],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to list library images: {e}")))?;

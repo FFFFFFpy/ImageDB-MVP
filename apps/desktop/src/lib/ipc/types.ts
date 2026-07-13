@@ -385,11 +385,10 @@ export interface LibraryAlbumSummary {
 
 export interface LibraryAlbumPage {
   albums: LibraryAlbumSummary[];
+  next_cursor: string | null;
   total_albums: number;
   total_images: number;
   total_size: number;
-  offset: number;
-  limit: number;
 }
 
 export interface LibraryImageSummary {
@@ -405,10 +404,9 @@ export interface LibraryImageSummary {
 export interface LibraryImagePage {
   album_id: string;
   images: LibraryImageSummary[];
+  next_cursor: string | null;
   total_images: number;
   total_size: number;
-  offset: number;
-  limit: number;
 }
 
 export interface ImagePreview {

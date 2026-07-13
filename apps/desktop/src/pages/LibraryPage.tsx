@@ -40,11 +40,8 @@ function LibraryAlbumImages({ album }: { album: LibraryAlbumSummary }) {
     queryKey: ['library-images', album.album_id],
     queryFn: ({ pageParam }) =>
       api.getLibraryImages(album.album_id, pageParam, LIBRARY_IMAGE_BATCH_SIZE),
-    initialPageParam: 0,
-    getNextPageParam: (lastPage) => {
-      const nextOffset = lastPage.offset + lastPage.images.length;
-      return nextOffset < lastPage.total_images ? nextOffset : undefined;
-    },
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
   });
 
   const images = imagesQuery.data?.pages.flatMap((page) => page.images) ?? [];
@@ -119,11 +116,8 @@ export function LibraryPage({ onNavigate }: LibraryPageProps) {
   const albumsQuery = useInfiniteQuery({
     queryKey: ['library-albums'],
     queryFn: ({ pageParam }) => api.getLibraryAlbums(pageParam, LIBRARY_ALBUM_BATCH_SIZE),
-    initialPageParam: 0,
-    getNextPageParam: (lastPage) => {
-      const nextOffset = lastPage.offset + lastPage.albums.length;
-      return nextOffset < lastPage.total_albums ? nextOffset : undefined;
-    },
+    initialPageParam: null as string | null,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
   });
 
   const albums = albumsQuery.data?.pages.flatMap((page) => page.albums) ?? [];

@@ -38,11 +38,11 @@ export const api = {
 
   getDatabaseInfoDashboard: () => invoke<DatabaseInfoDashboard>('get_database_info_dashboard'),
 
-  getLibraryAlbums: (offset: number, limit: number) =>
-    invoke<LibraryAlbumPage>('get_library_albums', { offset, limit }),
+  getLibraryAlbums: (cursor: string | null, limit: number) =>
+    invoke<LibraryAlbumPage>('get_library_albums', { cursor, limit }),
 
-  getLibraryImages: (albumId: string, offset: number, limit: number) =>
-    invoke<LibraryImagePage>('get_library_images', { albumId, offset, limit }),
+  getLibraryImages: (albumId: string, cursor: string | null, limit: number) =>
+    invoke<LibraryImagePage>('get_library_images', { albumId, cursor, limit }),
 
   initializeManagedDatabase: () => invoke<DatabaseState>('initialize_managed_database'),
 

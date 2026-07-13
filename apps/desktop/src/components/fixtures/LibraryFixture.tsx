@@ -53,8 +53,7 @@ const albums: LibraryAlbumPage = {
   total_albums: 6,
   total_images: 5808,
   total_size: 68_934_574_080,
-  offset: 0,
-  limit: 50,
+  next_cursor: null,
 };
 
 const travelImages: LibraryImagePage = {
@@ -90,18 +89,17 @@ const travelImages: LibraryImagePage = {
   ],
   total_images: 3,
   total_size: 10_128_386,
-  offset: 0,
-  limit: 24,
+  next_cursor: null,
 };
 
 const fixtureClient = new QueryClient({
   defaultOptions: { queries: { staleTime: Infinity, retry: false } },
 });
 
-fixtureClient.setQueryData(['library-albums'], { pages: [albums], pageParams: [0] });
+fixtureClient.setQueryData(['library-albums'], { pages: [albums], pageParams: [null] });
 fixtureClient.setQueryData(['library-images', 'fixture-album-travel'], {
   pages: [travelImages],
-  pageParams: [0],
+  pageParams: [null],
 });
 fixtureClient.setQueryData(['database-info-dashboard'], {
   imports: { failed_album_count: 0, pending_review_count: 0, recovery_required_run_count: 0 },

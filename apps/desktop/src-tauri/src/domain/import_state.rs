@@ -415,11 +415,10 @@ pub struct LibraryAlbumSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LibraryAlbumPage {
     pub albums: Vec<LibraryAlbumSummary>,
+    pub next_cursor: Option<String>,
     pub total_albums: u32,
     pub total_images: u32,
     pub total_size: i64,
-    pub offset: u32,
-    pub limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -437,10 +436,9 @@ pub struct LibraryImageSummary {
 pub struct LibraryImagePage {
     pub album_id: String,
     pub images: Vec<LibraryImageSummary>,
+    pub next_cursor: Option<String>,
     pub total_images: u32,
     pub total_size: i64,
-    pub offset: u32,
-    pub limit: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
