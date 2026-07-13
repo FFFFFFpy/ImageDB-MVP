@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
@@ -39,6 +39,32 @@ interface ViewState {
   scale: number;
   offsetX: number;
   offsetY: number;
+}
+
+export type PreviewState = 'idle' | 'loading' | 'success' | 'error';
+
+interface PreviewEvidence {
+  candidateId: string | null;
+  state: PreviewState;
+  dataUrl: string | null;
+  error: string | null;
+}
+
+interface ReviewMutationError {
+  message: string;
+  retryHint: string;
+  mayBeSaved: boolean;
+}
+
+function ReviewMutationErrorBanner({ error }: { error: ReviewMutationError }) {
+  return (
+    <StatusBanner
+      tone={error.mayBeSaved ? 'warning' : 'danger'}
+      title={error.mayBeSaved ? '审核操作可能已保存' : '审核操作未保存'}
+    >
+      {error.message} {error.retryHint}
+    </StatusBanner>
+  );
 }
 
 export interface ImportPlanAlbumGroup {
@@ -95,6 +121,19 @@ export function shouldIgnoreReviewShortcut(event: KeyboardEvent, previewOpen: bo
   );
 }
 
+export function useNonPassiveWheelZoom(
+  ref: React.RefObject<HTMLElement | null>,
+  onWheel: (event: WheelEvent) => void,
+) {
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+
+    element.addEventListener('wheel', onWheel, { passive: false });
+    return () => element.removeEventListener('wheel', onWheel);
+  }, [onWheel, ref]);
+}
+
 export const REVIEW_DECISION_OPTIONS: ReadonlyArray<{
   decision: ReviewDecision;
   shortcut: string;
@@ -107,12 +146,209 @@ export const REVIEW_DECISION_OPTIONS: ReadonlyArray<{
 
 type ReviewInvalidationClient = Pick<QueryClient, 'invalidateQueries'>;
 
-export function invalidateReviewWorkflowQueries(queryClient: ReviewInvalidationClient) {
-  queryClient.invalidateQueries({ queryKey: ['reviewQueue'] });
-  queryClient.invalidateQueries({ queryKey: ['reviewProgress'] });
-  queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] });
-  queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] });
-  queryClient.invalidateQueries({ queryKey: ['import-run-albums'] });
+export async function invalidateReviewWorkflowQueries(queryClient: ReviewInvalidationClient) {
+  const options = { throwOnError: true } as const;
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['reviewQueue'] }, options),
+    queryClient.invalidateQueries({ queryKey: ['reviewProgress'] }, options),
+    queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }, options),
+    queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }, options),
+    queryClient.invalidateQueries({ queryKey: ['import-run-albums'] }, options),
+  ]);
+}
+
+function useReviewPreviewEvidence(
+  candidateId: string | null,
+  detailReady: boolean,
+  side: 'source' | 'candidate',
+  initialDataUrl: string | null,
+) {
+  const [attempt, setAttempt] = useState(0);
+  const [evidence, setEvidence] = useState<PreviewEvidence>({
+    candidateId: null,
+    state: 'idle',
+    dataUrl: null,
+    error: null,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!candidateId || !detailReady) {
+      setEvidence({ candidateId, state: 'idle', dataUrl: null, error: null });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const candidateAtRequest = candidateId;
+    const suppliedPreview = attempt === 0 ? initialDataUrl : null;
+    setEvidence({
+      candidateId: candidateAtRequest,
+      state: 'loading',
+      dataUrl: suppliedPreview,
+      error: null,
+    });
+
+    if (suppliedPreview) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    api
+      .getImagePreview(candidateAtRequest, side)
+      .then((preview) => {
+        if (cancelled) return;
+        if (!preview.data_url) {
+          setEvidence({
+            candidateId: candidateAtRequest,
+            state: 'error',
+            dataUrl: null,
+            error: '预览服务返回了空图片数据。',
+          });
+          return;
+        }
+        setEvidence({
+          candidateId: candidateAtRequest,
+          state: 'loading',
+          dataUrl: preview.data_url,
+          error: null,
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setEvidence({
+          candidateId: candidateAtRequest,
+          state: 'error',
+          dataUrl: null,
+          error: String(error),
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [attempt, candidateId, detailReady, initialDataUrl, side]);
+
+  const currentEvidence =
+    evidence.candidateId === candidateId
+      ? evidence
+      : {
+          candidateId,
+          state: detailReady ? ('loading' as const) : ('idle' as const),
+          dataUrl: null,
+          error: null,
+        };
+
+  const markLoaded = useCallback(() => {
+    setEvidence((current) =>
+      current.candidateId === candidateId && current.dataUrl
+        ? { ...current, state: 'success', error: null }
+        : current,
+    );
+  }, [candidateId]);
+
+  const markFailed = useCallback(() => {
+    setEvidence((current) =>
+      current.candidateId === candidateId
+        ? {
+            ...current,
+            state: 'error',
+            dataUrl: null,
+            error: '图片数据无法显示。',
+          }
+        : current,
+    );
+  }, [candidateId]);
+
+  const retry = useCallback(() => {
+    if (!candidateId || !detailReady) return;
+    setEvidence({ candidateId, state: 'loading', dataUrl: null, error: null });
+    setAttempt((current) => current + 1);
+  }, [candidateId, detailReady]);
+
+  return { evidence: currentEvidence, markLoaded, markFailed, retry };
+}
+
+interface ReviewImageContainerProps {
+  children: React.ReactNode;
+  onWheelZoom: (event: WheelEvent) => void;
+}
+
+function ReviewImageContainer({ children, onWheelZoom }: ReviewImageContainerProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  useNonPassiveWheelZoom(ref, onWheelZoom);
+  return (
+    <div className="review-image-container" ref={ref}>
+      {children}
+    </div>
+  );
+}
+
+interface ReviewPreviewContentProps {
+  evidence: PreviewEvidence;
+  label: string;
+  alt: string;
+  style: React.CSSProperties;
+  onLoaded: () => void;
+  onFailed: () => void;
+  onRetry: () => void;
+}
+
+function ReviewPreviewContent({
+  evidence,
+  label,
+  alt,
+  style,
+  onLoaded,
+  onFailed,
+  onRetry,
+}: ReviewPreviewContentProps) {
+  if (evidence.state === 'idle') {
+    return (
+      <div className="review-image-placeholder" role="status">
+        等待加载{label}预览…
+      </div>
+    );
+  }
+
+  if (evidence.state === 'error') {
+    return (
+      <div className="review-image-placeholder review-image-placeholder--error" role="alert">
+        <strong>无法加载{label}预览</strong>
+        <span>{evidence.error}</span>
+        <Button variant="quiet" onMouseDown={(event) => event.stopPropagation()} onClick={onRetry}>
+          重试{label}预览
+        </Button>
+      </div>
+    );
+  }
+
+  if (!evidence.dataUrl) {
+    return (
+      <div className="review-image-placeholder" role="status">
+        正在加载{label}预览…
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <img
+        src={evidence.dataUrl}
+        alt={alt}
+        style={style}
+        draggable={false}
+        onLoad={onLoaded}
+        onError={onFailed}
+      />
+      {evidence.state === 'loading' && (
+        <span className="review-image-loading-label" role="status">
+          正在加载{label}预览…
+        </span>
+      )}
+    </>
+  );
 }
 
 function formatFileSize(bytes: number): string {
@@ -266,8 +502,6 @@ export function ReviewPage({
   const [view, setView] = useState<ViewState>(DEFAULT_VIEW);
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
-  const [leftPreview, setLeftPreview] = useState<string | null>(null);
-  const [rightPreview, setRightPreview] = useState<string | null>(null);
   const [importPlan, setImportPlan] = useState<ImportPlan | null>(initialPlan);
   const [showPlan, setShowPlan] = useState(initialShowPlan);
   const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
@@ -280,6 +514,15 @@ export function ReviewPage({
     dataUrl: string | null;
   } | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [submissionAction, setSubmissionAction] = useState<ReviewDecision | 'skip_album' | null>(
+    null,
+  );
+  const [decisionError, setDecisionError] = useState<ReviewMutationError | null>(null);
+  const submissionLockRef = useRef(false);
+  const submittedCandidateIdsRef = useRef(new Set<string>());
+  const skippedAlbumIdsRef = useRef(new Set<string>());
+  const activeCandidateIdRef = useRef<string | null>(null);
+  const initialPreviewCandidateIdRef = useRef<string | null>(null);
   const [planGenerationPending, setPlanGenerationPending] = useState(false);
   const [planGenerationError, setPlanGenerationError] = useState<string | null>(null);
   const [workflowAbandonConfirm, setWorkflowAbandonConfirm] = useState(false);
@@ -352,92 +595,145 @@ export function ReviewPage({
     enabled: !!currentCandidate,
   });
 
-  const detail = detailQuery.data ?? null;
-
-  useEffect(() => {
-    if (!detail) {
-      setLeftPreview(null);
-      setRightPreview(null);
-      return;
-    }
-    if (initialPreviews) {
-      setLeftPreview(initialPreviews.left);
-      setRightPreview(initialPreviews.right);
-      return;
-    }
-    let cancelled = false;
-
-    api
-      .getImagePreview(detail.candidate_id, 'source')
-      .then((p) => {
-        if (!cancelled) setLeftPreview(p.data_url);
-      })
-      .catch(() => {
-        if (!cancelled) setLeftPreview(null);
-      });
-
-    api
-      .getImagePreview(detail.candidate_id, 'candidate')
-      .then((p) => {
-        if (!cancelled) setRightPreview(p.data_url);
-      })
-      .catch(() => {
-        if (!cancelled) setRightPreview(null);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [detail?.candidate_id, initialPreviews]);
+  const currentCandidateId = currentCandidate?.candidate_id ?? null;
+  activeCandidateIdRef.current = currentCandidateId;
+  if (initialPreviews && currentCandidateId && !initialPreviewCandidateIdRef.current) {
+    initialPreviewCandidateIdRef.current = currentCandidateId;
+  }
+  const initialPreviewsMatchCurrent =
+    initialPreviewCandidateIdRef.current === currentCandidateId ? initialPreviews : null;
+  const detail = detailQuery.data?.candidate_id === currentCandidateId ? detailQuery.data : null;
+  const detailCandidateMismatch =
+    detailQuery.isSuccess &&
+    detailQuery.data !== undefined &&
+    detailQuery.data.candidate_id !== currentCandidateId;
+  const detailReady = detailQuery.isSuccess && detail !== null && currentCandidateId !== null;
+  const sourcePreview = useReviewPreviewEvidence(
+    currentCandidateId,
+    detailReady,
+    'source',
+    initialPreviewsMatchCurrent?.left ?? null,
+  );
+  const candidatePreview = useReviewPreviewEvidence(
+    currentCandidateId,
+    detailReady,
+    'candidate',
+    initialPreviewsMatchCurrent?.right ?? null,
+  );
+  const currentCandidateAlreadySubmitted = currentCandidateId
+    ? submittedCandidateIdsRef.current.has(currentCandidateId)
+    : false;
+  const currentAlbumAlreadySkipped = detail
+    ? skippedAlbumIdsRef.current.has(detail.album_id)
+    : false;
+  const decisionReady =
+    detailReady &&
+    sourcePreview.evidence.state === 'success' &&
+    candidatePreview.evidence.state === 'success' &&
+    !currentCandidateAlreadySubmitted &&
+    !currentAlbumAlreadySkipped &&
+    !submitting;
+  const skipAlbumReady =
+    detailReady && !currentCandidateAlreadySubmitted && !currentAlbumAlreadySkipped && !submitting;
 
   useEffect(() => {
     setView(DEFAULT_VIEW);
     setOverlayMode(false);
-  }, [currentCandidate?.candidate_id]);
+    setDecisionError(null);
+  }, [currentCandidateId]);
+
+  useEffect(() => {
+    setCurrentIndex((current) => Math.max(0, Math.min(current, undecidedQueue.length - 1)));
+  }, [undecidedQueue.length]);
 
   const submitDecision = useMutation({
     mutationFn: ({ candidateId, decision }: { candidateId: string; decision: ReviewDecision }) =>
       api.submitReviewDecision(candidateId, decision),
-    onSuccess: () => {
-      invalidateReviewWorkflowQueries(queryClient);
-      setSubmitting(false);
-    },
-    onError: () => {
-      setSubmitting(false);
-    },
   });
 
   const handleDecision = useCallback(
     async (decision: ReviewDecision) => {
-      if (!currentCandidate || submitting) return;
+      if (!currentCandidate || !decisionReady || submissionLockRef.current) return;
+      const candidateIdAtSubmit = currentCandidate.candidate_id;
+      submissionLockRef.current = true;
       setSubmitting(true);
+      setSubmissionAction(decision);
+      setDecisionError(null);
+      let decisionSaved = false;
       try {
         await submitDecision.mutateAsync({
           candidateId: currentCandidate.candidate_id,
           decision,
         });
+        decisionSaved = true;
+        submittedCandidateIdsRef.current.add(currentCandidate.candidate_id);
+        await invalidateReviewWorkflowQueries(queryClient);
         if (currentIndex >= undecidedQueue.length - 1) {
           setCurrentIndex(Math.max(0, undecidedQueue.length - 2));
         }
-      } catch {
-        // error handled by mutation
+      } catch (error) {
+        if (activeCandidateIdRef.current === candidateIdAtSubmit) {
+          setDecisionError({
+            message: String(error),
+            retryHint: decisionSaved
+              ? '审核决定可能已经保存，但队列刷新失败。请重新加载审核页确认，不要重复提交。'
+              : '决定没有从当前页面移除。请重新点击刚才的审核决定重试。',
+            mayBeSaved: decisionSaved,
+          });
+        }
+      } finally {
+        submissionLockRef.current = false;
+        setSubmitting(false);
+        setSubmissionAction(null);
       }
     },
-    [currentCandidate, submitting, submitDecision, currentIndex, undecidedQueue.length],
+    [
+      currentCandidate,
+      currentIndex,
+      decisionReady,
+      queryClient,
+      submitDecision,
+      undecidedQueue.length,
+    ],
   );
 
   const handleSkipAlbum = useCallback(async () => {
-    if (!detail || !importRunId || submitting) return;
+    if (
+      !detail ||
+      !currentCandidateId ||
+      !importRunId ||
+      !skipAlbumReady ||
+      submissionLockRef.current
+    )
+      return;
+    const candidateIdAtSubmit = currentCandidateId;
+    submissionLockRef.current = true;
     setSubmitting(true);
+    setSubmissionAction('skip_album');
+    setDecisionError(null);
+    let albumSkipped = false;
     try {
       await api.skipReviewAlbum(importRunId, detail.album_id);
-      invalidateReviewWorkflowQueries(queryClient);
+      albumSkipped = true;
+      skippedAlbumIdsRef.current.add(detail.album_id);
+      await invalidateReviewWorkflowQueries(queryClient);
       setCurrentIndex(0);
-    } catch {
-      // ignore
+    } catch (error) {
+      if (activeCandidateIdRef.current === candidateIdAtSubmit) {
+        setDecisionError({
+          message: String(error),
+          retryHint: albumSkipped
+            ? '跳过请求可能已经保存，但队列刷新失败。请重新加载审核页确认，不要重复提交。'
+            : '图集仍保留在审核队列中。请再次点击“跳过图集”重试。',
+          mayBeSaved: albumSkipped,
+        });
+      }
+    } finally {
+      submissionLockRef.current = false;
+      setSubmitting(false);
+      setSubmissionAction(null);
     }
-    setSubmitting(false);
-  }, [detail, importRunId, submitting, queryClient]);
+  }, [currentCandidateId, detail, importRunId, queryClient, skipAlbumReady]);
 
   const handleGeneratePlan = useCallback(async () => {
     if (!importRunId || planGenerationPending) return;
@@ -583,10 +879,12 @@ export function ReviewPage({
   );
 
   const handlePrev = useCallback(() => {
+    if (submissionLockRef.current) return;
     setCurrentIndex((i) => Math.max(0, i - 1));
   }, []);
 
   const handleNext = useCallback(() => {
+    if (submissionLockRef.current) return;
     setCurrentIndex((i) => Math.min(undecidedQueue.length - 1, i + 1));
   }, [undecidedQueue.length]);
 
@@ -628,9 +926,11 @@ export function ReviewPage({
     return () => window.removeEventListener('keydown', handler);
   }, [handleDecision, handleSkipAlbum, handlePrev, handleNext, previewModal]);
 
-  const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+  const handleWheel = useCallback((event: WheelEvent) => {
     event.preventDefault();
-    const rect = event.currentTarget.getBoundingClientRect();
+    const element = event.currentTarget;
+    if (!(element instanceof HTMLElement)) return;
+    const rect = element.getBoundingClientRect();
     setView((current) =>
       zoomViewAtPointer(current, event.clientX, event.clientY, rect, event.deltaY),
     );
@@ -926,7 +1226,29 @@ export function ReviewPage({
     return (
       <div className="review-page review-page--m3">
         <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
-        <StatusBanner tone="danger" title="无法加载审核数据">
+        {decisionError && <ReviewMutationErrorBanner error={decisionError} />}
+        <StatusBanner
+          tone="danger"
+          title="无法加载审核数据"
+          actions={
+            <Button
+              variant="secondary"
+              loading={
+                queueQuery.isFetching || progressQuery.isFetching || frozenPlanQuery.isFetching
+              }
+              loadingLabel="正在重新加载…"
+              onClick={() =>
+                void Promise.all([
+                  queueQuery.refetch(),
+                  progressQuery.refetch(),
+                  frozenPlanQuery.refetch(),
+                ])
+              }
+            >
+              重新加载审核数据
+            </Button>
+          }
+        >
           {String(reviewQueryError)}
         </StatusBanner>
       </div>
@@ -1032,20 +1354,57 @@ export function ReviewPage({
             <Button
               variant="quiet"
               className={overlayMode ? 'is-active' : undefined}
+              disabled={!detailReady}
               onClick={() => setOverlayMode((mode) => !mode)}
               title="切换叠加模式 (O)"
               aria-pressed={overlayMode}
             >
               叠加比较
             </Button>
-            <Button variant="quiet" onClick={() => setView(DEFAULT_VIEW)} title="重置缩放 (R)">
+            <Button
+              variant="quiet"
+              disabled={!detailReady}
+              onClick={() => setView(DEFAULT_VIEW)}
+              title="重置缩放 (R)"
+            >
               重置视图
             </Button>
           </>
         }
       />
 
-      {detailQuery.isLoading || !detail ? (
+      {decisionError && <ReviewMutationErrorBanner error={decisionError} />}
+
+      {detailQuery.isError ? (
+        <StatusBanner
+          tone="danger"
+          title="无法加载当前候选详情"
+          actions={
+            <Button
+              variant="secondary"
+              loading={detailQuery.isFetching}
+              loadingLabel="正在重新加载…"
+              onClick={() => void detailQuery.refetch()}
+            >
+              重新加载详情
+            </Button>
+          }
+        >
+          {String(detailQuery.error)}
+        </StatusBanner>
+      ) : detailCandidateMismatch ? (
+        <StatusBanner
+          tone="danger"
+          title="候选详情与当前审核项不匹配"
+          actions={
+            <Button variant="secondary" onClick={() => void detailQuery.refetch()}>
+              重新加载详情
+            </Button>
+          }
+        >
+          为避免误审，当前详情已被拒绝使用。请重新加载后再作决定。
+        </StatusBanner>
+      ) : detailQuery.isLoading || !detail ? (
         <div className="review-loading-panel" role="status" aria-label="正在加载候选">
           <Skeleton height={420} radius="var(--radius-image)" />
         </div>
@@ -1063,41 +1422,44 @@ export function ReviewPage({
                 <span>源图片</span>
                 <kbd>1</kbd>
               </div>
-              <div className="review-image-container" onWheel={handleWheel}>
-                {leftPreview ? (
-                  <img src={leftPreview} alt="源图片" style={imageStyle} draggable={false} />
-                ) : (
-                  <div className="review-image-placeholder">没有预览</div>
-                )}
-              </div>
+              <ReviewImageContainer onWheelZoom={handleWheel}>
+                <ReviewPreviewContent
+                  evidence={sourcePreview.evidence}
+                  label="源图片"
+                  alt="源图片"
+                  style={imageStyle}
+                  onLoaded={sourcePreview.markLoaded}
+                  onFailed={sourcePreview.markFailed}
+                  onRetry={sourcePreview.retry}
+                />
+              </ReviewImageContainer>
             </div>
             <div className="review-image-panel right-panel">
               <div className="review-image-label">
                 <span>{detail.scope === 'library' ? '历史图库匹配' : '候选图片'}</span>
                 <kbd>2</kbd>
               </div>
-              <div className="review-image-container" onWheel={handleWheel}>
-                {overlayMode ? (
-                  rightPreview ? (
-                    <img
-                      src={rightPreview}
-                      alt="候选图片"
-                      style={{
-                        ...imageStyle,
-                        opacity: overlayOpacity,
-                        position: 'absolute',
-                        top: 0,
-                        left: 0,
-                      }}
-                      draggable={false}
-                    />
-                  ) : null
-                ) : rightPreview ? (
-                  <img src={rightPreview} alt="候选图片" style={imageStyle} draggable={false} />
-                ) : (
-                  <div className="review-image-placeholder">没有预览</div>
-                )}
-              </div>
+              <ReviewImageContainer onWheelZoom={handleWheel}>
+                <ReviewPreviewContent
+                  evidence={candidatePreview.evidence}
+                  label={detail.scope === 'library' ? '历史图库图片' : '候选图片'}
+                  alt="候选图片"
+                  style={
+                    overlayMode
+                      ? {
+                          ...imageStyle,
+                          opacity: overlayOpacity,
+                          position: 'absolute',
+                          top: 0,
+                          left: 0,
+                        }
+                      : imageStyle
+                  }
+                  onLoaded={candidatePreview.markLoaded}
+                  onFailed={candidatePreview.markFailed}
+                  onRetry={candidatePreview.retry}
+                />
+              </ReviewImageContainer>
             </div>
           </div>
 
@@ -1235,13 +1597,17 @@ export function ReviewPage({
 
           <div className="review-actions">
             <div className="review-nav">
-              <Button variant="quiet" onClick={handlePrev} disabled={currentIndex === 0}>
+              <Button
+                variant="quiet"
+                onClick={handlePrev}
+                disabled={currentIndex === 0 || submitting}
+              >
                 ← 上一个
               </Button>
               <Button
                 variant="quiet"
                 onClick={handleNext}
-                disabled={currentIndex >= undecidedQueue.length - 1}
+                disabled={currentIndex >= undecidedQueue.length - 1 || submitting}
               >
                 下一个 →
               </Button>
@@ -1258,8 +1624,8 @@ export function ReviewPage({
                     variant={option.decision === 'keep_all' ? 'secondary' : 'primary'}
                     className={option.decision === 'keep_all' ? undefined : 'review-choice'}
                     onClick={() => handleDecision(option.decision)}
-                    disabled={submitting}
-                    loading={submitting && submitDecision.variables?.decision === option.decision}
+                    disabled={!decisionReady}
+                    loading={submitting && submissionAction === option.decision}
                     loadingLabel="正在保存…"
                     title={`${label} (${option.shortcut})`}
                   >
@@ -1271,7 +1637,9 @@ export function ReviewPage({
                 variant="quiet"
                 className="review-skip-album"
                 onClick={handleSkipAlbum}
-                disabled={submitting}
+                disabled={!skipAlbumReady}
+                loading={submitting && submissionAction === 'skip_album'}
+                loadingLabel="正在跳过图集…"
                 title="跳过该图集的所有候选 (4)"
               >
                 跳过图集 <kbd>4</kbd>

@@ -84,6 +84,7 @@
   height: clamp(300px, 46vh, 520px);
   min-height: 300px;
   overflow: hidden;
+  overscroll-behavior: contain;
   place-items: center;
   border: 1px solid #34413a;
   border-radius: var(--radius-image);
@@ -98,8 +99,41 @@
 }
 
 .review-page--m3 .review-image-placeholder {
+  display: grid;
+  max-width: min(32rem, calc(100% - var(--space-6)));
+  gap: var(--space-2);
+  place-items: center;
   color: #c8d1cb;
   font-size: 13px;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.review-page--m3 .review-image-placeholder--error {
+  padding: var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--color-danger) 64%, transparent);
+  border-radius: var(--radius-control);
+  background: rgb(34 24 25 / 92%);
+  color: #f7d9d9;
+  pointer-events: auto;
+}
+
+.review-page--m3 .review-image-placeholder--error strong {
+  color: #fff1f1;
+}
+
+.review-page--m3 .review-image-loading-label {
+  position: absolute;
+  right: var(--space-3);
+  bottom: var(--space-3);
+  padding: 6px 9px;
+  border: 1px solid rgb(255 255 255 / 24%);
+  border-radius: 8px;
+  background: rgb(15 24 19 / 86%);
+  color: #eff5f1;
+  font-size: 12px;
+  font-weight: 700;
+  pointer-events: none;
 }
 
 .review-page--m3 .review-images.overlay-mode {
@@ -125,6 +159,12 @@
 .review-page--m3 .review-images.overlay-mode .right-panel .review-image-container {
   height: 100%;
   min-height: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.review-page--m3 .review-images.overlay-mode .right-panel .review-image-placeholder {
+  pointer-events: auto;
 }
 
 .review-page--m3 .overlay-opacity-control {
