@@ -6,27 +6,27 @@
 
 ## 当前结论
 
-M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。初始 UI 重设计未改后端；本轮静态审查随后发现“用户确认的计划”和“真正提交的计划”之间缺少哈希契约，因此以独立契约修复补充 Rust command/service/repository 的 `plan_hash` 返回与行锁内校验。该修复未修改 schema、migration、匹配算法或文件事务发布/恢复语义。
+M3.0–M3.6 与用户授权扩展 M3.8 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。初始 UI 重设计未改后端；本轮静态审查随后发现“用户确认的计划”和“真正提交的计划”之间缺少哈希契约，因此以独立契约修复补充 Rust command/service/repository 的 `plan_hash` 返回与行锁内校验。M3.8 进一步增加文件事务开始前的 frozen plan 安全撤销，以及已提交图库的只读明细查询；没有修改 schema、migration、匹配算法或文件事务发布/恢复顺序。
 
 2026-07-13 的完成性反证审计随后补齐了 1,000 图集/10,000 图片压力、键盘与焦点、全页 WCAG、真实 Tauri UI 主链、分析中断续跑和 Commit 中断恢复证据。当前机器通过 Win32 `GetDpiForSystem` 测得 120 DPI，即真实 Windows 125% 缩放；100% 与 150% 仍不能由 WebView device scale factor 代替。
 
 ## 自动门禁
 
-| 命令                                       | 结果                                                    |
-| ------------------------------------------ | ------------------------------------------------------- |
-| `pnpm format:check`                        | 通过                                                    |
-| `pnpm typecheck`                           | 通过                                                    |
-| `pnpm test:unit`                           | 12 个文件、93 项通过                                    |
-| `pnpm --filter @imagedb/desktop build:web` | 228 modules，JS 360.61 KB，CSS 169.90 KB                |
-| `pnpm rust:test`                           | 213 通过、0 失败、3 个 real test 按设计忽略             |
-| `pnpm rust:clippy`                         | 通过，warnings 作为错误处理                             |
-| `pnpm rust:test:real`                      | 99 项真实 PostgreSQL/文件系统测试通过，0 失败，528.7 秒 |
-| `pnpm release:performance`                 | 通过，120 张真实图片完整链路 6.108 秒                   |
-| `pnpm --filter @imagedb/desktop build`     | release exe 与 NSIS 安装包构建通过                      |
-| `pnpm release:verify-artifacts`            | exe、安装包与内置 PostgreSQL runtime 均通过             |
-| `CI=true pnpm release:gate`                | 通过，含完整真实库、构建、产物和安装门禁，705.7 秒      |
+| 命令                                       | 结果                                                     |
+| ------------------------------------------ | -------------------------------------------------------- |
+| `pnpm format:check`                        | 通过                                                     |
+| `pnpm typecheck`                           | 通过                                                     |
+| `pnpm test:unit`                           | 13 个文件、99 项通过                                     |
+| `pnpm --filter @imagedb/desktop build:web` | 231 modules，JS 372.29 KB，CSS 173.13 KB                 |
+| `pnpm rust:test`                           | 214 通过、0 失败、3 个 real test 按设计忽略              |
+| `pnpm rust:clippy`                         | 通过，warnings 作为错误处理                              |
+| `pnpm rust:test:real`                      | 102 项真实 PostgreSQL/文件系统测试通过，0 失败，660.5 秒 |
+| `pnpm release:performance`                 | 通过，120 张真实图片完整链路 7.956 秒                    |
+| `pnpm --filter @imagedb/desktop build`     | release exe 与 NSIS 安装包构建通过                       |
+| `pnpm release:verify-artifacts`            | exe、安装包与内置 PostgreSQL runtime 均通过              |
+| `CI=true pnpm release:gate`                | 通过，含完整真实库、构建、产物和安装门禁，833.3 秒       |
 
-性能门禁记录：托管 PostgreSQL 启动 3334ms，扫描 64.52 images/s，计划生成 58ms，Commit 148.33 images/s，空 Recovery 扫描 22ms。
+性能门禁记录：托管 PostgreSQL 启动 4506ms，扫描 57.12 images/s，计划生成 74ms，Commit 98.28 images/s，空 Recovery 扫描 24ms。
 
 ## 真实数据库与文件系统
 
@@ -66,6 +66,18 @@ M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字
 
 首次直接执行 `pnpm release:gate` 时，`pnpm install` 因无 TTY 拒绝清理 `node_modules`；按 pnpm 提示设置 `CI=true` 后总门禁通过。一次 10 分钟外层时限不足，最终以 20 分钟时限完成，实际耗时 705.7 秒。这两次均为执行环境/时限问题，不是测试断言失败。
 
+## M3.8 安全撤销与图库明细复验
+
+2026-07-13 在同一 feature 分支完成两个用户明确授权的受限扩展：
+
+- Review 与 Commit 均提供二次确认的“撤销计划”；成功后 frozen plan 标记为 `invalidated`，审核决定、源快照与计划历史保留，界面失效 frozen-plan、Dashboard 和 latest-committable 缓存；
+- 撤销与 Commit capture 共用 import run `FOR UPDATE` 锁。真实 PostgreSQL 用例证明零文件事务时可撤销并重新生成；只要存在任何 `file_transactions` 证据即拒绝撤销，原 frozen plan 保持有效并继续走 Commit / Recovery；
+- 工作台图库概览进入只读“图库明细”，command → service → repository 只返回 `committed` 图集与图片；图集每批 50 个、展开图片每批 24 张，汇总与分页总数由真实 PostgreSQL 用例校验；
+- 前端回归覆盖 Review 撤销、Commit 撤销、缓存失效、图库图集/图片增量分页、加载错误不伪装为空、真实空图库和工作台路由；
+- `?m3-fixture=library` 在默认桌面视口完成截图检查；720px 视口的 DOM 边界测量无横向溢出，控制台 0 warning / error。
+
+本轮先执行 `pnpm check`，结果为 99 项前端测试、214 项 Rust 测试、格式、类型与 Clippy 全部通过；随后执行 `CI=true pnpm release:gate`，完整结果见上表。测试清单盘点确认 `rust:test:real` 当前 23 个过滤套件合计 102 项真实测试。
+
 ## 视觉、响应式与可访问性
 
 确定性 fixture 已覆盖 1440×900、1280×720、960×720、720×720。最终补查确认：
@@ -83,6 +95,7 @@ M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字
 ## 长列表与响应
 
 - frozen plan 图集每批最多挂载 50 个；展开图集图片每批最多挂载 24 张，缩略图 `loading="lazy"`；
+- 图库明细每批最多查询并挂载 50 个图集；仅在展开时查询图片，每批最多 24 张；
 - 实际压力 fixture 固定生成 1,000 图集 / 10,000 图片；首屏只挂载 50 图集、402 个 DOM 节点，开发构建导航约 707.7ms，JS heap 约 21.5MB；
 - 加载下一批 50 图集约 55.9ms，DOM 为 652 个；展开首图集 10 张图片约 93.1ms，DOM 为 723 个；各阶段均无横向溢出、控制台错误或一次性挂载全部重内容；
 - 审核只挂载当前候选的左右预览，不渲染 10,000 个候选重内容；
