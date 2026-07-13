@@ -44,11 +44,15 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] Dashboard 主 CTA 对所有后端 `next_action` 映射正确。
 - [x] 前端没有根据计数或零散字段重建状态机。
 - [x] 普通开始创建新 run；resume 只对显式 run id 生效。
+- [x] Dashboard、Scan、Review 与 Commit 的显式 workflow run ID 贯穿，不被“查询最新任务”覆盖。
+- [x] “查询最新任务”只用于用户直接进入审核或提交页面时的兜底。
 - [x] abandoned run 只作为历史证据展示，不重新进入当前工作流。
 - [x] pending、analyzing、analyzed、review_required、failed 的图集状态区分清楚。
 - [x] 审核左右布局或排序变化不改变最终 selected image 语义。
 - [x] 生成/冻结计划与执行 Commit 是两个清楚的步骤。
 - [x] Commit 展示与读取的 frozen plan 一致，不临场重算。
+- [x] 计划编辑期间所有离开计划页的入口均禁用；编辑结果会刷新计划与 Dashboard 缓存。
+- [x] Commit 展示确认的 `plan_hash`，启动提交时后端在行锁内拒绝已变化的计划。
 - [x] recover、resume_commit、inspect_transaction_failure 入口语义准确。
 - [x] conflict、证据不完整和终态失败保持 fail closed。
 
@@ -59,6 +63,8 @@ M3 只有在以下四类门禁同时通过后，才能定性为完成：
 - [x] 状态不只依赖颜色，均有文字或图标。
 - [x] 长路径、中文、空格、括号、UUID 和 hash 不破坏布局。
 - [x] 空、加载、慢加载、成功、警告、错误、取消和恢复状态均有设计与实现。
+- [x] 审核加载失败和冻结计划失败不会伪装成空候选，均有可见错误状态。
+- [x] 不提供文件事务模型明确拒绝的跨源图集拖拽移动；计划只保留导入/跳过调整。
 - [x] 加载 skeleton 与实际布局匹配，按钮 loading 不发生宽度跳动。
 - [x] 主要交互动效为 150–220ms，且服务于状态反馈。
 - [x] `prefers-reduced-motion` 下无必要位移或循环动画。

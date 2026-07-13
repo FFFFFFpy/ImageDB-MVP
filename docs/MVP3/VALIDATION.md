@@ -6,26 +6,27 @@
 
 ## 当前结论
 
-M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。UI 重设计未修改 Rust domain、service、repository、migration、匹配算法或文件事务协议；Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。
+M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字。Dashboard 继续只消费后端 `next_action`，Commit 继续读取 frozen plan。初始 UI 重设计未改后端；本轮静态审查随后发现“用户确认的计划”和“真正提交的计划”之间缺少哈希契约，因此以独立契约修复补充 Rust command/service/repository 的 `plan_hash` 返回与行锁内校验。该修复未修改 schema、migration、匹配算法或文件事务发布/恢复语义。
 
 2026-07-13 的完成性反证审计随后补齐了 1,000 图集/10,000 图片压力、键盘与焦点、全页 WCAG、真实 Tauri UI 主链、分析中断续跑和 Commit 中断恢复证据。当前机器通过 Win32 `GetDpiForSystem` 测得 120 DPI，即真实 Windows 125% 缩放；100% 与 150% 仍不能由 WebView device scale factor 代替。
 
 ## 自动门禁
 
-| 命令                                       | 结果                                                  |
-| ------------------------------------------ | ----------------------------------------------------- |
-| `pnpm format:check`                        | 通过                                                  |
-| `pnpm typecheck`                           | 通过                                                  |
-| `pnpm test:unit`                           | 12 个文件、83 项通过                                  |
-| `pnpm --filter @imagedb/desktop build:web` | 228 modules，JS 356.90 KB，CSS 169.83 KB              |
-| `pnpm rust:test`                           | 212 通过、0 失败、3 个 real test 按设计忽略           |
-| `pnpm rust:clippy`                         | 通过，warnings 作为错误处理                           |
-| `pnpm rust:test:real`                      | 99 项真实 PostgreSQL/文件系统测试通过，0 失败，541 秒 |
-| `pnpm release:performance`                 | 通过，120 张真实图片完整链路 6.388 秒                 |
-| `pnpm --filter @imagedb/desktop build`     | release exe 与 NSIS 安装包构建通过                    |
-| `pnpm release:verify-artifacts`            | exe、安装包与内置 PostgreSQL runtime 均通过           |
+| 命令                                       | 结果                                                    |
+| ------------------------------------------ | ------------------------------------------------------- |
+| `pnpm format:check`                        | 通过                                                    |
+| `pnpm typecheck`                           | 通过                                                    |
+| `pnpm test:unit`                           | 12 个文件、93 项通过                                    |
+| `pnpm --filter @imagedb/desktop build:web` | 228 modules，JS 360.61 KB，CSS 169.90 KB                |
+| `pnpm rust:test`                           | 213 通过、0 失败、3 个 real test 按设计忽略             |
+| `pnpm rust:clippy`                         | 通过，warnings 作为错误处理                             |
+| `pnpm rust:test:real`                      | 99 项真实 PostgreSQL/文件系统测试通过，0 失败，528.7 秒 |
+| `pnpm release:performance`                 | 通过，120 张真实图片完整链路 6.108 秒                   |
+| `pnpm --filter @imagedb/desktop build`     | release exe 与 NSIS 安装包构建通过                      |
+| `pnpm release:verify-artifacts`            | exe、安装包与内置 PostgreSQL runtime 均通过             |
+| `CI=true pnpm release:gate`                | 通过，含完整真实库、构建、产物和安装门禁，705.7 秒      |
 
-性能门禁记录：托管 PostgreSQL 启动 3346ms，扫描 58.97 images/s，计划生成 157ms，Commit 147.97 images/s，空 Recovery 扫描 19ms。
+性能门禁记录：托管 PostgreSQL 启动 3334ms，扫描 64.52 images/s，计划生成 58ms，Commit 148.33 images/s，空 Recovery 扫描 22ms。
 
 ## 真实数据库与文件系统
 
@@ -39,6 +40,31 @@ M3.0–M3.6 已完成，M3.7 仅剩 Windows 100% / 150% 系统缩放人工签字
 - 外部 PostgreSQL 初始化、升级、超时、不可达回退和数据迁移。
 
 所有套件均为真实 PostgreSQL 与真实临时文件系统，不以 mock 代替事务结果。
+
+## 静态审查修复复验
+
+2026-07-13 在提交 `1b15e5e` 完成审查修复，并以新增回归锁定以下行为：
+
+- 两个双任务场景证明 Dashboard 显式选择的较旧 run 不会被 Review / Commit 各自查询到的较新 run 覆盖；Scan 前往审核同样携带当前 active run；
+- 计划图片或图集编辑期间，返回审核、前往提交和侧栏导航全部禁用；编辑完成后同步更新两组 frozen-plan query，并失效 Dashboard 状态；
+- Commit 确认页显示 `plan_hash`，IPC 传递 `expectedPlanHash`，后端在计划编辑共用的 run 行锁内比对，哈希变化即 fail closed；
+- 移除跨源图集图片拖拽和对应公开 IPC，只保留“导入 / 跳过”；
+- 审核加载、查询错误、冻结失败分别呈现 loading / error / empty；
+- 设置页在表单可编辑和可保存前回填图库根目录及全部非秘密外部数据库字段，并区分主动清空；
+- 审核滚轮缩放按鼠标指向位置修正偏移；全局快捷键避开 `select`、contenteditable、预览 modal、组合键和输入法 composing；取消扫描不再显示成功色。
+
+本轮实际执行：
+
+- `pnpm typecheck`：通过；
+- `pnpm test:unit`：12 个文件、93 项通过；
+- `pnpm format:check`：通过；
+- `pnpm rust:clippy`：通过，warnings 作为错误；
+- `pnpm rust:test`：213 通过、0 失败、3 个 real test 按设计忽略；
+- `pnpm rust:test:real`：完整真实 PostgreSQL / 文件系统套件通过；
+- `pnpm --filter @imagedb/desktop build:web`：通过；
+- `CI=true pnpm release:gate`：通过，含 release/NSIS、产物校验和静默安装/卸载。
+
+首次直接执行 `pnpm release:gate` 时，`pnpm install` 因无 TTY 拒绝清理 `node_modules`；按 pnpm 提示设置 `CI=true` 后总门禁通过。一次 10 分钟外层时限不足，最终以 20 分钟时限完成，实际耗时 705.7 秒。这两次均为执行环境/时限问题，不是测试断言失败。
 
 ## 视觉、响应式与可访问性
 
