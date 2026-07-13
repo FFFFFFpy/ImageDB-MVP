@@ -138,9 +138,6 @@ export const api = {
       included,
     }),
 
-  moveImportPlanImage: (importRunId: string, imageId: string, targetAlbumId: string) =>
-    invoke<ImportPlan>('move_import_plan_image', { importRunId, imageId, targetAlbumId }),
-
   getLatestCompletedImportRun: () => invoke<string | null>('get_latest_completed_import_run'),
 
   getLatestReviewableImportRun: () => invoke<string | null>('get_latest_reviewable_import_run'),
@@ -153,8 +150,8 @@ export const api = {
   getImportPlanImagePreview: (importRunId: string, imageId: string) =>
     invoke<ImagePreview>('get_import_plan_image_preview', { importRunId, imageId }),
 
-  startImportCommit: (importRunId: string) =>
-    invoke<string>('start_import_commit', { importRunId }),
+  startImportCommit: (importRunId: string, expectedPlanHash: string) =>
+    invoke<string>('start_import_commit', { importRunId, expectedPlanHash }),
 
   cancelImportCommit: () => invoke<string>('cancel_import_commit'),
 

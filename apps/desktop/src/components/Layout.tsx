@@ -9,6 +9,7 @@ interface LayoutProps {
   currentRoute: Route;
   onNavigate: (route: Route) => void;
   enablePolling?: boolean;
+  navigationDisabled?: boolean;
 }
 
 const NAV_ITEMS: { route: Route; label: string; icon: AppIconName }[] = [
@@ -19,7 +20,13 @@ const NAV_ITEMS: { route: Route; label: string; icon: AppIconName }[] = [
   { route: 'recovery', label: '恢复', icon: 'recovery' },
 ];
 
-export function Layout({ children, currentRoute, onNavigate, enablePolling = true }: LayoutProps) {
+export function Layout({
+  children,
+  currentRoute,
+  onNavigate,
+  enablePolling = true,
+  navigationDisabled = false,
+}: LayoutProps) {
   const databaseInfo = useQuery({
     queryKey: ['database-info-dashboard'],
     queryFn: api.getDatabaseInfoDashboard,
@@ -39,6 +46,7 @@ export function Layout({ children, currentRoute, onNavigate, enablePolling = tru
           className="app-brand"
           type="button"
           aria-label="ImageDB 工作台"
+          disabled={navigationDisabled}
           onClick={() => onNavigate('dashboard')}
         >
           <span className="app-brand__mark">
@@ -59,6 +67,7 @@ export function Layout({ children, currentRoute, onNavigate, enablePolling = tru
                 aria-current={isActive ? 'page' : undefined}
                 aria-label={item.label}
                 title={item.label}
+                disabled={navigationDisabled}
                 onClick={() => onNavigate(item.route)}
               >
                 <AppIcon name={item.icon} />
@@ -82,6 +91,7 @@ export function Layout({ children, currentRoute, onNavigate, enablePolling = tru
             }
             aria-label="设置"
             title="设置"
+            disabled={navigationDisabled}
             onClick={() => onNavigate('settings')}
           >
             <AppIcon name="settings" />

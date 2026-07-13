@@ -194,6 +194,10 @@ describe('SettingsPage external PostgreSQL GUI', () => {
   test('initializes an external database directly from settings', async () => {
     renderSettingsPage();
 
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '连接并初始化外部库' })).toBeEnabled(),
+    );
+
     fireEvent.change(await screen.findByLabelText('主机'), {
       target: { value: '192.168.31.25' },
     });
@@ -253,7 +257,9 @@ describe('SettingsPage external PostgreSQL GUI', () => {
 
     renderSettingsPage();
 
-    fireEvent.click(await screen.findByRole('button', { name: '测试连接' }));
+    const testButton = await screen.findByRole('button', { name: '测试连接' });
+    await waitFor(() => expect(testButton).toBeEnabled());
+    fireEvent.click(testButton);
 
     expect(await screen.findByText('PostgreSQL 18.4')).toBeInTheDocument();
     expect(screen.getByText('postgres.version')).toBeInTheDocument();
@@ -308,6 +314,7 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     renderSettingsPage();
 
     const input = await screen.findByLabelText('目标图库根目录');
+    await waitFor(() => expect(input).toBeEnabled());
     fireEvent.change(input, { target: { value: 'C:/ImageLibrary' } });
     fireEvent.click(screen.getByRole('button', { name: '检测存储能力' }));
 
@@ -342,5 +349,72 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     );
     expect(screen.getByText(/CC BY-NC 4\.0/)).toBeInTheDocument();
     expect(screen.getByText(/个人自用、非商业项目/)).toBeInTheDocument();
+  });
+
+  test('hydrates existing library and external settings before allowing save', async () => {
+    mockedApi.getSettings.mockResolvedValue({
+      database_mode: 'external',
+      library_root: 'D:/ExistingLibrary',
+      external_host: 'db.lan',
+      external_port: 6543,
+      external_database: 'photos',
+      external_username: 'owner',
+      external_tls_mode: 'verify_ca',
+      external_ca_cert_path: 'D:/certs/ca.pem',
+      external_client_cert_path: 'D:/certs/client.pem',
+      external_client_key_path: 'D:/certs/client.key',
+      external_connect_timeout_secs: 23,
+      external_query_timeout_secs: 45,
+      external_profile_name: 'home',
+      first_run_completed: true,
+    });
+    mockedApi.updateSettings.mockImplementation(async (next) => next);
+
+    renderSettingsPage();
+
+    expect(await screen.findByDisplayValue('D:/ExistingLibrary')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('db.lan')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('6543')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('photos')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('owner')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('D:/certs/ca.pem')).toBeInTheDocument();
+
+    const saveButton = screen.getByRole('button', { name: '保存' });
+    expect(saveButton).toBeEnabled();
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(mockedApi.updateSettings).toHaveBeenCalled());
+    expect(mockedApi.updateSettings.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ library_root: 'D:/ExistingLibrary' }),
+    );
+  });
+
+  test('persists an intentional library root clear after form initialization', async () => {
+    mockedApi.getSettings.mockResolvedValue({
+      database_mode: 'managed_local',
+      library_root: 'D:/ExistingLibrary',
+      external_host: null,
+      external_port: null,
+      external_database: null,
+      external_username: null,
+      external_tls_mode: null,
+      external_ca_cert_path: null,
+      external_client_cert_path: null,
+      external_client_key_path: null,
+      external_connect_timeout_secs: null,
+      external_query_timeout_secs: null,
+      external_profile_name: null,
+      first_run_completed: true,
+    });
+    mockedApi.updateSettings.mockImplementation(async (next) => next);
+    renderSettingsPage();
+
+    const input = await screen.findByDisplayValue('D:/ExistingLibrary');
+    fireEvent.change(input, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => expect(mockedApi.updateSettings).toHaveBeenCalled());
+    expect(mockedApi.updateSettings.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ library_root: null }),
+    );
   });
 });

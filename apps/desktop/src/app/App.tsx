@@ -16,7 +16,8 @@ import { SettingsPage } from '../pages/SettingsPage';
 export function App() {
   const { route, navigate } = useRouter();
   const queryClient = useQueryClient();
-  const [scanImportRunId, setScanImportRunId] = useState<string | null>(null);
+  const [workflowImportRunId, setWorkflowImportRunId] = useState<string | null>(null);
+  const [workflowNavigationBlocked, setWorkflowNavigationBlocked] = useState(false);
 
   const settings = useQuery({
     queryKey: ['settings'],
@@ -27,7 +28,9 @@ export function App() {
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
   const handleLayoutNavigate = (nextRoute: Parameters<typeof navigate>[0]) => {
-    if (nextRoute === 'scan') setScanImportRunId(null);
+    if (nextRoute === 'scan' || nextRoute === 'review' || nextRoute === 'commit') {
+      setWorkflowImportRunId(null);
+    }
     navigate(nextRoute);
   };
 
@@ -57,25 +60,61 @@ export function App() {
       {showOnboarding ? (
         <OnboardingPage onComplete={handleOnboardingComplete} />
       ) : (
-        <Layout currentRoute={route} onNavigate={handleLayoutNavigate}>
+        <Layout
+          currentRoute={route}
+          onNavigate={handleLayoutNavigate}
+          navigationDisabled={workflowNavigationBlocked}
+        >
           {route === 'dashboard' && (
             <DashboardPage
               needsOnboarding={needsOnboarding}
               onConfigureDatabase={() => navigate('settings')}
               onGoScan={(importRunId) => {
-                setScanImportRunId(importRunId ?? null);
+                setWorkflowImportRunId(importRunId ?? null);
                 navigate('scan');
               }}
-              onGoReview={() => navigate('review')}
-              onGoCommit={() => navigate('commit')}
+              onGoReview={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('review');
+              }}
+              onGoCommit={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('commit');
+              }}
               onGoRecovery={() => navigate('recovery')}
             />
           )}
           {route === 'scan' && (
-            <ScanPage initialImportRunId={scanImportRunId} onNavigate={navigate} />
+            <ScanPage
+              initialImportRunId={workflowImportRunId}
+              onNavigate={navigate}
+              onGoReview={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('review');
+              }}
+            />
           )}
-          {route === 'review' && <ReviewPage onNavigate={navigate} />}
-          {route === 'commit' && <CommitPage onNavigate={navigate} />}
+          {route === 'review' && (
+            <ReviewPage
+              initialImportRunId={workflowImportRunId}
+              onNavigate={navigate}
+              onGoCommit={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('commit');
+              }}
+              onPlanEditPendingChange={setWorkflowNavigationBlocked}
+            />
+          )}
+          {route === 'commit' && (
+            <CommitPage
+              initialImportRunId={workflowImportRunId}
+              onNavigate={navigate}
+              onGoReview={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('review');
+              }}
+            />
+          )}
           {route === 'recovery' && <RecoveryPage onNavigate={navigate} />}
           {route === 'settings' && <SettingsPage onOpenProbes={() => navigate('probes')} />}
           {route === 'probes' && <ProbesPage />}

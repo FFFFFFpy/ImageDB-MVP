@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { api } from '../lib/ipc/api';
 import { importPlanFixture } from '../components/fixtures/importPlanFixture';
@@ -14,6 +14,8 @@ import {
   invalidateReviewWorkflowQueries,
   REVIEW_DECISION_OPTIONS,
   ReviewPage,
+  shouldIgnoreReviewShortcut,
+  zoomViewAtPointer,
 } from './ReviewPage';
 
 afterEach(() => {
@@ -208,5 +210,152 @@ describe('REVIEW_DECISION_OPTIONS', () => {
 
     expect(await screen.findByRole('heading', { name: '导入计划' })).toBeVisible();
     expect(screen.queryByText('没有待审核候选')).not.toBeInTheDocument();
+  });
+});
+
+describe('review workflow hardening', () => {
+  test('keeps the pointed image coordinate fixed while zooming', () => {
+    const next = zoomViewAtPointer(
+      { scale: 1, offsetX: 0, offsetY: 0 },
+      175,
+      125,
+      { left: 100, top: 50, width: 100, height: 100 },
+      -1,
+    );
+
+    expect(next.scale).toBeCloseTo(1.1);
+    expect(next.offsetX).toBeCloseTo(-2.5);
+    expect(next.offsetY).toBeCloseTo(-2.5);
+  });
+
+  test('guards shortcuts in selects, editable regions, modals, composition, and modifiers', () => {
+    const select = document.createElement('select');
+    const selectEvent = new KeyboardEvent('keydown', { key: '1' });
+    Object.defineProperty(selectEvent, 'target', { value: select });
+    expect(shouldIgnoreReviewShortcut(selectEvent, false)).toBe(true);
+
+    const editable = document.createElement('div');
+    editable.setAttribute('contenteditable', 'true');
+    const editableEvent = new KeyboardEvent('keydown', { key: '1' });
+    Object.defineProperty(editableEvent, 'target', { value: editable });
+    expect(shouldIgnoreReviewShortcut(editableEvent, false)).toBe(true);
+    expect(shouldIgnoreReviewShortcut(new KeyboardEvent('keydown', { key: '1' }), true)).toBe(true);
+    expect(
+      shouldIgnoreReviewShortcut(new KeyboardEvent('keydown', { key: '1', ctrlKey: true }), false),
+    ).toBe(true);
+    expect(
+      shouldIgnoreReviewShortcut(
+        new KeyboardEvent('keydown', { key: '1', isComposing: true }),
+        false,
+      ),
+    ).toBe(true);
+  });
+
+  test('shows loading and error states instead of claiming the review queue is empty', async () => {
+    const importRunId = 'loading-run';
+    let rejectProgress!: (error: Error) => void;
+    vi.spyOn(api, 'getReviewQueue').mockReturnValue(new Promise(() => undefined));
+    vi.spyOn(api, 'getReviewProgress').mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectProgress = reject;
+      }),
+    );
+    vi.spyOn(api, 'getFrozenImportPlanSummary').mockResolvedValue(null);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewPage initialImportRunId={importRunId} enablePolling={false} onNavigate={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByLabelText('正在加载审核数据')).toBeInTheDocument();
+    expect(screen.queryByText('没有待审核候选')).not.toBeInTheDocument();
+
+    act(() => rejectProgress(new Error('review progress unavailable')));
+    expect(await screen.findByText(/review progress unavailable/)).toBeInTheDocument();
+    expect(screen.queryByText('没有待审核候选')).not.toBeInTheDocument();
+  });
+
+  test('surfaces frozen-plan generation failures', async () => {
+    const importRunId = 'freeze-error-run';
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData(['reviewQueue', importRunId], []);
+    client.setQueryData(['reviewProgress', importRunId], {
+      import_run_id: importRunId,
+      total_review_candidates: 0,
+      decided_count: 0,
+      remaining_count: 0,
+      all_decided: true,
+    });
+    client.setQueryData(['reviewFrozenImportPlanSummary', importRunId], null);
+    vi.spyOn(api, 'freezeImportPlan').mockRejectedValue(new Error('freeze transaction failed'));
+
+    render(
+      <QueryClientProvider client={client}>
+        <ReviewPage initialImportRunId={importRunId} enablePolling={false} onNavigate={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '生成导入计划' }));
+    expect(await screen.findByText(/freeze transaction failed/)).toBeInTheDocument();
+  });
+
+  test('blocks plan navigation until the active edit and query refreshes finish', async () => {
+    let resolveEdit!: (plan: typeof importPlanFixture) => void;
+    const edit = vi.spyOn(api, 'setImportPlanImageIncluded').mockReturnValue(
+      new Promise((resolve) => {
+        resolveEdit = resolve;
+      }),
+    );
+    vi.spyOn(api, 'getImportPlanImagePreview').mockResolvedValue({ data_url: '' });
+    const onGoCommit = vi.fn();
+    const onPlanEditPendingChange = vi.fn();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <ReviewPage
+          initialImportRunId={importPlanFixture.import_run_id}
+          initialPlan={importPlanFixture}
+          initialShowPlan
+          enablePolling={false}
+          onNavigate={vi.fn()}
+          onGoCommit={onGoCommit}
+          onPlanEditPendingChange={onPlanEditPendingChange}
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(await screen.findByText('旅行风光'));
+    const imageToggle = await waitFor(() => {
+      const element = container.querySelector<HTMLButtonElement>(
+        '.import-plan-image-row .plan-toggle',
+      );
+      expect(element).not.toBeNull();
+      return element!;
+    });
+    fireEvent.click(imageToggle);
+    expect(edit).toHaveBeenCalledOnce();
+    expect(screen.getByRole('button', { name: '返回审核' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '正在保存计划…' })).toBeDisabled();
+    expect(onPlanEditPendingChange).toHaveBeenLastCalledWith(true);
+
+    fireEvent.click(screen.getByRole('button', { name: '正在保存计划…' }));
+    expect(onGoCommit).not.toHaveBeenCalled();
+
+    await act(async () => resolveEdit({ ...importPlanFixture, plan_hash: 'updated-hash' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '前往提交确认' })).toBeEnabled());
+    expect(onPlanEditPendingChange).toHaveBeenLastCalledWith(false);
+    fireEvent.click(screen.getByRole('button', { name: '前往提交确认' }));
+    expect(onGoCommit).toHaveBeenCalledWith(importPlanFixture.import_run_id);
+    expect(
+      client.getQueryData(['frozenImportPlanSummary', importPlanFixture.import_run_id]),
+    ).toMatchObject({
+      plan_hash: 'updated-hash',
+    });
   });
 });

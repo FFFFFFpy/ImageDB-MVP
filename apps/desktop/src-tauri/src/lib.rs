@@ -543,7 +543,6 @@ pub fn run() {
             commands::get_frozen_import_plan_summary,
             commands::set_import_plan_album_included,
             commands::set_import_plan_image_included,
-            commands::move_import_plan_image,
             commands::get_latest_completed_import_run,
             commands::get_latest_reviewable_import_run,
             commands::get_latest_committable_import_run,

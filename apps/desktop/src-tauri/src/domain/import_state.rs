@@ -390,6 +390,7 @@ pub struct ImportPlanAlbum {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportPlan {
     pub import_run_id: String,
+    pub plan_hash: Option<String>,
     pub total_albums: u32,
     pub total_images: u32,
     pub kept_images: Vec<ImportPlanImage>,

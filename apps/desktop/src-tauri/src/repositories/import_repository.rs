@@ -3518,6 +3518,11 @@ impl ImportRepository {
         let kept_count = kept_images.len() as u64;
         Ok(Some(ImportPlan {
             import_run_id: import_run_id.to_string(),
+            plan_hash: frozen.plan_hash.as_ref().map(|hash| {
+                hash.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            }),
             total_albums: total_albums as u32,
             total_images: total_images as u32,
             kept_images,

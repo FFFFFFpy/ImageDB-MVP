@@ -6,6 +6,7 @@ import {
   isTerminalScanState,
   nextActionLabelForScanState,
   nextRouteForScanState,
+  scanStatusTone,
   ScanPage,
 } from './ScanPage';
 
@@ -114,7 +115,11 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: mockListen,
 }));
 
-function renderScanPage(onNavigate = vi.fn(), initialImportRunId: string | null = 'run-1') {
+function renderScanPage(
+  onNavigate = vi.fn(),
+  initialImportRunId: string | null = 'run-1',
+  onGoReview?: (importRunId: string) => void,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -123,7 +128,11 @@ function renderScanPage(onNavigate = vi.fn(), initialImportRunId: string | null 
     onNavigate,
     ...render(
       <QueryClientProvider client={client}>
-        <ScanPage initialImportRunId={initialImportRunId} onNavigate={onNavigate} />
+        <ScanPage
+          initialImportRunId={initialImportRunId}
+          onNavigate={onNavigate}
+          onGoReview={onGoReview}
+        />
       </QueryClientProvider>,
     ),
   };
@@ -156,6 +165,13 @@ describe('ScanPage state routing', () => {
     expect(nextRouteForScanState('cancelled')).toBeNull();
     expect(nextRouteForScanState('completed')).toBeNull();
     expect(nextRouteForScanState(null)).toBeNull();
+  });
+
+  test('does not present a cancelled scan as successful', () => {
+    expect(scanStatusTone('cancelled')).toBe('warning');
+    expect(scanStatusTone('completed')).toBe('success');
+    expect(scanStatusTone('review_required')).toBe('info');
+    expect(scanStatusTone('failed')).toBe('danger');
   });
 
   test('uses the same review action for review-required and ready-to-commit results', () => {
@@ -291,7 +307,8 @@ describe('ScanPage album workflow', () => {
   });
 
   test('shows retry for failed albums and review only for albums with candidates', async () => {
-    const { onNavigate } = renderScanPage();
+    const onGoReview = vi.fn();
+    const { onNavigate } = renderScanPage(vi.fn(), 'run-1', onGoReview);
 
     const failedRow = (await screen.findByText('failed-album')).closest('tr');
     expect(failedRow).not.toBeNull();
@@ -302,7 +319,8 @@ describe('ScanPage album workflow', () => {
     const reviewRow = screen.getByText('review-album').closest('tr');
     expect(reviewRow).not.toBeNull();
     fireEvent.click(within(reviewRow!).getByRole('button'));
-    expect(onNavigate).toHaveBeenCalledWith('review');
+    expect(onGoReview).toHaveBeenCalledWith('run-1');
+    expect(onNavigate).not.toHaveBeenCalledWith('review');
     expect(
       within(screen.getByText('done-album').closest('tr')!).queryAllByRole('button'),
     ).toHaveLength(0);

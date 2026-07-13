@@ -23,6 +23,7 @@ import {
 
 interface CommitPageProps {
   onNavigate: (route: Route) => void;
+  onGoReview?: (importRunId: string) => void;
   initialPhase?: Phase;
   initialPlan?: ImportPlan | null;
   initialProgress?: CommitProgress | null;
@@ -195,6 +196,7 @@ function stageLabel(stage: string | undefined): string {
 
 export function CommitPage({
   onNavigate,
+  onGoReview,
   initialPhase = 'confirm',
   initialPlan = null,
   initialProgress = null,
@@ -263,7 +265,8 @@ export function CommitPage({
   }, [phase, enablePolling]);
 
   const commitMutation = useMutation({
-    mutationFn: (runId: string) => api.startImportCommit(runId),
+    mutationFn: ({ runId, planHash }: { runId: string; planHash: string }) =>
+      api.startImportCommit(runId, planHash),
     onSuccess: () => {
       setError(null);
       setPhase('committing');
@@ -274,9 +277,9 @@ export function CommitPage({
   });
 
   const handleStartCommit = useCallback(() => {
-    if (!importRunId) return;
-    commitMutation.mutate(importRunId);
-  }, [commitMutation, importRunId]);
+    if (!importRunId || !plan?.plan_hash) return;
+    commitMutation.mutate({ runId: importRunId, planHash: plan.plan_hash });
+  }, [commitMutation, importRunId, plan?.plan_hash]);
 
   const handleCancel = useCallback(async () => {
     try {
@@ -325,13 +328,20 @@ export function CommitPage({
           actions={
             plan ? (
               <>
-                <Button variant="quiet" onClick={() => onNavigate('review')}>
+                <Button
+                  variant="quiet"
+                  onClick={() =>
+                    committableRunId && onGoReview
+                      ? onGoReview(committableRunId)
+                      : onNavigate('review')
+                  }
+                >
                   退回导入计划
                 </Button>
                 <Button
                   variant="primary"
                   onClick={handleStartCommit}
-                  disabled={plan.kept_images.length === 0}
+                  disabled={plan.kept_images.length === 0 || !plan.plan_hash}
                   loading={commitMutation.isPending}
                   loadingLabel="正在启动…"
                 >
@@ -341,6 +351,17 @@ export function CommitPage({
             ) : undefined
           }
         />
+
+        {plan && (
+          <StatusBanner
+            tone={plan.plan_hash ? 'info' : 'danger'}
+            title={plan.plan_hash ? '已锁定本次提交计划' : '计划缺少完整性哈希'}
+          >
+            {plan.plan_hash
+              ? `计划哈希：${plan.plan_hash}`
+              : '无法确认当前页面展示的计划与后端即将提交的计划一致，提交已阻止。请返回审核页重新生成 frozen plan。'}
+          </StatusBanner>
+        )}
 
         {latestRun.isLoading && !plan && (
           <div className="commit-loading" role="status" aria-label="正在加载可提交的导入任务">
@@ -353,7 +374,14 @@ export function CommitPage({
             description="当前没有已冻结计划的可提交任务。请先完成审核并生成导入计划。"
             action={
               <div className="commit-empty-actions">
-                <Button variant="primary" onClick={() => onNavigate('review')}>
+                <Button
+                  variant="primary"
+                  onClick={() =>
+                    committableRunId && onGoReview
+                      ? onGoReview(committableRunId)
+                      : onNavigate('review')
+                  }
+                >
                   前往审核 / 生成计划
                 </Button>
                 <Button variant="quiet" onClick={() => onNavigate('scan')}>

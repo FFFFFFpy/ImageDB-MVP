@@ -16,8 +16,8 @@ interface DashboardPageProps {
   needsOnboarding: boolean;
   onConfigureDatabase: () => void;
   onGoScan: (importRunId?: string | null) => void;
-  onGoReview: () => void;
-  onGoCommit: () => void;
+  onGoReview: (importRunId: string) => void;
+  onGoCommit: (importRunId: string) => void;
   onGoRecovery: () => void;
   enablePolling?: boolean;
 }
@@ -194,14 +194,14 @@ export function DashboardPage({
         return;
       case 'review':
       case 'generate_plan':
-        onGoReview();
+        if (actionableRun?.import_run_id) onGoReview(actionableRun.import_run_id);
         return;
       case 'resume_analysis':
       case 'inspect_failed':
         onGoScan(actionableRun?.import_run_id ?? null);
         return;
       case 'resume_commit':
-        onGoCommit();
+        if (actionableRun?.import_run_id) onGoCommit(actionableRun.import_run_id);
         return;
       case 'new_import':
         onGoScan(null);

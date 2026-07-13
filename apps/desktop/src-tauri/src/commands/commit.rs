@@ -8,13 +8,28 @@ use tauri::State;
 pub async fn start_import_commit(
     state: State<'_, AppState>,
     import_run_id: String,
+    expected_plan_hash: String,
 ) -> Result<String, String> {
-    start_import_commit_for_state(&state, import_run_id).await
+    start_import_commit_for_state_with_expected_hash(
+        &state,
+        import_run_id,
+        Some(expected_plan_hash),
+    )
+    .await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn start_import_commit_for_state(
     state: &AppState,
     import_run_id: String,
+) -> Result<String, String> {
+    start_import_commit_for_state_with_expected_hash(state, import_run_id, None).await
+}
+
+pub(crate) async fn start_import_commit_for_state_with_expected_hash(
+    state: &AppState,
+    import_run_id: String,
+    expected_plan_hash: Option<String>,
 ) -> Result<String, String> {
     tracing::info!(import_run_id = %import_run_id, "start_import_commit command received");
     let run_id = uuid::Uuid::parse_str(&import_run_id).map_err(|e| format!("invalid UUID: {e}"))?;
@@ -58,12 +73,13 @@ pub(crate) async fn start_import_commit_for_state(
     let tracker_clone = progress_tracker.clone();
 
     let task = tokio::spawn(async move {
-        let result = commit_service::run_import_commit(
+        let result = commit_service::run_import_commit_with_expected_plan_hash(
             postgres_manager,
             library_root,
             run_id,
             cancelled_clone,
             tracker_clone.clone(),
+            expected_plan_hash,
         )
         .await;
 

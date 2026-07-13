@@ -63,6 +63,23 @@ pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn ensure_expected_plan_hash(
+    import_run_id: Uuid,
+    validated_plan_hash: &[u8],
+    expected_plan_hash: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(expected_plan_hash) = expected_plan_hash else {
+        return Ok(());
+    };
+    let actual_plan_hash = bytes_to_hex(validated_plan_hash);
+    if actual_plan_hash.eq_ignore_ascii_case(expected_plan_hash) {
+        return Ok(());
+    }
+    Err(AppError::Internal(format!(
+        "frozen import plan changed after confirmation for run {import_run_id}; expected hash {expected_plan_hash}, actual hash {actual_plan_hash}; review the plan again before committing"
+    )))
+}
+
 /// Canonical on-disk manifest for a published album directory.
 ///
 /// This struct is serialized into `.imagedb-manifest.json` inside both the
@@ -278,12 +295,32 @@ pub(crate) fn read_manifest_with_hash(dir: &Path) -> Result<(AlbumManifest, Vec<
     Ok((manifest, hash))
 }
 
+#[allow(dead_code)]
 pub async fn run_import_commit(
     postgres_manager: Arc<Mutex<PostgresManager>>,
     library_root_path: String,
     import_run_id: Uuid,
     cancelled: Arc<AtomicBool>,
     progress_tracker: Arc<Mutex<CommitProgress>>,
+) -> Result<CommitResult, AppError> {
+    run_import_commit_with_expected_plan_hash(
+        postgres_manager,
+        library_root_path,
+        import_run_id,
+        cancelled,
+        progress_tracker,
+        None,
+    )
+    .await
+}
+
+pub async fn run_import_commit_with_expected_plan_hash(
+    postgres_manager: Arc<Mutex<PostgresManager>>,
+    library_root_path: String,
+    import_run_id: Uuid,
+    cancelled: Arc<AtomicBool>,
+    progress_tracker: Arc<Mutex<CommitProgress>>,
+    expected_plan_hash: Option<String>,
 ) -> Result<CommitResult, AppError> {
     let started_at = Instant::now();
     tracing::info!(
@@ -311,6 +348,7 @@ pub async fn run_import_commit(
         import_run_id,
         &cancelled,
         &progress_tracker,
+        expected_plan_hash.as_deref(),
     )
     .await;
 
@@ -356,6 +394,7 @@ async fn execute_commit_pipeline(
     import_run_id: Uuid,
     cancelled: &Arc<AtomicBool>,
     progress_tracker: &Arc<Mutex<CommitProgress>>,
+    expected_plan_hash: Option<&str>,
 ) -> Result<CommitResult, AppError> {
     let import_run = ImportRepository::get_import_run_by_id(client, import_run_id)
         .await?
@@ -427,6 +466,7 @@ async fn execute_commit_pipeline(
         // Rule 4: validate and hash the immutable plan while the edit lock is
         // held. Commit and Recovery share this canonical hash validation.
         let validated_plan_hash = validate_and_hash_frozen_plan(&frozen, library_root_id)?;
+        ensure_expected_plan_hash(import_run_id, &validated_plan_hash, expected_plan_hash)?;
         let publish_strategy = if frozen.albums.is_empty() {
             None
         } else {
@@ -3367,6 +3407,18 @@ mod tests {
         assert_eq!(back.plan_hash, bytes_to_hex(&[1u8; 32]));
         assert_eq!(back.image_count, 1);
         assert_eq!(back.images[0].blake3, bytes_to_hex(&[7u8; 32]));
+    }
+
+    #[test]
+    fn commit_rejects_a_plan_hash_changed_after_confirmation() {
+        let run_id = Uuid::new_v4();
+        let actual = [7u8; 32];
+        ensure_expected_plan_hash(run_id, &actual, Some(&bytes_to_hex(&actual)))
+            .expect("the confirmed hash should be accepted");
+
+        let error = ensure_expected_plan_hash(run_id, &actual, Some(&bytes_to_hex(&[8u8; 32])))
+            .expect_err("a stale confirmed hash must block commit");
+        assert!(error.to_string().contains("changed after confirmation"));
     }
 
     #[test]

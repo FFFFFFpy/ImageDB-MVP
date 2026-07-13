@@ -436,26 +436,6 @@ pub async fn set_plan_image_included(
         .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
 }
 
-pub async fn move_plan_image(
-    client: &Client,
-    import_run_id: Uuid,
-    image_id: Uuid,
-    target_album_id: Uuid,
-) -> Result<ImportPlan, AppError> {
-    let image = ImportRepository::get_import_images_by_ids(client, &[image_id])
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal(format!("import image {image_id} not found")))?;
-    if image.import_album_id != target_album_id {
-        return Err(AppError::Internal(
-            "cross-source album move is blocked by the current file transaction model; move within the source album only"
-                .to_string(),
-        ));
-    }
-    set_plan_image_included(client, import_run_id, image_id, target_album_id, true).await
-}
-
 async fn ensure_plan_editable(client: &Client, import_run_id: Uuid) -> Result<(), AppError> {
     // Every plan editor calls this after BEGIN. The row lock is the per-run
     // serialization point shared with Commit's short plan-capture
@@ -927,6 +907,7 @@ pub fn build_import_plan(
 
     ImportPlan {
         import_run_id,
+        plan_hash: None,
         total_albums: albums.len() as u32,
         total_images,
         excluded_count: total_images.saturating_sub(kept_images.len() as u32),

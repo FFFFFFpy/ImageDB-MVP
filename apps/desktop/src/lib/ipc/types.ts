@@ -362,6 +362,7 @@ export interface ImportPlanAlbum {
 
 export interface ImportPlan {
   import_run_id: string;
+  plan_hash: string | null;
   total_albums: number;
   total_images: number;
   kept_images: ImportPlanImage[];

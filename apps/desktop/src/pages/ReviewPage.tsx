@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
@@ -25,6 +25,8 @@ import {
 
 interface ReviewPageProps {
   onNavigate: (route: Route) => void;
+  onGoCommit?: (importRunId: string) => void;
+  onPlanEditPendingChange?: (pending: boolean) => void;
   initialImportRunId?: string | null;
   initialPreviews?: { left: string; right: string } | null;
   initialPlan?: ImportPlan | null;
@@ -49,6 +51,48 @@ export interface ImportPlanAlbumGroup {
 }
 
 const DEFAULT_VIEW: ViewState = { scale: 1, offsetX: 0, offsetY: 0 };
+
+export function zoomViewAtPointer(
+  view: ViewState,
+  clientX: number,
+  clientY: number,
+  rect: Pick<DOMRect, 'left' | 'top' | 'width' | 'height'>,
+  deltaY: number,
+): ViewState {
+  const nextScale = Math.max(0.1, Math.min(10, view.scale * (deltaY > 0 ? 0.9 : 1.1)));
+  const ratio = nextScale / view.scale;
+  const pointerX = clientX - (rect.left + rect.width / 2);
+  const pointerY = clientY - (rect.top + rect.height / 2);
+  return {
+    scale: nextScale,
+    offsetX: pointerX - (pointerX - view.offsetX) * ratio,
+    offsetY: pointerY - (pointerY - view.offsetY) * ratio,
+  };
+}
+
+export function shouldIgnoreReviewShortcut(event: KeyboardEvent, previewOpen: boolean): boolean {
+  if (
+    previewOpen ||
+    event.defaultPrevented ||
+    event.isComposing ||
+    event.repeat ||
+    event.ctrlKey ||
+    event.altKey ||
+    event.metaKey
+  ) {
+    return true;
+  }
+  const target = event.target;
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    (target instanceof HTMLElement &&
+      (target.isContentEditable ||
+        target.getAttribute('contenteditable') === 'true' ||
+        target.closest('[contenteditable="true"]') !== null))
+  );
+}
 
 export const REVIEW_DECISION_OPTIONS: ReadonlyArray<{
   decision: ReviewDecision;
@@ -203,6 +247,8 @@ function formatTransform(t: string | null): string {
 
 export function ReviewPage({
   onNavigate,
+  onGoCommit,
+  onPlanEditPendingChange,
   initialImportRunId = null,
   initialPreviews = null,
   initialPlan = null,
@@ -232,8 +278,19 @@ export function ReviewPage({
     dataUrl: string | null;
   } | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [planGenerationPending, setPlanGenerationPending] = useState(false);
+  const [planGenerationError, setPlanGenerationError] = useState<string | null>(null);
 
-  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    onPlanEditPendingChange?.(planEditPending || planGenerationPending);
+  }, [onPlanEditPendingChange, planEditPending, planGenerationPending]);
+
+  useEffect(
+    () => () => {
+      onPlanEditPendingChange?.(false);
+    },
+    [onPlanEditPendingChange],
+  );
 
   const runQuery = useQuery({
     queryKey: ['latestReviewableImportRun'],
@@ -378,7 +435,9 @@ export function ReviewPage({
   }, [detail, importRunId, submitting, queryClient]);
 
   const handleGeneratePlan = useCallback(async () => {
-    if (!importRunId) return;
+    if (!importRunId || planGenerationPending) return;
+    setPlanGenerationPending(true);
+    setPlanGenerationError(null);
     try {
       // Freeze the plan as a single atomic transaction so the commit page
       // can read the frozen summary without re-deriving from candidates.
@@ -387,10 +446,18 @@ export function ReviewPage({
       setShowPlan(true);
       setOpenPlanAlbums(new Set());
       setPlanEditError(null);
-    } catch {
-      // ignore
+      queryClient.setQueryData(['reviewFrozenImportPlanSummary', importRunId], plan);
+      queryClient.setQueryData(['frozenImportPlanSummary', importRunId], plan);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
+        queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
+      ]);
+    } catch (error) {
+      setPlanGenerationError(String(error));
+    } finally {
+      setPlanGenerationPending(false);
     }
-  }, [importRunId]);
+  }, [importRunId, planGenerationPending, queryClient]);
 
   const applyPlanEdit = useCallback(
     async (edit: () => Promise<ImportPlan>) => {
@@ -400,13 +467,28 @@ export function ReviewPage({
       try {
         const nextPlan = await edit();
         setImportPlan(nextPlan);
+        queryClient.setQueryData(
+          ['reviewFrozenImportPlanSummary', nextPlan.import_run_id],
+          nextPlan,
+        );
+        queryClient.setQueryData(['frozenImportPlanSummary', nextPlan.import_run_id], nextPlan);
+        await Promise.all([
+          queryClient.invalidateQueries({
+            queryKey: ['reviewFrozenImportPlanSummary', nextPlan.import_run_id],
+          }),
+          queryClient.invalidateQueries({
+            queryKey: ['frozenImportPlanSummary', nextPlan.import_run_id],
+          }),
+          queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
+          queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
+        ]);
       } catch (error) {
         setPlanEditError(String(error));
       } finally {
         setPlanEditPending(false);
       }
     },
-    [planEditPending],
+    [planEditPending, queryClient],
   );
 
   const togglePlanAlbum = useCallback(
@@ -429,16 +511,6 @@ export function ReviewPage({
           album.albumId,
           !image.included,
         ),
-      );
-    },
-    [applyPlanEdit, importPlan],
-  );
-
-  const movePlanImage = useCallback(
-    (imageId: string, targetAlbumId: string) => {
-      if (!importPlan) return;
-      applyPlanEdit(() =>
-        api.moveImportPlanImage(importPlan.import_run_id, imageId, targetAlbumId),
       );
     },
     [applyPlanEdit, importPlan],
@@ -476,7 +548,7 @@ export function ReviewPage({
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (shouldIgnoreReviewShortcut(e, previewModal !== null)) return;
       switch (e.key) {
         case '1':
           handleDecision('keep_source');
@@ -510,21 +582,14 @@ export function ReviewPage({
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [handleDecision, handleSkipAlbum, handlePrev, handleNext]);
+  }, [handleDecision, handleSkipAlbum, handlePrev, handleNext, previewModal]);
 
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const handler = (e: WheelEvent) => {
-      e.preventDefault();
-      const factor = e.deltaY > 0 ? 0.9 : 1.1;
-      setView((v) => ({
-        ...v,
-        scale: Math.max(0.1, Math.min(10, v.scale * factor)),
-      }));
-    };
-    el.addEventListener('wheel', handler, { passive: false });
-    return () => el.removeEventListener('wheel', handler);
+  const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    setView((current) =>
+      zoomViewAtPointer(current, event.clientX, event.clientY, rect, event.deltaY),
+    );
   }, []);
 
   const handleMouseDown = useCallback(
@@ -561,6 +626,10 @@ export function ReviewPage({
             <Skeleton height={28} width="38%" />
             <Skeleton height={18} width="62%" />
           </div>
+        ) : runQuery.isError ? (
+          <StatusBanner tone="danger" title="无法查询可审核任务">
+            {String(runQuery.error)}
+          </StatusBanner>
         ) : (
           <EmptyState
             title="没有可审核的导入"
@@ -578,28 +647,6 @@ export function ReviewPage({
     (progress?.all_decided ?? false) ||
     (queueQuery.isSuccess && undecidedQueue.length === 0 && totalCandidates > 0);
 
-  if (totalCandidates === 0 && !(showPlan && importPlan)) {
-    return (
-      <div className="review-page review-page--m3">
-        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
-        <EmptyState
-          title="没有待审核候选"
-          description="该导入任务没有需要人工确认的重复候选，可以直接生成导入计划。"
-          action={
-            <div className="review-empty-actions">
-              <Button variant="primary" onClick={handleGeneratePlan}>
-                生成导入计划
-              </Button>
-              <Button variant="quiet" onClick={() => onNavigate('dashboard')}>
-                返回工作台
-              </Button>
-            </div>
-          }
-        />
-      </div>
-    );
-  }
-
   if (showPlan && importPlan) {
     const albumGroups = planAlbumsForDisplay(importPlan);
     const keptAlbums = albumGroups.filter((album) => album.included).length;
@@ -612,10 +659,18 @@ export function ReviewPage({
           meta={<StatusBadge tone="success">计划已冻结</StatusBadge>}
           actions={
             <>
-              <Button variant="quiet" onClick={() => setShowPlan(false)}>
+              <Button variant="quiet" disabled={planEditPending} onClick={() => setShowPlan(false)}>
                 返回审核
               </Button>
-              <Button variant="primary" onClick={() => onNavigate('commit')}>
+              <Button
+                variant="primary"
+                disabled={planEditPending}
+                loading={planEditPending}
+                loadingLabel="正在保存计划…"
+                onClick={() =>
+                  onGoCommit ? onGoCommit(importPlan.import_run_id) : onNavigate('commit')
+                }
+              >
                 前往提交确认
               </Button>
             </>
@@ -671,12 +726,6 @@ export function ReviewPage({
                         return next;
                       });
                     }}
-                    onDragOver={(event) => event.preventDefault()}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      const imageId = event.dataTransfer.getData('text/plain');
-                      if (imageId) movePlanImage(imageId, album.albumId);
-                    }}
                   >
                     <summary>
                       <span
@@ -705,11 +754,6 @@ export function ReviewPage({
                             <div
                               className={`import-plan-image-row ${img.included ? 'included' : 'skipped'}`}
                               key={img.image_id}
-                              draggable
-                              onDragStart={(event) => {
-                                event.dataTransfer.setData('text/plain', img.image_id);
-                                event.dataTransfer.effectAllowed = 'move';
-                              }}
                             >
                               <PlanImageThumbnail
                                 importRunId={importPlan.import_run_id}
@@ -734,7 +778,8 @@ export function ReviewPage({
                               </button>
                             </div>
                           ))}
-                        {album.images.length > (planImageLimits[album.albumId] ?? 24) && (
+                        {album.images.length >
+                          (planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE) && (
                           <Button
                             variant="quiet"
                             className="plan-load-more"
@@ -782,6 +827,68 @@ export function ReviewPage({
     );
   }
 
+  const reviewQueriesLoading =
+    progressQuery.isLoading || queueQuery.isLoading || frozenPlanQuery.isLoading;
+  const reviewQueryError = progressQuery.error ?? queueQuery.error ?? frozenPlanQuery.error;
+
+  if (reviewQueryError) {
+    return (
+      <div className="review-page review-page--m3">
+        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
+        <StatusBanner tone="danger" title="无法加载审核数据">
+          {String(reviewQueryError)}
+        </StatusBanner>
+      </div>
+    );
+  }
+
+  if (reviewQueriesLoading) {
+    return (
+      <div className="review-page review-page--m3">
+        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
+        <div className="review-loading-panel" role="status" aria-label="正在加载审核数据">
+          <Skeleton height={420} radius="var(--radius-image)" />
+        </div>
+      </div>
+    );
+  }
+
+  if (totalCandidates === 0) {
+    return (
+      <div className="review-page review-page--m3">
+        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
+        <EmptyState
+          title="没有待审核候选"
+          description="该导入任务没有需要人工确认的重复候选，可以直接生成导入计划。"
+          action={
+            <div className="review-empty-actions">
+              <Button
+                variant="primary"
+                onClick={handleGeneratePlan}
+                loading={planGenerationPending}
+                loadingLabel="正在生成…"
+              >
+                生成导入计划
+              </Button>
+              <Button
+                variant="quiet"
+                disabled={planGenerationPending}
+                onClick={() => onNavigate('dashboard')}
+              >
+                返回工作台
+              </Button>
+            </div>
+          }
+        />
+        {planGenerationError && (
+          <StatusBanner tone="danger" title="生成导入计划失败">
+            {planGenerationError}
+          </StatusBanner>
+        )}
+      </div>
+    );
+  }
+
   if (allDecided) {
     return (
       <div className="review-page review-page--m3">
@@ -790,11 +897,21 @@ export function ReviewPage({
           title="所有候选已审核"
           description={`已处理 ${progress?.decided_count ?? 0} / ${progress?.total_review_candidates ?? 0} 个候选。`}
           action={
-            <Button variant="primary" onClick={handleGeneratePlan}>
+            <Button
+              variant="primary"
+              onClick={handleGeneratePlan}
+              loading={planGenerationPending}
+              loadingLabel="正在生成…"
+            >
               生成导入计划
             </Button>
           }
         />
+        {planGenerationError && (
+          <StatusBanner tone="danger" title="生成导入计划失败">
+            {planGenerationError}
+          </StatusBanner>
+        )}
       </div>
     );
   }
@@ -806,7 +923,7 @@ export function ReviewPage({
   };
 
   return (
-    <div className="review-page review-page--m3" ref={containerRef}>
+    <div className="review-page review-page--m3">
       <PageHeader
         title={`审核：${currentCandidate?.album_name ?? '待审核图集'}`}
         description={`当前有 ${reviewAlbumCount} 个图集包含待审核候选，可在整批分析结束前先处理。`}
@@ -855,7 +972,7 @@ export function ReviewPage({
                 <span>源图片</span>
                 <kbd>1</kbd>
               </div>
-              <div className="review-image-container">
+              <div className="review-image-container" onWheel={handleWheel}>
                 {leftPreview ? (
                   <img src={leftPreview} alt="源图片" style={imageStyle} draggable={false} />
                 ) : (
@@ -868,7 +985,7 @@ export function ReviewPage({
                 <span>{detail.scope === 'library' ? '历史图库匹配' : '候选图片'}</span>
                 <kbd>2</kbd>
               </div>
-              <div className="review-image-container">
+              <div className="review-image-container" onWheel={handleWheel}>
                 {overlayMode ? (
                   rightPreview ? (
                     <img

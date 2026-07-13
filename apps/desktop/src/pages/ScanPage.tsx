@@ -16,6 +16,7 @@ interface ScanPageProps {
   initialProgress?: ScanProgress | null;
   enablePolling?: boolean;
   onNavigate: (route: Route) => void;
+  onGoReview?: (importRunId: string) => void;
 }
 
 interface ScanProgressEvent {
@@ -116,6 +117,16 @@ export function nextActionLabelForScanState(state: string | null | undefined): s
   return null;
 }
 
+export function scanStatusTone(
+  state: string,
+): 'neutral' | 'info' | 'success' | 'warning' | 'danger' {
+  if (state === 'failed') return 'danger';
+  if (state === 'cancelled') return 'warning';
+  if (state === 'completed' || state === 'ready_to_commit') return 'success';
+  if (state === 'review_required' || state === 'analyzing' || state === 'running') return 'info';
+  return 'neutral';
+}
+
 function canResumeRun(run: ImportRunDashboard | null): boolean {
   if (!run || run.state === 'abandoned') return false;
   return run.pending_albums > 0 || run.analyzing_albums > 0;
@@ -136,6 +147,7 @@ export function ScanPage({
   initialProgress = null,
   enablePolling = true,
   onNavigate,
+  onGoReview,
 }: ScanPageProps) {
   const queryClient = useQueryClient();
   const [sourcePath, setSourcePath] = useState(() => loadScanDraft().sourcePath);
@@ -660,9 +672,7 @@ export function ScanPage({
               <h2 id="scan-progress-title">分析进度</h2>
               <p>{STAGE_LABELS[displayProgress.current_stage] ?? displayProgress.current_stage}</p>
             </div>
-            <StatusBadge
-              tone={displayProgress.state === 'failed' ? 'danger' : isFinished ? 'success' : 'info'}
-            >
+            <StatusBadge tone={scanStatusTone(displayProgress.state)}>
               {STAGE_LABELS[displayProgress.state] ?? displayProgress.state}
             </StatusBadge>
           </div>
@@ -712,7 +722,14 @@ export function ScanPage({
           {isFinished && (
             <div className="scan-finished-actions">
               {nextRoute && nextActionLabel && (
-                <Button variant="primary" onClick={() => onNavigate(nextRoute)}>
+                <Button
+                  variant="primary"
+                  onClick={() =>
+                    nextRoute === 'review' && activeImportRunId && onGoReview
+                      ? onGoReview(activeImportRunId)
+                      : onNavigate(nextRoute)
+                  }
+                >
                   {nextActionLabel}
                 </Button>
               )}
@@ -819,7 +836,14 @@ export function ScanPage({
                           </Button>
                         )}
                         {activeRun.state !== 'abandoned' && album.review_candidate_count > 0 && (
-                          <Button variant="quiet" onClick={() => onNavigate('review')}>
+                          <Button
+                            variant="quiet"
+                            onClick={() =>
+                              activeImportRunId && onGoReview
+                                ? onGoReview(activeImportRunId)
+                                : onNavigate('review')
+                            }
+                          >
                             审核
                           </Button>
                         )}

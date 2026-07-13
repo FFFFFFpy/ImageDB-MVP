@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import { formatDiagnostic, formatTaggedStatus, taggedStatusCode } from '../lib/format';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button, PageHeader, StatusBadge } from '../components/ui';
 import type {
   CapabilityProbe,
@@ -132,6 +132,28 @@ export function SettingsPage({
   const [extQueryTimeout, setExtQueryTimeout] = useState('15');
   const [extProfileName, setExtProfileName] = useState('default');
   const [libRoot, setLibRoot] = useState('');
+  const [formInitialized, setFormInitialized] = useState(false);
+
+  useEffect(() => {
+    const current = settings.data;
+    if (!current) return;
+    const tlsModes = ['disable', 'require', 'verify_ca', 'verify_full'] as const;
+    const tlsMode = tlsModes.find((mode) => mode === current.external_tls_mode) ?? 'verify_full';
+    setLibRoot(current.library_root ?? '');
+    setExtHost(current.external_host ?? '');
+    setExtPort(String(current.external_port ?? 5432));
+    setExtDb(current.external_database ?? 'imagedb');
+    setExtUser(current.external_username ?? '');
+    setExtPass('');
+    setExtTlsMode(tlsMode);
+    setExtCaCert(current.external_ca_cert_path ?? '');
+    setExtClientCert(current.external_client_cert_path ?? '');
+    setExtClientKey(current.external_client_key_path ?? '');
+    setExtConnectTimeout(String(current.external_connect_timeout_secs ?? 10));
+    setExtQueryTimeout(String(current.external_query_timeout_secs ?? 15));
+    setExtProfileName(current.external_profile_name ?? 'default');
+    setFormInitialized(true);
+  }, [settings.data]);
 
   const saveSettings = useMutation({
     mutationFn: api.updateSettings,
@@ -179,7 +201,7 @@ export function SettingsPage({
   });
 
   const probeStorage = useMutation({
-    mutationFn: () => api.probeStorageCapabilities(libRoot || settings.data?.library_root || ''),
+    mutationFn: () => api.probeStorageCapabilities(libRoot),
   });
 
   function buildExternalConfig(): ExternalConnectionConfig {
@@ -224,7 +246,7 @@ export function SettingsPage({
 
   const migration = migrationProgress.data;
   const migrationRunning = migration?.state === 'running' || startMigration.isPending;
-  const effectiveLibraryRoot = libRoot || settings.data?.library_root || '';
+  const effectiveLibraryRoot = formInitialized ? libRoot : '';
   const currentDbMode = dbStatus.data?.mode;
   const externalConfig = dbStatus.data?.external_config;
   const managedConfig = dbStatus.data?.managed_config;
@@ -411,7 +433,7 @@ export function SettingsPage({
           </div>
           <p>仅在已有数据库环境或需要迁移托管库时配置。</p>
         </div>
-        <div className="form-grid">
+        <fieldset className="form-grid settings-form-fieldset" disabled={!formInitialized}>
           <label>
             主机
             <input value={extHost} onChange={(e) => setExtHost(e.target.value)} />
@@ -478,21 +500,21 @@ export function SettingsPage({
             配置名称
             <input value={extProfileName} onChange={(e) => setExtProfileName(e.target.value)} />
           </label>
-        </div>
-        <button onClick={() => testExt.mutate()} disabled={testExt.isPending}>
+        </fieldset>
+        <button onClick={() => testExt.mutate()} disabled={!formInitialized || testExt.isPending}>
           {testExt.isPending ? '测试中…' : '测试连接'}
         </button>
         <button
           className="settings-primary-action"
           onClick={() => initExternal.mutate()}
-          disabled={initExternal.isPending}
+          disabled={!formInitialized || initExternal.isPending}
         >
           {initExternal.isPending ? '连接中…' : '连接并初始化外部库'}
         </button>
         <button
           className="settings-secondary-action"
           onClick={() => startMigration.mutate()}
-          disabled={migrationRunning}
+          disabled={!formInitialized || migrationRunning}
         >
           {migrationRunning ? '迁移中…' : '从托管库迁移'}
         </button>
@@ -652,6 +674,7 @@ export function SettingsPage({
             value={libRoot}
             onChange={(e) => setLibRoot(e.target.value)}
             placeholder="例如 D:\ImageLibrary"
+            disabled={!formInitialized}
           />
         </label>
         <button
@@ -664,13 +687,13 @@ export function SettingsPage({
               });
             }
           }}
-          disabled={saveSettings.isPending}
+          disabled={!formInitialized || settings.isLoading || saveSettings.isPending}
         >
           保存
         </button>
         <button
           onClick={() => probeStorage.mutate()}
-          disabled={probeStorage.isPending || !effectiveLibraryRoot}
+          disabled={!formInitialized || probeStorage.isPending || !effectiveLibraryRoot}
         >
           {probeStorage.isPending ? '检测中…' : '检测存储能力'}
         </button>
