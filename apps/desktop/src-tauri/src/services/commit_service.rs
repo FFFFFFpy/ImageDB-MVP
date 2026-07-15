@@ -45,6 +45,8 @@ use tokio_postgres::Client;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+type PersistedFingerprintV2 = (Vec<u8>, Vec<u8>, Vec<u8>, String);
+
 /// Schema version written into every album manifest.
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
 pub const COMMIT_MARKER_SCHEMA_VERSION: &str = "1.0";
@@ -2635,7 +2637,7 @@ pub(crate) fn build_manifest(
                 width: img.width,
                 height: img.height,
                 format: img.format.clone(),
-                fingerprint_version: None,
+                fingerprint_version: Some("2".to_string()),
             })
             .collect(),
     }
@@ -2700,6 +2702,47 @@ pub(crate) async fn commit_library_records_transaction(
         }
     };
 
+    let import_image_ids: Vec<Uuid> = images.iter().map(|image| image.import_image_id).collect();
+    let fingerprint_rows = transaction
+        .query(
+            "SELECT id, pixel_hash, block_hash_16, double_gradient_hash_32,
+                    fingerprint_version
+             FROM import_images
+             WHERE id = ANY($1)",
+            &[&import_image_ids],
+        )
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to batch load frozen-plan fingerprints: {error}"
+            ))
+        })?;
+    let fingerprints: HashMap<Uuid, PersistedFingerprintV2> = fingerprint_rows
+        .iter()
+        .map(|row| {
+            let id: Uuid = row.get("id");
+            let pixel_hash: Option<Vec<u8>> = row.get("pixel_hash");
+            let block_hash: Option<Vec<u8>> = row.get("block_hash_16");
+            let double_gradient_hash: Option<Vec<u8>> = row.get("double_gradient_hash_32");
+            let version: Option<String> = row.get("fingerprint_version");
+            match (pixel_hash, block_hash, double_gradient_hash, version) {
+                (Some(pixel), Some(block), Some(fine), Some(version)) if version == "2" => {
+                    Ok((id, (pixel, block, fine, version)))
+                }
+                _ => Err(AppError::Internal(format!(
+                    "frozen plan image {id} does not have a complete Fingerprint V2"
+                ))),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    if fingerprints.len() != images.len() {
+        return Err(AppError::Internal(format!(
+            "frozen plan fingerprint count {} does not match image count {}",
+            fingerprints.len(),
+            images.len()
+        )));
+    }
+
     // Confirm existing images or insert missing ones. Idempotent: re-running
     // a DB commit for the same transaction must not duplicate rows.
     for img in images {
@@ -2718,14 +2761,21 @@ pub(crate) async fn commit_library_records_transaction(
         if exists {
             continue;
         }
+        let (pixel_hash, block_hash_16, double_gradient_hash_32, fingerprint_version) =
+            fingerprints.get(&img.import_image_id).ok_or_else(|| {
+                AppError::Internal(format!(
+                    "frozen plan image {} is missing persisted Fingerprint V2 evidence",
+                    img.import_image_id
+                ))
+            })?;
         let image_id = Uuid::new_v4();
-        let fp_version = img.format.as_deref().unwrap_or("unknown");
         transaction
             .execute(
                 "INSERT INTO library_images
                  (id, album_id, relative_path, file_size, width, height, format,
-                  blake3, fingerprint_version, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'committed')",
+                  blake3, pixel_hash, block_hash_16, double_gradient_hash_32,
+                  fingerprint_version, state)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'committed')",
                 &[
                     &image_id,
                     &library_album_id,
@@ -2735,7 +2785,10 @@ pub(crate) async fn commit_library_records_transaction(
                     &img.height,
                     &img.format,
                     &img.expected_blake3,
-                    &fp_version,
+                    pixel_hash,
+                    block_hash_16,
+                    double_gradient_hash_32,
+                    fingerprint_version,
                 ],
             )
             .await
@@ -3647,11 +3700,10 @@ mod tests {
                     format: Some("png".to_string()),
                     decode_state: DecodeState::Decoded,
                     blake3: Some(b3),
-                    pixel_hash: Some(vec![1; 8]),
-                    gradient_hash: Some(vec![1; 8]),
-                    block_hash: Some(vec![1; 8]),
-                    median_hash: Some(vec![1; 8]),
-                    fingerprint_version: Some("test".to_string()),
+                    pixel_hash: Some(vec![1; 32]),
+                    block_hash_16: Some(vec![1; 32]),
+                    double_gradient_hash_32: Some(vec![1; 68]),
+                    fingerprint_version: Some("2".to_string()),
                     state: ImportImageState::Fingerprinted,
                 },
             )

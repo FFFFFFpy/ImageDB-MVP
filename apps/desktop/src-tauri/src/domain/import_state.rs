@@ -346,9 +346,10 @@ pub struct ReviewCandidateDetail {
     pub match_type: String,
     pub blake3_equal: bool,
     pub pixel_hash_equal: bool,
-    pub gradient_distance: Option<i32>,
     pub block_distance: Option<i32>,
-    pub median_distance: Option<i32>,
+    pub double_gradient_distance: Option<i32>,
+    pub block_distance_ratio: Option<f64>,
+    pub double_gradient_distance_ratio: Option<f64>,
     pub transform_type: Option<String>,
     pub confidence: Option<f64>,
     pub album_name: String,
@@ -439,52 +440,6 @@ pub struct LibraryImagePage {
     pub next_cursor: Option<String>,
     pub total_images: u32,
     pub total_size: i64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MatchingStrategy {
-    Strict,
-    Balanced,
-    Loose,
-}
-
-impl fmt::Display for MatchingStrategy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Strict => write!(f, "strict"),
-            Self::Balanced => write!(f, "balanced"),
-            Self::Loose => write!(f, "loose"),
-        }
-    }
-}
-
-impl MatchingStrategy {
-    pub fn perceptual_thresholds(self) -> PerceptualThresholds {
-        match self {
-            Self::Strict => PerceptualThresholds {
-                near_max_distance: 4,
-                similar_max_total: 12,
-                auto_decide: true,
-            },
-            Self::Balanced => PerceptualThresholds {
-                near_max_distance: 8,
-                similar_max_total: 24,
-                auto_decide: true,
-            },
-            Self::Loose => PerceptualThresholds {
-                near_max_distance: 12,
-                similar_max_total: 40,
-                auto_decide: false,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PerceptualThresholds {
-    pub near_max_distance: i32,
-    pub similar_max_total: i32,
-    pub auto_decide: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -687,21 +642,6 @@ mod tests {
             );
         }
         assert_eq!(ReviewDecisionAction::from_str_opt("bogus"), None);
-    }
-
-    #[test]
-    fn matching_strategy_thresholds() {
-        let strict = MatchingStrategy::Strict.perceptual_thresholds();
-        let balanced = MatchingStrategy::Balanced.perceptual_thresholds();
-        let loose = MatchingStrategy::Loose.perceptual_thresholds();
-
-        assert!(strict.near_max_distance < balanced.near_max_distance);
-        assert!(balanced.near_max_distance < loose.near_max_distance);
-        assert!(strict.similar_max_total < balanced.similar_max_total);
-        assert!(balanced.similar_max_total < loose.similar_max_total);
-        assert!(strict.auto_decide);
-        assert!(balanced.auto_decide);
-        assert!(!loose.auto_decide);
     }
 
     #[test]

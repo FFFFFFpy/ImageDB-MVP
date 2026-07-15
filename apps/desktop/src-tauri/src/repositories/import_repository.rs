@@ -186,9 +186,9 @@ pub struct LibraryImageRow {
     pub file_size: i64,
     pub blake3: Vec<u8>,
     pub pixel_hash: Option<Vec<u8>>,
-    pub gradient_hash: Option<Vec<u8>>,
-    pub block_hash: Option<Vec<u8>>,
-    pub median_hash: Option<Vec<u8>>,
+    pub block_hash_16: Option<Vec<u8>>,
+    pub double_gradient_hash_32: Option<Vec<u8>>,
+    pub fingerprint_version: String,
 }
 
 pub struct NewImportImage {
@@ -203,9 +203,8 @@ pub struct NewImportImage {
     pub decode_state: DecodeState,
     pub blake3: Option<Vec<u8>>,
     pub pixel_hash: Option<Vec<u8>>,
-    pub gradient_hash: Option<Vec<u8>>,
-    pub block_hash: Option<Vec<u8>>,
-    pub median_hash: Option<Vec<u8>>,
+    pub block_hash_16: Option<Vec<u8>>,
+    pub double_gradient_hash_32: Option<Vec<u8>>,
     pub fingerprint_version: Option<String>,
     pub state: ImportImageState,
 }
@@ -227,9 +226,10 @@ pub struct NewDuplicateCandidate {
     pub match_type: MatchType,
     pub blake3_equal: bool,
     pub pixel_hash_equal: bool,
-    pub gradient_distance: Option<i32>,
     pub block_distance: Option<i32>,
-    pub median_distance: Option<i32>,
+    pub double_gradient_distance: Option<i32>,
+    pub block_distance_ratio: Option<f64>,
+    pub double_gradient_distance_ratio: Option<f64>,
     pub transform_type: Option<String>,
     pub confidence: Option<f64>,
     pub decision: Option<Decision>,
@@ -270,9 +270,10 @@ pub struct ReviewCandidateDetailRow {
     pub match_type: String,
     pub blake3_equal: bool,
     pub pixel_hash_equal: bool,
-    pub gradient_distance: Option<i32>,
     pub block_distance: Option<i32>,
-    pub median_distance: Option<i32>,
+    pub double_gradient_distance: Option<i32>,
+    pub block_distance_ratio: Option<f64>,
+    pub double_gradient_distance_ratio: Option<f64>,
     pub transform_type: Option<String>,
     pub confidence: Option<f64>,
     pub album_name: String,
@@ -331,9 +332,8 @@ pub struct ImportImageFullRow {
     pub format: Option<String>,
     pub blake3: Option<Vec<u8>>,
     pub pixel_hash: Option<Vec<u8>>,
-    pub gradient_hash: Option<Vec<u8>>,
-    pub block_hash: Option<Vec<u8>>,
-    pub median_hash: Option<Vec<u8>>,
+    pub block_hash_16: Option<Vec<u8>>,
+    pub double_gradient_hash_32: Option<Vec<u8>>,
     pub fingerprint_version: Option<String>,
     pub import_album_id: Uuid,
 }
@@ -1344,9 +1344,9 @@ impl ImportRepository {
                 "INSERT INTO import_images
                  (id, import_album_id, source_path, relative_path, file_size, modified_at,
                   width, height, format, decode_state, blake3, pixel_hash,
-                  gradient_hash, block_hash, median_hash,
+                  block_hash_16, double_gradient_hash_32,
                   fingerprint_version, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
                 &[
                     &id,
                     &new_image.album_id,
@@ -1360,9 +1360,8 @@ impl ImportRepository {
                     &ds,
                     &new_image.blake3,
                     &new_image.pixel_hash,
-                    &new_image.gradient_hash,
-                    &new_image.block_hash,
-                    &new_image.median_hash,
+                    &new_image.block_hash_16,
+                    &new_image.double_gradient_hash_32,
                     &new_image.fingerprint_version,
                     &st,
                 ],
@@ -1382,61 +1381,87 @@ impl ImportRepository {
         if images.is_empty() {
             return Ok(());
         }
-        let hex = |value: &Option<Vec<u8>>| {
-            value
-                .as_ref()
-                .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
-        };
-        let payload = serde_json::Value::Array(
-            images
-                .iter()
-                .map(|(id, image)| {
-                    serde_json::json!({
-                        "id": id,
-                        "album_id": image.album_id,
-                        "source_path": image.source_path,
-                        "relative_path": image.relative_path,
-                        "file_size": image.file_size,
-                        "modified_at": image.modified_at,
-                        "width": image.width,
-                        "height": image.height,
-                        "format": image.format,
-                        "decode_state": image.decode_state.to_string(),
-                        "blake3": hex(&image.blake3),
-                        "pixel_hash": hex(&image.pixel_hash),
-                        "gradient_hash": hex(&image.gradient_hash),
-                        "block_hash": hex(&image.block_hash),
-                        "median_hash": hex(&image.median_hash),
-                        "fingerprint_version": image.fingerprint_version,
-                        "state": image.state.to_string()
-                    })
-                })
-                .collect(),
-        );
+        let ids: Vec<Uuid> = images.iter().map(|(id, _)| *id).collect();
+        let album_ids: Vec<Uuid> = images.iter().map(|(_, image)| image.album_id).collect();
+        let source_paths: Vec<String> = images
+            .iter()
+            .map(|(_, image)| image.source_path.clone())
+            .collect();
+        let relative_paths: Vec<String> = images
+            .iter()
+            .map(|(_, image)| image.relative_path.clone())
+            .collect();
+        let file_sizes: Vec<i64> = images.iter().map(|(_, image)| image.file_size).collect();
+        let modified_at: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+            images.iter().map(|(_, image)| image.modified_at).collect();
+        let widths: Vec<Option<i32>> = images.iter().map(|(_, image)| image.width).collect();
+        let heights: Vec<Option<i32>> = images.iter().map(|(_, image)| image.height).collect();
+        let formats: Vec<Option<String>> = images
+            .iter()
+            .map(|(_, image)| image.format.clone())
+            .collect();
+        let decode_states: Vec<String> = images
+            .iter()
+            .map(|(_, image)| image.decode_state.to_string())
+            .collect();
+        let blake3: Vec<Option<Vec<u8>>> = images
+            .iter()
+            .map(|(_, image)| image.blake3.clone())
+            .collect();
+        let pixel_hashes: Vec<Option<Vec<u8>>> = images
+            .iter()
+            .map(|(_, image)| image.pixel_hash.clone())
+            .collect();
+        let block_hashes: Vec<Option<Vec<u8>>> = images
+            .iter()
+            .map(|(_, image)| image.block_hash_16.clone())
+            .collect();
+        let double_gradient_hashes: Vec<Option<Vec<u8>>> = images
+            .iter()
+            .map(|(_, image)| image.double_gradient_hash_32.clone())
+            .collect();
+        let fingerprint_versions: Vec<Option<String>> = images
+            .iter()
+            .map(|(_, image)| image.fingerprint_version.clone())
+            .collect();
+        let states: Vec<String> = images
+            .iter()
+            .map(|(_, image)| image.state.to_string())
+            .collect();
         client
             .execute(
                 "INSERT INTO import_images
                     (id, import_album_id, source_path, relative_path, file_size, modified_at,
                      width, height, format, decode_state, blake3, pixel_hash,
-                     gradient_hash, block_hash, median_hash, fingerprint_version, state)
-                 SELECT x.id, x.album_id, x.source_path, x.relative_path, x.file_size, x.modified_at,
-                        x.width, x.height, x.format, x.decode_state,
-                        CASE WHEN x.blake3 IS NULL THEN NULL ELSE decode(x.blake3, 'hex') END,
-                        CASE WHEN x.pixel_hash IS NULL THEN NULL ELSE decode(x.pixel_hash, 'hex') END,
-                        CASE WHEN x.gradient_hash IS NULL THEN NULL ELSE decode(x.gradient_hash, 'hex') END,
-                        CASE WHEN x.block_hash IS NULL THEN NULL ELSE decode(x.block_hash, 'hex') END,
-                        CASE WHEN x.median_hash IS NULL THEN NULL ELSE decode(x.median_hash, 'hex') END,
-                        x.fingerprint_version, x.state
-                 FROM jsonb_to_recordset($1) AS x(
-                    id uuid, album_id uuid, source_path text, relative_path text,
-                    file_size bigint, modified_at timestamptz, width integer, height integer,
-                    format text, decode_state text, blake3 text, pixel_hash text,
-                    gradient_hash text, block_hash text, median_hash text,
-                    fingerprint_version text, state text) ",
-                &[&payload],
+                     block_hash_16, double_gradient_hash_32, fingerprint_version, state)
+                 SELECT * FROM UNNEST(
+                    $1::uuid[], $2::uuid[], $3::text[], $4::text[],
+                    $5::bigint[], $6::timestamptz[], $7::integer[], $8::integer[],
+                    $9::text[], $10::text[], $11::bytea[], $12::bytea[],
+                    $13::bytea[], $14::bytea[], $15::text[], $16::text[])",
+                &[
+                    &ids,
+                    &album_ids,
+                    &source_paths,
+                    &relative_paths,
+                    &file_sizes,
+                    &modified_at,
+                    &widths,
+                    &heights,
+                    &formats,
+                    &decode_states,
+                    &blake3,
+                    &pixel_hashes,
+                    &block_hashes,
+                    &double_gradient_hashes,
+                    &fingerprint_versions,
+                    &states,
+                ],
             )
             .await
-            .map_err(|e| AppError::Internal(format!("failed to batch insert import images: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("failed to batch insert import images: {e}"))
+            })?;
         Ok(())
     }
 
@@ -1500,12 +1525,13 @@ impl ImportRepository {
             .query_opt(
                 "INSERT INTO duplicate_candidates
                  (id, import_run_id, source_image_id, candidate_source_image_id,
-                  candidate_library_image_id, scope, match_type,
+                 candidate_library_image_id, scope, match_type,
                   blake3_equal, pixel_hash_equal,
-                  gradient_distance, block_distance, median_distance,
+                  block_distance, double_gradient_distance,
+                  block_distance_ratio, double_gradient_distance_ratio,
                   transform_type, confidence,
                   decision, decision_source, rule_version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                  ON CONFLICT DO NOTHING
                  RETURNING id",
                 &[
@@ -1518,9 +1544,10 @@ impl ImportRepository {
                     &match_str,
                     &candidate.blake3_equal,
                     &candidate.pixel_hash_equal,
-                    &candidate.gradient_distance,
                     &candidate.block_distance,
-                    &candidate.median_distance,
+                    &candidate.double_gradient_distance,
+                    &candidate.block_distance_ratio,
+                    &candidate.double_gradient_distance_ratio,
                     &candidate.transform_type,
                     &candidate.confidence,
                     &decision_str,
@@ -1576,9 +1603,10 @@ impl ImportRepository {
                     "UPDATE duplicate_candidates
                      SET scope = $2, match_type = $3,
                          blake3_equal = $4, pixel_hash_equal = $5,
-                         gradient_distance = $6, block_distance = $7, median_distance = $8,
-                         transform_type = $9, confidence = $10,
-                         decision = $11, decision_source = $12, rule_version = $13
+                         block_distance = $6, double_gradient_distance = $7,
+                         block_distance_ratio = $8, double_gradient_distance_ratio = $9,
+                         transform_type = $10, confidence = $11,
+                         decision = $12, decision_source = $13, rule_version = $14
                      WHERE id = $1",
                     &[
                         &existing_id,
@@ -1586,9 +1614,10 @@ impl ImportRepository {
                         &match_str,
                         &candidate.blake3_equal,
                         &candidate.pixel_hash_equal,
-                        &candidate.gradient_distance,
                         &candidate.block_distance,
-                        &candidate.median_distance,
+                        &candidate.double_gradient_distance,
+                        &candidate.block_distance_ratio,
+                        &candidate.double_gradient_distance_ratio,
                         &candidate.transform_type,
                         &candidate.confidence,
                         &decision_str,
@@ -1604,12 +1633,91 @@ impl ImportRepository {
         Ok((existing_id, false))
     }
 
+    /// Persist a complete album's deduplicated candidate set in one database
+    /// round trip. Callers canonicalize import/import pairs before this point;
+    /// the unique indexes remain the concurrency and retry guard.
+    pub async fn upsert_duplicate_candidates_batch(
+        client: &Client,
+        candidates: &[NewDuplicateCandidate],
+    ) -> Result<u64, AppError> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let payload = serde_json::Value::Array(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "id": Uuid::new_v4(),
+                        "import_run_id": candidate.import_run_id,
+                        "source_image_id": candidate.source_image_id,
+                        "candidate_source_image_id": candidate.candidate_source_image_id,
+                        "candidate_library_image_id": candidate.candidate_library_image_id,
+                        "scope": candidate.scope.to_string(),
+                        "match_type": candidate.match_type.to_string(),
+                        "blake3_equal": candidate.blake3_equal,
+                        "pixel_hash_equal": candidate.pixel_hash_equal,
+                        "block_distance": candidate.block_distance,
+                        "double_gradient_distance": candidate.double_gradient_distance,
+                        "block_distance_ratio": candidate.block_distance_ratio,
+                        "double_gradient_distance_ratio": candidate.double_gradient_distance_ratio,
+                        "transform_type": candidate.transform_type,
+                        "confidence": candidate.confidence,
+                        "decision": candidate.decision.as_ref().map(ToString::to_string),
+                        "decision_source": candidate.decision_source.as_ref().map(ToString::to_string),
+                        "rule_version": SCAN_POLICY_VERSION,
+                    })
+                })
+                .collect(),
+        );
+        let rows = client
+            .query(
+                "INSERT INTO duplicate_candidates
+                    (id, import_run_id, source_image_id, candidate_source_image_id,
+                     candidate_library_image_id, scope, match_type,
+                     blake3_equal, pixel_hash_equal,
+                     block_distance, double_gradient_distance,
+                     block_distance_ratio, double_gradient_distance_ratio,
+                     transform_type, confidence, decision, decision_source, rule_version)
+                 SELECT x.id, x.import_run_id, x.source_image_id, x.candidate_source_image_id,
+                        x.candidate_library_image_id, x.scope, x.match_type,
+                        x.blake3_equal, x.pixel_hash_equal,
+                        x.block_distance, x.double_gradient_distance,
+                        x.block_distance_ratio, x.double_gradient_distance_ratio,
+                        x.transform_type, x.confidence, x.decision, x.decision_source,
+                        x.rule_version
+                 FROM jsonb_to_recordset($1) AS x(
+                    id uuid, import_run_id uuid, source_image_id uuid,
+                    candidate_source_image_id uuid, candidate_library_image_id uuid,
+                    scope text, match_type text, blake3_equal boolean,
+                    pixel_hash_equal boolean, block_distance integer,
+                    double_gradient_distance integer, block_distance_ratio double precision,
+                    double_gradient_distance_ratio double precision, transform_type text,
+                    confidence double precision, decision text, decision_source text,
+                    rule_version text)
+                 ON CONFLICT DO NOTHING
+                 RETURNING id",
+                &[&payload],
+            )
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to batch upsert duplicate candidates: {error}"
+                ))
+            })?;
+        Ok(rows.len() as u64)
+    }
+
     pub async fn get_library_images_for_comparison(
         client: &Client,
     ) -> Result<Vec<LibraryImageRow>, AppError> {
         let rows = client
             .query(
-                "SELECT id, file_size, blake3, pixel_hash, gradient_hash, block_hash, median_hash FROM library_images",
+                "SELECT id, file_size, blake3, pixel_hash, block_hash_16,
+                        double_gradient_hash_32, fingerprint_version
+                 FROM library_images
+                 WHERE fingerprint_version = '2' AND block_hash_16 IS NOT NULL
+                 ORDER BY id",
                 &[],
             )
             .await
@@ -1622,9 +1730,9 @@ impl ImportRepository {
                 file_size: r.get("file_size"),
                 blake3: r.get("blake3"),
                 pixel_hash: r.get("pixel_hash"),
-                gradient_hash: r.get("gradient_hash"),
-                block_hash: r.get("block_hash"),
-                median_hash: r.get("median_hash"),
+                block_hash_16: r.get("block_hash_16"),
+                double_gradient_hash_32: r.get("double_gradient_hash_32"),
+                fingerprint_version: r.get("fingerprint_version"),
             })
             .collect())
     }
@@ -1639,9 +1747,11 @@ impl ImportRepository {
         }
         let rows = client
             .query(
-                "SELECT id, file_size, blake3, pixel_hash, gradient_hash, block_hash, median_hash
+                "SELECT id, file_size, blake3, pixel_hash, block_hash_16,
+                        double_gradient_hash_32, fingerprint_version
                  FROM library_images
-                 WHERE blake3 = ANY($1)",
+                 WHERE fingerprint_version = '2' AND blake3 = ANY($1)
+                 ORDER BY id",
                 &[&blake3_hashes],
             )
             .await
@@ -1654,43 +1764,38 @@ impl ImportRepository {
                 file_size: r.get("file_size"),
                 blake3: r.get("blake3"),
                 pixel_hash: r.get("pixel_hash"),
-                gradient_hash: r.get("gradient_hash"),
-                block_hash: r.get("block_hash"),
-                median_hash: r.get("median_hash"),
+                block_hash_16: r.get("block_hash_16"),
+                double_gradient_hash_32: r.get("double_gradient_hash_32"),
+                fingerprint_version: r.get("fingerprint_version"),
             })
             .collect())
     }
 
-    /// Query library images by perceptual band (bucketed similarity recall).
-    /// Returns every row in a matching bucket in stable order. Silently
-    /// dropping row 51 made correctness depend on heap order and VACUUM.
-    /// TODO: add UUID keyset pagination plus cancellation without changing
-    /// complete-bucket recall semantics.
-    pub async fn find_library_images_by_perceptual_band(
+    /// Load the fine verification evidence for one recalled candidate set in
+    /// a single query. The caller supplies a stable, capped UUID list.
+    pub async fn find_library_images_by_ids(
         client: &Client,
-        band_index: u8,
-        band_value: &[u8],
+        image_ids: &[Uuid],
     ) -> Result<Vec<LibraryImageRow>, AppError> {
-        let band_col = match band_index {
-            0 => "perceptual_band_0",
-            1 => "perceptual_band_1",
-            2 => "perceptual_band_2",
-            3 => "perceptual_band_3",
-            _ => return Ok(Vec::new()),
-        };
-
-        let query = format!(
-            "SELECT id, file_size, blake3, pixel_hash, gradient_hash, block_hash, median_hash
-             FROM library_images
-             WHERE {} = $1
-             ORDER BY id",
-            band_col
-        );
+        if image_ids.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let rows = client
-            .query(&query, &[&band_value])
+            .query(
+                "SELECT id, file_size, blake3, pixel_hash, block_hash_16,
+                        double_gradient_hash_32, fingerprint_version
+                 FROM library_images
+                 WHERE fingerprint_version = '2' AND id = ANY($1)
+                 ORDER BY id",
+                &[&image_ids],
+            )
             .await
-            .map_err(|e| AppError::Internal(format!("failed to query library by band: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "failed to batch query recalled library images: {e}"
+                ))
+            })?;
 
         Ok(rows
             .iter()
@@ -1699,9 +1804,47 @@ impl ImportRepository {
                 file_size: r.get("file_size"),
                 blake3: r.get("blake3"),
                 pixel_hash: r.get("pixel_hash"),
-                gradient_hash: r.get("gradient_hash"),
-                block_hash: r.get("block_hash"),
-                median_hash: r.get("median_hash"),
+                block_hash_16: r.get("block_hash_16"),
+                double_gradient_hash_32: r.get("double_gradient_hash_32"),
+                fingerprint_version: r.get("fingerprint_version"),
+            })
+            .collect())
+    }
+
+    /// V2 rows written by a successful import run. Used to update an already
+    /// constructed in-memory library index without rebuilding it.
+    pub async fn get_library_images_for_import_run(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<LibraryImageRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT li.id, li.file_size, li.blake3, li.pixel_hash,
+                        li.block_hash_16, li.double_gradient_hash_32,
+                        li.fingerprint_version
+                 FROM library_images li
+                 JOIN library_albums la ON la.id = li.album_id
+                 JOIN file_transactions ft ON ft.id = la.transaction_id
+                 WHERE ft.import_run_id = $1 AND li.fingerprint_version = '2'
+                 ORDER BY li.id",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to query committed V2 fingerprints for index update: {error}"
+                ))
+            })?;
+        Ok(rows
+            .iter()
+            .map(|row| LibraryImageRow {
+                id: row.get("id"),
+                file_size: row.get("file_size"),
+                blake3: row.get("blake3"),
+                pixel_hash: row.get("pixel_hash"),
+                block_hash_16: row.get("block_hash_16"),
+                double_gradient_hash_32: row.get("double_gradient_hash_32"),
+                fingerprint_version: row.get("fingerprint_version"),
             })
             .collect())
     }
@@ -1828,9 +1971,10 @@ impl ImportRepository {
                         dc.match_type,
                         dc.blake3_equal,
                         dc.pixel_hash_equal,
-                        dc.gradient_distance,
                         dc.block_distance,
-                        dc.median_distance,
+                        dc.double_gradient_distance,
+                        dc.block_distance_ratio,
+                        dc.double_gradient_distance_ratio,
                         dc.transform_type,
                         dc.confidence,
                         ia.source_name AS album_name,
@@ -1873,9 +2017,10 @@ impl ImportRepository {
             match_type: r.get("match_type"),
             blake3_equal: r.get("blake3_equal"),
             pixel_hash_equal: r.get("pixel_hash_equal"),
-            gradient_distance: r.get("gradient_distance"),
             block_distance: r.get("block_distance"),
-            median_distance: r.get("median_distance"),
+            double_gradient_distance: r.get("double_gradient_distance"),
+            block_distance_ratio: r.get("block_distance_ratio"),
+            double_gradient_distance_ratio: r.get("double_gradient_distance_ratio"),
             transform_type: r.get("transform_type"),
             confidence: r.get("confidence"),
             album_name: r.get("album_name"),
@@ -2800,7 +2945,7 @@ impl ImportRepository {
         let rows = client
             .query(
                 "SELECT id, source_path, relative_path, file_size, width, height, format,
-                        blake3, pixel_hash, gradient_hash, block_hash, median_hash,
+                        blake3, pixel_hash, block_hash_16, double_gradient_hash_32,
                         fingerprint_version, import_album_id
                  FROM import_images WHERE id = ANY($1)",
                 &[&image_ids],
@@ -2822,9 +2967,8 @@ impl ImportRepository {
                 format: r.get("format"),
                 blake3: r.get("blake3"),
                 pixel_hash: r.get("pixel_hash"),
-                gradient_hash: r.get("gradient_hash"),
-                block_hash: r.get("block_hash"),
-                median_hash: r.get("median_hash"),
+                block_hash_16: r.get("block_hash_16"),
+                double_gradient_hash_32: r.get("double_gradient_hash_32"),
                 fingerprint_version: r.get("fingerprint_version"),
                 import_album_id: r.get("import_album_id"),
             })

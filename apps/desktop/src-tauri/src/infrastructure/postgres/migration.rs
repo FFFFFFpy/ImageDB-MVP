@@ -18,6 +18,7 @@ const MIGRATION_0013: &str =
     include_str!("../../../migrations/0013_workflow_escape_and_candidate_uniqueness.sql");
 const MIGRATION_0014: &str =
     include_str!("../../../migrations/0014_candidate_review_semantics_and_abandoned_filters.sql");
+const MIGRATION_0015: &str = include_str!("../../../migrations/0015_fingerprint_v2.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
@@ -40,6 +41,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0014_candidate_review_semantics_and_abandoned_filters",
         MIGRATION_0014,
     ),
+    ("0015_fingerprint_v2", MIGRATION_0015),
 ];
 
 pub struct MigrationRunner;
@@ -176,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 14);
+        assert_eq!(MIGRATIONS.len(), 15);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
         assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
@@ -194,6 +196,8 @@ mod tests {
         assert!(MIGRATION_0013.contains("idx_duplicate_candidates_library_pair"));
         assert!(MIGRATION_0013.contains("conflicting normalized review outcomes"));
         assert!(MIGRATION_0014.contains("enforce_review_decision_semantics"));
+        assert!(MIGRATION_0015.contains("block_hash_16"));
+        assert!(MIGRATION_0015.contains("double_gradient_distance_ratio"));
     }
 
     #[test]
@@ -214,13 +218,11 @@ mod tests {
                 "0011_album_workflow_state",
                 "0012_album_workflow_repair",
                 "0013_workflow_escape_and_candidate_uniqueness",
-                "0014_candidate_review_semantics_and_abandoned_filters"
+                "0014_candidate_review_semantics_and_abandoned_filters",
+                "0015_fingerprint_v2"
             ]
         );
-        assert_eq!(
-            MigrationRunner::latest_version(),
-            "0014_candidate_review_semantics_and_abandoned_filters"
-        );
+        assert_eq!(MigrationRunner::latest_version(), "0015_fingerprint_v2");
     }
 
     #[test]
@@ -437,7 +439,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            2
+            3
         );
         for selected in [import_a, library_source] {
             let row = client
@@ -703,12 +705,7 @@ mod tests {
     #[ignore]
     #[cfg(feature = "real-db-tests")]
     async fn real_migration_0012_repairs_original_and_edited_0011_rows() {
-        use crate::domain::import_state::{
-            Decision, DecisionSource, DecodeState, DuplicateScope, ImportImageState, MatchType,
-        };
-        use crate::repositories::import_repository::{
-            ImportRepository, NewDuplicateCandidate, NewImportImage,
-        };
+        use crate::repositories::import_repository::ImportRepository;
         use tempfile::TempDir;
         use uuid::Uuid;
 
@@ -732,29 +729,26 @@ mod tests {
         .unwrap();
 
         async fn insert_image(client: &Client, album_id: Uuid, marker: u8) -> Uuid {
-            ImportRepository::insert_import_image(
-                client,
-                NewImportImage {
-                    album_id,
-                    source_path: format!("C:/migration-0012/{marker}.png"),
-                    relative_path: format!("album/{marker}.png"),
-                    file_size: 10,
-                    modified_at: None,
-                    width: Some(1),
-                    height: Some(1),
-                    format: Some("png".to_string()),
-                    decode_state: DecodeState::Decoded,
-                    blake3: Some(vec![marker; 32]),
-                    pixel_hash: Some(vec![marker; 8]),
-                    gradient_hash: Some(vec![marker; 8]),
-                    block_hash: Some(vec![marker; 8]),
-                    median_hash: Some(vec![marker; 8]),
-                    fingerprint_version: Some("test".to_string()),
-                    state: ImportImageState::Fingerprinted,
-                },
-            )
-            .await
-            .unwrap()
+            let id = Uuid::new_v4();
+            let source_path = format!("C:/migration-0012/{marker}.png");
+            let relative_path = format!("album/{marker}.png");
+            let hash = vec![marker; 8];
+            let blake3 = vec![marker; 32];
+            client
+                .execute(
+                    "INSERT INTO import_images (
+                        id, import_album_id, source_path, relative_path, file_size,
+                        width, height, format, decode_state, blake3, pixel_hash,
+                        gradient_hash, block_hash, median_hash, fingerprint_version, state
+                     ) VALUES (
+                        $1, $2, $3, $4, 10, 1, 1, 'png', 'decoded', $5, $6,
+                        $6, $6, $6, 'test', 'fingerprinted'
+                     )",
+                    &[&id, &album_id, &source_path, &relative_path, &blake3, &hash],
+                )
+                .await
+                .unwrap();
+            id
         }
 
         let original_stale_album = ImportRepository::insert_import_album(
@@ -785,28 +779,23 @@ mod tests {
         let stale_image = insert_image(&client, original_stale_album, 1).await;
         let _pending_image = insert_image(&client, edited_pending_album, 2).await;
         let terminal_image = insert_image(&client, terminal_album, 3).await;
-        ImportRepository::insert_duplicate_candidate(
-            &client,
-            NewDuplicateCandidate {
-                import_run_id,
-                source_image_id: stale_image,
-                candidate_source_image_id: Some(terminal_image),
-                candidate_library_image_id: None,
-                scope: DuplicateScope::CrossAlbum,
-                match_type: MatchType::FileExact,
-                blake3_equal: true,
-                pixel_hash_equal: false,
-                gradient_distance: None,
-                block_distance: None,
-                median_distance: None,
-                transform_type: None,
-                confidence: Some(1.0),
-                decision: Some(Decision::AutoDuplicate),
-                decision_source: Some(DecisionSource::ExactRule),
-            },
-        )
-        .await
-        .unwrap();
+        client
+            .execute(
+                "INSERT INTO duplicate_candidates (
+                    id, import_run_id, source_image_id, candidate_source_image_id,
+                    scope, match_type, blake3_equal, pixel_hash_equal,
+                    confidence, decision, decision_source
+                 ) VALUES ($1, $2, $3, $4, 'cross_album', 'file_exact', TRUE, FALSE,
+                           1.0, 'auto_duplicate', 'exact_rule')",
+                &[
+                    &Uuid::new_v4(),
+                    &import_run_id,
+                    &stale_image,
+                    &terminal_image,
+                ],
+            )
+            .await
+            .unwrap();
         client
             .execute(
                 "UPDATE import_albums SET state = 'scanning' WHERE id = $1",
@@ -837,7 +826,8 @@ mod tests {
             vec![
                 "0012_album_workflow_repair",
                 "0013_workflow_escape_and_candidate_uniqueness",
-                "0014_candidate_review_semantics_and_abandoned_filters"
+                "0014_candidate_review_semantics_and_abandoned_filters",
+                "0015_fingerprint_v2"
             ]
         );
 
@@ -885,7 +875,7 @@ mod tests {
         assert_eq!(candidate_count, 0);
         assert_eq!(
             MigrationRunner::current_version(&client).await.unwrap(),
-            Some("0014_candidate_review_semantics_and_abandoned_filters".to_string())
+            Some(MigrationRunner::latest_version().to_string())
         );
 
         drop(client);
