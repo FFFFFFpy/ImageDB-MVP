@@ -1,5 +1,6 @@
 use crate::domain::import_state::{CommitProgress, ScanProgress};
 use crate::domain::ExternalMigrationProgress;
+use crate::infrastructure::library_fingerprint_index::LibraryFingerprintIndex;
 use crate::infrastructure::postgres::PostgresManager;
 use crate::infrastructure::secrets::CredentialStore;
 use crate::infrastructure::settings::SettingsStore;
@@ -8,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CriticalTaskKind {
@@ -331,6 +332,7 @@ pub struct AppState {
     pub scan_state: Arc<Mutex<ScanState>>,
     pub commit_state: Arc<Mutex<CommitState>>,
     pub external_migration_state: Arc<Mutex<ExternalMigrationState>>,
+    pub library_fingerprint_index: Arc<RwLock<Option<LibraryFingerprintIndex>>>,
     pub critical_operation_guard: CriticalOperationGuard,
 }
 
@@ -357,6 +359,7 @@ impl AppState {
             scan_state: Arc::new(Mutex::new(ScanState::default())),
             commit_state: Arc::new(Mutex::new(CommitState::default())),
             external_migration_state: Arc::new(Mutex::new(ExternalMigrationState::default())),
+            library_fingerprint_index: Arc::new(RwLock::new(None)),
             critical_operation_guard: CriticalOperationGuard::default(),
         })
     }

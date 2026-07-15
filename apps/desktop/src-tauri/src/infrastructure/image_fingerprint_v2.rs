@@ -4,6 +4,7 @@ use exif::{In, Reader, Tag};
 use image::imageops::FilterType as ImageFilterType;
 use image::{DynamicImage, GrayImage, ImageFormat, RgbaImage};
 use image_hasher::{FilterType as HashFilterType, HashAlg, HasherConfig};
+use serde::Serialize;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -56,6 +57,27 @@ pub struct ImageFingerprintV2 {
     pub fine_thumbnail_32: GrayImage,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageFingerprintProbeEntry {
+    pub fingerprint_version: u32,
+    pub file_path: String,
+    pub format: String,
+    pub width: u32,
+    pub height: u32,
+    pub file_size: u64,
+    pub blake3_bytes: usize,
+    pub pixel_hash_bytes: usize,
+    pub block_hash_bits: usize,
+    pub double_gradient_hash_bits: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageFingerprintProbeResult {
+    pub fingerprints: Vec<ImageFingerprintProbeEntry>,
+    pub diagnostics: Vec<String>,
+    pub success: bool,
+}
+
 pub fn fingerprint_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
@@ -103,6 +125,90 @@ pub fn weighted_similarity(block_ratio: f64, double_gradient_ratio: f64) -> f64 
 pub fn fingerprint_image(path: &Path) -> Result<ImageFingerprintV2, AppError> {
     let file_bytes = std::fs::read(path)?;
     fingerprint_bytes(path, &file_bytes)
+}
+
+pub fn run_probe(fixture_dir: &Path) -> ImageFingerprintProbeResult {
+    let mut diagnostics = Vec::new();
+    let mut fingerprints = Vec::new();
+    let entries = match std::fs::read_dir(fixture_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return ImageFingerprintProbeResult {
+                fingerprints,
+                diagnostics: vec![format!("Cannot read fixture directory: {error}")],
+                success: false,
+            };
+        }
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+            continue;
+        }
+        match fingerprint_image(&path) {
+            Ok(fingerprint) => fingerprints.push(ImageFingerprintProbeEntry {
+                fingerprint_version: FINGERPRINT_VERSION,
+                file_path: fingerprint.file_path,
+                format: fingerprint.format,
+                width: fingerprint.width,
+                height: fingerprint.height,
+                file_size: fingerprint.file_size,
+                blake3_bytes: fingerprint.blake3.len(),
+                pixel_hash_bytes: fingerprint.pixel_hash.len(),
+                block_hash_bits: fingerprint.block_hash_16.len() * 8,
+                double_gradient_hash_bits: fingerprint.double_gradient_hash_32.len() * 8,
+            }),
+            Err(error) => {
+                diagnostics.push(format!("Failed to fingerprint {}: {error}", path.display()))
+            }
+        }
+    }
+    let success = !fingerprints.is_empty();
+    diagnostics.push(format!(
+        "Fingerprint V2 probe processed {} image(s)",
+        fingerprints.len()
+    ));
+    ImageFingerprintProbeResult {
+        fingerprints,
+        diagnostics,
+        success,
+    }
+}
+
+pub fn generate_test_samples(dir: &Path) -> Result<Vec<String>, AppError> {
+    let mut image = image::RgbImage::new(64, 64);
+    for y in 0..64 {
+        for x in 0..64 {
+            image.put_pixel(
+                x,
+                y,
+                image::Rgb([
+                    ((x * 4) % 256) as u8,
+                    ((y * 4) % 256) as u8,
+                    (((x + y) * 2) % 256) as u8,
+                ]),
+            );
+        }
+    }
+    let mut created = Vec::new();
+    for (name, format) in [
+        ("test-sample.png", ImageFormat::Png),
+        ("test-sample.jpg", ImageFormat::Jpeg),
+        ("test-sample.webp", ImageFormat::WebP),
+    ] {
+        let path = dir.join(name);
+        image.save_with_format(&path, format)?;
+        created.push(path.display().to_string());
+    }
+    Ok(created)
 }
 
 fn fingerprint_bytes(path: &Path, file_bytes: &[u8]) -> Result<ImageFingerprintV2, AppError> {
@@ -381,16 +487,13 @@ mod tests {
     fn equal_pixels_in_different_encodings_have_equal_pixel_hashes() {
         let tmp = TempDir::new().unwrap();
         let image = patterned_rgba(24, 18);
-        let png_a = tmp.path().join("a.png");
-        let png_b = tmp.path().join("b.png");
-        write_png(&png_a, &image);
-        write_png(&png_b, &image);
-        let mut bytes = fs::read(&png_b).unwrap();
-        bytes.extend_from_slice(b"ignored trailing metadata bytes");
-        fs::write(&png_b, bytes).unwrap();
+        let png = tmp.path().join("same-pixels.png");
+        let bmp = tmp.path().join("same-pixels.bmp");
+        image.save_with_format(&png, ImageFormat::Png).unwrap();
+        image.save_with_format(&bmp, ImageFormat::Bmp).unwrap();
 
-        let first = fingerprint_image(&png_a).unwrap();
-        let second = fingerprint_image(&png_b).unwrap();
+        let first = fingerprint_image(&png).unwrap();
+        let second = fingerprint_image(&bmp).unwrap();
         assert_ne!(first.blake3, second.blake3);
         assert_eq!(first.pixel_hash, second.pixel_hash);
         assert_eq!(first.pixel_hash.len(), 32);

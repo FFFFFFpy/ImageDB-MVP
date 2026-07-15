@@ -1,7 +1,7 @@
 use crate::infrastructure::file_transaction;
 use crate::infrastructure::file_transaction::FileTransactionProbeResult;
-use crate::infrastructure::image_fingerprint;
-use crate::infrastructure::image_fingerprint::ImageFingerprintProbeResult;
+use crate::infrastructure::image_fingerprint_v2;
+use crate::infrastructure::image_fingerprint_v2::ImageFingerprintProbeResult;
 use crate::infrastructure::postgres::PostgresProbeResult;
 use crate::state::{AppState, CriticalOperationGuard, CriticalOperationKind};
 use serde::Serialize;
@@ -49,7 +49,7 @@ fn run_image_fingerprint_probe(fixture_dir: &Path) -> Result<ImageFingerprintPro
 
     let needs_samples = !fixture_dir.join("test-sample.png").exists();
     if needs_samples {
-        match image_fingerprint::generate_test_samples(fixture_dir) {
+        match image_fingerprint_v2::generate_test_samples(fixture_dir) {
             Ok(created) => {
                 tracing::info!("Generated test samples: {created:?}");
             }
@@ -63,7 +63,7 @@ fn run_image_fingerprint_probe(fixture_dir: &Path) -> Result<ImageFingerprintPro
         }
     }
 
-    Ok(image_fingerprint::run_probe(fixture_dir))
+    Ok(image_fingerprint_v2::run_probe(fixture_dir))
 }
 
 #[tauri::command]

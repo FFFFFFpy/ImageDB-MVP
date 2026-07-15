@@ -126,10 +126,12 @@ pub(crate) async fn initialize_managed_database_for_state(
         .critical_operation_guard
         .begin_operation(CriticalOperationKind::InitializeManagedDatabase)?;
     let service = &state.database_service;
-    service
+    let result = service
         .initialize_managed()
         .await
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| format!("{e}"))?;
+    *state.library_fingerprint_index.write().await = None;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -146,10 +148,12 @@ pub(crate) async fn switch_to_managed_database_for_state(
         .critical_operation_guard
         .begin_operation(CriticalOperationKind::SwitchToManagedDatabase)?;
     let service = &state.database_service;
-    service
+    let result = service
         .switch_to_managed()
         .await
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| format!("{e}"))?;
+    *state.library_fingerprint_index.write().await = None;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -182,10 +186,12 @@ pub(crate) async fn initialize_external_database_for_state(
         .begin_operation(CriticalOperationKind::InitializeExternalDatabase)?;
     let service = &state.database_service;
     let conn_config: ConnectionConfig = config.into();
-    service
+    let result = service
         .initialize_external(&conn_config)
         .await
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| format!("{e}"))?;
+    *state.library_fingerprint_index.write().await = None;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -205,10 +211,12 @@ pub(crate) async fn migrate_managed_to_external_database_for_state(
         .begin_task(CriticalTaskKind::ExternalMigration)?;
     let service = &state.database_service;
     let conn_config: ConnectionConfig = config.into();
-    service
+    let result = service
         .migrate_managed_to_external(&conn_config)
         .await
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| format!("{e}"))?;
+    *state.library_fingerprint_index.write().await = None;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -244,6 +252,7 @@ pub async fn start_managed_to_external_migration(
         ExternalMigrationProgress::running("queued"),
     ));
     let service = state.database_service.clone();
+    let library_fingerprint_index = state.library_fingerprint_index.clone();
 
     let cancelled_clone = cancelled.clone();
     let tracker_clone = progress_tracker.clone();
@@ -259,6 +268,7 @@ pub async fn start_managed_to_external_migration(
 
         match result {
             Ok(_) => {
+                *library_fingerprint_index.write().await = None;
                 let progress = tracker_clone.lock().await;
                 progress.clone()
             }
@@ -352,7 +362,10 @@ pub(crate) async fn shutdown_database_for_state(state: &AppState) -> Result<(), 
         .critical_operation_guard
         .begin_operation(CriticalOperationKind::ShutdownDatabase)?;
     let mut mgr = state.postgres_manager.lock().await;
-    mgr.shutdown().await.map_err(|e| format!("{e}"))
+    mgr.shutdown().await.map_err(|e| format!("{e}"))?;
+    drop(mgr);
+    *state.library_fingerprint_index.write().await = None;
+    Ok(())
 }
 
 #[cfg(test)]

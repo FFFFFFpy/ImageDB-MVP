@@ -113,6 +113,9 @@ pub(crate) async fn recover_transaction_for_state(
     let outcome = recovery_service::recover_transaction(pg, tx_id)
         .await
         .map_err(|e| format!("{e}"))?;
+    if outcome.recovered || outcome.final_state == "committed" {
+        *state.library_fingerprint_index.write().await = None;
+    }
     Ok(RecoveryOutcomeDto {
         transaction_id: outcome.transaction_id.to_string(),
         final_state: outcome.final_state,

@@ -1,6 +1,6 @@
 pub mod file_transaction;
-pub mod image_fingerprint;
 pub mod image_fingerprint_v2;
+pub mod library_fingerprint_index;
 pub mod logging;
 pub mod postgres;
 pub mod secrets;

@@ -1,8 +1,59 @@
 use crate::domain::import_state::CommitProgress;
+use crate::infrastructure::library_fingerprint_index::LibraryFingerprintIndex;
+use crate::infrastructure::postgres::PostgresManager;
+use crate::repositories::import_repository::ImportRepository;
 use crate::services::commit_service;
 use crate::state::{AppState, CriticalTaskKind};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tauri::State;
+use tokio::sync::{Mutex, RwLock};
+
+async fn update_library_fingerprint_index_after_commit(
+    postgres_manager: Arc<Mutex<PostgresManager>>,
+    cache: Arc<RwLock<Option<LibraryFingerprintIndex>>>,
+    import_run_id: uuid::Uuid,
+) {
+    if cache.read().await.is_none() {
+        return;
+    }
+    let result = async {
+        let (client, handle) = {
+            let manager = postgres_manager.lock().await;
+            manager.connect().await?
+        };
+        let rows =
+            ImportRepository::get_library_images_for_import_run(&client, import_run_id).await;
+        handle.abort();
+        let rows = rows?;
+        let mut guard = cache.write().await;
+        let index = guard.as_mut().ok_or_else(|| {
+            crate::error::AppError::Internal(
+                "library fingerprint index was invalidated during commit update".to_string(),
+            )
+        })?;
+        for row in &rows {
+            index.add(row)?;
+        }
+        Ok::<usize, crate::error::AppError>(rows.len())
+    }
+    .await;
+    match result {
+        Ok(added) => tracing::info!(
+            %import_run_id,
+            added,
+            "library fingerprint index incrementally updated after commit"
+        ),
+        Err(error) => {
+            *cache.write().await = None;
+            tracing::error!(
+                %import_run_id,
+                error = %error,
+                "library fingerprint index update failed; cache invalidated"
+            );
+        }
+    }
+}
 
 #[tauri::command]
 pub async fn start_import_commit(
@@ -68,6 +119,7 @@ pub(crate) async fn start_import_commit_for_state_with_expected_hash(
 
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let postgres_manager = state.postgres_manager.clone();
+    let library_fingerprint_index = state.library_fingerprint_index.clone();
     let progress_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(CommitProgress::idle(
         &import_run_id,
     )));
@@ -77,6 +129,7 @@ pub(crate) async fn start_import_commit_for_state_with_expected_hash(
 
     let task = tokio::spawn(async move {
         let _commit_lease = commit_lease;
+        let index_postgres_manager = postgres_manager.clone();
         let result = commit_service::run_import_commit_with_expected_plan_hash(
             postgres_manager,
             library_root,
@@ -86,6 +139,15 @@ pub(crate) async fn start_import_commit_for_state_with_expected_hash(
             expected_plan_hash,
         )
         .await;
+
+        if result.is_ok() {
+            update_library_fingerprint_index_after_commit(
+                index_postgres_manager,
+                library_fingerprint_index,
+                run_id,
+            )
+            .await;
+        }
 
         match result {
             Ok(_) => {

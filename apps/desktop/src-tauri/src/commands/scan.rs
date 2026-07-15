@@ -91,6 +91,7 @@ async fn start_scan_for_state_inner(
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let postgres_manager = state.postgres_manager.clone();
     let settings = state.settings.clone();
+    let library_fingerprint_index = state.library_fingerprint_index.clone();
     let progress_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(ScanProgress {
         state: "running".to_string(),
         current_stage: "scanning".to_string(),
@@ -107,6 +108,7 @@ async fn start_scan_for_state_inner(
             scan_service::run_scan_for_import_run(
                 postgres_manager,
                 settings,
+                library_fingerprint_index,
                 source_root_clone,
                 import_run_id,
                 cancelled_clone,
@@ -117,6 +119,7 @@ async fn start_scan_for_state_inner(
             scan_service::run_scan(
                 postgres_manager,
                 settings,
+                library_fingerprint_index,
                 source_root_clone,
                 cancelled_clone,
                 tracker_clone,
