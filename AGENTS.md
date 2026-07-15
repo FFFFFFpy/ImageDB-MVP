@@ -14,8 +14,10 @@ MVP1 已定性为：
 
 用户明确要求 MVP3 / M3 UI 重设计工作时，当前 MVP3 文档入口为：[`docs/MVP3/README.md`](docs/MVP3/README.md)
 
+用户明确要求 MVP4 / Fingerprint V2 工作时，当前 MVP4 文档入口为：[`docs/MVP4/README.md`](docs/MVP4/README.md)
+
 Agent / Codex 不应再按“继续开发下一个里程碑”的方式工作。默认只处理 Debug、bugfix、诊断、测试、文档和 release gate 问题。
-例外：用户明确指定 MVP2 或 MVP3 任务包时，可以在独立 feature 分支上执行，但不得破坏 frozen plan / commit / recovery 文件事务安全边界。MVP3 只重设计呈现层与交互层，不得在 React 中重建后端状态机。
+例外：用户明确指定 MVP2、MVP3 或 MVP4 任务包时，可以在独立 feature 分支上执行，但不得破坏 frozen plan / commit / recovery 文件事务安全边界。MVP3 只重设计呈现层与交互层，不得在 React 中重建后端状态机；MVP4 只替换指纹、重复检测、相关持久化与证据展示，不改变审核动作和文件事务语义。
 
 ## 阅读顺序
 
@@ -28,7 +30,8 @@ Agent / Codex 不应再按“继续开发下一个里程碑”的方式工作。
 5. `docs/MVP1/DEBUG_PLAYBOOK.md`
 6. 若任务明确属于 MVP2，阅读 `docs/MVP2/README.md`、`docs/MVP2/ALBUM_WORKFLOW.md`、`docs/MVP2/ACCEPTANCE.md`
 7. 若任务明确属于 MVP3 / M3，阅读 `docs/MVP3/README.md`、`docs/MVP3/PRODUCT_BRIEF.md`、`docs/MVP3/UI_SPEC.md`、`docs/MVP3/IMPLEMENTATION_PLAN.md`、`docs/MVP3/ACCEPTANCE.md`
-8. 与当前 bug / gate / 测试相关的代码或文档
+8. 若任务明确属于 MVP4，阅读 `docs/MVP4/README.md`、`docs/MVP4/ARCHITECTURE.md`、`docs/MVP4/ACCEPTANCE.md`
+9. 与当前 bug / gate / 测试相关的代码或文档
 
 历史材料位于 `docs/MVP1/archive/`，只用于追溯，不作为当前状态入口。
 
