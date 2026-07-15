@@ -46,7 +46,11 @@ ALTER TABLE import_images
     ADD CONSTRAINT chk_import_images_fingerprint_v2_lengths CHECK (
         fingerprint_version IS DISTINCT FROM '2'
         OR (
-            octet_length(blake3) = 32
+            blake3 IS NOT NULL
+            AND pixel_hash IS NOT NULL
+            AND block_hash_16 IS NOT NULL
+            AND double_gradient_hash_32 IS NOT NULL
+            AND octet_length(blake3) = 32
             AND octet_length(pixel_hash) = 32
             AND octet_length(block_hash_16) = 32
             AND octet_length(double_gradient_hash_32) = 68
@@ -57,7 +61,11 @@ ALTER TABLE library_images
     ADD CONSTRAINT chk_library_images_fingerprint_v2_lengths CHECK (
         fingerprint_version IS DISTINCT FROM '2'
         OR (
-            octet_length(blake3) = 32
+            blake3 IS NOT NULL
+            AND pixel_hash IS NOT NULL
+            AND block_hash_16 IS NOT NULL
+            AND double_gradient_hash_32 IS NOT NULL
+            AND octet_length(blake3) = 32
             AND octet_length(pixel_hash) = 32
             AND octet_length(block_hash_16) = 32
             AND octet_length(double_gradient_hash_32) = 68
@@ -76,6 +84,11 @@ ALTER TABLE duplicate_candidates
     ADD CONSTRAINT chk_duplicate_candidates_confidence CHECK (
         confidence IS NULL OR confidence BETWEEN 0.0 AND 1.0
     );
+
+DROP INDEX IF EXISTS idx_import_images_blake3;
+DROP INDEX IF EXISTS idx_import_images_pixel_hash;
+DROP INDEX IF EXISTS idx_library_images_blake3;
+DROP INDEX IF EXISTS idx_library_images_pixel_hash;
 
 CREATE INDEX idx_import_images_blake3_v2
     ON import_images (blake3)

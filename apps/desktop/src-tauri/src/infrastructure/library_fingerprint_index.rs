@@ -117,26 +117,64 @@ fn search_node(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryFingerprintMetadata {
     pub image_id: Uuid,
     pub file_size: i64,
     pub blake3: Vec<u8>,
-    pub pixel_hash: Option<Vec<u8>>,
+    pub pixel_hash: Vec<u8>,
     pub block_hash_16: Vec<u8>,
+    fingerprint_signature: [u8; 32],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryRecallMatch {
     pub image_id: Uuid,
     pub block_distance: u32,
-    pub transform: TransformType,
+    pub transforms: Vec<TransformType>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LibraryRecallResult {
     pub matches: Vec<LibraryRecallMatch>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockTransformMatches {
+    pub block_distance: u32,
+    pub transforms: Vec<TransformType>,
+}
+
+impl BlockTransformMatches {
+    pub fn new(block_distance: u32, transform: TransformType) -> Self {
+        Self {
+            block_distance,
+            transforms: vec![transform],
+        }
+    }
+
+    /// Keep every transform tied at the minimum BlockHash distance. Fine
+    /// verification decides between them later.
+    pub fn consider(&mut self, block_distance: u32, transform: TransformType) {
+        if block_distance < self.block_distance {
+            self.block_distance = block_distance;
+            self.transforms.clear();
+            self.transforms.push(transform);
+        } else if block_distance == self.block_distance && !self.transforms.contains(&transform) {
+            self.transforms.push(transform);
+            self.transforms
+                .sort_by_key(|candidate| candidate.to_string());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LibraryIndexUpsertStats {
+    pub inserted: usize,
+    pub unchanged: usize,
+    pub updated: usize,
+    pub rebuilt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -171,73 +209,98 @@ impl LibraryFingerprintIndex {
 
     pub fn build(rows: &[LibraryImageRow]) -> Result<Self, AppError> {
         let mut index = Self::new();
-        for row in rows {
-            index.add(row)?;
-        }
+        index.upsert_many(rows)?;
         Ok(index)
     }
 
     pub fn add(&mut self, row: &LibraryImageRow) -> Result<bool, AppError> {
-        if row.fingerprint_version != FINGERPRINT_VERSION.to_string() {
-            return Ok(false);
-        }
-        let block_hash_16 = row.block_hash_16.clone().ok_or_else(|| {
-            AppError::Internal(format!(
-                "V2 library image {} is missing BlockHash 16x16",
-                row.id
-            ))
-        })?;
-        if row.blake3.len() != 32 || block_hash_16.len() != 32 {
-            return Err(AppError::Internal(format!(
-                "V2 library image {} has invalid hash lengths",
-                row.id
-            )));
-        }
-        if row
-            .pixel_hash
-            .as_ref()
-            .is_some_and(|pixel_hash| pixel_hash.len() != 32)
-        {
-            return Err(AppError::Internal(format!(
-                "V2 library image {} has an invalid pixel hash length",
-                row.id
-            )));
+        let stats = self.upsert_many(std::slice::from_ref(row))?;
+        Ok(stats.inserted + stats.updated > 0)
+    }
+
+    /// Upsert a committed batch without rebuilding once per existing ID.
+    ///
+    /// New IDs are appended to the secondary indexes. Identical IDs are
+    /// skipped. If one or more existing fingerprints changed, metadata is
+    /// replaced first and all secondary indexes are rebuilt exactly once.
+    /// The caller must invalidate the outer cache if this method returns an
+    /// error.
+    pub fn upsert_many(
+        &mut self,
+        rows: &[LibraryImageRow],
+    ) -> Result<LibraryIndexUpsertStats, AppError> {
+        let mut prepared = BTreeMap::new();
+        for row in rows {
+            let Some(metadata) = metadata_from_row(row)? else {
+                continue;
+            };
+            if let Some(previous) = prepared.insert(metadata.image_id, metadata.clone()) {
+                if previous != metadata {
+                    return Err(AppError::Internal(format!(
+                        "library index batch contains conflicting rows for image {}",
+                        metadata.image_id
+                    )));
+                }
+            }
         }
 
-        if self.image_by_id.contains_key(&row.id) {
-            self.remove(row.id)?;
+        let mut stats = LibraryIndexUpsertStats::default();
+        let mut new_metadata = Vec::new();
+        let mut changed_metadata = Vec::new();
+        for metadata in prepared.into_values() {
+            match self.image_by_id.get(&metadata.image_id) {
+                None => {
+                    stats.inserted += 1;
+                    new_metadata.push(metadata);
+                }
+                Some(current) if current == &metadata => stats.unchanged += 1,
+                Some(_) => {
+                    stats.updated += 1;
+                    changed_metadata.push(metadata);
+                }
+            }
         }
-        self.block_tree.insert(block_hash_16.clone())?;
+
+        if changed_metadata.is_empty() {
+            for metadata in new_metadata {
+                self.insert_metadata_incrementally(metadata)?;
+            }
+        } else {
+            for metadata in new_metadata.into_iter().chain(changed_metadata) {
+                self.image_by_id.insert(metadata.image_id, metadata);
+            }
+            self.rebuild_secondary_indexes()?;
+            stats.rebuilt = true;
+        }
+        self.image_count = self.image_by_id.len();
+        Ok(stats)
+    }
+
+    fn insert_metadata_incrementally(
+        &mut self,
+        metadata: LibraryFingerprintMetadata,
+    ) -> Result<(), AppError> {
+        self.block_tree.insert(metadata.block_hash_16.clone())?;
         insert_sorted_unique(
             self.hash_to_image_ids
-                .entry(block_hash_16.clone())
+                .entry(metadata.block_hash_16.clone())
                 .or_default(),
-            row.id,
+            metadata.image_id,
         );
         insert_sorted_unique(
             self.file_exact
-                .entry((row.file_size, row.blake3.clone()))
+                .entry((metadata.file_size, metadata.blake3.clone()))
                 .or_default(),
-            row.id,
+            metadata.image_id,
         );
-        if let Some(pixel_hash) = &row.pixel_hash {
-            insert_sorted_unique(
-                self.pixel_exact.entry(pixel_hash.clone()).or_default(),
-                row.id,
-            );
-        }
-        self.image_by_id.insert(
-            row.id,
-            LibraryFingerprintMetadata {
-                image_id: row.id,
-                file_size: row.file_size,
-                blake3: row.blake3.clone(),
-                pixel_hash: row.pixel_hash.clone(),
-                block_hash_16,
-            },
+        insert_sorted_unique(
+            self.pixel_exact
+                .entry(metadata.pixel_hash.clone())
+                .or_default(),
+            metadata.image_id,
         );
-        self.image_count = self.image_by_id.len();
-        Ok(true)
+        self.image_by_id.insert(metadata.image_id, metadata);
+        Ok(())
     }
 
     pub fn remove(&mut self, image_id: Uuid) -> Result<bool, AppError> {
@@ -269,12 +332,10 @@ impl LibraryFingerprintIndex {
                     .or_default(),
                 metadata.image_id,
             );
-            if let Some(pixel_hash) = metadata.pixel_hash {
-                insert_sorted_unique(
-                    self.pixel_exact.entry(pixel_hash).or_default(),
-                    metadata.image_id,
-                );
-            }
+            insert_sorted_unique(
+                self.pixel_exact.entry(metadata.pixel_hash).or_default(),
+                metadata.image_id,
+            );
         }
         self.image_count = self.image_by_id.len();
         Ok(())
@@ -306,20 +367,23 @@ impl LibraryFingerprintIndex {
                     continue;
                 };
                 for image_id in image_ids {
-                    let candidate = LibraryRecallMatch {
-                        image_id: *image_id,
-                        block_distance: distance,
-                        transform: variant.transform,
-                    };
-                    let should_replace = best_by_image
-                        .get(image_id)
-                        .map(|current| {
-                            (candidate.block_distance, candidate.transform.to_string())
-                                < (current.block_distance, current.transform.to_string())
-                        })
-                        .unwrap_or(true);
-                    if should_replace {
-                        best_by_image.insert(*image_id, candidate);
+                    if let Some(current) = best_by_image.get_mut(image_id) {
+                        let mut matches = BlockTransformMatches {
+                            block_distance: current.block_distance,
+                            transforms: std::mem::take(&mut current.transforms),
+                        };
+                        matches.consider(distance, variant.transform);
+                        current.block_distance = matches.block_distance;
+                        current.transforms = matches.transforms;
+                    } else {
+                        best_by_image.insert(
+                            *image_id,
+                            LibraryRecallMatch {
+                                image_id: *image_id,
+                                block_distance: distance,
+                                transforms: vec![variant.transform],
+                            },
+                        );
                     }
                 }
             }
@@ -342,6 +406,58 @@ impl LibraryFingerprintIndex {
     pub fn unique_hash_count(&self) -> usize {
         self.block_tree.unique_hash_count()
     }
+}
+
+fn metadata_from_row(
+    row: &LibraryImageRow,
+) -> Result<Option<LibraryFingerprintMetadata>, AppError> {
+    if row.fingerprint_version != FINGERPRINT_VERSION.to_string() {
+        return Ok(None);
+    }
+    let pixel_hash = row.pixel_hash.clone().ok_or_else(|| {
+        AppError::Internal(format!(
+            "V2 library image {} is missing its pixel hash",
+            row.id
+        ))
+    })?;
+    let block_hash_16 = row.block_hash_16.clone().ok_or_else(|| {
+        AppError::Internal(format!(
+            "V2 library image {} is missing BlockHash 16x16",
+            row.id
+        ))
+    })?;
+    let double_gradient_hash_32 = row.double_gradient_hash_32.clone().ok_or_else(|| {
+        AppError::Internal(format!(
+            "V2 library image {} is missing DoubleGradient 32x32",
+            row.id
+        ))
+    })?;
+    if row.blake3.len() != 32
+        || pixel_hash.len() != 32
+        || block_hash_16.len() != 32
+        || double_gradient_hash_32.len() != 68
+    {
+        return Err(AppError::Internal(format!(
+            "V2 library image {} has invalid hash lengths",
+            row.id
+        )));
+    }
+    // Equality checks for batch upserts must include the fine hash without
+    // retaining fine evidence in the recall index itself.
+    let mut signature = blake3::Hasher::new();
+    signature.update(&row.file_size.to_le_bytes());
+    signature.update(&row.blake3);
+    signature.update(&pixel_hash);
+    signature.update(&block_hash_16);
+    signature.update(&double_gradient_hash_32);
+    Ok(Some(LibraryFingerprintMetadata {
+        image_id: row.id,
+        file_size: row.file_size,
+        blake3: row.blake3.clone(),
+        pixel_hash,
+        block_hash_16,
+        fingerprint_signature: *signature.finalize().as_bytes(),
+    }))
 }
 
 fn insert_sorted_unique(values: &mut Vec<Uuid>, value: Uuid) {
@@ -418,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_distance_results_are_uuid_sorted_and_transform_deduplicated() {
+    fn equal_distance_results_are_uuid_sorted_and_keep_every_tied_transform() {
         let mut rows = Vec::new();
         for value in [5u128, 1, 3, 2, 4] {
             rows.push(row(Uuid::from_u128(value), vec![0; 32], value as u8));
@@ -427,6 +543,10 @@ mod tests {
         assert_eq!(index.unique_hash_count(), 1);
         let result = index.recall(&variants(vec![0; 32]), 0).unwrap();
         assert_eq!(result.matches.len(), 5);
+        assert!(result
+            .matches
+            .iter()
+            .all(|entry| entry.transforms.len() == TransformType::ALL.len()));
         assert_eq!(
             result
                 .matches
@@ -454,5 +574,52 @@ mod tests {
     fn malformed_v2_hash_invalidates_build() {
         let malformed = row(Uuid::from_u128(1), vec![0; 8], 1);
         assert!(LibraryFingerprintIndex::build(&[malformed]).is_err());
+    }
+
+    #[test]
+    fn upsert_many_skips_identical_rows_and_rebuilds_once_for_changed_rows() {
+        let first_id = Uuid::from_u128(1);
+        let second_id = Uuid::from_u128(2);
+        let third_id = Uuid::from_u128(3);
+        let first = row(first_id, vec![0; 32], 1);
+        let second = row(second_id, vec![0xff; 32], 2);
+        let mut index = LibraryFingerprintIndex::build(&[first.clone(), second.clone()]).unwrap();
+
+        let unchanged = index.upsert_many(&[second.clone(), first.clone()]).unwrap();
+        assert_eq!(unchanged.unchanged, 2);
+        assert_eq!(unchanged.inserted, 0);
+        assert_eq!(unchanged.updated, 0);
+        assert!(!unchanged.rebuilt);
+
+        let mut changed_first = first.clone();
+        changed_first.file_size = 9;
+        changed_first.blake3 = vec![9; 32];
+        changed_first.pixel_hash = Some(vec![9; 32]);
+        changed_first.block_hash_16 = Some(vec![0x55; 32]);
+        changed_first.double_gradient_hash_32 = Some(vec![9; 68]);
+        let third = row(third_id, vec![0xaa; 32], 3);
+        let changed = index.upsert_many(&[changed_first, third]).unwrap();
+        assert_eq!(changed.inserted, 1);
+        assert_eq!(changed.updated, 1);
+        assert_eq!(changed.unchanged, 0);
+        assert!(changed.rebuilt);
+        assert_eq!(index.image_count, 3);
+        assert!(index.exact_file_matches(1, &[1; 32]).is_empty());
+        assert_eq!(index.exact_file_matches(9, &[9; 32]), vec![first_id]);
+        assert_eq!(index.exact_pixel_matches(&[3; 32]), vec![third_id]);
+    }
+
+    #[test]
+    fn upsert_many_validates_the_whole_batch_before_mutating() {
+        let first = row(Uuid::from_u128(1), vec![0; 32], 1);
+        let valid_new = row(Uuid::from_u128(2), vec![1; 32], 2);
+        let mut malformed = row(Uuid::from_u128(3), vec![2; 32], 3);
+        malformed.double_gradient_hash_32 = None;
+        let mut index = LibraryFingerprintIndex::build(std::slice::from_ref(&first)).unwrap();
+
+        assert!(index.upsert_many(&[valid_new, malformed]).is_err());
+        assert_eq!(index.image_count, 1);
+        assert_eq!(index.exact_file_matches(1, &[1; 32]), vec![first.id]);
+        assert!(index.exact_file_matches(2, &[2; 32]).is_empty());
     }
 }

@@ -1811,11 +1811,12 @@ impl ImportRepository {
             .collect())
     }
 
-    /// V2 rows written by a successful import run. Used to update an already
-    /// constructed in-memory library index without rebuilding it.
-    pub async fn get_library_images_for_import_run(
+    /// V2 rows written by a successful import run at or after the captured
+    /// commit boundary. Used to avoid reloading the run's historical rows.
+    pub async fn get_library_images_for_import_run_committed_after(
         client: &Client,
         import_run_id: Uuid,
+        committed_after: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<LibraryImageRow>, AppError> {
         let rows = client
             .query(
@@ -1826,8 +1827,9 @@ impl ImportRepository {
                  JOIN library_albums la ON la.id = li.album_id
                  JOIN file_transactions ft ON ft.id = la.transaction_id
                  WHERE ft.import_run_id = $1 AND li.fingerprint_version = '2'
+                   AND ($2::timestamptz IS NULL OR li.committed_at >= $2)
                  ORDER BY li.id",
-                &[&import_run_id],
+                &[&import_run_id, &committed_after],
             )
             .await
             .map_err(|error| {

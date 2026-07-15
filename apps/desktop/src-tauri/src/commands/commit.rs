@@ -13,6 +13,7 @@ async fn update_library_fingerprint_index_after_commit(
     postgres_manager: Arc<Mutex<PostgresManager>>,
     cache: Arc<RwLock<Option<LibraryFingerprintIndex>>>,
     import_run_id: uuid::Uuid,
+    committed_after: Option<chrono::DateTime<chrono::Utc>>,
 ) {
     if cache.read().await.is_none() {
         return;
@@ -22,8 +23,12 @@ async fn update_library_fingerprint_index_after_commit(
             let manager = postgres_manager.lock().await;
             manager.connect().await?
         };
-        let rows =
-            ImportRepository::get_library_images_for_import_run(&client, import_run_id).await;
+        let rows = ImportRepository::get_library_images_for_import_run_committed_after(
+            &client,
+            import_run_id,
+            committed_after,
+        )
+        .await;
         handle.abort();
         let rows = rows?;
         let mut guard = cache.write().await;
@@ -32,17 +37,17 @@ async fn update_library_fingerprint_index_after_commit(
                 "library fingerprint index was invalidated during commit update".to_string(),
             )
         })?;
-        for row in &rows {
-            index.add(row)?;
-        }
-        Ok::<usize, crate::error::AppError>(rows.len())
+        index.upsert_many(&rows)
     }
     .await;
     match result {
-        Ok(added) => tracing::info!(
+        Ok(stats) => tracing::info!(
             %import_run_id,
-            added,
-            "library fingerprint index incrementally updated after commit"
+            inserted = stats.inserted,
+            unchanged = stats.unchanged,
+            updated = stats.updated,
+            rebuilt = stats.rebuilt,
+            "library fingerprint index batch-updated after commit"
         ),
         Err(error) => {
             *cache.write().await = None;
@@ -53,6 +58,26 @@ async fn update_library_fingerprint_index_after_commit(
             );
         }
     }
+}
+
+async fn database_clock(
+    postgres_manager: Arc<Mutex<PostgresManager>>,
+) -> Result<chrono::DateTime<chrono::Utc>, crate::error::AppError> {
+    let (client, handle) = {
+        let manager = postgres_manager.lock().await;
+        manager.connect().await?
+    };
+    let result = client
+        .query_one("SELECT clock_timestamp()", &[])
+        .await
+        .map(|row| row.get(0))
+        .map_err(|error| {
+            crate::error::AppError::Internal(format!(
+                "failed to capture commit index-update boundary: {error}"
+            ))
+        });
+    handle.abort();
+    result
 }
 
 #[tauri::command]
@@ -130,6 +155,22 @@ pub(crate) async fn start_import_commit_for_state_with_expected_hash(
     let task = tokio::spawn(async move {
         let _commit_lease = commit_lease;
         let index_postgres_manager = postgres_manager.clone();
+        let index_was_loaded = library_fingerprint_index.read().await.is_some();
+        let committed_after = if index_was_loaded {
+            match database_clock(index_postgres_manager.clone()).await {
+                Ok(timestamp) => Some(timestamp),
+                Err(error) => {
+                    tracing::warn!(
+                        %run_id,
+                        error = %error,
+                        "could not capture index-update boundary; falling back to the full run"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let result = commit_service::run_import_commit_with_expected_plan_hash(
             postgres_manager,
             library_root,
@@ -145,6 +186,7 @@ pub(crate) async fn start_import_commit_for_state_with_expected_hash(
                 index_postgres_manager,
                 library_fingerprint_index,
                 run_id,
+                committed_after,
             )
             .await;
         }

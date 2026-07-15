@@ -198,6 +198,8 @@ mod tests {
         assert!(MIGRATION_0014.contains("enforce_review_decision_semantics"));
         assert!(MIGRATION_0015.contains("block_hash_16"));
         assert!(MIGRATION_0015.contains("double_gradient_distance_ratio"));
+        assert!(MIGRATION_0015.contains("double_gradient_hash_32 IS NOT NULL"));
+        assert!(MIGRATION_0015.contains("DROP INDEX IF EXISTS idx_import_images_blake3"));
     }
 
     #[test]
@@ -955,6 +957,152 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(plan_album_count, 1);
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0015_rejects_incomplete_v2_rows_and_drops_old_exact_indexes() {
+        use crate::repositories::import_repository::ImportRepository;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+        assert!(manager.binaries_available());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            "C:/migration-0015/source",
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let import_album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            "C:/migration-0015/source/album",
+            "album",
+        )
+        .await
+        .unwrap();
+        let library_album_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO library_albums
+                    (id, library_root_id, display_name, relative_path, manifest_version,
+                     manifest_hash, image_count, state)
+                 VALUES ($1, $2, 'album', $3, '1', $4, 0, 'committed')",
+                &[
+                    &library_album_id,
+                    &library_root_id,
+                    &format!("migration-0015-{library_album_id}"),
+                    &vec![1_u8; 32],
+                ],
+            )
+            .await
+            .unwrap();
+
+        for missing in ["pixel_hash", "block_hash_16", "double_gradient_hash_32"] {
+            let image_id = Uuid::new_v4();
+            let source_path = format!("C:/migration-0015/{image_id}.png");
+            let relative_path = format!("album/{image_id}.png");
+            let blake3 = Some(vec![1_u8; 32]);
+            let pixel_hash = (missing != "pixel_hash").then(|| vec![2_u8; 32]);
+            let block_hash = (missing != "block_hash_16").then(|| vec![3_u8; 32]);
+            let fine_hash = (missing != "double_gradient_hash_32").then(|| vec![4_u8; 68]);
+            let error = client
+                .execute(
+                    "INSERT INTO import_images
+                        (id, import_album_id, source_path, relative_path, file_size,
+                         width, height, format, decode_state, blake3, pixel_hash,
+                         block_hash_16, double_gradient_hash_32, fingerprint_version, state)
+                     VALUES ($1, $2, $3, $4, 1, 1, 1, 'png', 'decoded',
+                             $5, $6, $7, $8, '2', 'fingerprinted')",
+                    &[
+                        &image_id,
+                        &import_album_id,
+                        &source_path,
+                        &relative_path,
+                        &blake3,
+                        &pixel_hash,
+                        &block_hash,
+                        &fine_hash,
+                    ],
+                )
+                .await
+                .expect_err("incomplete import Fingerprint V2 must be rejected");
+            assert_eq!(
+                error.as_db_error().and_then(|db| db.constraint()),
+                Some("chk_import_images_fingerprint_v2_lengths")
+            );
+
+            let library_image_id = Uuid::new_v4();
+            let library_relative_path = format!("{library_image_id}.png");
+            let error = client
+                .execute(
+                    "INSERT INTO library_images
+                        (id, album_id, relative_path, file_size, width, height, format,
+                         blake3, pixel_hash, block_hash_16, double_gradient_hash_32,
+                         fingerprint_version, state)
+                     VALUES ($1, $2, $3, 1, 1, 1, 'png', $4, $5, $6, $7, '2', 'committed')",
+                    &[
+                        &library_image_id,
+                        &library_album_id,
+                        &library_relative_path,
+                        &blake3,
+                        &pixel_hash,
+                        &block_hash,
+                        &fine_hash,
+                    ],
+                )
+                .await
+                .expect_err("incomplete library Fingerprint V2 must be rejected");
+            assert_eq!(
+                error.as_db_error().and_then(|db| db.constraint()),
+                Some("chk_library_images_fingerprint_v2_lengths")
+            );
+        }
+
+        let old_index_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE schemaname = 'public'
+                   AND indexname IN (
+                       'idx_import_images_blake3', 'idx_import_images_pixel_hash',
+                       'idx_library_images_blake3', 'idx_library_images_pixel_hash'
+                   )",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(old_index_count, 0);
+        let v2_index_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE schemaname = 'public'
+                   AND indexname IN (
+                       'idx_import_images_blake3_v2', 'idx_import_images_pixel_hash_v2',
+                       'idx_library_images_blake3_v2', 'idx_library_images_pixel_hash_v2'
+                   )",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(v2_index_count, 4);
 
         drop(client);
         handle.abort();
