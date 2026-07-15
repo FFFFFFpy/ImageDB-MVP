@@ -90,9 +90,10 @@ function reviewDetail(
     match_type: candidate.match_type,
     blake3_equal: false,
     pixel_hash_equal: false,
-    gradient_distance: 2,
     block_distance: 3,
-    median_distance: 2,
+    double_gradient_distance: 4,
+    block_distance_ratio: 3 / 256,
+    double_gradient_distance_ratio: 4 / 544,
     transform_type: candidate.transform_type,
     confidence: candidate.confidence,
     album_name: candidate.album_name,
@@ -272,9 +273,10 @@ describe('REVIEW_DECISION_OPTIONS', () => {
       match_type: candidate.match_type,
       blake3_equal: false,
       pixel_hash_equal: false,
-      gradient_distance: 2,
       block_distance: 3,
-      median_distance: 2,
+      double_gradient_distance: 4,
+      block_distance_ratio: 3 / 256,
+      double_gradient_distance_ratio: 4 / 544,
       transform_type: 'identity',
       confidence: 0.9,
       album_name: candidate.album_name,
@@ -320,6 +322,11 @@ describe('REVIEW_DECISION_OPTIONS', () => {
 
     const sourcePreview = await screen.findByAltText('源图片');
     const candidatePreview = await screen.findByAltText('候选图片');
+    fireEvent.click(screen.getByText('查看图片与匹配详情'));
+    expect(screen.getByText('3 / 256（距离 1.2%）')).toBeVisible();
+    expect(screen.getByText('4 / 544（距离 0.7%）')).toBeVisible();
+    expect(screen.getByText('原方向')).toBeVisible();
+    expect(screen.getByText('90.0%')).toBeVisible();
     expect(screen.getByRole('button', { name: /保留源图片/ })).toBeDisabled();
     fireEvent.load(sourcePreview);
     fireEvent.load(candidatePreview);

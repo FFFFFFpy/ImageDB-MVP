@@ -443,9 +443,10 @@ function PlanImageThumbnail({ importRunId, image, onOpen }: PlanImageThumbnailPr
   );
 }
 
-function formatDistance(val: number | null): string {
+function formatDistance(val: number | null, bitLength: number, ratio: number | null): string {
   if (val === null) return '无';
-  return val.toString();
+  const normalized = ratio ?? val / bitLength;
+  return `${val} / ${bitLength}（距离 ${(normalized * 100).toFixed(1)}%）`;
 }
 
 function formatMatchType(t: string): string {
@@ -470,10 +471,10 @@ function formatScope(s: string): string {
 function formatTransform(t: string | null): string {
   if (!t) return '无';
   const map: Record<string, string> = {
-    identity: '不变',
-    rot90: '旋转 90 度',
-    rot180: '旋转 180 度',
-    rot270: '旋转 270 度',
+    identity: '原方向',
+    rot90: '旋转 90°',
+    rot180: '旋转 180°',
+    rot270: '旋转 270°',
     flip_h: '水平翻转',
     flip_v: '垂直翻转',
     transpose: '主对角线翻转',
@@ -1572,20 +1573,24 @@ export function ReviewPage({
                       <td>{detail.pixel_hash_equal ? '是' : '否'}</td>
                     </tr>
                     <tr>
-                      <td>梯度距离</td>
-                      <td>{formatDistance(detail.gradient_distance)}</td>
+                      <td>BlockHash 距离</td>
+                      <td>
+                        {formatDistance(detail.block_distance, 256, detail.block_distance_ratio)}
+                      </td>
                     </tr>
                     <tr>
-                      <td>分块距离</td>
-                      <td>{formatDistance(detail.block_distance)}</td>
-                    </tr>
-                    <tr>
-                      <td>中值距离</td>
-                      <td>{formatDistance(detail.median_distance)}</td>
+                      <td>DoubleGradient 距离</td>
+                      <td>
+                        {formatDistance(
+                          detail.double_gradient_distance,
+                          544,
+                          detail.double_gradient_distance_ratio,
+                        )}
+                      </td>
                     </tr>
                     {detail.confidence !== null && (
                       <tr>
-                        <td>置信度</td>
+                        <td>综合相似度</td>
                         <td>{(detail.confidence * 100).toFixed(1)}%</td>
                       </tr>
                     )}

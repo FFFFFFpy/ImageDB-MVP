@@ -169,11 +169,10 @@ export interface ImageFingerprintEntry {
   width: number;
   height: number;
   file_size: number;
-  blake3: string;
-  pixel_hash: string;
-  gradient_hash: string;
-  block_hash: string;
-  median_hash: string;
+  blake3_bytes: number;
+  pixel_hash_bytes: number;
+  block_hash_bits: number;
+  double_gradient_hash_bits: number;
 }
 
 export interface ImageFingerprintProbeResult {
@@ -329,9 +328,10 @@ export interface ReviewCandidateDetail {
   match_type: string;
   blake3_equal: boolean;
   pixel_hash_equal: boolean;
-  gradient_distance: number | null;
   block_distance: number | null;
-  median_distance: number | null;
+  double_gradient_distance: number | null;
+  block_distance_ratio: number | null;
+  double_gradient_distance_ratio: number | null;
   transform_type: string | null;
   confidence: number | null;
   album_name: string;

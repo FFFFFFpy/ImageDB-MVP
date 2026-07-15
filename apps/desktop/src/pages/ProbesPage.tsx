@@ -266,24 +266,20 @@ function FpResultView({ result }: { result: ImageFingerprintProbeResult }) {
                 <td className="mono">{fp.fingerprint_version}</td>
               </tr>
               <tr>
-                <td>BLAKE3</td>
-                <td className="mono">{fp.blake3.slice(0, 32)}...</td>
+                <td>文件 BLAKE3</td>
+                <td className="mono">{fp.blake3_bytes} bytes</td>
               </tr>
               <tr>
-                <td>像素哈希</td>
-                <td className="mono">{fp.pixel_hash}</td>
+                <td>像素 BLAKE3</td>
+                <td className="mono">{fp.pixel_hash_bytes} bytes</td>
               </tr>
               <tr>
-                <td>梯度哈希</td>
-                <td className="mono">{fp.gradient_hash}</td>
+                <td>BlockHash 16×16</td>
+                <td className="mono">{fp.block_hash_bits} bits</td>
               </tr>
               <tr>
-                <td>分块哈希</td>
-                <td className="mono">{fp.block_hash}</td>
-              </tr>
-              <tr>
-                <td>中值哈希</td>
-                <td className="mono">{fp.median_hash}</td>
+                <td>DoubleGradient 32×32</td>
+                <td className="mono">{fp.double_gradient_hash_bits} bits</td>
               </tr>
             </tbody>
           </table>
