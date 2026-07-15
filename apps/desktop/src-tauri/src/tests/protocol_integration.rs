@@ -413,11 +413,10 @@ async fn real_protocol_tampered_plan_hash_rejected() {
             format: Some("png".to_string()),
             decode_state: DecodeState::Decoded,
             blake3: Some(b3.clone()),
-            pixel_hash: Some(vec![1; 8]),
-            gradient_hash: Some(vec![1; 8]),
-            block_hash: Some(vec![1; 8]),
-            median_hash: Some(vec![1; 8]),
-            fingerprint_version: Some("test".to_string()),
+            pixel_hash: Some(vec![1; 32]),
+            block_hash_16: Some(vec![1; 32]),
+            double_gradient_hash_32: Some(vec![1; 68]),
+            fingerprint_version: Some("2".to_string()),
             state: ImportImageState::Fingerprinted,
         },
     )
@@ -1012,11 +1011,27 @@ async fn real_protocol_cross_album_and_history_duplicates() {
         &[&lib_album_id, &library_root_id],
     ).await.unwrap();
     let lib_img_id = uuid::Uuid::new_v4();
-    client.execute(
-        "INSERT INTO library_images (id, album_id, relative_path, file_size, width, height, format, blake3, fingerprint_version, state)
-         VALUES ($1, $2, 'x.png', 12, 1, 1, 'png', $3, 'test', 'committed')",
-        &[&lib_img_id, &lib_album_id, &b3],
-    ).await.unwrap();
+    let pixel_hash = vec![0x11u8; 32];
+    let block_hash = vec![0x22u8; 32];
+    let double_gradient_hash = vec![0x33u8; 68];
+    client
+        .execute(
+            "INSERT INTO library_images
+            (id, album_id, relative_path, file_size, width, height, format,
+             blake3, pixel_hash, block_hash_16, double_gradient_hash_32,
+             fingerprint_version, state)
+         VALUES ($1, $2, 'x.png', 12, 1, 1, 'png', $3, $4, $5, $6, '2', 'committed')",
+            &[
+                &lib_img_id,
+                &lib_album_id,
+                &b3,
+                &pixel_hash,
+                &block_hash,
+                &double_gradient_hash,
+            ],
+        )
+        .await
+        .unwrap();
 
     // Cross-album: siblings share blake3 across albums.
     let siblings =
@@ -1097,11 +1112,10 @@ fn new_img(
         format: Some("png".to_string()),
         decode_state: DecodeState::Decoded,
         blake3: Some(b3.to_vec()),
-        pixel_hash: Some(vec![1; 8]),
-        gradient_hash: Some(vec![1; 8]),
-        block_hash: Some(vec![1; 8]),
-        median_hash: Some(vec![1; 8]),
-        fingerprint_version: Some("test".to_string()),
+        pixel_hash: Some(vec![1; 32]),
+        block_hash_16: Some(vec![1; 32]),
+        double_gradient_hash_32: Some(vec![1; 68]),
+        fingerprint_version: Some("2".to_string()),
         state: ImportImageState::Fingerprinted,
     }
 }
@@ -1180,11 +1194,10 @@ async fn real_protocol_manifest_path_is_published() {
             format: Some("png".to_string()),
             decode_state: DecodeState::Decoded,
             blake3: Some(b3.clone()),
-            pixel_hash: Some(vec![1; 8]),
-            gradient_hash: Some(vec![1; 8]),
-            block_hash: Some(vec![1; 8]),
-            median_hash: Some(vec![1; 8]),
-            fingerprint_version: Some("test".to_string()),
+            pixel_hash: Some(vec![1; 32]),
+            block_hash_16: Some(vec![1; 32]),
+            double_gradient_hash_32: Some(vec![1; 68]),
+            fingerprint_version: Some("2".to_string()),
             state: ImportImageState::Fingerprinted,
         },
     )
