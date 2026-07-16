@@ -416,6 +416,7 @@ async fn real_protocol_tampered_plan_hash_rejected() {
             pixel_hash: Some(vec![1; 32]),
             block_hash_16: Some(vec![1; 32]),
             double_gradient_hash_32: Some(vec![1; 68]),
+            perceptual_eligible: true,
             fingerprint_version: Some("2".to_string()),
             state: ImportImageState::Fingerprinted,
         },
@@ -947,11 +948,10 @@ async fn real_protocol_frozen_workflow_abandon_is_auditable_and_stops_at_transac
 }
 
 /// Phase 8 / 10: cross-album exact duplicates + a historical library image.
-/// Verifies the indexed match queries (find_sibling_images_by_blake3 for
-/// cross-album, find_library_images_by_blake3 for history) and the duplicate
-/// group representative preference. This does NOT call run_scan (which links
-/// the tauri runtime in the test binary); it exercises the same repository
-/// + duplicate-group logic directly.
+/// Verifies restoration of run-level exact representatives, indexed history
+/// lookup, and duplicate-group representative preference. This does NOT call
+/// run_scan (which links the tauri runtime in the test binary); it exercises
+/// the same repository + duplicate-group logic directly.
 #[tokio::test]
 #[ignore]
 async fn real_protocol_cross_album_and_history_duplicates() {
@@ -1002,6 +1002,14 @@ async fn real_protocol_cross_album_and_history_duplicates() {
         ImportRepository::insert_import_image(&client, new_img(album_b, "album_b/x.png", &b3))
             .await
             .unwrap();
+    for album_id in [album_a, album_b] {
+        ImportRepository::mark_import_album_analyzing(&client, album_id)
+            .await
+            .unwrap();
+        ImportRepository::finalize_import_album_analysis(&client, album_id)
+            .await
+            .unwrap();
+    }
 
     // A pre-existing library image with the SAME blake3 (historical dup).
     let lib_album_id = uuid::Uuid::new_v4();
@@ -1033,20 +1041,17 @@ async fn real_protocol_cross_album_and_history_duplicates() {
         .await
         .unwrap();
 
-    // Cross-album: siblings share blake3 across albums.
-    let siblings =
-        ImportRepository::find_sibling_images_by_blake3(&client, run_id, std::slice::from_ref(&b3))
-            .await
-            .unwrap();
-    assert!(
-        siblings.iter().any(|(id, _, _, _)| *id == img_a),
-        "img_a should be a sibling"
+    // Resumed scans restore one lightweight exact-fingerprint row per image;
+    // the in-memory run index reduces each hash group to its stable UUID.
+    let siblings = ImportRepository::get_analyzed_run_exact_representatives(&client, run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        siblings.len(),
+        1,
+        "one stable representative per exact group"
     );
-    assert!(
-        siblings.iter().any(|(id, _, _, _)| *id == img_b),
-        "img_b should be a sibling"
-    );
-    assert_eq!(siblings.len(), 2, "exactly two siblings across albums");
+    assert_eq!(siblings[0].id, img_a.min(img_b));
 
     // Historical: library image matched by blake3.
     let lib_matches =
@@ -1115,6 +1120,7 @@ fn new_img(
         pixel_hash: Some(vec![1; 32]),
         block_hash_16: Some(vec![1; 32]),
         double_gradient_hash_32: Some(vec![1; 68]),
+        perceptual_eligible: true,
         fingerprint_version: Some("2".to_string()),
         state: ImportImageState::Fingerprinted,
     }
@@ -1197,6 +1203,7 @@ async fn real_protocol_manifest_path_is_published() {
             pixel_hash: Some(vec![1; 32]),
             block_hash_16: Some(vec![1; 32]),
             double_gradient_hash_32: Some(vec![1; 68]),
+            perceptual_eligible: true,
             fingerprint_version: Some("2".to_string()),
             state: ImportImageState::Fingerprinted,
         },

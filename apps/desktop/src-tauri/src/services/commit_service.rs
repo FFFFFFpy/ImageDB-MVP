@@ -45,7 +45,7 @@ use tokio_postgres::Client;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-type PersistedFingerprintV2 = (Vec<u8>, Vec<u8>, Vec<u8>, String);
+type PersistedFingerprintV2 = (Vec<u8>, Vec<u8>, Vec<u8>, bool, String);
 
 /// Schema version written into every album manifest.
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
@@ -2706,7 +2706,7 @@ pub(crate) async fn commit_library_records_transaction(
     let fingerprint_rows = transaction
         .query(
             "SELECT id, pixel_hash, block_hash_16, double_gradient_hash_32,
-                    fingerprint_version
+                    perceptual_eligible, fingerprint_version
              FROM import_images
              WHERE id = ANY($1)",
             &[&import_image_ids],
@@ -2724,10 +2724,11 @@ pub(crate) async fn commit_library_records_transaction(
             let pixel_hash: Option<Vec<u8>> = row.get("pixel_hash");
             let block_hash: Option<Vec<u8>> = row.get("block_hash_16");
             let double_gradient_hash: Option<Vec<u8>> = row.get("double_gradient_hash_32");
+            let perceptual_eligible: bool = row.get("perceptual_eligible");
             let version: Option<String> = row.get("fingerprint_version");
             match (pixel_hash, block_hash, double_gradient_hash, version) {
                 (Some(pixel), Some(block), Some(fine), Some(version)) if version == "2" => {
-                    Ok((id, (pixel, block, fine, version)))
+                    Ok((id, (pixel, block, fine, perceptual_eligible, version)))
                 }
                 _ => Err(AppError::Internal(format!(
                     "frozen plan image {id} does not have a complete Fingerprint V2"
@@ -2761,21 +2762,26 @@ pub(crate) async fn commit_library_records_transaction(
         if exists {
             continue;
         }
-        let (pixel_hash, block_hash_16, double_gradient_hash_32, fingerprint_version) =
-            fingerprints.get(&img.import_image_id).ok_or_else(|| {
-                AppError::Internal(format!(
-                    "frozen plan image {} is missing persisted Fingerprint V2 evidence",
-                    img.import_image_id
-                ))
-            })?;
+        let (
+            pixel_hash,
+            block_hash_16,
+            double_gradient_hash_32,
+            perceptual_eligible,
+            fingerprint_version,
+        ) = fingerprints.get(&img.import_image_id).ok_or_else(|| {
+            AppError::Internal(format!(
+                "frozen plan image {} is missing persisted Fingerprint V2 evidence",
+                img.import_image_id
+            ))
+        })?;
         let image_id = Uuid::new_v4();
         transaction
             .execute(
                 "INSERT INTO library_images
                  (id, album_id, relative_path, file_size, width, height, format,
                   blake3, pixel_hash, block_hash_16, double_gradient_hash_32,
-                  fingerprint_version, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'committed')",
+                  perceptual_eligible, fingerprint_version, state)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'committed')",
                 &[
                     &image_id,
                     &library_album_id,
@@ -2788,6 +2794,7 @@ pub(crate) async fn commit_library_records_transaction(
                     pixel_hash,
                     block_hash_16,
                     double_gradient_hash_32,
+                    perceptual_eligible,
                     fingerprint_version,
                 ],
             )
@@ -3703,6 +3710,7 @@ mod tests {
                     pixel_hash: Some(vec![1; 32]),
                     block_hash_16: Some(vec![1; 32]),
                     double_gradient_hash_32: Some(vec![1; 68]),
+                    perceptual_eligible: true,
                     fingerprint_version: Some("2".to_string()),
                     state: ImportImageState::Fingerprinted,
                 },
@@ -3785,17 +3793,26 @@ mod tests {
             let mgr = pg_manager.lock().await;
             mgr.connect().await.unwrap()
         };
-        let count: i64 = client2
+        let library_row = client2
             .query_one(
-                "SELECT COUNT(*) FROM library_images li JOIN library_albums la ON la.id = li.album_id WHERE la.relative_path = 'album_a'",
+                "SELECT COUNT(*) AS image_count,
+                        COUNT(*) FILTER (WHERE li.perceptual_eligible) AS eligible_count
+                 FROM library_images li
+                 JOIN library_albums la ON la.id = li.album_id
+                 WHERE la.relative_path = 'album_a'",
                 &[],
             )
             .await
-            .unwrap()
-            .get(0);
+            .unwrap();
+        let count: i64 = library_row.get("image_count");
         assert_eq!(
             count, 2,
             "exactly two library images after idempotent rerun"
+        );
+        assert_eq!(
+            library_row.get::<_, i64>("eligible_count"),
+            2,
+            "perceptual eligibility must be copied into committed library rows"
         );
         drop(client2);
         handle2.abort();

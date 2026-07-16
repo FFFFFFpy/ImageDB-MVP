@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`feat/mvp4-fingerprint-v2`
 
-当前实施阶段：Fingerprint V2 审查修复与验证收口。固定方案为完整文件/像素 BLAKE3、BlockHash 16×16、DoubleGradient 32×32、Triangle、8 种几何变换、并列粗距离变换精排、图集内与图库内存 BK-tree、代表边精确去重、缓存批量 upsert、候选批量读写及 `fingerprint_version = 2`。MVP4 不增加算法设置 UI，不改变审核动作、frozen plan、Commit、文件事务或 Recovery 状态机。
+当前实施阶段：Fingerprint V2 审查修复完成，完整质量门已通过。固定方案为完整文件/像素 BLAKE3、BlockHash 16×16、DoubleGradient 32×32、Triangle、8 种几何变换、低信息量感知资格门禁、并列粗距离变换精排、图集内与图库内存 BK-tree、import run 级代表边精确去重、缓存批量 upsert、候选批量读写及 `fingerprint_version = 2`。MVP4 不增加算法设置 UI，不改变审核动作、frozen plan、Commit、文件事务或 Recovery 状态机。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。除 M3.8 明确授权的 `abandoned` / `invalidated` 外，M3 不修改 frozen plan、Commit、Recovery、数据库 migration、匹配算法或文件事务语义。
 
@@ -58,7 +58,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
 - MVP3 UI 重设计：M3.0–M3.8 已进入审查修复与验证收口；Windows 100% / 150% 系统缩放不是本轮完成门禁或阻塞项。
-- MVP4 Fingerprint V2：实现完成，进入最终质量门与提交收口。
+- MVP4 Fingerprint V2：实现与审查修复完成，完整质量门通过，待分支提交交付。
 
 ## 文档入口
 

@@ -16,6 +16,7 @@ DROP INDEX IF EXISTS idx_import_images_band_3;
 ALTER TABLE import_images
     ADD COLUMN block_hash_16 BYTEA,
     ADD COLUMN double_gradient_hash_32 BYTEA,
+    ADD COLUMN perceptual_eligible BOOLEAN NOT NULL DEFAULT FALSE,
     DROP COLUMN gradient_hash,
     DROP COLUMN block_hash,
     DROP COLUMN median_hash,
@@ -27,6 +28,7 @@ ALTER TABLE import_images
 ALTER TABLE library_images
     ADD COLUMN block_hash_16 BYTEA,
     ADD COLUMN double_gradient_hash_32 BYTEA,
+    ADD COLUMN perceptual_eligible BOOLEAN NOT NULL DEFAULT FALSE,
     DROP COLUMN gradient_hash,
     DROP COLUMN block_hash,
     DROP COLUMN median_hash,

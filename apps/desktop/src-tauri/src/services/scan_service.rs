@@ -11,11 +11,12 @@ use crate::infrastructure::image_fingerprint_v2::{
 };
 use crate::infrastructure::library_fingerprint_index::{
     BlockTransformMatches, HammingBkTree, LibraryFingerprintIndex, LibraryRecallMatch,
+    LibraryRecallResult,
 };
 use crate::infrastructure::postgres::PostgresManager;
 use crate::infrastructure::settings::SettingsStore;
 use crate::repositories::import_repository::{
-    ImportRepository, NewDuplicateCandidate, NewImportImage,
+    ImportRepository, NewDuplicateCandidate, NewImportImage, RunExactFingerprintRow,
 };
 use crate::services::source_snapshot_service::{
     capture_source_album_snapshot_with_cancel, verify_source_album_snapshot_with_cancel,
@@ -92,6 +93,7 @@ struct FingerprintedData {
     pixel_hash_bytes: Vec<u8>,
     block_hash_16: Vec<u8>,
     double_gradient_hash_32: Vec<u8>,
+    perceptual_eligible: bool,
     block_variants: Vec<BlockHashVariant>,
     fine_thumbnail_32: image::GrayImage,
 }
@@ -101,12 +103,86 @@ struct AlbumImageEntry {
     fp: FingerprintedData,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunExactFingerprint {
+    image_id: Uuid,
+    album_id: Uuid,
+    file_size: i64,
+    blake3: Vec<u8>,
+    pixel_hash: Vec<u8>,
+}
+
+impl RunExactFingerprint {
+    fn from_album_image(album_id: Uuid, image: &AlbumImageEntry) -> Self {
+        Self {
+            image_id: image.image_db_id,
+            album_id,
+            file_size: image.fp.file_size as i64,
+            blake3: image.fp.blake3_bytes.clone(),
+            pixel_hash: image.fp.pixel_hash_bytes.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunExactRepresentativeIndex {
+    file_representatives: HashMap<(i64, Vec<u8>), RunExactFingerprint>,
+    pixel_representatives: HashMap<Vec<u8>, RunExactFingerprint>,
+}
+
+impl RunExactRepresentativeIndex {
+    fn from_rows(rows: Vec<RunExactFingerprintRow>) -> Self {
+        let mut index = Self::default();
+        for row in rows {
+            index.add(RunExactFingerprint {
+                image_id: row.id,
+                album_id: row.album_id,
+                file_size: row.file_size,
+                blake3: row.blake3,
+                pixel_hash: row.pixel_hash,
+            });
+        }
+        index
+    }
+
+    fn add_album(&mut self, album_id: Uuid, images: &[AlbumImageEntry]) {
+        for image in images {
+            self.add(RunExactFingerprint::from_album_image(album_id, image));
+        }
+    }
+
+    fn add(&mut self, fingerprint: RunExactFingerprint) {
+        let file_key = (fingerprint.file_size, fingerprint.blake3.clone());
+        match self.file_representatives.get_mut(&file_key) {
+            Some(current) if fingerprint.image_id < current.image_id => {
+                *current = fingerprint.clone();
+            }
+            None => {
+                self.file_representatives
+                    .insert(file_key, fingerprint.clone());
+            }
+            _ => {}
+        }
+        match self.pixel_representatives.get_mut(&fingerprint.pixel_hash) {
+            Some(current) if fingerprint.image_id < current.image_id => {
+                *current = fingerprint.clone();
+            }
+            None => {
+                self.pixel_representatives
+                    .insert(fingerprint.pixel_hash.clone(), fingerprint);
+            }
+            _ => {}
+        }
+    }
+}
+
 struct AlbumDetectionContext<'a> {
     client: &'a Client,
     import_run_id: Uuid,
     album_id: Uuid,
     cancelled: &'a AtomicBool,
     library_index: &'a Arc<RwLock<Option<LibraryFingerprintIndex>>>,
+    run_exact_index: &'a RunExactRepresentativeIndex,
 }
 
 async fn emit_progress(progress: &ScanProgressEvent, tracker: &Mutex<ScanProgress>) {
@@ -236,6 +312,7 @@ fn normalize_relative_path(path: &Path) -> String {
 
 #[derive(Debug)]
 struct PerceptualEvidence {
+    perceptual_eligible: bool,
     block_distance: i32,
     double_gradient_distance: i32,
     block_distance_ratio: f64,
@@ -255,6 +332,7 @@ struct AlbumAnalysisMetrics {
     image_count: usize,
     fingerprint_success_count: usize,
     fingerprint_failure_count: usize,
+    perceptual_ineligible_count: usize,
     file_exact_candidate_count: usize,
     pixel_exact_candidate_count: usize,
     perceptual_recall_candidate_count: usize,
@@ -316,84 +394,103 @@ fn insert_best_candidate(
     Ok(())
 }
 
-fn insert_intra_exact_representative_candidates(
+fn insert_run_exact_representative_candidates(
     import_run_id: Uuid,
+    album_id: Uuid,
     images: &[&AlbumImageEntry],
+    run_index: &RunExactRepresentativeIndex,
     candidates: &mut HashMap<CandidateKey, NewDuplicateCandidate>,
 ) -> Result<(), AppError> {
-    let mut file_groups: HashMap<(u64, Vec<u8>), Vec<&AlbumImageEntry>> = HashMap::new();
-    let mut pixel_groups: HashMap<Vec<u8>, Vec<&AlbumImageEntry>> = HashMap::new();
+    let mut file_groups: HashMap<(i64, Vec<u8>), Vec<RunExactFingerprint>> = HashMap::new();
+    let mut pixel_groups: HashMap<Vec<u8>, Vec<RunExactFingerprint>> = HashMap::new();
     for &image in images {
+        let fingerprint = RunExactFingerprint::from_album_image(album_id, image);
         file_groups
-            .entry((image.fp.file_size, image.fp.blake3_bytes.clone()))
+            .entry((fingerprint.file_size, fingerprint.blake3.clone()))
             .or_default()
-            .push(image);
+            .push(fingerprint.clone());
         pixel_groups
-            .entry(image.fp.pixel_hash_bytes.clone())
+            .entry(fingerprint.pixel_hash.clone())
             .or_default()
-            .push(image);
+            .push(fingerprint);
     }
 
-    for group in file_groups.values() {
-        if let Some(&representative) = group.iter().min_by_key(|image| image.image_db_id) {
-            for &current in group {
-                if current.image_db_id == representative.image_db_id {
-                    continue;
-                }
-                insert_best_candidate(
-                    candidates,
-                    NewDuplicateCandidate {
-                        import_run_id,
-                        source_image_id: current.image_db_id,
-                        candidate_source_image_id: Some(representative.image_db_id),
-                        candidate_library_image_id: None,
-                        scope: DuplicateScope::IntraAlbum,
-                        match_type: MatchType::FileExact,
-                        blake3_equal: true,
-                        pixel_hash_equal: current.fp.pixel_hash_bytes
-                            == representative.fp.pixel_hash_bytes,
-                        block_distance: None,
-                        double_gradient_distance: None,
-                        block_distance_ratio: None,
-                        double_gradient_distance_ratio: None,
-                        transform_type: None,
-                        confidence: Some(1.0),
-                        decision: Some(Decision::AutoDuplicate),
-                        decision_source: Some(DecisionSource::ExactRule),
-                    },
-                )?;
-            }
+    for (key, group) in file_groups {
+        insert_exact_star(
+            import_run_id,
+            group,
+            run_index.file_representatives.get(&key),
+            MatchType::FileExact,
+            candidates,
+        )?;
+    }
+    for (key, group) in pixel_groups {
+        insert_exact_star(
+            import_run_id,
+            group,
+            run_index.pixel_representatives.get(&key),
+            MatchType::PixelExact,
+            candidates,
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_exact_star(
+    import_run_id: Uuid,
+    mut current_members: Vec<RunExactFingerprint>,
+    prior_representative: Option<&RunExactFingerprint>,
+    match_type: MatchType,
+    candidates: &mut HashMap<CandidateKey, NewDuplicateCandidate>,
+) -> Result<(), AppError> {
+    if let Some(prior) = prior_representative {
+        if !current_members
+            .iter()
+            .any(|member| member.image_id == prior.image_id)
+        {
+            current_members.push(prior.clone());
         }
     }
-    for group in pixel_groups.values() {
-        if let Some(&representative) = group.iter().min_by_key(|image| image.image_db_id) {
-            for &current in group {
-                if current.image_db_id == representative.image_db_id {
-                    continue;
-                }
-                insert_best_candidate(
-                    candidates,
-                    NewDuplicateCandidate {
-                        import_run_id,
-                        source_image_id: current.image_db_id,
-                        candidate_source_image_id: Some(representative.image_db_id),
-                        candidate_library_image_id: None,
-                        scope: DuplicateScope::IntraAlbum,
-                        match_type: MatchType::PixelExact,
-                        blake3_equal: false,
-                        pixel_hash_equal: true,
-                        block_distance: None,
-                        double_gradient_distance: None,
-                        block_distance_ratio: None,
-                        double_gradient_distance_ratio: None,
-                        transform_type: None,
-                        confidence: Some(1.0),
-                        decision: Some(Decision::AutoDuplicate),
-                        decision_source: Some(DecisionSource::ExactRule),
-                    },
-                )?;
-            }
+    let Some(representative) = current_members
+        .iter()
+        .min_by_key(|member| member.image_id)
+        .cloned()
+    else {
+        return Ok(());
+    };
+
+    for member in current_members {
+        if member.image_id == representative.image_id {
+            continue;
         }
+        let is_file_exact =
+            member.file_size == representative.file_size && member.blake3 == representative.blake3;
+        let is_pixel_exact = member.pixel_hash == representative.pixel_hash;
+        insert_best_candidate(
+            candidates,
+            NewDuplicateCandidate {
+                import_run_id,
+                source_image_id: member.image_id,
+                candidate_source_image_id: Some(representative.image_id),
+                candidate_library_image_id: None,
+                scope: if member.album_id == representative.album_id {
+                    DuplicateScope::IntraAlbum
+                } else {
+                    DuplicateScope::CrossAlbum
+                },
+                match_type: match_type.clone(),
+                blake3_equal: is_file_exact,
+                pixel_hash_equal: is_pixel_exact,
+                block_distance: None,
+                double_gradient_distance: None,
+                block_distance_ratio: None,
+                double_gradient_distance_ratio: None,
+                transform_type: None,
+                confidence: Some(1.0),
+                decision: Some(Decision::AutoDuplicate),
+                decision_source: Some(DecisionSource::ExactRule),
+            },
+        )?;
     }
     Ok(())
 }
@@ -401,6 +498,9 @@ fn insert_intra_exact_representative_candidates(
 fn classify_perceptual(
     evidence: &PerceptualEvidence,
 ) -> Option<(MatchType, Option<Decision>, Option<DecisionSource>)> {
+    if !evidence.perceptual_eligible {
+        return None;
+    }
     if evidence.block_distance_ratio <= BLOCK_AUTO_DISTANCE_RATIO
         && evidence.double_gradient_distance_ratio <= DOUBLE_GRADIENT_AUTO_DISTANCE_RATIO
     {
@@ -420,6 +520,7 @@ fn classify_perceptual(
 
 fn select_best_fine_transform(
     source: &FingerprintedData,
+    candidate_perceptual_eligible: bool,
     candidate_block_hash: &[u8],
     candidate_fine_hash: &[u8],
     transforms: &[TransformType],
@@ -444,6 +545,7 @@ fn select_best_fine_transform(
             });
         let fine_distance = hamming_distance(transformed_fine, candidate_fine_hash)?;
         let evidence = PerceptualEvidence {
+            perceptual_eligible: source.perceptual_eligible && candidate_perceptual_eligible,
             block_distance: block_distance.raw_distance as i32,
             double_gradient_distance: fine_distance.raw_distance as i32,
             block_distance_ratio: block_distance.normalized_distance,
@@ -488,6 +590,7 @@ fn fingerprint_image_sync(path: &Path) -> Result<FingerprintedData, AppError> {
         pixel_hash_bytes: fingerprint.pixel_hash,
         block_hash_16: fingerprint.block_hash_16,
         double_gradient_hash_32: fingerprint.double_gradient_hash_32,
+        perceptual_eligible: fingerprint.perceptual_eligible,
         block_variants: fingerprint.block_variants,
         fine_thumbnail_32: fingerprint.fine_thumbnail_32,
     })
@@ -549,14 +652,24 @@ async fn detect_album_duplicates(
     let mut block_hash_to_images: HashMap<Vec<u8>, Vec<&AlbumImageEntry>> = HashMap::new();
     let intra_started = Instant::now();
 
-    // Exact groups only need a stable star: every member is connected to the
-    // lowest UUID representative. Connected-component grouping is identical
-    // to a clique while candidate storage stays O(k).
-    insert_intra_exact_representative_candidates(ctx.import_run_id, images, &mut candidates)?;
+    // File and pixel exact groups share run-level stable representatives.
+    // Every new member adds one representative edge, so a k-member group has
+    // k - 1 stored edges even when it spans many albums or a resumed scan.
+    insert_run_exact_representative_candidates(
+        ctx.import_run_id,
+        ctx.album_id,
+        images,
+        ctx.run_exact_index,
+        &mut candidates,
+    )?;
 
     for current in images {
         if ctx.cancelled.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        if !current.fp.perceptual_eligible {
+            metrics.perceptual_ineligible_count += 1;
+            continue;
         }
 
         let mut recalled: HashMap<Uuid, (&AlbumImageEntry, BlockTransformMatches)> = HashMap::new();
@@ -603,6 +716,7 @@ async fn detect_album_duplicates(
             let fine_started = Instant::now();
             let evidence = select_best_fine_transform(
                 &current.fp,
+                prior.fp.perceptual_eligible,
                 &prior.fp.block_hash_16,
                 &prior.fp.double_gradient_hash_32,
                 &block_matches.transforms,
@@ -644,57 +758,6 @@ async fn detect_album_duplicates(
     }
     metrics.intra_detection_ms = intra_started.elapsed().as_millis();
 
-    let album_blake3: Vec<Vec<u8>> = images
-        .iter()
-        .map(|entry| entry.fp.blake3_bytes.clone())
-        .collect();
-    let siblings = ImportRepository::find_sibling_images_by_blake3(
-        ctx.client,
-        ctx.import_run_id,
-        &album_blake3,
-    )
-    .await?;
-    let mut siblings_by_hash: HashMap<Vec<u8>, Vec<(Uuid, Uuid, i64)>> = HashMap::new();
-    for (id, album_id, file_size, blake3) in siblings {
-        siblings_by_hash
-            .entry(blake3)
-            .or_default()
-            .push((id, album_id, file_size));
-    }
-    for entry in images {
-        if let Some(siblings) = siblings_by_hash.get(&entry.fp.blake3_bytes) {
-            for (sibling_id, sibling_album_id, file_size) in siblings {
-                if *sibling_album_id == ctx.album_id
-                    || *sibling_id == entry.image_db_id
-                    || *file_size != entry.fp.file_size as i64
-                {
-                    continue;
-                }
-                insert_best_candidate(
-                    &mut candidates,
-                    NewDuplicateCandidate {
-                        import_run_id: ctx.import_run_id,
-                        source_image_id: entry.image_db_id,
-                        candidate_source_image_id: Some(*sibling_id),
-                        candidate_library_image_id: None,
-                        scope: DuplicateScope::CrossAlbum,
-                        match_type: MatchType::FileExact,
-                        blake3_equal: true,
-                        pixel_hash_equal: false,
-                        block_distance: None,
-                        double_gradient_distance: None,
-                        block_distance_ratio: None,
-                        double_gradient_distance_ratio: None,
-                        transform_type: None,
-                        confidence: Some(1.0),
-                        decision: Some(Decision::AutoDuplicate),
-                        decision_source: Some(DecisionSource::ExactRule),
-                    },
-                )?;
-            }
-        }
-    }
-
     ensure_library_index(ctx.client, ctx.library_index).await?;
     for entry in images {
         if ctx.cancelled.load(Ordering::Relaxed) {
@@ -709,10 +772,17 @@ async fn detect_album_duplicates(
             let exact_file_ids =
                 index.exact_file_matches(entry.fp.file_size as i64, &entry.fp.blake3_bytes);
             let exact_pixel_ids = index.exact_pixel_matches(&entry.fp.pixel_hash_bytes);
-            let recall = index.recall(
-                &entry.fp.block_variants,
-                recall_radius((entry.fp.block_hash_16.len() * 8) as u32),
-            )?;
+            let recall = if entry.fp.perceptual_eligible {
+                index.recall(
+                    &entry.fp.block_variants,
+                    recall_radius((entry.fp.block_hash_16.len() * 8) as u32),
+                )?
+            } else {
+                LibraryRecallResult {
+                    matches: Vec::new(),
+                    truncated: false,
+                }
+            };
 
             for library_id in &exact_file_ids {
                 let pixel_equal = index
@@ -812,6 +882,7 @@ async fn detect_album_duplicates(
             let fine_started = Instant::now();
             let evidence = select_best_fine_transform(
                 &entry.fp,
+                library.perceptual_eligible,
                 library_block_hash,
                 library_fine_hash,
                 &recall.transforms,
@@ -1099,6 +1170,10 @@ async fn run_scan_inner(
     emit_progress(&progress, &progress_tracker).await;
     tracing::info!(%import_run_id, "album workflow analysis stage started");
 
+    let analyzed_exact_rows =
+        ImportRepository::get_analyzed_run_exact_representatives(&client, import_run_id).await?;
+    let mut run_exact_index = RunExactRepresentativeIndex::from_rows(analyzed_exact_rows);
+
     let album_rows = client
         .query(
             "SELECT id, source_path, source_name, state
@@ -1324,6 +1399,7 @@ async fn run_scan_inner(
                             pixel_hash: Some(fp.pixel_hash_bytes.clone()),
                             block_hash_16: Some(fp.block_hash_16.clone()),
                             double_gradient_hash_32: Some(fp.double_gradient_hash_32.clone()),
+                            perceptual_eligible: fp.perceptual_eligible,
                             fingerprint_version: Some(FINGERPRINT_VERSION.to_string()),
                             state: ImportImageState::Fingerprinted,
                         },
@@ -1352,6 +1428,7 @@ async fn run_scan_inner(
                             pixel_hash: None,
                             block_hash_16: None,
                             double_gradient_hash_32: None,
+                            perceptual_eligible: false,
                             fingerprint_version: None,
                             state: ImportImageState::Failed,
                         },
@@ -1398,6 +1475,7 @@ async fn run_scan_inner(
             album_id: album_db_id,
             cancelled: &cancelled,
             library_index: &library_index,
+            run_exact_index: &run_exact_index,
         };
         if let Err(e) = detect_album_duplicates(
             &detection_ctx,
@@ -1436,6 +1514,7 @@ async fn run_scan_inner(
 
         let album_status =
             ImportRepository::finalize_import_album_analysis(&client, album_db_id).await?;
+        run_exact_index.add_album(album_db_id, &album_images);
         emit_progress(&progress, &progress_tracker).await;
         tracing::info!(
             %import_run_id,
@@ -1448,6 +1527,7 @@ async fn run_scan_inner(
             image_count = album_metrics.image_count,
             fingerprint_success_count = album_metrics.fingerprint_success_count,
             fingerprint_failure_count = album_metrics.fingerprint_failure_count,
+            perceptual_ineligible_count = album_metrics.perceptual_ineligible_count,
             file_exact_candidate_count = album_metrics.file_exact_candidate_count,
             pixel_exact_candidate_count = album_metrics.pixel_exact_candidate_count,
             perceptual_recall_candidate_count = album_metrics.perceptual_recall_candidate_count,
@@ -1606,6 +1686,7 @@ mod tests {
             pixel_hash_bytes: vec![marker; 32],
             block_hash_16: vec![marker; 32],
             double_gradient_hash_32: vec![marker; 68],
+            perceptual_eligible: true,
             block_variants: TransformType::ALL
                 .iter()
                 .map(|&transform| BlockHashVariant {
@@ -1620,7 +1701,8 @@ mod tests {
     #[test]
     fn exact_duplicate_groups_use_one_stable_representative_edge_per_member() {
         let import_run_id = Uuid::from_u128(999);
-        let images: Vec<_> = (1..=500_u128)
+        let album_id = Uuid::from_u128(1000);
+        let images: Vec<_> = (1..=20_u128)
             .rev()
             .map(|id| AlbumImageEntry {
                 image_db_id: Uuid::from_u128(id),
@@ -1629,17 +1711,63 @@ mod tests {
             .collect();
         let refs: Vec<_> = images.iter().collect();
         let mut candidates = HashMap::new();
+        let run_index = RunExactRepresentativeIndex::default();
 
-        insert_intra_exact_representative_candidates(import_run_id, &refs, &mut candidates)
-            .unwrap();
+        insert_run_exact_representative_candidates(
+            import_run_id,
+            album_id,
+            &refs,
+            &run_index,
+            &mut candidates,
+        )
+        .unwrap();
 
         let representative = Uuid::from_u128(1);
-        assert_eq!(candidates.len(), 499);
+        assert_eq!(candidates.len(), 19);
         assert!(candidates.values().all(|candidate| {
             candidate.match_type == MatchType::FileExact
                 && candidate.source_image_id == representative
                 && candidate.candidate_source_image_id != Some(representative)
         }));
+    }
+
+    #[test]
+    fn run_exact_groups_across_four_albums_store_only_nineteen_edges() {
+        let import_run_id = Uuid::from_u128(900);
+        let mut run_index = RunExactRepresentativeIndex::default();
+        let mut candidates = HashMap::new();
+
+        for album_number in 0..4_u128 {
+            let album_id = Uuid::from_u128(100 + album_number);
+            let images: Vec<_> = (1..=5_u128)
+                .map(|offset| AlbumImageEntry {
+                    image_db_id: Uuid::from_u128(album_number * 5 + offset),
+                    fp: synthetic_fingerprint(7),
+                })
+                .collect();
+            let refs: Vec<_> = images.iter().collect();
+            insert_run_exact_representative_candidates(
+                import_run_id,
+                album_id,
+                &refs,
+                &run_index,
+                &mut candidates,
+            )
+            .unwrap();
+            run_index.add_album(album_id, &images);
+        }
+
+        assert_eq!(candidates.len(), 19);
+        assert_eq!(
+            candidates
+                .values()
+                .filter(|candidate| candidate.scope == DuplicateScope::CrossAlbum)
+                .count(),
+            15
+        );
+        assert!(candidates
+            .values()
+            .all(|candidate| candidate.match_type == MatchType::FileExact));
     }
 
     #[test]
@@ -1668,6 +1796,7 @@ mod tests {
 
         let evidence = select_best_fine_transform(
             &source,
+            true,
             &[0; 32],
             &rot90_fine,
             &[TransformType::FlipH, TransformType::Rot90],
@@ -1710,6 +1839,7 @@ mod tests {
         let fine_distance =
             hamming_distance(&source_fine, &candidate.double_gradient_hash_32).unwrap();
         PerceptualEvidence {
+            perceptual_eligible: source.perceptual_eligible && candidate.perceptual_eligible,
             block_distance: block_distance.raw_distance as i32,
             double_gradient_distance: fine_distance.raw_distance as i32,
             block_distance_ratio: block_distance.normalized_distance,
@@ -2118,6 +2248,7 @@ mod tests {
     #[test]
     fn test_classify_perceptual_near_auto() {
         let evidence = PerceptualEvidence {
+            perceptual_eligible: true,
             block_distance: 1,
             double_gradient_distance: 2,
             block_distance_ratio: 0.03,
@@ -2134,6 +2265,7 @@ mod tests {
     #[test]
     fn test_classify_perceptual_review() {
         let evidence = PerceptualEvidence {
+            perceptual_eligible: true,
             block_distance: 5,
             double_gradient_distance: 5,
             block_distance_ratio: 0.12,
@@ -2150,6 +2282,7 @@ mod tests {
     #[test]
     fn test_classify_perceptual_rejects_outside_review_threshold() {
         let evidence = PerceptualEvidence {
+            perceptual_eligible: true,
             block_distance: 6,
             double_gradient_distance: 7,
             block_distance_ratio: 0.121,
@@ -2157,6 +2290,21 @@ mod tests {
             transform_type: TransformType::Rot90,
             confidence: 0.7,
         };
+        assert!(classify_perceptual(&evidence).is_none());
+    }
+
+    #[test]
+    fn perceptually_ineligible_images_never_auto_duplicate() {
+        let evidence = PerceptualEvidence {
+            perceptual_eligible: false,
+            block_distance: 0,
+            double_gradient_distance: 0,
+            block_distance_ratio: 0.0,
+            double_gradient_distance_ratio: 0.0,
+            transform_type: TransformType::Identity,
+            confidence: 1.0,
+        };
+
         assert!(classify_perceptual(&evidence).is_none());
     }
 
@@ -2279,6 +2427,7 @@ mod tests {
                     pixel_hash: Some(fp.pixel_hash_bytes.clone()),
                     block_hash_16: Some(fp.block_hash_16.clone()),
                     double_gradient_hash_32: Some(fp.double_gradient_hash_32.clone()),
+                    perceptual_eligible: fp.perceptual_eligible,
                     fingerprint_version: Some("2".to_string()),
                     state: ImportImageState::Fingerprinted,
                 },
@@ -2532,12 +2681,14 @@ mod tests {
         };
         let cancelled = AtomicBool::new(false);
         let library_index = Arc::new(RwLock::new(None));
+        let run_exact_index = RunExactRepresentativeIndex::default();
         let detection_ctx = AlbumDetectionContext {
             client: &client,
             import_run_id,
             album_id,
             cancelled: &cancelled,
             library_index: &library_index,
+            run_exact_index: &run_exact_index,
         };
         let mut detected = 0;
         let mut metrics = AlbumAnalysisMetrics::default();
@@ -2642,6 +2793,7 @@ mod tests {
                     pixel_hash: Some(fp.pixel_hash_bytes),
                     block_hash_16: Some(fp.block_hash_16),
                     double_gradient_hash_32: Some(fp.double_gradient_hash_32),
+                    perceptual_eligible: fp.perceptual_eligible,
                     fingerprint_version: Some("2".to_string()),
                     state: ImportImageState::Fingerprinted,
                 },

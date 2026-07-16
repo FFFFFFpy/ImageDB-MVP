@@ -21,6 +21,10 @@ pub const BLOCK_DISTANCE_WEIGHT: f64 = 0.40;
 pub const DOUBLE_GRADIENT_DISTANCE_WEIGHT: f64 = 0.60;
 pub const MAX_RECALL_CANDIDATES_PER_IMAGE: usize = 256;
 
+const MIN_GRAYSCALE_STDDEV: f64 = 8.0;
+const MIN_EFFECTIVE_GRAYSCALE_BINS: usize = 4;
+const MIN_MEAN_EDGE_DELTA: f64 = 2.0;
+
 pub const BLOCK_HASH_BIT_LENGTH: u32 = BLOCK_HASH_SIZE * BLOCK_HASH_SIZE;
 // image_hasher's DoubleGradient 32x32 configuration compares both axes on
 // a 17x17 working image: 16x17 horizontal plus 17x16 vertical comparisons.
@@ -51,6 +55,7 @@ pub struct ImageFingerprintV2 {
     pub pixel_hash: Vec<u8>,
     pub block_hash_16: Vec<u8>,
     pub double_gradient_hash_32: Vec<u8>,
+    pub perceptual_eligible: bool,
     pub block_variants: Vec<BlockHashVariant>,
     /// Small, post-orientation grayscale image retained only while the scan
     /// is active so the winning transform can be fine-hashed once.
@@ -241,6 +246,11 @@ fn fingerprint_bytes(path: &Path, file_bytes: &[u8]) -> Result<ImageFingerprintV
 
     let block_hash_16 = compute_block_hash(&block_thumbnail);
     let double_gradient_hash_32 = compute_double_gradient_hash(&fine_thumbnail_32);
+    let perceptual_eligible = evaluate_perceptual_eligibility(
+        &fine_thumbnail_32,
+        &block_hash_16,
+        &double_gradient_hash_32,
+    );
     let block_variants = TransformType::ALL
         .iter()
         .map(|&transform| {
@@ -262,9 +272,81 @@ fn fingerprint_bytes(path: &Path, file_bytes: &[u8]) -> Result<ImageFingerprintV
         pixel_hash,
         block_hash_16,
         double_gradient_hash_32,
+        perceptual_eligible,
         block_variants,
         fine_thumbnail_32,
     })
+}
+
+fn evaluate_perceptual_eligibility(
+    thumbnail: &GrayImage,
+    block_hash: &[u8],
+    double_gradient_hash: &[u8],
+) -> bool {
+    let sample_count = (thumbnail.width() * thumbnail.height()) as usize;
+    if sample_count == 0 {
+        return false;
+    }
+
+    let mut sum = 0.0;
+    let mut histogram = [0_usize; 16];
+    for pixel in thumbnail.pixels() {
+        let value = pixel[0] as usize;
+        sum += value as f64;
+        histogram[value / 16] += 1;
+    }
+    let mean = sum / sample_count as f64;
+    let variance = thumbnail
+        .pixels()
+        .map(|pixel| {
+            let delta = pixel[0] as f64 - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / sample_count as f64;
+    let standard_deviation = variance.sqrt();
+
+    // Ignore isolated compression speckles when counting meaningful levels.
+    let minimum_bin_population = (sample_count / 200).max(2);
+    let effective_bins = histogram
+        .iter()
+        .filter(|&&count| count >= minimum_bin_population)
+        .count();
+
+    let mut edge_delta_sum = 0_u64;
+    let mut edge_count = 0_u64;
+    for y in 0..thumbnail.height() {
+        for x in 0..thumbnail.width() {
+            let value = thumbnail.get_pixel(x, y)[0];
+            if x + 1 < thumbnail.width() {
+                edge_delta_sum += value.abs_diff(thumbnail.get_pixel(x + 1, y)[0]) as u64;
+                edge_count += 1;
+            }
+            if y + 1 < thumbnail.height() {
+                edge_delta_sum += value.abs_diff(thumbnail.get_pixel(x, y + 1)[0]) as u64;
+                edge_count += 1;
+            }
+        }
+    }
+    let mean_edge_delta = if edge_count == 0 {
+        0.0
+    } else {
+        edge_delta_sum as f64 / edge_count as f64
+    };
+
+    let block_information = hash_information_bits(block_hash);
+    let fine_information = hash_information_bits(double_gradient_hash);
+    standard_deviation >= MIN_GRAYSCALE_STDDEV
+        && effective_bins >= MIN_EFFECTIVE_GRAYSCALE_BINS
+        && mean_edge_delta >= MIN_MEAN_EDGE_DELTA
+        && block_information >= ((block_hash.len() * 8) as u32 / 64).max(1)
+        && fine_information >= ((double_gradient_hash.len() * 8) as u32 / 64).max(1)
+}
+
+fn hash_information_bits(hash: &[u8]) -> u32 {
+    let one_bits: u32 = hash.iter().map(|byte| byte.count_ones()).sum();
+    let total_bits = (hash.len() * 8) as u32;
+    one_bits.min(total_bits.saturating_sub(one_bits))
 }
 
 pub fn compute_double_gradient_for_transform(
@@ -575,6 +657,48 @@ mod tests {
             .block_variants
             .iter()
             .any(|variant| variant.transform == TransformType::Identity));
+        assert!(fingerprint.perceptual_eligible);
+    }
+
+    #[test]
+    fn flat_and_near_blank_images_are_not_perceptually_eligible() {
+        let tmp = TempDir::new().unwrap();
+        let fixtures = [
+            ("white.png", image::Rgba([255, 255, 255, 255])),
+            ("black.png", image::Rgba([0, 0, 0, 255])),
+            ("red.png", image::Rgba([255, 0, 0, 255])),
+            ("blue.png", image::Rgba([0, 0, 255, 255])),
+            ("gray-80.png", image::Rgba([80, 80, 80, 255])),
+            ("gray-160.png", image::Rgba([160, 160, 160, 255])),
+        ];
+        let mut fingerprints = Vec::new();
+        for (name, color) in fixtures {
+            let path = tmp.path().join(name);
+            write_png(&path, &RgbaImage::from_pixel(128, 128, color));
+            let fingerprint = fingerprint_image(&path).unwrap();
+            assert!(!fingerprint.perceptual_eligible, "fixture {name}");
+            fingerprints.push(fingerprint);
+        }
+        assert_ne!(fingerprints[0].pixel_hash, fingerprints[1].pixel_hash);
+        assert_ne!(fingerprints[2].pixel_hash, fingerprints[3].pixel_hash);
+        assert_ne!(fingerprints[4].pixel_hash, fingerprints[5].pixel_hash);
+
+        let blank_path = tmp.path().join("near-blank.png");
+        let content_path = tmp.path().join("near-blank-with-content.png");
+        let blank = RgbaImage::from_pixel(128, 128, image::Rgba([250, 250, 250, 255]));
+        let mut tiny_content = blank.clone();
+        for y in 61..67 {
+            for x in 59..65 {
+                tiny_content.put_pixel(x, y, image::Rgba([40, 40, 40, 255]));
+            }
+        }
+        write_png(&blank_path, &blank);
+        write_png(&content_path, &tiny_content);
+        let blank_fingerprint = fingerprint_image(&blank_path).unwrap();
+        let content_fingerprint = fingerprint_image(&content_path).unwrap();
+        assert_ne!(blank_fingerprint.pixel_hash, content_fingerprint.pixel_hash);
+        assert!(!blank_fingerprint.perceptual_eligible);
+        assert!(!content_fingerprint.perceptual_eligible);
     }
 
     #[test]

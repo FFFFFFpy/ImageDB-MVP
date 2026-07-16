@@ -124,6 +124,7 @@ pub struct LibraryFingerprintMetadata {
     pub blake3: Vec<u8>,
     pub pixel_hash: Vec<u8>,
     pub block_hash_16: Vec<u8>,
+    pub perceptual_eligible: bool,
     fingerprint_signature: [u8; 32],
 }
 
@@ -280,13 +281,15 @@ impl LibraryFingerprintIndex {
         &mut self,
         metadata: LibraryFingerprintMetadata,
     ) -> Result<(), AppError> {
-        self.block_tree.insert(metadata.block_hash_16.clone())?;
-        insert_sorted_unique(
-            self.hash_to_image_ids
-                .entry(metadata.block_hash_16.clone())
-                .or_default(),
-            metadata.image_id,
-        );
+        if metadata.perceptual_eligible {
+            self.block_tree.insert(metadata.block_hash_16.clone())?;
+            insert_sorted_unique(
+                self.hash_to_image_ids
+                    .entry(metadata.block_hash_16.clone())
+                    .or_default(),
+                metadata.image_id,
+            );
+        }
         insert_sorted_unique(
             self.file_exact
                 .entry((metadata.file_size, metadata.blake3.clone()))
@@ -319,13 +322,15 @@ impl LibraryFingerprintIndex {
         let mut rows: Vec<_> = self.image_by_id.values().cloned().collect();
         rows.sort_by_key(|metadata| metadata.image_id);
         for metadata in rows {
-            self.block_tree.insert(metadata.block_hash_16.clone())?;
-            insert_sorted_unique(
-                self.hash_to_image_ids
-                    .entry(metadata.block_hash_16.clone())
-                    .or_default(),
-                metadata.image_id,
-            );
+            if metadata.perceptual_eligible {
+                self.block_tree.insert(metadata.block_hash_16.clone())?;
+                insert_sorted_unique(
+                    self.hash_to_image_ids
+                        .entry(metadata.block_hash_16.clone())
+                        .or_default(),
+                    metadata.image_id,
+                );
+            }
             insert_sorted_unique(
                 self.file_exact
                     .entry((metadata.file_size, metadata.blake3.clone()))
@@ -450,12 +455,14 @@ fn metadata_from_row(
     signature.update(&pixel_hash);
     signature.update(&block_hash_16);
     signature.update(&double_gradient_hash_32);
+    signature.update(&[u8::from(row.perceptual_eligible)]);
     Ok(Some(LibraryFingerprintMetadata {
         image_id: row.id,
         file_size: row.file_size,
         blake3: row.blake3.clone(),
         pixel_hash,
         block_hash_16,
+        perceptual_eligible: row.perceptual_eligible,
         fingerprint_signature: *signature.finalize().as_bytes(),
     }))
 }
@@ -479,6 +486,7 @@ mod tests {
             pixel_hash: Some(vec![marker; 32]),
             block_hash_16: Some(block),
             double_gradient_hash_32: Some(vec![marker; 68]),
+            perceptual_eligible: true,
             fingerprint_version: "2".to_string(),
         }
     }
@@ -531,6 +539,24 @@ mod tests {
         let index = LibraryFingerprintIndex::build(&[legacy]).unwrap();
         assert_eq!(index.image_count, 0);
         assert!(index.block_tree.is_empty());
+    }
+
+    #[test]
+    fn perceptually_ineligible_rows_only_participate_in_exact_matching() {
+        let image_id = Uuid::from_u128(7);
+        let mut flat = row(image_id, vec![0; 32], 7);
+        flat.perceptual_eligible = false;
+        let index = LibraryFingerprintIndex::build(&[flat]).unwrap();
+
+        assert_eq!(index.image_count, 1);
+        assert_eq!(index.exact_file_matches(7, &[7; 32]), vec![image_id]);
+        assert_eq!(index.exact_pixel_matches(&[7; 32]), vec![image_id]);
+        assert_eq!(index.unique_hash_count(), 0);
+        assert!(index
+            .recall(&variants(vec![0; 32]), 0)
+            .unwrap()
+            .matches
+            .is_empty());
     }
 
     #[test]

@@ -188,7 +188,17 @@ pub struct LibraryImageRow {
     pub pixel_hash: Option<Vec<u8>>,
     pub block_hash_16: Option<Vec<u8>>,
     pub double_gradient_hash_32: Option<Vec<u8>>,
+    pub perceptual_eligible: bool,
     pub fingerprint_version: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunExactFingerprintRow {
+    pub id: Uuid,
+    pub album_id: Uuid,
+    pub file_size: i64,
+    pub blake3: Vec<u8>,
+    pub pixel_hash: Vec<u8>,
 }
 
 pub struct NewImportImage {
@@ -205,6 +215,7 @@ pub struct NewImportImage {
     pub pixel_hash: Option<Vec<u8>>,
     pub block_hash_16: Option<Vec<u8>>,
     pub double_gradient_hash_32: Option<Vec<u8>>,
+    pub perceptual_eligible: bool,
     pub fingerprint_version: Option<String>,
     pub state: ImportImageState,
 }
@@ -1345,8 +1356,8 @@ impl ImportRepository {
                  (id, import_album_id, source_path, relative_path, file_size, modified_at,
                   width, height, format, decode_state, blake3, pixel_hash,
                   block_hash_16, double_gradient_hash_32,
-                  fingerprint_version, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                  perceptual_eligible, fingerprint_version, state)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
                 &[
                     &id,
                     &new_image.album_id,
@@ -1362,6 +1373,7 @@ impl ImportRepository {
                     &new_image.pixel_hash,
                     &new_image.block_hash_16,
                     &new_image.double_gradient_hash_32,
+                    &new_image.perceptual_eligible,
                     &new_image.fingerprint_version,
                     &st,
                 ],
@@ -1420,6 +1432,10 @@ impl ImportRepository {
             .iter()
             .map(|(_, image)| image.double_gradient_hash_32.clone())
             .collect();
+        let perceptual_eligibility: Vec<bool> = images
+            .iter()
+            .map(|(_, image)| image.perceptual_eligible)
+            .collect();
         let fingerprint_versions: Vec<Option<String>> = images
             .iter()
             .map(|(_, image)| image.fingerprint_version.clone())
@@ -1433,12 +1449,13 @@ impl ImportRepository {
                 "INSERT INTO import_images
                     (id, import_album_id, source_path, relative_path, file_size, modified_at,
                      width, height, format, decode_state, blake3, pixel_hash,
-                     block_hash_16, double_gradient_hash_32, fingerprint_version, state)
+                     block_hash_16, double_gradient_hash_32, perceptual_eligible,
+                     fingerprint_version, state)
                  SELECT * FROM UNNEST(
                     $1::uuid[], $2::uuid[], $3::text[], $4::text[],
                     $5::bigint[], $6::timestamptz[], $7::integer[], $8::integer[],
                     $9::text[], $10::text[], $11::bytea[], $12::bytea[],
-                    $13::bytea[], $14::bytea[], $15::text[], $16::text[])",
+                    $13::bytea[], $14::bytea[], $15::boolean[], $16::text[], $17::text[])",
                 &[
                     &ids,
                     &album_ids,
@@ -1454,6 +1471,7 @@ impl ImportRepository {
                     &pixel_hashes,
                     &block_hashes,
                     &double_gradient_hashes,
+                    &perceptual_eligibility,
                     &fingerprint_versions,
                     &states,
                 ],
@@ -1714,7 +1732,7 @@ impl ImportRepository {
         let rows = client
             .query(
                 "SELECT id, file_size, blake3, pixel_hash, block_hash_16,
-                        double_gradient_hash_32, fingerprint_version
+                        double_gradient_hash_32, perceptual_eligible, fingerprint_version
                  FROM library_images
                  WHERE fingerprint_version = '2' AND block_hash_16 IS NOT NULL
                  ORDER BY id",
@@ -1732,6 +1750,7 @@ impl ImportRepository {
                 pixel_hash: r.get("pixel_hash"),
                 block_hash_16: r.get("block_hash_16"),
                 double_gradient_hash_32: r.get("double_gradient_hash_32"),
+                perceptual_eligible: r.get("perceptual_eligible"),
                 fingerprint_version: r.get("fingerprint_version"),
             })
             .collect())
@@ -1748,7 +1767,7 @@ impl ImportRepository {
         let rows = client
             .query(
                 "SELECT id, file_size, blake3, pixel_hash, block_hash_16,
-                        double_gradient_hash_32, fingerprint_version
+                        double_gradient_hash_32, perceptual_eligible, fingerprint_version
                  FROM library_images
                  WHERE fingerprint_version = '2' AND blake3 = ANY($1)
                  ORDER BY id",
@@ -1766,6 +1785,7 @@ impl ImportRepository {
                 pixel_hash: r.get("pixel_hash"),
                 block_hash_16: r.get("block_hash_16"),
                 double_gradient_hash_32: r.get("double_gradient_hash_32"),
+                perceptual_eligible: r.get("perceptual_eligible"),
                 fingerprint_version: r.get("fingerprint_version"),
             })
             .collect())
@@ -1784,7 +1804,7 @@ impl ImportRepository {
         let rows = client
             .query(
                 "SELECT id, file_size, blake3, pixel_hash, block_hash_16,
-                        double_gradient_hash_32, fingerprint_version
+                        double_gradient_hash_32, perceptual_eligible, fingerprint_version
                  FROM library_images
                  WHERE fingerprint_version = '2' AND id = ANY($1)
                  ORDER BY id",
@@ -1806,6 +1826,7 @@ impl ImportRepository {
                 pixel_hash: r.get("pixel_hash"),
                 block_hash_16: r.get("block_hash_16"),
                 double_gradient_hash_32: r.get("double_gradient_hash_32"),
+                perceptual_eligible: r.get("perceptual_eligible"),
                 fingerprint_version: r.get("fingerprint_version"),
             })
             .collect())
@@ -1822,7 +1843,7 @@ impl ImportRepository {
             .query(
                 "SELECT li.id, li.file_size, li.blake3, li.pixel_hash,
                         li.block_hash_16, li.double_gradient_hash_32,
-                        li.fingerprint_version
+                        li.perceptual_eligible, li.fingerprint_version
                  FROM library_images li
                  JOIN library_albums la ON la.id = li.album_id
                  JOIN file_transactions ft ON ft.id = la.transaction_id
@@ -1846,42 +1867,64 @@ impl ImportRepository {
                 pixel_hash: row.get("pixel_hash"),
                 block_hash_16: row.get("block_hash_16"),
                 double_gradient_hash_32: row.get("double_gradient_hash_32"),
+                perceptual_eligible: row.get("perceptual_eligible"),
                 fingerprint_version: row.get("fingerprint_version"),
             })
             .collect())
     }
 
-    /// Find import images in the same run that share BLAKE3 hashes (cross-album exact match).
-    pub async fn find_sibling_images_by_blake3(
+    /// Load exact fingerprints from albums whose analysis checkpoint is
+    /// durable. Resumed scans use these rows to restore the run-level stable
+    /// representatives without retaining full fingerprint thumbnails.
+    pub async fn get_analyzed_run_exact_representatives(
         client: &Client,
         import_run_id: Uuid,
-        blake3_hashes: &[Vec<u8>],
-    ) -> Result<Vec<(Uuid, Uuid, i64, Vec<u8>)>, AppError> {
-        if blake3_hashes.is_empty() {
-            return Ok(Vec::new());
-        }
+    ) -> Result<Vec<RunExactFingerprintRow>, AppError> {
         let rows = client
             .query(
-                "SELECT ii.id, ii.import_album_id, ii.file_size, ii.blake3
-                 FROM import_images ii
-                 JOIN import_albums ia ON ii.import_album_id = ia.id
-                 WHERE ia.import_run_id = $1 AND ii.blake3 = ANY($2)",
-                &[&import_run_id, &blake3_hashes],
+                "WITH eligible AS (
+                    SELECT ii.id, ii.import_album_id, ii.file_size, ii.blake3, ii.pixel_hash
+                    FROM import_images ii
+                    JOIN import_albums ia ON ii.import_album_id = ia.id
+                    WHERE ia.import_run_id = $1
+                      AND ia.state IN ('analyzed', 'review_required')
+                      AND ii.fingerprint_version = '2'
+                      AND ii.blake3 IS NOT NULL
+                      AND ii.pixel_hash IS NOT NULL
+                 ), file_representatives AS (
+                    SELECT DISTINCT ON (file_size, blake3)
+                           id, import_album_id, file_size, blake3, pixel_hash
+                    FROM eligible
+                    ORDER BY file_size, blake3, id
+                 ), pixel_representatives AS (
+                    SELECT DISTINCT ON (pixel_hash)
+                           id, import_album_id, file_size, blake3, pixel_hash
+                    FROM eligible
+                    ORDER BY pixel_hash, id
+                 )
+                 SELECT id, import_album_id, file_size, blake3, pixel_hash
+                 FROM file_representatives
+                 UNION
+                 SELECT id, import_album_id, file_size, blake3, pixel_hash
+                 FROM pixel_representatives
+                 ORDER BY id",
+                &[&import_run_id],
             )
             .await
             .map_err(|e| {
-                AppError::Internal(format!("failed to query sibling images by blake3: {e}"))
+                AppError::Internal(format!(
+                    "failed to load analyzed run exact representatives: {e}"
+                ))
             })?;
 
         Ok(rows
             .iter()
-            .map(|r| {
-                (
-                    r.get("id"),
-                    r.get("import_album_id"),
-                    r.get("file_size"),
-                    r.get("blake3"),
-                )
+            .map(|row| RunExactFingerprintRow {
+                id: row.get("id"),
+                album_id: row.get("import_album_id"),
+                file_size: row.get("file_size"),
+                blake3: row.get("blake3"),
+                pixel_hash: row.get("pixel_hash"),
             })
             .collect())
     }

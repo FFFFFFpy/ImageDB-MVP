@@ -139,6 +139,7 @@ async fn setup_full_env_with_roots(
                 pixel_hash: Some(vec![1; 32]),
                 block_hash_16: Some(vec![1; 32]),
                 double_gradient_hash_32: Some(vec![1; 68]),
+                perceptual_eligible: true,
                 fingerprint_version: Some("2".to_string()),
                 state: ImportImageState::Fingerprinted,
             },

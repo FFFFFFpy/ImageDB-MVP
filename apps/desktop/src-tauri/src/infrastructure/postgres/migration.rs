@@ -197,6 +197,7 @@ mod tests {
         assert!(MIGRATION_0013.contains("conflicting normalized review outcomes"));
         assert!(MIGRATION_0014.contains("enforce_review_decision_semantics"));
         assert!(MIGRATION_0015.contains("block_hash_16"));
+        assert!(MIGRATION_0015.contains("perceptual_eligible BOOLEAN NOT NULL DEFAULT FALSE"));
         assert!(MIGRATION_0015.contains("double_gradient_distance_ratio"));
         assert!(MIGRATION_0015.contains("double_gradient_hash_32 IS NOT NULL"));
         assert!(MIGRATION_0015.contains("DROP INDEX IF EXISTS idx_import_images_blake3"));
@@ -1074,6 +1075,21 @@ mod tests {
                 Some("chk_library_images_fingerprint_v2_lengths")
             );
         }
+
+        let eligibility_column_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND table_name IN ('import_images', 'library_images')
+                   AND column_name = 'perceptual_eligible'
+                   AND is_nullable = 'NO'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(eligibility_column_count, 2);
 
         let old_index_count: i64 = client
             .query_one(
