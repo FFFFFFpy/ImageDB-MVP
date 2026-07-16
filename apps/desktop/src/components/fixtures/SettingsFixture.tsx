@@ -1,5 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { AppSettings, DatabaseState, ExternalMigrationProgress } from '../../lib/ipc/types';
+import type {
+  AppSettings,
+  CriticalOperationGuardStatus,
+  DatabaseState,
+  ExternalMigrationProgress,
+} from '../../lib/ipc/types';
 import { SettingsPage } from '../../pages/SettingsPage';
 import { Layout } from '../Layout';
 
@@ -47,6 +52,13 @@ const migration: ExternalMigrationProgress = {
   cancel_requested: false,
 };
 
+const criticalOperationGuard: CriticalOperationGuardStatus = {
+  is_blocked: false,
+  blocking_reason: null,
+  active_task_kinds: [],
+  active_operation: null,
+};
+
 const fixtureClient = new QueryClient({
   defaultOptions: { queries: { staleTime: Infinity, retry: false } },
 });
@@ -54,6 +66,7 @@ const fixtureClient = new QueryClient({
 fixtureClient.setQueryData(['settings'], settings);
 fixtureClient.setQueryData(['database-status'], settingsDatabaseState);
 fixtureClient.setQueryData(['external-migration-progress'], migration);
+fixtureClient.setQueryData(['critical-operation-guard-status'], criticalOperationGuard);
 fixtureClient.setQueryData(['database-info-dashboard'], {
   imports: { failed_album_count: 0, pending_review_count: 0, recovery_required_run_count: 0 },
 });

@@ -92,6 +92,128 @@ async fn real_protocol_migrations_run_on_empty_db() {
 
 #[tokio::test]
 #[ignore]
+async fn real_protocol_database_history_reset_reapplies_latest_schema() {
+    let (_tmp, mgr) = fresh_db().await;
+    let (mut client, handle) = mgr.lock().await.connect().await.unwrap();
+    seed_run(&client).await;
+    client
+        .batch_execute(
+            "CREATE TABLE external_owner_note (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
+             INSERT INTO external_owner_note (id, note) VALUES (1, 'preserve me');
+             INSERT INTO library_albums
+                 (id, library_root_id, display_name, relative_path, manifest_version,
+                  manifest_hash, image_count, state)
+             VALUES
+                 ('00000000-0000-0000-0000-0000000000e5',
+                  '00000000-0000-0000-0000-0000000000a1',
+                  'old album', 'old-album', '1', decode('01', 'hex'), 0, 'active');
+             INSERT INTO file_transactions
+                 (id, import_run_id, import_album_id, state)
+             VALUES
+                 ('00000000-0000-0000-0000-0000000000d4',
+                  '00000000-0000-0000-0000-0000000000b2',
+                  '00000000-0000-0000-0000-0000000000c3',
+                  'source_archived');
+             ALTER TABLE import_images DROP COLUMN perceptual_eligible;
+             ALTER TABLE library_images DROP COLUMN perceptual_eligible;",
+        )
+        .await
+        .unwrap();
+
+    let summary = MigrationRunner::reset_to_empty(&mut client)
+        .await
+        .expect("historical ImageDB schema should reset atomically");
+    assert_eq!(summary.previous_import_runs, 1);
+    assert_eq!(summary.previous_library_albums, 1);
+    assert_eq!(summary.previous_library_images, 0);
+    assert_eq!(summary.previous_file_transactions, 1);
+    assert_eq!(
+        summary.migrations_applied,
+        MigrationRunner::total_migrations()
+    );
+    assert_eq!(summary.migration_version, MigrationRunner::latest_version());
+    assert!(summary.filesystem_untouched);
+
+    let applied = MigrationRunner::get_applied_migrations(&client)
+        .await
+        .unwrap();
+    assert_eq!(applied.len(), MigrationRunner::total_migrations());
+    let eligible_columns: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name IN ('import_images', 'library_images')
+               AND column_name = 'perceptual_eligible'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(eligible_columns, 2);
+    let import_runs: i64 = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM import_runs", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(import_runs, 0);
+    let external_note: String = client
+        .query_one("SELECT note FROM external_owner_note WHERE id = 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(external_note, "preserve me");
+
+    drop(client);
+    handle.abort();
+    mgr.lock().await.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_protocol_database_history_reset_preserves_recovery_evidence() {
+    let (_tmp, mgr) = fresh_db().await;
+    let (mut client, handle) = mgr.lock().await.connect().await.unwrap();
+    seed_run(&client).await;
+    let transaction_id = uuid::Uuid::parse_str(TX).unwrap();
+    let run_id = uuid::Uuid::parse_str(RUN).unwrap();
+    let album_id = uuid::Uuid::parse_str(ALBUM).unwrap();
+    client
+        .execute(
+            "INSERT INTO file_transactions (id, import_run_id, import_album_id, state)
+             VALUES ($1, $2, $3, 'planned')",
+            &[&transaction_id, &run_id, &album_id],
+        )
+        .await
+        .unwrap();
+
+    let error = MigrationRunner::reset_to_empty(&mut client)
+        .await
+        .expect_err("recoverable transaction must block reset");
+    assert!(error
+        .to_string()
+        .contains("unfinished file transactions still require recovery: planned (1)"));
+    let transaction_count: i64 = client
+        .query_one("SELECT COUNT(*)::BIGINT FROM file_transactions", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(transaction_count, 1);
+    assert_eq!(
+        MigrationRunner::current_version(&client)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(MigrationRunner::latest_version())
+    );
+
+    drop(client);
+    handle.abort();
+    mgr.lock().await.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
 async fn real_protocol_library_root_lease_excludes_second_writer_and_allows_expiry_takeover() {
     let (_tmp, mgr) = fresh_db().await;
     let (client, handle) = mgr.lock().await.connect().await.unwrap();

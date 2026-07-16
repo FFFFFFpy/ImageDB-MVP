@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`feat/mvp4-fingerprint-v2`
 
-当前实施阶段：Fingerprint V2 审查修复完成，完整质量门已通过。固定方案为完整文件/像素 BLAKE3、BlockHash 16×16、DoubleGradient 32×32、Triangle、8 种几何变换、低信息量感知资格门禁、并列粗距离变换精排、图集内与图库内存 BK-tree、import run 级代表边精确去重、缓存批量 upsert、候选批量读写及 `fingerprint_version = 2`。MVP4 不增加算法设置 UI，不改变审核动作、frozen plan、Commit、文件事务或 Recovery 状态机。
+当前实施阶段：Fingerprint V2 审查修复完成，完整质量门已通过。固定方案为完整文件/像素 BLAKE3、BlockHash 16×16、DoubleGradient 32×32、Triangle、8 种几何变换、低信息量感知资格门禁、并列粗距离变换精排、图集内与图库内存 BK-tree、import run 级代表边精确去重、缓存批量 upsert、候选批量读写及 `fingerprint_version = 2`。本分支同时增加 Debug 用的“清空历史数据库并重新开始”危险操作：不迁移旧数据、不删除磁盘文件，并在存在未完成文件事务时拒绝执行；该操作已通过完整静态、单元和真实 PostgreSQL 质量门。MVP4 不增加算法设置 UI，不改变审核动作、frozen plan、Commit、文件事务或 Recovery 状态机。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。除 M3.8 明确授权的 `abandoned` / `invalidated` 外，M3 不修改 frozen plan、Commit、Recovery、数据库 migration、匹配算法或文件事务语义。
 

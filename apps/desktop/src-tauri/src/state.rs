@@ -46,6 +46,7 @@ pub enum CriticalOperationKind {
     SwitchToManagedDatabase,
     InitializeExternalDatabase,
     ShutdownDatabase,
+    ResetDatabaseHistory,
     UpdateCriticalSettings,
 }
 
@@ -57,6 +58,7 @@ impl CriticalOperationKind {
             Self::SwitchToManagedDatabase => "switch_to_managed_database",
             Self::InitializeExternalDatabase => "initialize_external_database",
             Self::ShutdownDatabase => "shutdown_database",
+            Self::ResetDatabaseHistory => "reset_database_history",
             Self::UpdateCriticalSettings => "update_critical_settings",
         }
     }
@@ -68,6 +70,7 @@ impl CriticalOperationKind {
             Self::SwitchToManagedDatabase => "switch database",
             Self::InitializeExternalDatabase => "initialize external database",
             Self::ShutdownDatabase => "stop database",
+            Self::ResetDatabaseHistory => "reset database history",
             Self::UpdateCriticalSettings => "change database or library settings",
         }
     }
@@ -79,6 +82,7 @@ impl CriticalOperationKind {
             Self::SwitchToManagedDatabase => "database switch",
             Self::InitializeExternalDatabase => "external database initialization",
             Self::ShutdownDatabase => "database shutdown",
+            Self::ResetDatabaseHistory => "database history reset",
             Self::UpdateCriticalSettings => "database or library settings update",
         }
     }

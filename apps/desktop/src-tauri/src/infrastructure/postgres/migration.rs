@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 
 const MIGRATION_0001: &str = include_str!("../../../migrations/0001_initial.sql");
@@ -44,9 +45,50 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("0015_fingerprint_v2", MIGRATION_0015),
 ];
 
+const RESET_DROP_SQL: &str = "
+    DROP TABLE IF EXISTS review_decisions;
+    DROP TABLE IF EXISTS duplicate_candidates;
+    DROP TABLE IF EXISTS file_operations;
+    DROP TABLE IF EXISTS library_root_leases;
+    DROP TABLE IF EXISTS import_plan_images;
+    DROP TABLE IF EXISTS import_plan_albums;
+    DROP TABLE IF EXISTS import_plans;
+    DROP TABLE IF EXISTS source_album_snapshot_files;
+    DROP TABLE IF EXISTS source_album_snapshots;
+    DROP TABLE IF EXISTS library_images;
+    DROP TABLE IF EXISTS library_albums;
+    DROP TABLE IF EXISTS file_transactions;
+    DROP TABLE IF EXISTS import_images;
+    DROP TABLE IF EXISTS import_albums;
+    DROP TABLE IF EXISTS audit_events;
+    DROP TABLE IF EXISTS import_runs;
+    DROP TABLE IF EXISTS library_roots;
+    DROP TABLE IF EXISTS app_meta;
+    DROP TABLE IF EXISTS schema_migrations;
+";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseResetSummary {
+    pub previous_import_runs: i64,
+    pub previous_library_albums: i64,
+    pub previous_library_images: i64,
+    pub previous_file_transactions: i64,
+    pub migrations_applied: usize,
+    pub migration_version: String,
+    pub filesystem_untouched: bool,
+}
+
 pub struct MigrationRunner;
 
 impl MigrationRunner {
+    fn database_error(context: &str, error: tokio_postgres::Error) -> AppError {
+        let detail = error
+            .as_db_error()
+            .map(|db_error| db_error.message().to_string())
+            .unwrap_or_else(|| error.to_string());
+        AppError::Internal(format!("{context}: {detail}"))
+    }
+
     async fn ensure_schema_migrations_table(client: &Client) -> Result<(), AppError> {
         client
             .batch_execute(
@@ -160,6 +202,147 @@ impl MigrationRunner {
         }
 
         Ok(newly_applied)
+    }
+
+    /// Rebuilds only the ImageDB-owned tables in `public` and reapplies every
+    /// embedded migration in one transaction. Unknown tables are preserved,
+    /// and external dependencies on ImageDB tables make the operation fail and
+    /// roll back instead of being removed through `CASCADE`.
+    pub async fn reset_to_empty(client: &mut Client) -> Result<DatabaseResetSummary, AppError> {
+        let transaction = client.transaction().await.map_err(|error| {
+            Self::database_error("failed to begin database reset transaction", error)
+        })?;
+        transaction
+            .batch_execute("SET LOCAL search_path = public; SET LOCAL lock_timeout = '5s';")
+            .await
+            .map_err(|error| {
+                Self::database_error("failed to configure database reset transaction", error)
+            })?;
+
+        let signature = transaction
+            .query_one(
+                "SELECT
+                    to_regclass('public.schema_migrations') IS NOT NULL AS migrations,
+                    to_regclass('public.app_meta') IS NOT NULL AS app_meta,
+                    to_regclass('public.import_runs') IS NOT NULL AS import_runs,
+                    to_regclass('public.file_transactions') IS NOT NULL AS file_transactions",
+                &[],
+            )
+            .await
+            .map_err(|error| Self::database_error("failed to identify ImageDB schema", error))?;
+        let is_imagedb = signature.get::<_, bool>("migrations")
+            && signature.get::<_, bool>("app_meta")
+            && signature.get::<_, bool>("import_runs")
+            && signature.get::<_, bool>("file_transactions");
+        if !is_imagedb {
+            return Err(AppError::Internal(
+                "current database does not contain a complete recognizable ImageDB schema; refusing to reset it"
+                    .to_string(),
+            ));
+        }
+
+        let blockers = transaction
+            .query(
+                "SELECT state, COUNT(*)::BIGINT AS count
+                 FROM file_transactions
+                 WHERE state NOT IN ('source_archived', 'failed', 'cancelled')
+                 GROUP BY state
+                 ORDER BY state",
+                &[],
+            )
+            .await
+            .map_err(|error| {
+                Self::database_error("failed to check recoverable file transactions", error)
+            })?;
+        if !blockers.is_empty() {
+            let states = blockers
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{} ({})",
+                        row.get::<_, String>("state"),
+                        row.get::<_, i64>("count")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::Internal(format!(
+                "database reset blocked because unfinished file transactions still require recovery: {states}"
+            )));
+        }
+
+        async fn count_rows(
+            transaction: &tokio_postgres::Transaction<'_>,
+            table: &str,
+        ) -> Result<i64, AppError> {
+            let query = format!("SELECT COUNT(*)::BIGINT AS count FROM {table}");
+            transaction
+                .query_one(&query, &[])
+                .await
+                .map(|row| row.get::<_, i64>("count"))
+                .map_err(|error| {
+                    MigrationRunner::database_error(
+                        &format!("failed to count rows in {table} before reset"),
+                        error,
+                    )
+                })
+        }
+
+        let previous_import_runs = count_rows(&transaction, "import_runs").await?;
+        let previous_library_albums = count_rows(&transaction, "library_albums").await?;
+        let previous_library_images = count_rows(&transaction, "library_images").await?;
+        let previous_file_transactions = count_rows(&transaction, "file_transactions").await?;
+
+        transaction
+            .batch_execute(RESET_DROP_SQL)
+            .await
+            .map_err(|error| {
+                Self::database_error(
+                "failed to remove ImageDB schema (an external dependency may still reference it)",
+                error,
+            )
+            })?;
+        transaction
+            .batch_execute(
+                "CREATE TABLE schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )",
+            )
+            .await
+            .map_err(|error| Self::database_error("failed to recreate schema_migrations", error))?;
+
+        for (version, sql) in MIGRATIONS {
+            transaction.batch_execute(sql).await.map_err(|error| {
+                Self::database_error(&format!("migration {version} failed during reset"), error)
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version) VALUES ($1)",
+                    &[version],
+                )
+                .await
+                .map_err(|error| {
+                    Self::database_error(
+                        &format!("failed to record migration {version} during reset"),
+                        error,
+                    )
+                })?;
+        }
+
+        transaction.commit().await.map_err(|error| {
+            Self::database_error("failed to commit database reset transaction", error)
+        })?;
+
+        Ok(DatabaseResetSummary {
+            previous_import_runs,
+            previous_library_albums,
+            previous_library_images,
+            previous_file_transactions,
+            migrations_applied: MIGRATIONS.len(),
+            migration_version: Self::latest_version().to_string(),
+            filesystem_untouched: true,
+        })
     }
 
     pub async fn current_version(client: &Client) -> Result<Option<String>, AppError> {

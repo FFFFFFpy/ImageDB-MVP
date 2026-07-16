@@ -15,6 +15,7 @@ vi.mock('../lib/ipc/api', () => ({
     startManagedToExternalMigration: vi.fn(),
     cancelExternalMigration: vi.fn(),
     shutdownDatabase: vi.fn(),
+    resetDatabaseHistory: vi.fn(),
     switchToManagedDatabase: vi.fn(),
     exportDiagnostics: vi.fn(),
     updateSettings: vi.fn(),
@@ -153,6 +154,15 @@ beforeEach(() => {
     file_count: 1,
     redacted: true,
     byte_size: 1024,
+  });
+  mockedApi.resetDatabaseHistory.mockResolvedValue({
+    previous_import_runs: 3,
+    previous_library_albums: 12,
+    previous_library_images: 480,
+    previous_file_transactions: 12,
+    migrations_applied: 15,
+    migration_version: '0015_fingerprint_v2',
+    filesystem_untouched: true,
   });
 });
 
@@ -341,8 +351,28 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     expect(screen.getByRole('button', { name: '连接并初始化外部库' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '从托管库迁移' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '保存' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '清空数据库并重新开始' })).toBeDisabled();
     expect(screen.getByRole('button', { name: '测试连接' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '导出诊断' })).toBeEnabled();
+  });
+
+  test('requires typed confirmation and reports a completed database rebuild', async () => {
+    renderSettingsPage();
+
+    const resetButton = await screen.findByRole('button', { name: '清空数据库并重新开始' });
+    expect(resetButton).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText(/输入“从零开始”以确认/), {
+      target: { value: '从零开始' },
+    });
+    expect(resetButton).toBeEnabled();
+    fireEvent.click(resetButton);
+
+    await waitFor(() => expect(mockedApi.resetDatabaseHistory).toHaveBeenCalledWith('从零开始'));
+    expect(await screen.findByText('数据库已清空，现在可以从头开始导入。')).toBeVisible();
+    expect(screen.getByText('未迁移')).toBeVisible();
+    expect(screen.getByText('未改动')).toBeVisible();
+    expect(screen.getByLabelText(/输入“从零开始”以确认/)).toHaveValue('');
   });
 
   test('fails closed and offers retry when task guard status cannot be loaded', async () => {

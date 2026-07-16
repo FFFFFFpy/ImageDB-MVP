@@ -18,6 +18,16 @@ export interface CriticalOperationGuardStatus {
   active_operation: string | null;
 }
 
+export interface DatabaseResetSummary {
+  previous_import_runs: number;
+  previous_library_albums: number;
+  previous_library_images: number;
+  previous_file_transactions: number;
+  migrations_applied: number;
+  migration_version: string;
+  filesystem_untouched: boolean;
+}
+
 export interface DiagnosticsExportResult {
   path: string;
   generated_at: string;

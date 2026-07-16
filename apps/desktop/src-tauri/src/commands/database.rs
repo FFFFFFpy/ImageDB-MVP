@@ -2,6 +2,7 @@ use crate::domain::{
     ConnectionConfig, DatabaseState, ExternalCheckResult, ExternalMigrationProgress,
     ExternalMigrationResult, TlsMode,
 };
+use crate::infrastructure::postgres::{migration::DatabaseResetSummary, MigrationRunner};
 use crate::repositories::import_repository::{
     DatabaseInfoDashboard, DatabaseInfoDatabaseSection, ImportRepository,
 };
@@ -357,6 +358,47 @@ pub async fn shutdown_database(state: State<'_, AppState>) -> Result<(), String>
     shutdown_database_for_state(&state).await
 }
 
+const DATABASE_RESET_CONFIRMATION: &str = "从零开始";
+
+#[tauri::command]
+pub async fn reset_database_history(
+    state: State<'_, AppState>,
+    confirmation: String,
+) -> Result<DatabaseResetSummary, String> {
+    reset_database_history_for_state(&state, &confirmation).await
+}
+
+pub(crate) async fn reset_database_history_for_state(
+    state: &AppState,
+    confirmation: &str,
+) -> Result<DatabaseResetSummary, String> {
+    if confirmation != DATABASE_RESET_CONFIRMATION {
+        return Err(format!(
+            "confirmation text must exactly match '{DATABASE_RESET_CONFIRMATION}'"
+        ));
+    }
+
+    let _operation = state
+        .critical_operation_guard
+        .begin_operation(CriticalOperationKind::ResetDatabaseHistory)?;
+    let (mut client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|error| format!("{error}"))?
+    };
+    let result = MigrationRunner::reset_to_empty(&mut client)
+        .await
+        .map_err(|error| format!("{error}"));
+    handle.abort();
+    let summary = result?;
+
+    *state.library_fingerprint_index.write().await = None;
+    *state.scan_state.lock().await = crate::state::ScanState::default();
+    *state.commit_state.lock().await = crate::state::CommitState::default();
+    *state.external_migration_state.lock().await = crate::state::ExternalMigrationState::default();
+
+    Ok(summary)
+}
+
 pub(crate) async fn shutdown_database_for_state(state: &AppState) -> Result<(), String> {
     let _operation = state
         .critical_operation_guard
@@ -440,6 +482,13 @@ mod critical_lifecycle_tests {
             initialize_external_error,
             "cannot initialize external database while import commit is running"
         );
+        let reset_error = reset_database_history_for_state(&state, DATABASE_RESET_CONFIRMATION)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            reset_error,
+            "cannot reset database history while import commit is running"
+        );
 
         assert_eq!(database_mode(&state).await.as_deref(), Some("external"));
         assert_eq!(
@@ -451,6 +500,22 @@ mod critical_lifecycle_tests {
         shutdown_database_for_state(&state)
             .await
             .expect("shutdown must work after commit completion");
+    }
+
+    #[tokio::test]
+    async fn database_reset_requires_exact_confirmation_before_connecting() {
+        let temp = TempDir::new().unwrap();
+        let state = app_state(&temp);
+
+        let error = reset_database_history_for_state(&state, "重新开始")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "confirmation text must exactly match '从零开始'");
+        assert_eq!(
+            state.critical_operation_guard.snapshot().active_operation,
+            None
+        );
     }
 
     #[tokio::test]

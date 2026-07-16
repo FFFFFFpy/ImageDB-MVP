@@ -137,6 +137,25 @@
   color: var(--color-danger-ink);
 }
 
+.settings-page--m3 .settings-danger-zone {
+  border-color: var(--color-danger-border);
+}
+
+.settings-danger-zone .settings-section-heading span,
+.settings-danger-zone .settings-section-heading h2 {
+  color: var(--color-danger-ink);
+}
+
+.settings-reset-confirmation {
+  max-width: 420px;
+  margin-top: var(--space-4);
+}
+
+.settings-reset-result {
+  max-width: 680px;
+  margin-top: var(--space-4);
+}
+
 .settings-page--m3 table {
   width: 100%;
   table-layout: fixed;

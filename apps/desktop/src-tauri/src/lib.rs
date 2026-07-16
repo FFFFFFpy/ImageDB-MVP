@@ -522,6 +522,7 @@ pub fn run() {
             commands::cancel_external_migration,
             commands::get_external_migration_progress,
             commands::shutdown_database,
+            commands::reset_database_history,
             commands::export_diagnostics,
             commands::get_settings,
             commands::update_settings,

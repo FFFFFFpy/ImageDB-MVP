@@ -139,6 +139,7 @@ export function SettingsPage({
   const [extQueryTimeout, setExtQueryTimeout] = useState('15');
   const [extProfileName, setExtProfileName] = useState('default');
   const [libRoot, setLibRoot] = useState('');
+  const [resetConfirmation, setResetConfirmation] = useState('');
   const [formInitialized, setFormInitialized] = useState(false);
 
   useEffect(() => {
@@ -247,6 +248,14 @@ export function SettingsPage({
         queryClient.invalidateQueries({ queryKey: ['database-status'] }),
         queryClient.invalidateQueries({ queryKey: ['critical-operation-guard-status'] }),
       ]);
+    },
+  });
+
+  const resetDatabase = useMutation({
+    mutationFn: () => api.resetDatabaseHistory(resetConfirmation),
+    onSuccess: async () => {
+      setResetConfirmation('');
+      await queryClient.invalidateQueries();
     },
   });
 
@@ -487,6 +496,69 @@ export function SettingsPage({
             {exportDiagnostics.isError && (
               <pre className="status-err">{String(exportDiagnostics.error)}</pre>
             )}
+          </div>
+        )}
+      </section>
+
+      <section className="settings-section settings-danger-zone">
+        <div className="settings-section-heading">
+          <div>
+            <span>危险操作</span>
+            <h2>清空历史数据库</h2>
+          </div>
+          <p>丢弃当前数据库中的全部 ImageDB 历史记录，初始化一个可直接使用的空数据库。</p>
+        </div>
+        <StatusBanner tone="danger" title="此操作不可撤销，但不会删除磁盘文件">
+          <p>
+            不会迁移或保留旧数据。导入记录、审核结果、图库数据库记录和已结束的事务记录都会消失。当前数据库连接、应用设置和图库目录中的实际文件保持不变。
+          </p>
+          <p>若仍有需要恢复的文件事务，后端会拒绝重置。</p>
+        </StatusBanner>
+        <label className="settings-reset-confirmation">
+          输入“从零开始”以确认
+          <input
+            value={resetConfirmation}
+            onChange={(event) => setResetConfirmation(event.target.value)}
+            placeholder="从零开始"
+            autoComplete="off"
+          />
+        </label>
+        <button
+          className="settings-danger-action"
+          onClick={() => resetDatabase.mutate()}
+          disabled={
+            criticalSettingsDisabled ||
+            resetDatabase.isPending ||
+            resetConfirmation !== '从零开始' ||
+            taggedStatusCode(dbStatus.data?.status ?? '') !== 'connected'
+          }
+        >
+          {resetDatabase.isPending ? '正在清空数据库…' : '清空数据库并重新开始'}
+        </button>
+        {resetDatabase.isError && <pre className="status-err">{String(resetDatabase.error)}</pre>}
+        {resetDatabase.data && (
+          <div className="check-result settings-reset-result" role="status">
+            <p className="status-ok">数据库已清空，现在可以从头开始导入。</p>
+            <table>
+              <tbody>
+                <tr>
+                  <td>原导入任务</td>
+                  <td>{resetDatabase.data.previous_import_runs}</td>
+                </tr>
+                <tr>
+                  <td>原图库图片</td>
+                  <td>{resetDatabase.data.previous_library_images}</td>
+                </tr>
+                <tr>
+                  <td>旧数据</td>
+                  <td>未迁移</td>
+                </tr>
+                <tr>
+                  <td>磁盘文件</td>
+                  <td>{resetDatabase.data.filesystem_untouched ? '未改动' : '状态未知'}</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         )}
       </section>

@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AppSettings,
   DatabaseState,
+  DatabaseResetSummary,
   CriticalOperationGuardStatus,
   DatabaseInfoDashboard,
   DiagnosticsExportResult,
@@ -70,6 +71,9 @@ export const api = {
     invoke<ExternalMigrationProgress>('get_external_migration_progress'),
 
   shutdownDatabase: () => invoke<void>('shutdown_database'),
+
+  resetDatabaseHistory: (confirmation: string) =>
+    invoke<DatabaseResetSummary>('reset_database_history', { confirmation }),
 
   exportDiagnostics: () => invoke<DiagnosticsExportResult>('export_diagnostics'),
 
