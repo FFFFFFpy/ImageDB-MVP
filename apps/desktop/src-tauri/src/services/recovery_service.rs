@@ -15,7 +15,7 @@
 use crate::domain::import_state::ImportRunState;
 use crate::domain::state_machine::{self, FileOpState, TransactionState};
 use crate::error::AppError;
-use crate::infrastructure::postgres::PostgresManager;
+use crate::infrastructure::postgres::{DatabaseOperationLock, PostgresManager};
 use crate::infrastructure::storage_capabilities::{
     probe_storage_capabilities, CapabilityProbe, PublishStrategy as StoragePublishStrategy,
 };
@@ -504,6 +504,7 @@ pub async fn recover_transaction(
             .await
             .map_err(|e| AppError::Internal(format!("failed to connect for recovery: {e}")))?
     };
+    DatabaseOperationLock::acquire_shared(&client, "transaction recovery").await?;
 
     let result = recover_transaction_with_client(&mut client, transaction_id).await;
 

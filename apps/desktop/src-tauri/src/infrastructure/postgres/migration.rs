@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::infrastructure::postgres::DatabaseOperationLock;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 
@@ -155,6 +156,18 @@ impl MigrationRunner {
     }
 
     pub async fn run_pending(client: &mut Client) -> Result<Vec<String>, AppError> {
+        DatabaseOperationLock::acquire_exclusive_session(client, "database schema initialization")
+            .await?;
+        let result = Self::run_pending_locked(client).await;
+        let release = DatabaseOperationLock::release_exclusive_session(client).await;
+        match (result, release) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(applied), Ok(())) => Ok(applied),
+        }
+    }
+
+    async fn run_pending_locked(client: &mut Client) -> Result<Vec<String>, AppError> {
         Self::ensure_schema_migrations_table(client).await?;
 
         let applied = Self::get_applied_migrations(client).await?;
@@ -218,6 +231,8 @@ impl MigrationRunner {
             .map_err(|error| {
                 Self::database_error("failed to configure database reset transaction", error)
             })?;
+        DatabaseOperationLock::acquire_exclusive_transaction(&transaction, "database reset")
+            .await?;
 
         let signature = transaction
             .query_one(
@@ -225,7 +240,8 @@ impl MigrationRunner {
                     to_regclass('public.schema_migrations') IS NOT NULL AS migrations,
                     to_regclass('public.app_meta') IS NOT NULL AS app_meta,
                     to_regclass('public.import_runs') IS NOT NULL AS import_runs,
-                    to_regclass('public.file_transactions') IS NOT NULL AS file_transactions",
+                    to_regclass('public.file_transactions') IS NOT NULL AS file_transactions,
+                    to_regclass('public.library_root_leases') IS NOT NULL AS library_root_leases",
                 &[],
             )
             .await
@@ -239,6 +255,40 @@ impl MigrationRunner {
                 "current database does not contain a complete recognizable ImageDB schema; refusing to reset it"
                     .to_string(),
             ));
+        }
+
+        let active_leases = if signature.get::<_, bool>("library_root_leases") {
+            transaction
+                .query(
+                    "SELECT library_root_id, owner_instance_id, expires_at
+                     FROM library_root_leases
+                     WHERE expires_at > clock_timestamp()
+                     ORDER BY library_root_id",
+                    &[],
+                )
+                .await
+                .map_err(|error| {
+                    Self::database_error("failed to check active library root leases", error)
+                })?
+        } else {
+            Vec::new()
+        };
+        if !active_leases.is_empty() {
+            let holders = active_leases
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{} held by '{}' until {}",
+                        row.get::<_, uuid::Uuid>("library_root_id"),
+                        row.get::<_, String>("owner_instance_id"),
+                        row.get::<_, chrono::DateTime<chrono::Utc>>("expires_at")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::Internal(format!(
+                "database reset blocked because active library root leases still exist: {holders}"
+            )));
         }
 
         let blockers = transaction

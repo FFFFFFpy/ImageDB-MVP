@@ -3,6 +3,7 @@
 //! These surface the Recovery Service to the desktop GUI: scan non-terminal
 //! transactions, execute recovery for one, and re-verify a transaction's
 //! on-disk evidence.
+use crate::infrastructure::postgres::DatabaseOperationLock;
 use crate::repositories::import_repository::ImportRepository;
 use crate::services::commit_service::{
     validate_and_hash_frozen_plan, verify_complete_evidence, IdempotencyVerdict,
@@ -147,6 +148,9 @@ pub(crate) async fn reverify_transaction_for_state(
         let mgr = state.postgres_manager.lock().await;
         mgr.connect().await.map_err(|e| format!("{e}"))?
     };
+    DatabaseOperationLock::acquire_shared(&client, "transaction re-verification")
+        .await
+        .map_err(|e| format!("{e}"))?;
     let result = reverify_with_client(&client, tx_id).await;
     handle.abort();
     let (verdict, message) = result.map_err(|e| format!("{e}"))?;

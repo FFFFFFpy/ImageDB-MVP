@@ -13,15 +13,19 @@
 //!       real_protocol_ -- --ignored --test-threads=1
 #![cfg(test)]
 #![cfg(feature = "real-db-tests")]
-use crate::domain::import_state::ImportRunState;
+use crate::domain::import_state::{CommitProgress, ImportRunState, ScanProgress};
 use crate::domain::state_machine::{FileOpState, TransactionState};
-use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+use crate::infrastructure::library_fingerprint_index::LibraryFingerprintIndex;
+use crate::infrastructure::postgres::{DatabaseOperationLock, MigrationRunner, PostgresManager};
+use crate::infrastructure::settings::SettingsStore;
 use crate::repositories::import_repository::ImportRepository;
 use crate::services::library_service;
 use crate::services::review_service;
+use crate::services::{commit_service, recovery_service, scan_service};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 async fn fresh_db() -> (TempDir, Arc<Mutex<PostgresManager>>) {
     if std::env::var("IMAGEDB_POSTGRES_BIN")
@@ -42,6 +46,123 @@ async fn fresh_db() -> (TempDir, Arc<Mutex<PostgresManager>>) {
     drop(client);
     handle.abort();
     (tmp, Arc::new(Mutex::new(manager)))
+}
+
+type SchemaColumn = (String, String, i32, String, String, String, Option<String>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct ImageDbSchemaSnapshot {
+    tables: Vec<String>,
+    columns: Vec<SchemaColumn>,
+    constraints: Vec<(String, String, String, String)>,
+    indexes: Vec<(String, String, String)>,
+}
+
+async fn imagedb_schema_snapshot(client: &tokio_postgres::Client) -> ImageDbSchemaSnapshot {
+    let tables = client
+        .query(
+            "SELECT c.relname AS table_name
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relkind = 'r'
+             ORDER BY c.relname",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get("table_name"))
+        .collect();
+    let columns = client
+        .query(
+            "SELECT table_name, column_name, ordinal_position, data_type, udt_name,
+                    is_nullable, column_default
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+             ORDER BY table_name, ordinal_position",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("table_name"),
+                row.get("column_name"),
+                row.get("ordinal_position"),
+                row.get("data_type"),
+                row.get("udt_name"),
+                row.get("is_nullable"),
+                row.get("column_default"),
+            )
+        })
+        .collect();
+    let constraints = client
+        .query(
+            "SELECT table_rel.relname AS table_name, con.conname,
+                    con.contype::TEXT AS constraint_type,
+                    pg_get_constraintdef(con.oid, true) AS definition
+             FROM pg_constraint con
+             JOIN pg_class table_rel ON table_rel.oid = con.conrelid
+             JOIN pg_namespace n ON n.oid = table_rel.relnamespace
+             WHERE n.nspname = 'public'
+             ORDER BY table_rel.relname, con.conname",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("table_name"),
+                row.get("conname"),
+                row.get("constraint_type"),
+                row.get("definition"),
+            )
+        })
+        .collect();
+    let indexes = client
+        .query(
+            "SELECT tablename, indexname, indexdef
+             FROM pg_indexes
+             WHERE schemaname = 'public'
+             ORDER BY tablename, indexname",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("tablename"),
+                row.get("indexname"),
+                row.get("indexdef"),
+            )
+        })
+        .collect();
+    ImageDbSchemaSnapshot {
+        tables,
+        columns,
+        constraints,
+        indexes,
+    }
+}
+
+async fn public_table_oids(client: &tokio_postgres::Client) -> Vec<(String, i64)> {
+    client
+        .query(
+            "SELECT c.relname AS table_name, c.oid::BIGINT AS table_oid
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relkind = 'r'
+             ORDER BY c.relname",
+            &[],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get("table_name"), row.get("table_oid")))
+        .collect()
 }
 
 const RUN: &str = "00000000-0000-0000-0000-0000000000b2";
@@ -210,6 +331,182 @@ async fn real_protocol_database_history_reset_preserves_recovery_evidence() {
     drop(client);
     handle.abort();
     mgr.lock().await.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_protocol_database_reset_serializes_instances_and_rejects_active_leases() {
+    let (tmp, mgr) = fresh_db().await;
+    let (mut instance_a, handle_a) = mgr.lock().await.connect().await.unwrap();
+    let (mut instance_b, handle_b) = mgr.lock().await.connect().await.unwrap();
+    seed_run(&instance_a).await;
+
+    DatabaseOperationLock::acquire_shared(&instance_a, "simulated scan instance")
+        .await
+        .unwrap();
+    let reset_error = MigrationRunner::reset_to_empty(&mut instance_b)
+        .await
+        .expect_err("another instance's shared lock must exclude reset");
+    assert!(reset_error
+        .to_string()
+        .contains("another ImageDB instance is scanning, committing, recovering, or initializing"));
+    let run_count: i64 = instance_b
+        .query_one("SELECT COUNT(*)::BIGINT FROM import_runs", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(run_count, 1, "blocked reset must preserve all rows");
+    DatabaseOperationLock::release_shared(&instance_a)
+        .await
+        .unwrap();
+
+    let root_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000a1").unwrap();
+    let lease_token = uuid::Uuid::new_v4();
+    ImportRepository::acquire_library_root_lease(
+        &instance_a,
+        root_id,
+        "simulated-legacy-instance",
+        lease_token,
+        300,
+    )
+    .await
+    .unwrap();
+    let lease_error = MigrationRunner::reset_to_empty(&mut instance_b)
+        .await
+        .expect_err("unexpired library lease must block reset even without a shared lock");
+    assert!(lease_error
+        .to_string()
+        .contains("active library root leases still exist"));
+    ImportRepository::release_library_root_lease(&instance_a, root_id, lease_token)
+        .await
+        .unwrap();
+
+    let exclusive = instance_a.transaction().await.unwrap();
+    DatabaseOperationLock::acquire_exclusive_transaction(&exclusive, "simulated reset instance")
+        .await
+        .unwrap();
+    let scan_error = DatabaseOperationLock::acquire_shared(&instance_b, "simulated scan instance")
+        .await
+        .expect_err("reset's exclusive lock must close the scan-start race window");
+    assert!(scan_error
+        .to_string()
+        .contains("another ImageDB instance is resetting or initializing"));
+
+    let settings = Arc::new(Mutex::new(
+        SettingsStore::new(&tmp.path().join("settings")).unwrap(),
+    ));
+    let library_index = Arc::new(RwLock::new(None::<LibraryFingerprintIndex>));
+    let scan_entry_error = scan_service::run_scan(
+        mgr.clone(),
+        settings,
+        library_index,
+        tmp.path().join("unused-source").display().to_string(),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(ScanProgress::idle())),
+    )
+    .await
+    .expect_err("scan entry must obey the cross-instance database lock");
+    assert!(scan_entry_error
+        .to_string()
+        .contains("another ImageDB instance is resetting or initializing"));
+
+    let missing_run_id = uuid::Uuid::new_v4();
+    let commit_entry_error = commit_service::run_import_commit(
+        mgr.clone(),
+        tmp.path().join("unused-library").display().to_string(),
+        missing_run_id,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(CommitProgress::idle(
+            &missing_run_id.to_string(),
+        ))),
+    )
+    .await
+    .expect_err("commit entry must obey the cross-instance database lock");
+    assert!(commit_entry_error
+        .to_string()
+        .contains("another ImageDB instance is resetting or initializing"));
+
+    let recovery_entry_error =
+        recovery_service::recover_transaction(mgr.clone(), uuid::Uuid::new_v4())
+            .await
+            .expect_err("recovery entry must obey the cross-instance database lock");
+    assert!(recovery_entry_error
+        .to_string()
+        .contains("another ImageDB instance is resetting or initializing"));
+
+    exclusive.rollback().await.unwrap();
+    DatabaseOperationLock::acquire_shared(&instance_b, "simulated scan instance")
+        .await
+        .expect("shared operation must start after reset transaction releases its lock");
+    DatabaseOperationLock::release_shared(&instance_b)
+        .await
+        .unwrap();
+
+    drop(instance_a);
+    drop(instance_b);
+    handle_a.abort();
+    handle_b.abort();
+    mgr.lock().await.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_protocol_database_reset_matches_fresh_schema_and_recreates_every_table() {
+    let (_fresh_tmp, fresh_mgr) = fresh_db().await;
+    let (_reset_tmp, reset_mgr) = fresh_db().await;
+    let (fresh_client, fresh_handle) = fresh_mgr.lock().await.connect().await.unwrap();
+    let (mut reset_client, reset_handle) = reset_mgr.lock().await.connect().await.unwrap();
+    seed_run(&reset_client).await;
+
+    let fresh_schema = imagedb_schema_snapshot(&fresh_client).await;
+    let old_oids = public_table_oids(&reset_client).await;
+    MigrationRunner::reset_to_empty(&mut reset_client)
+        .await
+        .expect("reset database should become an empty current ImageDB schema");
+    let reset_schema = imagedb_schema_snapshot(&reset_client).await;
+    let new_oids = public_table_oids(&reset_client).await;
+
+    assert_eq!(
+        reset_schema, fresh_schema,
+        "reset schema tables, columns, constraints, and indexes must exactly match a fresh database"
+    );
+    assert_eq!(old_oids.len(), new_oids.len());
+    for ((old_name, old_oid), (new_name, new_oid)) in old_oids.iter().zip(&new_oids) {
+        assert_eq!(old_name, new_name);
+        assert_ne!(
+            old_oid, new_oid,
+            "table {old_name} survived reset instead of being recreated; update RESET_DROP_SQL"
+        );
+    }
+
+    for table in reset_schema
+        .tables
+        .iter()
+        .filter(|table| table.as_str() != "schema_migrations")
+    {
+        let quoted = table.replace('"', "\"\"");
+        let row_count: i64 = reset_client
+            .query_one(&format!("SELECT COUNT(*)::BIGINT FROM \"{quoted}\""), &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(row_count, 0, "business table {table} is not empty");
+    }
+    assert_eq!(
+        MigrationRunner::get_applied_migrations(&reset_client)
+            .await
+            .unwrap(),
+        MigrationRunner::get_applied_migrations(&fresh_client)
+            .await
+            .unwrap()
+    );
+
+    drop(fresh_client);
+    drop(reset_client);
+    fresh_handle.abort();
+    reset_handle.abort();
+    fresh_mgr.lock().await.shutdown().await.unwrap();
+    reset_mgr.lock().await.shutdown().await.unwrap();
 }
 
 #[tokio::test]

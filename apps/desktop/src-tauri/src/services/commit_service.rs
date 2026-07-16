@@ -18,7 +18,7 @@ use crate::domain::import_state::{
 };
 use crate::domain::state_machine::{self, FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
-use crate::infrastructure::postgres::PostgresManager;
+use crate::infrastructure::postgres::{DatabaseOperationLock, PostgresManager};
 use crate::infrastructure::storage_capabilities::{
     probe_storage_capabilities, PublishStrategy as StoragePublishStrategy,
 };
@@ -343,6 +343,7 @@ pub async fn run_import_commit_with_expected_plan_hash(
             .await
             .map_err(|e| AppError::Internal(format!("failed to connect for commit: {e}")))?
     };
+    DatabaseOperationLock::acquire_shared(&client, "import commit").await?;
 
     let result = execute_commit_pipeline(
         &mut client,

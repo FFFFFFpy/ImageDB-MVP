@@ -13,7 +13,7 @@ use crate::infrastructure::library_fingerprint_index::{
     BlockTransformMatches, HammingBkTree, LibraryFingerprintIndex, LibraryRecallMatch,
     LibraryRecallResult,
 };
-use crate::infrastructure::postgres::PostgresManager;
+use crate::infrastructure::postgres::{DatabaseOperationLock, PostgresManager};
 use crate::infrastructure::settings::SettingsStore;
 use crate::repositories::import_repository::{
     ImportRepository, NewDuplicateCandidate, NewImportImage, RunExactFingerprintRow,
@@ -1040,6 +1040,7 @@ async fn run_scan_inner(
         let mgr = postgres_manager.lock().await;
         mgr.connect().await?
     };
+    DatabaseOperationLock::acquire_shared(&client, "import scan").await?;
 
     let library_root_id = ImportRepository::upsert_default_library_root(&client).await?;
     if let Some(library_root) = {
