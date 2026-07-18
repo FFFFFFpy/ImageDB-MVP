@@ -1999,29 +1999,6 @@ async fn cleanup_retryable(
     }
 }
 
-async fn restore_quarantined_source_after_conflict(
-    source_path: &Path,
-    quarantine_path: &Path,
-) -> Result<String, AppError> {
-    if source_path.exists() {
-        return Ok(format!(
-            "original path is occupied; quarantined file retained at {}",
-            quarantine_path.display()
-        ));
-    }
-    tokio::fs::rename(quarantine_path, source_path)
-        .await
-        .map_err(|error| {
-            AppError::IoError(format!(
-                "cannot restore conflicted quarantine {} to {}: {error}",
-                quarantine_path.display(),
-                source_path.display()
-            ))
-        })?;
-    sync_parent_dir(source_path).await?;
-    Ok("quarantined file restored to its original path".to_string())
-}
-
 /// Remove only frozen-plan source files after publish and library DB evidence
 /// have succeeded. Each persisted source path is first atomically renamed to
 /// its unique same-directory quarantine path. Size and BLAKE3 verification,
@@ -2411,29 +2388,25 @@ pub(crate) async fn remove_selected_source_files(
             }
         };
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-            let restore = restore_quarantined_source_after_conflict(&source_path, &quarantine_path)
-                .await
-                .unwrap_or_else(|error| error.to_string());
             return Err(cleanup_conflict(
                 client,
                 operation.id,
                 format!(
-                    "quarantined source is not a regular file: {}; {restore}",
-                    quarantine_path.display()
+                    "quarantined source is not a regular file: {}; original path {} is never overwritten automatically; quarantined entry retained for manual resolution",
+                    quarantine_path.display(),
+                    source_path.display()
                 ),
             )
             .await);
         }
         if metadata.len() as i64 != operation.expected_size {
-            let restore = restore_quarantined_source_after_conflict(&source_path, &quarantine_path)
-                .await
-                .unwrap_or_else(|error| error.to_string());
             return Err(cleanup_conflict(
                 client,
                 operation.id,
                 format!(
-                    "quarantined source size changed before removal: {}; {restore}",
-                    quarantine_path.display()
+                    "quarantined source size changed before removal: {}; original path {} is never overwritten automatically; quarantined file retained for manual resolution",
+                    quarantine_path.display(),
+                    source_path.display()
                 ),
             )
             .await);
@@ -2455,15 +2428,13 @@ pub(crate) async fn remove_selected_source_files(
             }
         };
         if actual_hash != operation.expected_blake3 {
-            let restore = restore_quarantined_source_after_conflict(&source_path, &quarantine_path)
-                .await
-                .unwrap_or_else(|error| error.to_string());
             return Err(cleanup_conflict(
                 client,
                 operation.id,
                 format!(
-                    "quarantined source BLAKE3 changed before removal: {}; {restore}",
-                    quarantine_path.display()
+                    "quarantined source BLAKE3 changed before removal: {}; original path {} is never overwritten automatically; quarantined file retained for manual resolution",
+                    quarantine_path.display(),
+                    source_path.display()
                 ),
             )
             .await);

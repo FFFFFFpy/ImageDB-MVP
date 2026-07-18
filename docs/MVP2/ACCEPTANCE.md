@@ -43,6 +43,7 @@
 - [x] 只为 frozen plan 图片预写 cleanup operation，并逐文件校验路径、大小和 BLAKE3。
 - [x] 原路径先原子 rename 到持久化的同目录唯一隔离路径；大小、BLAKE3 与删除均作用于隔离文件，隔离后原路径新建文件不受影响。
 - [x] 内容、大小、BLAKE3、路径逃逸、清理集合不一致和已删除隔离文件重新出现保持永久 conflict；删除、目录同步、权限、文件占用和存储离线等 I/O 错误保持 `source_files_removing` 并允许重试。
+- [x] 隔离文件证据冲突后不自动恢复原名；无论原路径为空、被普通文件占用或出现符号链接，都保留隔离文件并记录完整路径供人工处理，绝不使用普通 rename 覆盖原目录项。
 - [x] 源图集目录、sidecar、嵌套文件和排除图片不删除。
 - [x] 正常完成、数据库提交后中断恢复、重复恢复幂等、源内容变化零删除冲突，以及部分删除后 PermissionDenied 重试与 TOCTOU 原路径替换保护均由真实 PostgreSQL / 文件系统测试覆盖。
 
@@ -84,7 +85,7 @@
 - [x] pnpm release:dataset
 - [x] pnpm release:performance
 
-2026-07-19 审查修复自动验证：`pnpm check` 通过（15 个前端测试文件、116 项测试；Rust 默认 246 项通过、4 项真实/大内存用例按设计忽略，并包含全特性 Clippy）；`real_migration_0012_` 3 项、`real_scan_` 4 项和完整 `fail_injection_` 30 项真实 PostgreSQL / 文件系统测试通过。新增回归覆盖 `source_files_removing + recovery_required → Dashboard recover`，以及第二张隔离文件模拟 PermissionDenied 后 Commit 与 Recovery 均保持可重试、再次恢复完成、原路径新文件和清单外文件不受影响；另覆盖 0016 旧 `verifying/removing` 清理行升级到 0017 时的安全恢复。`pnpm --filter @imagedb/desktop build:web` 通过。本轮没有重新运行包含大图内存门禁等全部 suite 的 `pnpm rust:test:real`，使用上述相关真实套件作为审查修复门禁。
+2026-07-19 审查修复自动验证：`pnpm check` 通过（15 个前端测试文件、116 项测试；Rust 默认 246 项通过、4 项真实/大内存用例按设计忽略，并包含全特性 Clippy）；`real_migration_0012_` 3 项、`real_scan_` 4 项和完整 `fail_injection_` 31 项真实 PostgreSQL / 文件系统测试通过。新增回归覆盖 `source_files_removing + recovery_required → Dashboard recover`，以及第二张隔离文件模拟 PermissionDenied 后 Commit 与 Recovery 均保持可重试、再次恢复完成、原路径新文件和清单外文件不受影响；另覆盖 0016 旧 `verifying/removing` 清理行升级到 0017 时的安全恢复，以及隔离文件哈希冲突时不覆盖已占用原路径并保留隔离文件。`pnpm --filter @imagedb/desktop build:web` 通过。本轮没有重新运行包含大图内存门禁等全部 suite 的 `pnpm rust:test:real`，使用上述相关真实套件作为审查修复门禁。
 
 2026-07-18 多图审核与移动入库任务包自动验证：`pnpm check` 通过（15 个前端测试文件、115 项测试；Rust 244 项通过、4 项真实/大内存用例按设计忽略）；`pnpm rust:test:real` 的 23 组、109 项真实 PostgreSQL / 文件系统 / 故障注入测试全部通过，耗时 567.4 秒，其中包含移动模式正常完成与幂等、数据库提交后中断恢复、源内容变化时零删除并进入 conflict。`pnpm --filter @imagedb/desktop build:web` 与 `pnpm build` 通过，生成 NSIS 安装包 `ImageDB_0.1.0_x64-setup.exe`。
 

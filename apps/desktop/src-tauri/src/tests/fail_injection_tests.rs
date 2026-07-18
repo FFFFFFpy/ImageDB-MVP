@@ -1664,6 +1664,105 @@ async fn fail_injection_move_selected_permission_denied_is_retryable_and_quarant
 
 #[tokio::test]
 #[ignore]
+async fn fail_injection_move_selected_hash_conflict_never_restores_over_occupied_path() {
+    let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
+    set_fault_point(CommitFaultPoint::DuringSelectedSourceRemoval);
+    let result = commit_service::run_import_commit(
+        pg.clone(),
+        library_root.display().to_string(),
+        run_id,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(
+            crate::domain::import_state::CommitProgress::idle(&run_id.to_string()),
+        )),
+    )
+    .await
+    .unwrap();
+    clear_fault_point();
+    assert_eq!(result.state, "recovery_required");
+
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let cleanup = client
+        .query_one(
+            "SELECT transaction_id, source_path, quarantine_path, state
+             FROM source_file_cleanup_operations
+             WHERE state = 'verifying'
+             ORDER BY source_path LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let transaction_id: Uuid = cleanup.get("transaction_id");
+    let source_path = std::path::PathBuf::from(cleanup.get::<_, String>("source_path"));
+    let quarantine_path = std::path::PathBuf::from(
+        cleanup
+            .get::<_, Option<String>>("quarantine_path")
+            .expect("isolated cleanup row must persist quarantine_path"),
+    );
+    let quarantine_path_text = quarantine_path.display().to_string();
+    assert_eq!(cleanup.get::<_, String>("state"), "verifying");
+    assert!(!source_path.exists());
+    assert!(quarantine_path.exists());
+    drop(client);
+    handle.abort();
+
+    let replacement = b"new file occupying original path";
+    std::fs::write(&source_path, replacement).unwrap();
+    let mut tampered = std::fs::read(&quarantine_path).unwrap();
+    assert!(!tampered.is_empty());
+    tampered[0] ^= 0xff;
+    std::fs::write(&quarantine_path, &tampered).unwrap();
+
+    let outcome = recovery_service::recover_transaction(pg.clone(), transaction_id)
+        .await
+        .unwrap();
+    assert!(!outcome.recovered);
+    assert_eq!(outcome.final_state, "conflict");
+    assert_eq!(std::fs::read(&source_path).unwrap(), replacement);
+    assert_eq!(std::fs::read(&quarantine_path).unwrap(), tampered);
+    assert!(album_path.join("photo2.png").exists());
+    assert!(album_path.join("description.txt").exists());
+    assert!(album_path.join("sub/meta.xmp").exists());
+
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let transaction = client
+        .query_one(
+            "SELECT state, last_error FROM file_transactions WHERE id = $1",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(transaction.get::<_, String>("state"), "conflict");
+    let last_error = transaction
+        .get::<_, Option<String>>("last_error")
+        .unwrap_or_default();
+    assert!(last_error.contains("BLAKE3"));
+    assert!(last_error.contains(&quarantine_path_text));
+    let operation_state: String = client
+        .query_one(
+            "SELECT state FROM source_file_cleanup_operations
+             WHERE transaction_id = $1 AND quarantine_path = $2",
+            &[&transaction_id, &quarantine_path_text],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(operation_state, "conflict");
+    drop(client);
+    handle.abort();
+
+    let mut manager = pg.lock().await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
 async fn fail_injection_move_selected_recovers_after_db_commit() {
     let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
     run_commit_with_fault(
