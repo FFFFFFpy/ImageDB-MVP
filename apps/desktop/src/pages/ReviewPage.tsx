@@ -165,6 +165,7 @@ function GroupMemberCard({
   member,
   action,
   keepCount,
+  groupResolved,
   onChange,
   onOpen,
 }: {
@@ -172,6 +173,7 @@ function GroupMemberCard({
   member: ReviewGroupMember;
   action: ReviewGroupMemberAction;
   keepCount: number;
+  groupResolved: boolean;
   onChange: (action: ReviewGroupMemberAction) => void;
   onOpen: (member: ReviewGroupMember, dataUrl: string | null) => void;
 }) {
@@ -180,7 +182,8 @@ function GroupMemberCard({
     queryFn: () => api.getReviewGroupMemberPreview(groupId, member.image_id, member.image_source),
     staleTime: Infinity,
   });
-  const readonly = member.image_source === 'library';
+  const libraryReadonly = member.image_source === 'library';
+  const readonly = libraryReadonly || groupResolved;
   const cannotExcludeLast = action === 'keep' && keepCount <= 1;
   return (
     <article className={`review-group-member review-group-member--${action}`}>
@@ -201,8 +204,14 @@ function GroupMemberCard({
       <div className="review-group-member__body">
         <div className="review-group-member__heading">
           <strong title={member.relative_path}>{member.relative_path}</strong>
-          <StatusBadge tone={readonly ? 'info' : action === 'keep' ? 'success' : 'neutral'}>
-            {readonly ? '库内图片' : action === 'keep' ? '保留' : '排除'}
+          <StatusBadge tone={libraryReadonly ? 'info' : action === 'keep' ? 'success' : 'neutral'}>
+            {libraryReadonly
+              ? '库内图片'
+              : groupResolved
+                ? '已提交'
+                : action === 'keep'
+                  ? '保留'
+                  : '排除'}
           </StatusBadge>
         </div>
         <p>{member.album_name}</p>
@@ -226,7 +235,11 @@ function GroupMemberCard({
             排除
           </Button>
         </div>
-        {readonly && <small>库内成员只读，并始终保留。</small>}
+        {libraryReadonly ? (
+          <small>库内成员只读，并始终保留。</small>
+        ) : groupResolved ? (
+          <small>该审核组已提交，成员决定为只读。</small>
+        ) : null}
       </div>
     </article>
   );
@@ -639,7 +652,11 @@ export function ReviewPage({
           <div className="review-group-heading">
             <div>
               <h2>{detail.members.length} 张关联图片</h2>
-              <p>默认全部保留。库内图片为只读；组内至少需要保留一张图片。</p>
+              <p>
+                {detail.state === 'resolved'
+                  ? '该审核组已经提交，成员决定为只读。'
+                  : '默认全部保留。库内图片为只读；组内至少需要保留一张图片。'}
+              </p>
             </div>
             <StatusBadge tone={detail.state === 'resolved' ? 'success' : 'warning'}>
               {detail.state === 'resolved' ? '已提交' : '尚未提交'}
@@ -653,6 +670,7 @@ export function ReviewPage({
                 member={member}
                 action={actions[member.image_id] ?? member.final_action}
                 keepCount={keepCount}
+                groupResolved={detail.state === 'resolved'}
                 onChange={(action) =>
                   setActions((current) => ({ ...current, [member.image_id]: action }))
                 }

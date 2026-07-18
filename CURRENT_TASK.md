@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`codex/group-review-large-image-move-import`
 
-当前实施阶段：任务包实现完成并通过自动质量门。审核由 pair 决策升级为持久化连通组，组内逐图 keep/exclude 是 frozen plan 的唯一审核事实；大图解码保持 Fingerprint V2 算法、哈希和阈值不变，产品像素上限提高到 5 亿并对 1 亿像素以上解码实行单槽限流；导入计划新增默认关闭的 `move_selected_without_backup`，模式绑定 plan hash、manifest、文件事务、恢复和结果，且仅在发布与数据库证据复验后逐文件删除 frozen plan 选中源图。
+当前实施阶段：任务包实现完成并进入审查修复收口。审核由 pair 决策升级为持久化连通组，组内逐图 keep/exclude 是 frozen plan 的唯一审核事实，resolved 组成员在界面上全部只读；大图解码保持 Fingerprint V2 算法、哈希和阈值不变，产品像素上限提高到 5 亿并对 1 亿像素以上解码实行单槽限流；导入计划新增默认关闭的 `move_selected_without_backup`，模式绑定 plan hash、manifest、文件事务、恢复和结果，且仅在发布与数据库证据复验后，将 frozen plan 选中源图原子隔离到持久化同目录临时路径并验证删除。`source_files_removing` 统一进入 Dashboard Recovery；临时删除 I/O 错误保持可重试，证据冲突才进入永久 conflict。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。除 M3.8 明确授权的 `abandoned` / `invalidated` 外，M3 不修改 frozen plan、Commit、Recovery、数据库 migration、匹配算法或文件事务语义。
 
@@ -58,7 +58,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
 - MVP3 UI 重设计：M3.0–M3.8 已进入审查修复与验证收口；Windows 100% / 150% 系统缩放不是本轮完成门禁或阻塞项。
-- 多图审核 / 大图解码 / 移动入库：实现完成；默认 Rust、前端、真实 PostgreSQL / 文件系统 / 故障注入门禁通过，待分支审查与提交。
+- 多图审核 / 大图解码 / 移动入库：实现完成；审查发现的 Dashboard 恢复路由、临时删除错误分类、删除 TOCTOU 和 resolved 组只读问题已修复，默认 Rust、前端、真实 PostgreSQL / 文件系统 / 完整故障注入门禁通过，待提交。
 
 ## 文档入口
 

@@ -21,12 +21,14 @@ pub(crate) enum CommitFaultPoint {
     BeforeSourceArchive = 9,
     DuringSourceArchive = 10,
     BeforeCommitMarker = 11,
-    Panic = 12,
+    DuringSelectedSourceRemoval = 12,
+    Panic = 13,
 }
 
 /// Global fault injection state (thread-safe).
 static FAULT_POINT: AtomicU8 = AtomicU8::new(255);
 static FAULT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static FAULT_TRIGGER_ATTEMPT: AtomicUsize = AtomicUsize::new(1);
 static FORCE_CONSERVATIVE_PUBLISH: AtomicU8 = AtomicU8::new(0);
 static FORCE_STORAGE_UNWRITABLE: AtomicU8 = AtomicU8::new(0);
 static FORCE_STORAGE_TIMEOUT: AtomicU8 = AtomicU8::new(0);
@@ -35,12 +37,23 @@ static FORCED_AVAILABLE_SPACE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Set the active fault point for the next commit operation.
 pub(crate) fn set_fault_point(fault: CommitFaultPoint) {
     FAULT_COUNTER.store(0, Ordering::SeqCst);
+    FAULT_TRIGGER_ATTEMPT.store(1, Ordering::SeqCst);
+    FAULT_POINT.store(fault as u8, Ordering::SeqCst);
+}
+
+/// Trigger a fault only on the selected 1-based visit to the injection point.
+pub(crate) fn set_fault_point_on_attempt(fault: CommitFaultPoint, attempt: usize) {
+    assert!(attempt > 0, "fault trigger attempt must be 1-based");
+    FAULT_COUNTER.store(0, Ordering::SeqCst);
+    FAULT_TRIGGER_ATTEMPT.store(attempt, Ordering::SeqCst);
     FAULT_POINT.store(fault as u8, Ordering::SeqCst);
 }
 
 /// Clear the active fault point.
 pub(crate) fn clear_fault_point() {
     FAULT_POINT.store(255, Ordering::SeqCst);
+    FAULT_COUNTER.store(0, Ordering::SeqCst);
+    FAULT_TRIGGER_ATTEMPT.store(1, Ordering::SeqCst);
 }
 
 pub(crate) fn set_force_conservative_publish(enabled: bool) {
@@ -85,8 +98,13 @@ pub(crate) fn check_fault(point: CommitFaultPoint) -> bool {
         return false;
     }
     if current == point as u8 {
-        let _ = FAULT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        true
+        let attempt = FAULT_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt == FAULT_TRIGGER_ATTEMPT.load(Ordering::SeqCst) {
+            FAULT_POINT.store(255, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     } else {
         false
     }

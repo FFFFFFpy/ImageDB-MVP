@@ -23,6 +23,7 @@ const MIGRATION_0014: &str =
 const MIGRATION_0015: &str = include_str!("../../../migrations/0015_fingerprint_v2.sql");
 const MIGRATION_0016: &str =
     include_str!("../../../migrations/0016_group_review_large_image_move_import.sql");
+const MIGRATION_0017: &str = include_str!("../../../migrations/0017_source_cleanup_quarantine.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
@@ -47,6 +48,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
     ("0015_fingerprint_v2", MIGRATION_0015),
     ("0016_group_review_large_image_move_import", MIGRATION_0016),
+    ("0017_source_cleanup_quarantine", MIGRATION_0017),
 ];
 
 const RESET_DROP_SQL: &str = "
@@ -417,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 16);
+        assert_eq!(MIGRATIONS.len(), 17);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
         assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
@@ -443,6 +445,7 @@ mod tests {
         assert!(MIGRATION_0016.contains("CREATE TABLE review_groups"));
         assert!(MIGRATION_0016.contains("source_file_cleanup_operations"));
         assert!(MIGRATION_0016.contains("move_selected_without_backup"));
+        assert!(MIGRATION_0017.contains("quarantine_path"));
     }
 
     #[test]
@@ -465,12 +468,13 @@ mod tests {
                 "0013_workflow_escape_and_candidate_uniqueness",
                 "0014_candidate_review_semantics_and_abandoned_filters",
                 "0015_fingerprint_v2",
-                "0016_group_review_large_image_move_import"
+                "0016_group_review_large_image_move_import",
+                "0017_source_cleanup_quarantine"
             ]
         );
         assert_eq!(
             MigrationRunner::latest_version(),
-            "0016_group_review_large_image_move_import"
+            "0017_source_cleanup_quarantine"
         );
     }
 
@@ -1077,7 +1081,8 @@ mod tests {
                 "0013_workflow_escape_and_candidate_uniqueness",
                 "0014_candidate_review_semantics_and_abandoned_filters",
                 "0015_fingerprint_v2",
-                "0016_group_review_large_image_move_import"
+                "0016_group_review_large_image_move_import",
+                "0017_source_cleanup_quarantine"
             ]
         );
 

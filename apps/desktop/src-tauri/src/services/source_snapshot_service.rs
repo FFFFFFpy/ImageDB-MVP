@@ -523,15 +523,16 @@ pub async fn verify_source_snapshot_files_async(
     .map_err(|e| AppError::Internal(format!("snapshot verify task failed: {e}")))?
 }
 
-/// Verify a source album after selected frozen-plan files may already have
-/// been removed. Every file that remains must still match the original full
-/// snapshot, there may be no new files, and only paths explicitly listed in
-/// `allowed_missing` may be absent. This is the recovery-safe counterpart to
-/// the exact snapshot verifier used before the first removal.
-pub async fn verify_source_snapshot_files_allowing_missing_async(
+/// Verify a source album after selected files have been atomically isolated.
+/// Every path outside `ignored_paths` must still match the original full
+/// snapshot exactly. Ignored paths are limited to persisted original and
+/// quarantine paths for cleanup operations that have already crossed the
+/// rename boundary; this permits a new user file at the original path without
+/// allowing any unrelated sidecar, excluded image, or directory change.
+pub async fn verify_source_snapshot_files_ignoring_paths_async(
     source_album_path: &Path,
     stored_files: Vec<SnapshotFileRecord>,
-    allowed_missing: std::collections::HashSet<String>,
+    ignored_paths: std::collections::HashSet<String>,
 ) -> Result<Vec<SnapshotVerifyError>, AppError> {
     let album_path = source_album_path.to_path_buf();
     let _permit = SNAPSHOT_CONCURRENCY
@@ -551,8 +552,10 @@ pub async fn verify_source_snapshot_files_allowing_missing_async(
         let mut errors = Vec::new();
 
         for (path, stored) in &stored_map {
+            if ignored_paths.contains(*path) {
+                continue;
+            }
             match actual_map.get(path) {
-                None if allowed_missing.contains(*path) => {}
                 None => errors.push(SnapshotVerifyError::MissingFile(path.to_string())),
                 Some(actual) => {
                     if stored.file_size != actual.file_size {
@@ -578,7 +581,7 @@ pub async fn verify_source_snapshot_files_allowing_missing_async(
             }
         }
         for path in actual_map.keys() {
-            if !stored_map.contains_key(path) {
+            if !stored_map.contains_key(path) && !ignored_paths.contains(*path) {
                 errors.push(SnapshotVerifyError::ExtraFile(path.to_string()));
             }
         }
@@ -950,7 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_snapshot_verifier_allows_only_persisted_selected_file_removals() {
+    async fn partial_snapshot_verifier_ignores_only_persisted_cleanup_paths() {
         let tmp = TempDir::new().unwrap();
         let album = tmp.path().join("album");
         std::fs::create_dir_all(album.join("meta")).unwrap();
@@ -971,18 +974,31 @@ mod tests {
             .collect();
 
         std::fs::remove_file(album.join("selected.jpg")).unwrap();
-        let allowed = std::collections::HashSet::from(["selected.jpg".to_string()]);
-        let errors = verify_source_snapshot_files_allowing_missing_async(
+        let ignored = std::collections::HashSet::from(["selected.jpg".to_string()]);
+        let errors = verify_source_snapshot_files_ignoring_paths_async(
             &album,
             stored.clone(),
-            allowed.clone(),
+            ignored.clone(),
         )
         .await
         .unwrap();
         assert!(errors.is_empty(), "{errors:?}");
 
+        std::fs::write(album.join("selected.jpg"), b"new user file").unwrap();
+        let errors = verify_source_snapshot_files_ignoring_paths_async(
+            &album,
+            stored.clone(),
+            ignored.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            errors.is_empty(),
+            "replacement at isolated path must be ignored"
+        );
+
         std::fs::write(album.join("meta").join("notes.xmp"), b"changed").unwrap();
-        let errors = verify_source_snapshot_files_allowing_missing_async(&album, stored, allowed)
+        let errors = verify_source_snapshot_files_ignoring_paths_async(&album, stored, ignored)
             .await
             .unwrap();
         assert!(errors.iter().any(|error| matches!(

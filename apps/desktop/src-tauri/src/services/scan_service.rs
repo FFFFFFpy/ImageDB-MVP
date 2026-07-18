@@ -3768,6 +3768,107 @@ mod tests {
         manager.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_scan_dashboard_source_files_removing_routes_to_recovery() {
+        use crate::infrastructure::postgres::PostgresManager;
+        use crate::repositories::import_repository::{
+            DashboardNextAction, DatabaseInfoDatabaseSection,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = PostgresManager::new(tmp.path());
+        manager.initialize().await.unwrap();
+        let (client, handle) = manager.connect().await.unwrap();
+        let root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        let album_id = Uuid::new_v4();
+        let transaction_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_runs
+                 (id, source_root, library_root_id, state, policy_version)
+                 VALUES ($1, 'C:/source', $2, 'recovery_required', 'test')",
+                &[&run_id, &root_id],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_albums
+                 (id, import_run_id, source_path, source_name, state)
+                 VALUES ($1, $2, 'C:/source/album', 'album', 'analyzed')",
+                &[&album_id, &run_id],
+            )
+            .await
+            .unwrap();
+        let plan_id = ImportRepository::create_import_plan(&client, run_id, 1, "test", root_id)
+            .await
+            .unwrap();
+        ImportRepository::insert_plan_album(&client, plan_id, album_id, "album", 0)
+            .await
+            .unwrap();
+        ImportRepository::set_plan_hash(&client, plan_id, &[9_u8; 32])
+            .await
+            .unwrap();
+        ImportRepository::update_import_plan_state(
+            &client,
+            plan_id,
+            &crate::domain::state_machine::PlanState::Frozen,
+        )
+        .await
+        .unwrap();
+        ImportRepository::insert_file_transaction(
+            &client,
+            transaction_id,
+            run_id,
+            album_id,
+            &crate::domain::state_machine::TransactionState::SourceFilesRemoving,
+            Some("C:/staging"),
+            Some("C:/library/album"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let dashboard = ImportRepository::get_database_info_dashboard(
+            &client,
+            DatabaseInfoDatabaseSection {
+                mode: Some("managed_local".to_string()),
+                status: "connected".to_string(),
+                pgvector_available: true,
+                migration_version: Some(
+                    crate::infrastructure::postgres::MigrationRunner::latest_version().to_string(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dashboard.next_action, DashboardNextAction::Recover);
+        let actionable = dashboard.latest_actionable_run.as_ref().unwrap();
+        assert_eq!(actionable.run.import_run_id, run_id.to_string());
+        assert!(actionable.has_recoverable_transaction);
+        assert_eq!(
+            ImportRepository::get_latest_committable_run(&client)
+                .await
+                .unwrap(),
+            None,
+            "an active source cleanup must route to Recovery, never Commit"
+        );
+
+        let recoverable = ImportRepository::get_recoverable_transactions(&client)
+            .await
+            .unwrap();
+        assert!(recoverable.iter().any(|row| row.id == transaction_id));
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
     fn make_snapshot_file(path: &str, ft: &str, size: i64, hash: u8) -> NewSnapshotFile {
         NewSnapshotFile {
             relative_path: path.to_string(),

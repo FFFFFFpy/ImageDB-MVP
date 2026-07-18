@@ -29,8 +29,9 @@ use crate::services::commit_service::{self, COMMIT_MARKER_FILE_NAME};
 use crate::services::recovery_service;
 use crate::services::source_snapshot_service::capture_source_album_snapshot;
 use crate::tests::fail_injection::{
-    clear_fault_point, set_fault_point, set_force_conservative_publish, set_force_storage_timeout,
-    set_force_storage_unwritable, set_forced_available_space, CommitFaultPoint,
+    clear_fault_point, set_fault_point, set_fault_point_on_attempt, set_force_conservative_publish,
+    set_force_storage_timeout, set_force_storage_unwritable, set_forced_available_space,
+    CommitFaultPoint,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -1515,6 +1516,154 @@ async fn fail_injection_move_selected_normal_and_idempotent() {
 
 #[tokio::test]
 #[ignore]
+async fn fail_injection_move_selected_permission_denied_is_retryable_and_quarantined() {
+    let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
+    set_fault_point_on_attempt(CommitFaultPoint::DuringSelectedSourceRemoval, 2);
+    let result = commit_service::run_import_commit(
+        pg.clone(),
+        library_root.display().to_string(),
+        run_id,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(
+            crate::domain::import_state::CommitProgress::idle(&run_id.to_string()),
+        )),
+    )
+    .await
+    .unwrap();
+    clear_fault_point();
+    assert_eq!(result.state, "recovery_required");
+
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let transaction = client
+        .query_one(
+            "SELECT id, state, last_error FROM file_transactions
+             WHERE import_run_id = $1 ORDER BY started_at DESC LIMIT 1",
+            &[&run_id],
+        )
+        .await
+        .unwrap();
+    let transaction_id: Uuid = transaction.get("id");
+    assert_eq!(
+        transaction.get::<_, String>("state"),
+        "source_files_removing"
+    );
+    assert!(transaction
+        .get::<_, Option<String>>("last_error")
+        .unwrap_or_default()
+        .contains("PermissionDenied"));
+    let cleanup_rows = client
+        .query(
+            "SELECT state, source_path, quarantine_path, last_error
+             FROM source_file_cleanup_operations
+             WHERE transaction_id = $1 ORDER BY source_path",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleanup_rows.len(), 2);
+    assert_eq!(cleanup_rows[0].get::<_, String>("state"), "removed");
+    assert_eq!(cleanup_rows[1].get::<_, String>("state"), "verifying");
+    assert!(cleanup_rows[1]
+        .get::<_, Option<String>>("last_error")
+        .unwrap_or_default()
+        .contains("PermissionDenied"));
+    let second_quarantine = std::path::PathBuf::from(
+        cleanup_rows[1]
+            .get::<_, Option<String>>("quarantine_path")
+            .expect("second cleanup operation must persist its quarantine path"),
+    );
+    assert!(!album_path.join("photo1.png").exists());
+    assert!(!album_path.join("photo2.png").exists());
+    assert!(second_quarantine.exists());
+    assert!(album_path.join("description.txt").exists());
+    assert!(album_path.join("sub/meta.xmp").exists());
+    drop(client);
+    handle.abort();
+
+    // The recovery path must classify the same transient deletion failure as
+    // retryable and return recovered=false without upgrading the transaction
+    // to conflict.
+    set_fault_point(CommitFaultPoint::DuringSelectedSourceRemoval);
+    let retry_outcome = recovery_service::recover_transaction(pg.clone(), transaction_id)
+        .await
+        .unwrap();
+    clear_fault_point();
+    assert!(!retry_outcome.recovered);
+    assert_eq!(retry_outcome.final_state, "source_files_removing");
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let retry_state: String = client
+        .query_one(
+            "SELECT state FROM file_transactions WHERE id = $1",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(retry_state, "source_files_removing");
+    drop(client);
+    handle.abort();
+
+    // Simulate another process creating a new file at the original path after
+    // ImageDB isolated the verified frozen-plan file. Recovery must unlink the
+    // quarantine only and leave this replacement untouched.
+    let replacement = b"replacement created after quarantine";
+    std::fs::write(album_path.join("photo2.png"), replacement).unwrap();
+    let outcomes = drive_recovery(pg.clone(), run_id).await;
+    assert!(outcomes
+        .iter()
+        .any(|outcome| { outcome.final_state == "source_files_removed" && outcome.recovered }));
+    assert!(drive_recovery(pg.clone(), run_id).await.is_empty());
+
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let transaction = client
+        .query_one(
+            "SELECT state, last_error FROM file_transactions WHERE id = $1",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        transaction.get::<_, String>("state"),
+        "source_files_removed"
+    );
+    assert_eq!(transaction.get::<_, Option<String>>("last_error"), None);
+    let remaining_quarantines: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM source_file_cleanup_operations
+             WHERE transaction_id = $1 AND state <> 'removed'",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining_quarantines, 0);
+    assert!(!second_quarantine.exists());
+    assert_eq!(
+        std::fs::read(album_path.join("photo2.png")).unwrap(),
+        replacement
+    );
+    assert!(album_path.join("description.txt").exists());
+    assert!(album_path.join("sub/meta.xmp").exists());
+    assert!(library_root.join("Albums/album_a/photo1.png").exists());
+    assert!(library_root.join("Albums/album_a/photo2.png").exists());
+    drop(client);
+    handle.abort();
+
+    let mut manager = pg.lock().await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
 async fn fail_injection_move_selected_recovers_after_db_commit() {
     let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
     run_commit_with_fault(
@@ -1531,6 +1680,78 @@ async fn fail_injection_move_selected_recovers_after_db_commit() {
     assert_move_selected_completed(pg.clone(), &library_root, &album_path).await;
     // A second recovery pass must be a no-op.
     assert!(drive_recovery(pg.clone(), run_id).await.is_empty());
+
+    let mut manager = pg.lock().await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn fail_injection_move_selected_legacy_cleanup_rows_upgrade_safely() {
+    let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
+    run_commit_with_fault(
+        pg.clone(),
+        &library_root,
+        run_id,
+        CommitFaultPoint::AfterDbCommit,
+    )
+    .await;
+
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let transaction_id: Uuid = client
+        .query_one(
+            "SELECT id FROM file_transactions WHERE import_run_id = $1",
+            &[&run_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let cleanup_rows = client
+        .query(
+            "SELECT id, source_path FROM source_file_cleanup_operations
+             WHERE transaction_id = $1 ORDER BY source_path",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleanup_rows.len(), 2);
+    let removed_id: Uuid = cleanup_rows[0].get("id");
+    let verifying_id: Uuid = cleanup_rows[1].get("id");
+    std::fs::remove_file(cleanup_rows[0].get::<_, String>("source_path")).unwrap();
+    client
+        .execute(
+            "UPDATE source_file_cleanup_operations
+             SET quarantine_path = NULL,
+                 state = CASE WHEN id = $1 THEN 'removing' ELSE 'verifying' END
+             WHERE id IN ($1, $2)",
+            &[&removed_id, &verifying_id],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    handle.abort();
+
+    drive_recovery(pg.clone(), run_id).await;
+    assert_move_selected_completed(pg.clone(), &library_root, &album_path).await;
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let missing_quarantine_paths: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM source_file_cleanup_operations
+             WHERE transaction_id = $1 AND quarantine_path IS NULL",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(missing_quarantine_paths, 0);
+    drop(client);
+    handle.abort();
 
     let mut manager = pg.lock().await;
     manager.shutdown().await.unwrap();

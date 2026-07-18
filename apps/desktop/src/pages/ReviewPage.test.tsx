@@ -127,10 +127,14 @@ function progress(overrides: Partial<ReviewProgress> = {}): ReviewProgress {
   };
 }
 
-function setupReviewMocks() {
-  vi.spyOn(api, 'getReviewGroups').mockResolvedValue(groups);
-  vi.spyOn(api, 'getReviewProgress').mockResolvedValue(progress());
-  vi.spyOn(api, 'getReviewGroupDetail').mockResolvedValue(detail);
+function setupReviewMocks(
+  groupDetail: ReviewGroupDetail = detail,
+  groupSummaries: ReviewGroupSummary[] = groups,
+  reviewProgress: ReviewProgress = progress(),
+) {
+  vi.spyOn(api, 'getReviewGroups').mockResolvedValue(groupSummaries);
+  vi.spyOn(api, 'getReviewProgress').mockResolvedValue(reviewProgress);
+  vi.spyOn(api, 'getReviewGroupDetail').mockResolvedValue(groupDetail);
   vi.spyOn(api, 'getFrozenImportPlanSummary').mockResolvedValue(null);
   vi.spyOn(api, 'getReviewGroupMemberPreview').mockResolvedValue({
     data_url: 'data:image/png;base64,AA==',
@@ -205,6 +209,25 @@ test('renders every group member and submits one action for every import member'
       { image_id: 'import-c', image_source: 'import', final_action: 'keep' },
     ]),
   );
+});
+
+test('keeps every member decision readonly after a review group is resolved', async () => {
+  const resolvedDetail = { ...detail, state: 'resolved' as const };
+  const resolvedGroups = [{ ...groups[0], state: 'resolved' as const }];
+  setupReviewMocks(
+    resolvedDetail,
+    resolvedGroups,
+    progress({ resolved_count: 1, remaining_count: 0, all_decided: true }),
+  );
+  renderReview();
+
+  expect(await screen.findByText('该审核组已经提交，成员决定为只读。')).toBeInTheDocument();
+  const cards = document.querySelectorAll('.review-group-member');
+  for (const card of cards) {
+    expect(within(card as HTMLElement).getByRole('button', { name: '保留' })).toBeDisabled();
+    expect(within(card as HTMLElement).getByRole('button', { name: '排除' })).toBeDisabled();
+  }
+  expect(screen.getByRole('button', { name: '提交整组决定' })).toBeDisabled();
 });
 
 test('shows frozen source mode as an explicit, default-off destructive toggle', async () => {

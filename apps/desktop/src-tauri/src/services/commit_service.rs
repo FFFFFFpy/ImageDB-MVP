@@ -28,11 +28,11 @@ use crate::repositories::import_repository::{
 };
 use crate::services::recovery_service::reconcile_import_run_state;
 use crate::services::source_snapshot_service::{
-    load_source_album_snapshot, verify_source_snapshot_files_allowing_missing_async,
-    verify_source_snapshot_files_async,
+    load_source_album_snapshot, verify_source_snapshot_files_async,
+    verify_source_snapshot_files_ignoring_paths_async,
 };
 #[cfg(feature = "fail-injection")]
-use crate::tests::fail_injection::{maybe_fault, CommitFaultPoint};
+use crate::tests::fail_injection::{check_fault, maybe_fault, CommitFaultPoint};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
@@ -61,6 +61,37 @@ pub const PREVIEW_MAX_PIXELS: u64 = 8_000_000;
 /// Maximum source file size (bytes) for a single source file preview.
 #[allow(dead_code)]
 pub const PREVIEW_MAX_SOURCE_BYTES: u64 = 80 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum SourceCleanupFailure {
+    Conflict(String),
+    Retryable(AppError),
+}
+
+impl SourceCleanupFailure {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Conflict(message) => message.clone(),
+            Self::Retryable(error) => error.to_string(),
+        }
+    }
+}
+
+impl From<AppError> for SourceCleanupFailure {
+    fn from(error: AppError) -> Self {
+        Self::Retryable(error)
+    }
+}
+
+fn classify_cleanup_snapshot_error(error: AppError) -> SourceCleanupFailure {
+    match error {
+        AppError::IoError(_) | AppError::PostgresUnavailable(_) => {
+            SourceCleanupFailure::Retryable(error)
+        }
+        AppError::Internal(message) => SourceCleanupFailure::Conflict(message),
+        other => SourceCleanupFailure::Retryable(other),
+    }
+}
 
 pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -1145,6 +1176,21 @@ async fn commit_single_album(
             target_path: target_path.display().to_string(),
             expected_size: img.expected_file_size,
             expected_blake3: img.expected_blake3.clone(),
+            source_cleanup_quarantine_path: if source_file_mode
+                == SourceFileMode::MoveSelectedWithoutBackup
+            {
+                Some(
+                    build_source_quarantine_path(
+                        Path::new(&img.source_path),
+                        tx_id,
+                        Uuid::new_v4(),
+                    )?
+                    .display()
+                    .to_string(),
+                )
+            } else {
+                None
+            },
         });
     }
 
@@ -1575,15 +1621,29 @@ async fn commit_single_album(
         )
         .await
         {
-            let message = error.to_string();
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx_id,
-                &TransactionState::Conflict,
-                Some(&message),
-            )
-            .await?;
-            return Err(error);
+            let message = error.message().to_string();
+            match error {
+                SourceCleanupFailure::Conflict(_) => {
+                    ImportRepository::update_file_transaction_state(
+                        client,
+                        tx_id,
+                        &TransactionState::Conflict,
+                        Some(&message),
+                    )
+                    .await?;
+                    return Err(AppError::Internal(message));
+                }
+                SourceCleanupFailure::Retryable(error) => {
+                    ImportRepository::update_file_transaction_state(
+                        client,
+                        tx_id,
+                        &TransactionState::SourceFilesRemoving,
+                        Some(&message),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            }
         }
         let removed = state_machine::transition_transaction(
             TransactionState::SourceFilesRemoving,
@@ -1797,11 +1857,177 @@ async fn commit_single_album(
     })
 }
 
+fn build_source_quarantine_path(
+    source_path: &Path,
+    transaction_id: Uuid,
+    token: Uuid,
+) -> Result<PathBuf, AppError> {
+    let parent = source_path.parent().ok_or_else(|| {
+        AppError::Internal(format!(
+            "selected source has no parent directory: {}",
+            source_path.display()
+        ))
+    })?;
+    if source_path.file_name().is_none() {
+        return Err(AppError::Internal(format!(
+            "selected source has no file name: {}",
+            source_path.display()
+        )));
+    }
+    Ok(parent.join(format!(".imagedb-moving-{transaction_id}-{token}")))
+}
+
+fn cleanup_relative_path(
+    source_album_dir: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<String, SourceCleanupFailure> {
+    let relative = path.strip_prefix(source_album_dir).map_err(|_| {
+        SourceCleanupFailure::Conflict(format!(
+            "{label} {} is outside source album {}",
+            path.display(),
+            source_album_dir.display()
+        ))
+    })?;
+    normalize_relative_path(&relative.to_string_lossy()).map_err(|error| {
+        SourceCleanupFailure::Conflict(format!("invalid {label} {}: {error}", path.display()))
+    })
+}
+
+fn validate_cleanup_quarantine_path(
+    source_album_dir: &Path,
+    source_path: &Path,
+    quarantine_path: &Path,
+    transaction_id: Uuid,
+) -> Result<(String, String), SourceCleanupFailure> {
+    let source_relative = cleanup_relative_path(source_album_dir, source_path, "cleanup source")?;
+    let quarantine_relative =
+        cleanup_relative_path(source_album_dir, quarantine_path, "cleanup quarantine")?;
+    let source_parent = source_path.parent().ok_or_else(|| {
+        SourceCleanupFailure::Conflict(format!(
+            "cleanup source has no parent: {}",
+            source_path.display()
+        ))
+    })?;
+    let quarantine_parent = quarantine_path.parent().ok_or_else(|| {
+        SourceCleanupFailure::Conflict(format!(
+            "cleanup quarantine has no parent: {}",
+            quarantine_path.display()
+        ))
+    })?;
+    let expected_prefix = format!(".imagedb-moving-{transaction_id}-");
+    let quarantine_name = quarantine_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !path_eq(source_parent, quarantine_parent)
+        || source_path == quarantine_path
+        || !quarantine_name.starts_with(&expected_prefix)
+    {
+        return Err(SourceCleanupFailure::Conflict(format!(
+            "invalid persisted quarantine path '{}' for selected source '{}'",
+            quarantine_path.display(),
+            source_path.display()
+        )));
+    }
+    Ok((source_relative, quarantine_relative))
+}
+
+async fn cleanup_path_exists(path: &Path) -> Result<bool, SourceCleanupFailure> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SourceCleanupFailure::Retryable(AppError::IoError(format!(
+            "cannot inspect cleanup path {}: {error}",
+            path.display()
+        )))),
+    }
+}
+
+async fn ensure_cleanup_album_accessible(
+    source_album_dir: &Path,
+) -> Result<(), SourceCleanupFailure> {
+    match tokio::fs::symlink_metadata(source_album_dir).await {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(())
+        }
+        Ok(_) => Err(SourceCleanupFailure::Conflict(format!(
+            "source album is no longer a regular directory: {}",
+            source_album_dir.display()
+        ))),
+        Err(error) => Err(SourceCleanupFailure::Retryable(AppError::IoError(format!(
+            "source album is temporarily unavailable for cleanup {}: {error}",
+            source_album_dir.display()
+        )))),
+    }
+}
+
+async fn cleanup_conflict(
+    client: &Client,
+    operation_id: Uuid,
+    message: String,
+) -> SourceCleanupFailure {
+    match ImportRepository::update_source_file_cleanup_operation(
+        client,
+        operation_id,
+        "conflict",
+        Some(&message),
+    )
+    .await
+    {
+        Ok(()) => SourceCleanupFailure::Conflict(message),
+        Err(error) => SourceCleanupFailure::Retryable(error),
+    }
+}
+
+async fn cleanup_retryable(
+    client: &Client,
+    operation_id: Uuid,
+    state: &str,
+    message: String,
+) -> SourceCleanupFailure {
+    let persist_result = ImportRepository::update_source_file_cleanup_operation(
+        client,
+        operation_id,
+        state,
+        Some(&message),
+    )
+    .await;
+    match persist_result {
+        Ok(()) => SourceCleanupFailure::Retryable(AppError::IoError(message)),
+        Err(error) => SourceCleanupFailure::Retryable(error),
+    }
+}
+
+async fn restore_quarantined_source_after_conflict(
+    source_path: &Path,
+    quarantine_path: &Path,
+) -> Result<String, AppError> {
+    if source_path.exists() {
+        return Ok(format!(
+            "original path is occupied; quarantined file retained at {}",
+            quarantine_path.display()
+        ));
+    }
+    tokio::fs::rename(quarantine_path, source_path)
+        .await
+        .map_err(|error| {
+            AppError::IoError(format!(
+                "cannot restore conflicted quarantine {} to {}: {error}",
+                quarantine_path.display(),
+                source_path.display()
+            ))
+        })?;
+    sync_parent_dir(source_path).await?;
+    Ok("quarantined file restored to its original path".to_string())
+}
+
 /// Remove only frozen-plan source files after publish and library DB evidence
-/// have succeeded. The persisted cleanup rows are the sole deletion set.
-/// Directories, sidecars, excluded images, and other snapshot members are
-/// never deletion targets. A crash after unlink but before the operation row
-/// is updated is recovered from the `removing` state.
+/// have succeeded. Each persisted source path is first atomically renamed to
+/// its unique same-directory quarantine path. Size and BLAKE3 verification,
+/// and the eventual unlink, operate on that quarantined identity rather than
+/// reopening the original path. A replacement created at the original path
+/// after rename is therefore never deleted.
 pub(crate) async fn remove_selected_source_files(
     client: &Client,
     tx_id: Uuid,
@@ -1809,23 +2035,23 @@ pub(crate) async fn remove_selected_source_files(
     snapshot_hash: &[u8],
     snapshot_files: &[SnapshotFileRecord],
     images: &[PlanImageRow],
-) -> Result<(), AppError> {
-    validate_plan_image_sources(source_album_dir, images)?;
-    let operations = ImportRepository::get_source_file_cleanup_operations(client, tx_id).await?;
+) -> Result<(), SourceCleanupFailure> {
+    ensure_cleanup_album_accessible(source_album_dir).await?;
+    if let Err(error) = validate_plan_image_sources(source_album_dir, images) {
+        return Err(match error {
+            AppError::Internal(message) => SourceCleanupFailure::Conflict(message),
+            other => SourceCleanupFailure::Retryable(other),
+        });
+    }
+    let mut operations = ImportRepository::get_source_file_cleanup_operations(client, tx_id)
+        .await
+        .map_err(SourceCleanupFailure::Retryable)?;
     if operations.len() != images.len() {
-        let msg = format!(
+        return Err(SourceCleanupFailure::Conflict(format!(
             "source cleanup set mismatch for transaction {tx_id}: {} rows for {} frozen images",
             operations.len(),
             images.len()
-        );
-        ImportRepository::update_file_transaction_state(
-            client,
-            tx_id,
-            &TransactionState::Conflict,
-            Some(&msg),
-        )
-        .await?;
-        return Err(AppError::Internal(msg));
+        )));
     }
 
     let plan_by_source: HashMap<&str, &PlanImageRow> = images
@@ -1833,284 +2059,468 @@ pub(crate) async fn remove_selected_source_files(
         .map(|image| (image.source_path.as_str(), image))
         .collect();
     if plan_by_source.len() != images.len() {
-        return Err(AppError::Internal(format!(
+        return Err(SourceCleanupFailure::Conflict(format!(
             "frozen plan for transaction {tx_id} contains duplicate source paths"
         )));
     }
     for operation in &operations {
         let Some(image) = plan_by_source.get(operation.source_path.as_str()) else {
-            let msg = format!(
+            let message = format!(
                 "cleanup operation {} is not a frozen-plan source: {}",
                 operation.id, operation.source_path
             );
-            ImportRepository::update_source_file_cleanup_operation(
-                client,
-                operation.id,
-                "conflict",
-                Some(&msg),
-            )
-            .await?;
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx_id,
-                &TransactionState::Conflict,
-                Some(&msg),
-            )
-            .await?;
-            return Err(AppError::Internal(msg));
+            return Err(cleanup_conflict(client, operation.id, message).await);
         };
         if operation.expected_size != image.expected_file_size
             || operation.expected_blake3 != image.expected_blake3
         {
-            let msg = format!(
+            let message = format!(
                 "cleanup evidence mismatch for frozen source {}",
                 operation.source_path
             );
-            ImportRepository::update_source_file_cleanup_operation(
-                client,
-                operation.id,
-                "conflict",
-                Some(&msg),
-            )
-            .await?;
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx_id,
-                &TransactionState::Conflict,
-                Some(&msg),
-            )
-            .await?;
-            return Err(AppError::Internal(msg));
+            return Err(cleanup_conflict(client, operation.id, message).await);
         }
     }
 
-    let relative_for = |source_path: &str| -> Result<String, AppError> {
-        let relative = Path::new(source_path)
-            .strip_prefix(source_album_dir)
-            .map_err(|_| {
-                AppError::Internal(format!(
-                    "cleanup source {source_path} is outside album {}",
-                    source_album_dir.display()
-                ))
-            })?;
-        normalize_relative_path(&relative.to_string_lossy())
-    };
-    let mut allowed_missing = HashSet::new();
-    for operation in &operations {
-        if matches!(operation.state.as_str(), "removing" | "removed") {
-            allowed_missing.insert(relative_for(&operation.source_path)?);
+    // 0016 rows may predate quarantine persistence. Normalize their old
+    // state semantics and assign a unique path in one PostgreSQL update so a
+    // crash can never expose a new quarantine path with an old `verifying`
+    // meaning. Old `removing` means the file was already hash-verified: if it
+    // is absent, the legacy unlink completed; if present, restart isolation.
+    for operation in &mut operations {
+        if operation.quarantine_path.is_none() {
+            let source_exists = cleanup_path_exists(Path::new(&operation.source_path)).await?;
+            let legacy_normalized_state = match operation.state.as_str() {
+                "pending" | "verifying" | "removing" if source_exists => "pending",
+                "removing" => "removed",
+                "removed" if !source_exists => "removed",
+                "pending" | "verifying" => {
+                    return Err(cleanup_conflict(
+                        client,
+                        operation.id,
+                        format!(
+                            "legacy selected source disappeared before verified removal: {}",
+                            operation.source_path
+                        ),
+                    )
+                    .await);
+                }
+                "removed" => {
+                    return Err(cleanup_conflict(
+                        client,
+                        operation.id,
+                        format!(
+                            "legacy selected source reappeared after persisted removal: {}",
+                            operation.source_path
+                        ),
+                    )
+                    .await);
+                }
+                "conflict" => {
+                    return Err(SourceCleanupFailure::Conflict(format!(
+                        "source cleanup operation {} is already in conflict",
+                        operation.id
+                    )));
+                }
+                other => {
+                    return Err(SourceCleanupFailure::Conflict(format!(
+                        "invalid legacy source cleanup state '{other}' for {}",
+                        operation.source_path
+                    )));
+                }
+            };
+            let generated = build_source_quarantine_path(
+                Path::new(&operation.source_path),
+                tx_id,
+                operation.id,
+            )
+            .map_err(|error| SourceCleanupFailure::Conflict(error.to_string()))?;
+            let (persisted_path, persisted_state) =
+                ImportRepository::initialize_source_cleanup_quarantine_if_missing(
+                    client,
+                    operation.id,
+                    &generated.display().to_string(),
+                    legacy_normalized_state,
+                )
+                .await
+                .map_err(SourceCleanupFailure::Retryable)?;
+            operation.quarantine_path = Some(persisted_path);
+            operation.state = persisted_state;
         }
     }
-    if allowed_missing.is_empty() {
-        if let Some(msg) = verify_source_snapshot_or_conflict(
-            client,
-            tx_id,
+
+    let mut ignored_paths = HashSet::new();
+    for operation in &operations {
+        let source_path = PathBuf::from(&operation.source_path);
+        let quarantine_path = PathBuf::from(
+            operation
+                .quarantine_path
+                .as_deref()
+                .expect("quarantine path assigned above"),
+        );
+        let (source_relative, quarantine_relative) = validate_cleanup_quarantine_path(
             source_album_dir,
-            snapshot_hash,
-            snapshot_files,
-            "source album before selected-file removal",
+            &source_path,
+            &quarantine_path,
+            tx_id,
+        )?;
+        let source_exists = cleanup_path_exists(&source_path).await?;
+        let quarantine_exists = cleanup_path_exists(&quarantine_path).await?;
+        match operation.state.as_str() {
+            "pending" if quarantine_exists => {
+                return Err(cleanup_conflict(
+                    client,
+                    operation.id,
+                    format!(
+                        "quarantine path existed before cleanup began: {}",
+                        quarantine_path.display()
+                    ),
+                )
+                .await);
+            }
+            "removing" if !source_exists && !quarantine_exists => {
+                return Err(cleanup_conflict(
+                    client,
+                    operation.id,
+                    format!(
+                        "selected source and quarantine both disappeared before isolation completed: {}",
+                        source_path.display()
+                    ),
+                )
+                .await);
+            }
+            "verifying" | "removed" => {
+                ignored_paths.insert(source_relative);
+                ignored_paths.insert(quarantine_relative);
+            }
+            "removing" if quarantine_exists => {
+                ignored_paths.insert(source_relative);
+                ignored_paths.insert(quarantine_relative);
+            }
+            "pending" | "removing" => {}
+            "conflict" => {
+                return Err(SourceCleanupFailure::Conflict(format!(
+                    "source cleanup operation {} is already in conflict",
+                    operation.id
+                )));
+            }
+            other => {
+                return Err(SourceCleanupFailure::Conflict(format!(
+                    "invalid source cleanup state '{other}' for {}",
+                    source_path.display()
+                )));
+            }
+        }
+    }
+
+    if ignored_paths.is_empty() {
+        let errors = verify_source_snapshot_files_async(
+            source_album_dir,
+            snapshot_hash.to_vec(),
+            snapshot_files.to_vec(),
         )
-        .await?
-        {
-            return Err(AppError::Internal(msg));
+        .await
+        .map_err(classify_cleanup_snapshot_error)?;
+        if !errors.is_empty() {
+            return Err(SourceCleanupFailure::Conflict(format!(
+                "source album before selected-file removal {} does not match captured snapshot: {}",
+                source_album_dir.display(),
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
         }
     } else {
-        let errors = verify_source_snapshot_files_allowing_missing_async(
+        let errors = verify_source_snapshot_files_ignoring_paths_async(
             source_album_dir,
             snapshot_files.to_vec(),
-            allowed_missing,
+            ignored_paths,
         )
-        .await?;
+        .await
+        .map_err(classify_cleanup_snapshot_error)?;
         if !errors.is_empty() {
-            let msg = format!(
+            return Err(SourceCleanupFailure::Conflict(format!(
                 "source album changed during selected-file recovery: {}",
                 errors
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join("; ")
-            );
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx_id,
-                &TransactionState::Conflict,
-                Some(&msg),
-            )
-            .await?;
-            return Err(AppError::Internal(msg));
+            )));
         }
     }
 
     for operation in operations {
         let source_path = PathBuf::from(&operation.source_path);
-        let metadata = tokio::fs::symlink_metadata(&source_path).await;
-        match metadata {
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                if matches!(operation.state.as_str(), "removing" | "removed") {
-                    ImportRepository::update_source_file_cleanup_operation(
-                        client,
-                        operation.id,
-                        "removed",
-                        None,
-                    )
-                    .await?;
-                    continue;
-                }
-                let msg = format!(
-                    "selected source disappeared before removal: {}",
-                    source_path.display()
-                );
-                ImportRepository::update_source_file_cleanup_operation(
+        let quarantine_path = PathBuf::from(
+            operation
+                .quarantine_path
+                .as_deref()
+                .expect("quarantine path assigned above"),
+        );
+        let mut quarantine_exists = cleanup_path_exists(&quarantine_path).await?;
+
+        if operation.state == "removed" {
+            if quarantine_exists {
+                return Err(cleanup_conflict(
                     client,
                     operation.id,
-                    "conflict",
-                    Some(&msg),
+                    format!(
+                        "quarantined file reappeared after persisted removal: {}",
+                        quarantine_path.display()
+                    ),
                 )
-                .await?;
-                ImportRepository::update_file_transaction_state(
-                    client,
-                    tx_id,
-                    &TransactionState::Conflict,
-                    Some(&msg),
-                )
-                .await?;
-                return Err(AppError::Internal(msg));
+                .await);
             }
-            Err(error) => {
-                return Err(AppError::IoError(format!(
-                    "cannot inspect selected source {}: {error}",
-                    source_path.display()
-                )));
-            }
-            Ok(metadata) => {
-                if operation.state == "removed" {
-                    let msg = format!(
-                        "selected source reappeared after persisted removal: {}",
-                        source_path.display()
-                    );
-                    ImportRepository::update_file_transaction_state(
-                        client,
-                        tx_id,
-                        &TransactionState::Conflict,
-                        Some(&msg),
-                    )
-                    .await?;
-                    return Err(AppError::Internal(msg));
-                }
-                if operation.state == "conflict"
-                    || !matches!(
-                        operation.state.as_str(),
-                        "pending" | "verifying" | "removing"
-                    )
-                {
-                    return Err(AppError::Internal(format!(
-                        "invalid source cleanup state '{}' for {}",
-                        operation.state,
-                        source_path.display()
-                    )));
-                }
-                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                    let msg = format!(
-                        "selected source is not a regular file: {}",
-                        source_path.display()
-                    );
-                    ImportRepository::update_source_file_cleanup_operation(
-                        client,
-                        operation.id,
-                        "conflict",
-                        Some(&msg),
-                    )
-                    .await?;
-                    ImportRepository::update_file_transaction_state(
-                        client,
-                        tx_id,
-                        &TransactionState::Conflict,
-                        Some(&msg),
-                    )
-                    .await?;
-                    return Err(AppError::Internal(msg));
-                }
-                if metadata.len() as i64 != operation.expected_size {
-                    let msg = format!(
-                        "selected source size changed before removal: {}",
-                        source_path.display()
-                    );
-                    ImportRepository::update_source_file_cleanup_operation(
-                        client,
-                        operation.id,
-                        "conflict",
-                        Some(&msg),
-                    )
-                    .await?;
-                    ImportRepository::update_file_transaction_state(
-                        client,
-                        tx_id,
-                        &TransactionState::Conflict,
-                        Some(&msg),
-                    )
-                    .await?;
-                    return Err(AppError::Internal(msg));
-                }
-            }
+            continue;
         }
 
-        ImportRepository::update_source_file_cleanup_operation(
-            client,
-            operation.id,
-            "verifying",
-            None,
-        )
-        .await?;
-        let actual_hash = hash_existing_file(&source_path).await?;
-        if actual_hash != operation.expected_blake3 {
-            let msg = format!(
-                "selected source BLAKE3 changed before removal: {}",
-                source_path.display()
-            );
+        if operation.state == "verifying" && !quarantine_exists {
             ImportRepository::update_source_file_cleanup_operation(
                 client,
                 operation.id,
-                "conflict",
-                Some(&msg),
+                "removed",
+                None,
             )
-            .await?;
-            ImportRepository::update_file_transaction_state(
-                client,
-                tx_id,
-                &TransactionState::Conflict,
-                Some(&msg),
-            )
-            .await?;
-            return Err(AppError::Internal(msg));
+            .await
+            .map_err(SourceCleanupFailure::Retryable)?;
+            continue;
         }
-        ImportRepository::update_source_file_cleanup_operation(
-            client,
-            operation.id,
-            "removing",
-            None,
-        )
-        .await?;
+
+        if !quarantine_exists {
+            let source_metadata = match tokio::fs::symlink_metadata(&source_path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return Err(cleanup_conflict(
+                        client,
+                        operation.id,
+                        format!(
+                            "selected source disappeared before quarantine rename: {}",
+                            source_path.display()
+                        ),
+                    )
+                    .await);
+                }
+                Err(error) => {
+                    return Err(cleanup_retryable(
+                        client,
+                        operation.id,
+                        "removing",
+                        format!(
+                            "cannot inspect selected source {}: {error}",
+                            source_path.display()
+                        ),
+                    )
+                    .await);
+                }
+            };
+            if !source_metadata.file_type().is_file() || source_metadata.file_type().is_symlink() {
+                return Err(cleanup_conflict(
+                    client,
+                    operation.id,
+                    format!(
+                        "selected source is not a regular file: {}",
+                        source_path.display()
+                    ),
+                )
+                .await);
+            }
+            ImportRepository::update_source_file_cleanup_operation(
+                client,
+                operation.id,
+                "removing",
+                None,
+            )
+            .await
+            .map_err(SourceCleanupFailure::Retryable)?;
+            if let Err(error) = tokio::fs::rename(&source_path, &quarantine_path).await {
+                quarantine_exists = cleanup_path_exists(&quarantine_path).await?;
+                let source_exists = cleanup_path_exists(&source_path).await?;
+                if !quarantine_exists && !source_exists {
+                    return Err(cleanup_conflict(
+                        client,
+                        operation.id,
+                        format!(
+                            "selected source and quarantine both disappeared during rename: {}",
+                            source_path.display()
+                        ),
+                    )
+                    .await);
+                }
+                if !quarantine_exists {
+                    return Err(cleanup_retryable(
+                        client,
+                        operation.id,
+                        "removing",
+                        format!(
+                            "cannot atomically quarantine selected source {}: {error}",
+                            source_path.display()
+                        ),
+                    )
+                    .await);
+                }
+            }
+            if let Err(error) = sync_parent_dir(&quarantine_path).await {
+                return Err(cleanup_retryable(
+                    client,
+                    operation.id,
+                    "removing",
+                    format!(
+                        "cannot sync quarantine rename for {}: {error}",
+                        quarantine_path.display()
+                    ),
+                )
+                .await);
+            }
+            ImportRepository::update_source_file_cleanup_operation(
+                client,
+                operation.id,
+                "verifying",
+                None,
+            )
+            .await
+            .map_err(SourceCleanupFailure::Retryable)?;
+        }
+
+        let metadata = match tokio::fs::symlink_metadata(&quarantine_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                ImportRepository::update_source_file_cleanup_operation(
+                    client,
+                    operation.id,
+                    "removed",
+                    None,
+                )
+                .await
+                .map_err(SourceCleanupFailure::Retryable)?;
+                continue;
+            }
+            Err(error) => {
+                return Err(cleanup_retryable(
+                    client,
+                    operation.id,
+                    "verifying",
+                    format!(
+                        "cannot inspect quarantined source {}: {error}",
+                        quarantine_path.display()
+                    ),
+                )
+                .await);
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            let restore = restore_quarantined_source_after_conflict(&source_path, &quarantine_path)
+                .await
+                .unwrap_or_else(|error| error.to_string());
+            return Err(cleanup_conflict(
+                client,
+                operation.id,
+                format!(
+                    "quarantined source is not a regular file: {}; {restore}",
+                    quarantine_path.display()
+                ),
+            )
+            .await);
+        }
+        if metadata.len() as i64 != operation.expected_size {
+            let restore = restore_quarantined_source_after_conflict(&source_path, &quarantine_path)
+                .await
+                .unwrap_or_else(|error| error.to_string());
+            return Err(cleanup_conflict(
+                client,
+                operation.id,
+                format!(
+                    "quarantined source size changed before removal: {}; {restore}",
+                    quarantine_path.display()
+                ),
+            )
+            .await);
+        }
+
+        let actual_hash = match hash_existing_file(&quarantine_path).await {
+            Ok(hash) => hash,
+            Err(error) => {
+                return Err(cleanup_retryable(
+                    client,
+                    operation.id,
+                    "verifying",
+                    format!(
+                        "cannot hash quarantined source {}: {error}",
+                        quarantine_path.display()
+                    ),
+                )
+                .await);
+            }
+        };
+        if actual_hash != operation.expected_blake3 {
+            let restore = restore_quarantined_source_after_conflict(&source_path, &quarantine_path)
+                .await
+                .unwrap_or_else(|error| error.to_string());
+            return Err(cleanup_conflict(
+                client,
+                operation.id,
+                format!(
+                    "quarantined source BLAKE3 changed before removal: {}; {restore}",
+                    quarantine_path.display()
+                ),
+            )
+            .await);
+        }
+
+        #[cfg(feature = "fail-injection")]
+        if check_fault(CommitFaultPoint::DuringSelectedSourceRemoval) {
+            return Err(cleanup_retryable(
+                client,
+                operation.id,
+                "verifying",
+                format!(
+                    "cannot remove quarantined source {}: injected PermissionDenied sharing violation",
+                    quarantine_path.display()
+                ),
+            )
+            .await);
+        }
+
         tracing::info!(
             transaction_id = %tx_id,
             source_path = %source_path.display(),
-            "removing verified frozen-plan source file"
+            quarantine_path = %quarantine_path.display(),
+            "removing verified quarantined frozen-plan source file"
         );
-        tokio::fs::remove_file(&source_path)
-            .await
-            .map_err(|error| {
-                AppError::IoError(format!(
-                    "cannot remove selected source {}: {error}",
-                    source_path.display()
-                ))
-            })?;
-        sync_parent_dir(&source_path).await?;
+        if let Err(error) = tokio::fs::remove_file(&quarantine_path).await {
+            return Err(cleanup_retryable(
+                client,
+                operation.id,
+                "verifying",
+                format!(
+                    "cannot remove quarantined source {}: {error}",
+                    quarantine_path.display()
+                ),
+            )
+            .await);
+        }
+        if let Err(error) = sync_parent_dir(&quarantine_path).await {
+            return Err(cleanup_retryable(
+                client,
+                operation.id,
+                "verifying",
+                format!(
+                    "cannot sync quarantined source removal {}: {error}",
+                    quarantine_path.display()
+                ),
+            )
+            .await);
+        }
         ImportRepository::update_source_file_cleanup_operation(
             client,
             operation.id,
             "removed",
             None,
         )
-        .await?;
+        .await
+        .map_err(SourceCleanupFailure::Retryable)?;
     }
     Ok(())
 }
@@ -3819,6 +4229,30 @@ pub(crate) async fn detect_extra_published_files(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cleanup_snapshot_io_is_retryable_but_evidence_errors_conflict() {
+        assert!(matches!(
+            classify_cleanup_snapshot_error(AppError::IoError("storage offline".to_string())),
+            SourceCleanupFailure::Retryable(_)
+        ));
+        assert!(matches!(
+            classify_cleanup_snapshot_error(AppError::Internal(
+                "unsupported filesystem entry (symlink)".to_string()
+            )),
+            SourceCleanupFailure::Conflict(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_cleanup_album_is_retryable_storage_unavailability() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("offline-album");
+        assert!(matches!(
+            ensure_cleanup_album_accessible(&missing).await,
+            Err(SourceCleanupFailure::Retryable(_))
+        ));
+    }
 
     #[test]
     fn normalize_rejects_absolute_path() {

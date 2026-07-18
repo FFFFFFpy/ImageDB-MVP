@@ -30,7 +30,8 @@ use crate::services::commit_service::{
     sync_parent_dir, validate_and_hash_frozen_plan, validate_commit_marker,
     validate_snapshot_album_path_identity, verify_committed_evidence_before_source_cleanup,
     verify_published_file_set, verify_source_snapshot_or_conflict, verify_staging_set,
-    write_commit_marker, write_synced_then_rename, IdempotencyVerdict, LIBRARY_ROOT_LEASE_TTL_SECS,
+    write_commit_marker, write_synced_then_rename, IdempotencyVerdict, SourceCleanupFailure,
+    LIBRARY_ROOT_LEASE_TTL_SECS,
 };
 use crate::services::source_snapshot_service::load_source_album_snapshot;
 use serde::Serialize;
@@ -2180,15 +2181,33 @@ async fn resume_source_removal(
     )
     .await
     {
-        let message = error.to_string();
-        ImportRepository::update_file_transaction_state(
-            client,
-            tx.id,
-            &TransactionState::Conflict,
-            Some(&message),
-        )
-        .await?;
-        return Ok((TransactionState::Conflict.to_string(), false, message));
+        let message = error.message().to_string();
+        return match error {
+            SourceCleanupFailure::Conflict(_) => {
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx.id,
+                    &TransactionState::Conflict,
+                    Some(&message),
+                )
+                .await?;
+                Ok((TransactionState::Conflict.to_string(), false, message))
+            }
+            SourceCleanupFailure::Retryable(_) => {
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx.id,
+                    &TransactionState::SourceFilesRemoving,
+                    Some(&message),
+                )
+                .await?;
+                Ok((
+                    TransactionState::SourceFilesRemoving.to_string(),
+                    false,
+                    message,
+                ))
+            }
+        };
     }
     let removed = state_machine::transition_transaction(removing, "removed")?;
     ImportRepository::update_file_transaction_state(client, tx.id, &removed, None).await?;

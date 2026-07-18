@@ -227,6 +227,7 @@ pub struct NewFileOperation {
     pub target_path: String,
     pub expected_size: i64,
     pub expected_blake3: Vec<u8>,
+    pub source_cleanup_quarantine_path: Option<String>,
 }
 
 pub struct NewDuplicateCandidate {
@@ -480,6 +481,7 @@ pub struct SourceFileCleanupOperationRow {
     pub id: Uuid,
     pub transaction_id: Uuid,
     pub source_path: String,
+    pub quarantine_path: Option<String>,
     pub expected_size: i64,
     pub expected_blake3: Vec<u8>,
     pub state: String,
@@ -2825,7 +2827,7 @@ impl ImportRepository {
                           AND ft.state IN (
                               'planned', 'staging', 'verifying', 'verified',
                               'publishing', 'published', 'db_committing',
-                              'library_committed', 'source_archiving',
+                              'library_committed', 'source_archiving', 'source_files_removing',
                               'cleanup_required', 'conflict'
                           )
                     ) AS has_recoverable_transaction,
@@ -3141,7 +3143,7 @@ impl ImportRepository {
                                  AND ft.state IN (
                                      'planned', 'staging', 'verifying', 'verified',
                                      'publishing', 'published', 'db_committing',
-                                     'library_committed', 'source_archiving',
+                                     'library_committed', 'source_archiving', 'source_files_removing',
                                      'cleanup_required', 'conflict', 'failed', 'cancelled'
                                  )
                            )
@@ -3153,7 +3155,7 @@ impl ImportRepository {
                                  AND ft.state IN (
                                      'planned', 'staging', 'verifying', 'verified',
                                      'publishing', 'published', 'db_committing',
-                                     'library_committed', 'source_archiving',
+                                     'library_committed', 'source_archiving', 'source_files_removing',
                                      'cleanup_required', 'conflict'
                                  )
                            )
@@ -3420,12 +3422,14 @@ impl ImportRepository {
                     transaction
                         .execute(
                             "INSERT INTO source_file_cleanup_operations
-                             (id, transaction_id, source_path, expected_size, expected_blake3, state)
-                             VALUES ($1, $2, $3, $4, $5, 'pending')",
+                             (id, transaction_id, source_path, quarantine_path,
+                              expected_size, expected_blake3, state)
+                             VALUES ($1, $2, $3, $4, $5, $6, 'pending')",
                             &[
                                 &Uuid::new_v4(),
                                 &transaction_id,
                                 &operation.source_path,
+                                &operation.source_cleanup_quarantine_path,
                                 &operation.expected_size,
                                 &operation.expected_blake3,
                             ],
@@ -4328,7 +4332,8 @@ impl ImportRepository {
     ) -> Result<Vec<SourceFileCleanupOperationRow>, AppError> {
         let rows = client
             .query(
-                "SELECT id, transaction_id, source_path, expected_size, expected_blake3,
+                "SELECT id, transaction_id, source_path, quarantine_path,
+                        expected_size, expected_blake3,
                         state, last_error
                  FROM source_file_cleanup_operations
                  WHERE transaction_id = $1
@@ -4345,6 +4350,7 @@ impl ImportRepository {
                 id: row.get("id"),
                 transaction_id: row.get("transaction_id"),
                 source_path: row.get("source_path"),
+                quarantine_path: row.get("quarantine_path"),
                 expected_size: row.get("expected_size"),
                 expected_blake3: row.get("expected_blake3"),
                 state: row.get("state"),
@@ -4371,6 +4377,38 @@ impl ImportRepository {
                 AppError::Internal(format!("failed to update source cleanup operation: {e}"))
             })?;
         Ok(())
+    }
+
+    pub async fn initialize_source_cleanup_quarantine_if_missing(
+        client: &Client,
+        operation_id: Uuid,
+        quarantine_path: &str,
+        legacy_normalized_state: &str,
+    ) -> Result<(String, String), AppError> {
+        let row = client
+            .query_one(
+                "UPDATE source_file_cleanup_operations
+                 SET state = CASE
+                         WHEN quarantine_path IS NULL THEN $2
+                         ELSE state
+                     END,
+                     quarantine_path = COALESCE(quarantine_path, $1),
+                     last_error = CASE
+                         WHEN quarantine_path IS NULL THEN NULL
+                         ELSE last_error
+                     END,
+                     updated_at = now()
+                 WHERE id = $3
+                 RETURNING quarantine_path, state",
+                &[&quarantine_path, &legacy_normalized_state, &operation_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "failed to persist source cleanup quarantine path: {e}"
+                ))
+            })?;
+        Ok((row.get("quarantine_path"), row.get("state")))
     }
 
     /// Persist the plan hash and manifest hash on the transaction.
