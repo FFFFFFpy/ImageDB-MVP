@@ -523,6 +523,71 @@ pub async fn verify_source_snapshot_files_async(
     .map_err(|e| AppError::Internal(format!("snapshot verify task failed: {e}")))?
 }
 
+/// Verify a source album after selected frozen-plan files may already have
+/// been removed. Every file that remains must still match the original full
+/// snapshot, there may be no new files, and only paths explicitly listed in
+/// `allowed_missing` may be absent. This is the recovery-safe counterpart to
+/// the exact snapshot verifier used before the first removal.
+pub async fn verify_source_snapshot_files_allowing_missing_async(
+    source_album_path: &Path,
+    stored_files: Vec<SnapshotFileRecord>,
+    allowed_missing: std::collections::HashSet<String>,
+) -> Result<Vec<SnapshotVerifyError>, AppError> {
+    let album_path = source_album_path.to_path_buf();
+    let _permit = SNAPSHOT_CONCURRENCY
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("snapshot semaphore closed: {e}")))?;
+    tokio::task::spawn_blocking(move || {
+        let actual_files = collect_album_files_with_cancel(&album_path, None)?;
+        let stored_map: std::collections::HashMap<&str, &SnapshotFileRecord> = stored_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file))
+            .collect();
+        let actual_map: std::collections::HashMap<&str, &NewSnapshotFile> = actual_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file))
+            .collect();
+        let mut errors = Vec::new();
+
+        for (path, stored) in &stored_map {
+            match actual_map.get(path) {
+                None if allowed_missing.contains(*path) => {}
+                None => errors.push(SnapshotVerifyError::MissingFile(path.to_string())),
+                Some(actual) => {
+                    if stored.file_size != actual.file_size {
+                        errors.push(SnapshotVerifyError::SizeMismatch {
+                            path: path.to_string(),
+                            expected: stored.file_size,
+                            actual: actual.file_size,
+                        });
+                    }
+                    if stored.blake3 != actual.blake3 {
+                        errors.push(SnapshotVerifyError::HashMismatch {
+                            path: path.to_string(),
+                        });
+                    }
+                    if stored.file_type != actual.file_type {
+                        errors.push(SnapshotVerifyError::FileTypeMismatch {
+                            path: path.to_string(),
+                            expected: stored.file_type.clone(),
+                            actual: actual.file_type.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for path in actual_map.keys() {
+            if !stored_map.contains_key(path) {
+                errors.push(SnapshotVerifyError::ExtraFile(path.to_string()));
+            }
+        }
+        Ok(errors)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("snapshot verify task failed: {e}")))?
+}
+
 /// Pure verifier: compare `source_album_path` against a previously captured
 /// set of snapshot files + expected snapshot hash. Used by commit Phase 6
 /// and recovery once the snapshot is already loaded into memory.
@@ -882,6 +947,51 @@ mod tests {
             has_snapshot_mismatch,
             "snapshot hash mismatch not reported: {errors:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_snapshot_verifier_allows_only_persisted_selected_file_removals() {
+        let tmp = TempDir::new().unwrap();
+        let album = tmp.path().join("album");
+        std::fs::create_dir_all(album.join("meta")).unwrap();
+        std::fs::write(album.join("selected.jpg"), b"selected").unwrap();
+        std::fs::write(album.join("excluded.jpg"), b"excluded").unwrap();
+        std::fs::write(album.join("meta").join("notes.xmp"), b"sidecar").unwrap();
+        let stored: Vec<SnapshotFileRecord> = collect_album_files(&album)
+            .unwrap()
+            .into_iter()
+            .map(|file| SnapshotFileRecord {
+                id: Uuid::new_v4(),
+                snapshot_id: Uuid::new_v4(),
+                relative_path: file.relative_path,
+                file_type: file.file_type,
+                file_size: file.file_size,
+                blake3: file.blake3,
+            })
+            .collect();
+
+        std::fs::remove_file(album.join("selected.jpg")).unwrap();
+        let allowed = std::collections::HashSet::from(["selected.jpg".to_string()]);
+        let errors = verify_source_snapshot_files_allowing_missing_async(
+            &album,
+            stored.clone(),
+            allowed.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+
+        std::fs::write(album.join("meta").join("notes.xmp"), b"changed").unwrap();
+        let errors = verify_source_snapshot_files_allowing_missing_async(&album, stored, allowed)
+            .await
+            .unwrap();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            SnapshotVerifyError::SizeMismatch { path, .. }
+                | SnapshotVerifyError::HashMismatch { path }
+                if path == "meta/notes.xmp"
+        )));
+        assert!(album.join("excluded.jpg").exists());
     }
 
     /// Batch 3: a plan-only view of the album (only imported images) is NOT

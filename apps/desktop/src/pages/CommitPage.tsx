@@ -146,7 +146,7 @@ export const COMMIT_PIPELINE = [
   { key: 'verifying', label: '验证暂存区' },
   { key: 'publishing', label: '发布目录' },
   { key: 'db', label: '数据库确认' },
-  { key: 'archiving', label: '源图集归档' },
+  { key: 'archiving', label: '处理源文件' },
 ] as const;
 
 const stageOrder: Record<string, number> = {
@@ -161,6 +161,8 @@ const stageOrder: Record<string, number> = {
   library_committed: 5,
   source_archiving: 5,
   source_archived: 6,
+  source_files_removing: 5,
+  source_files_removed: 6,
   done: 6,
 };
 
@@ -189,6 +191,8 @@ function stageLabel(stage: string | undefined): string {
     library_committed: '已正式入库',
     source_archiving: '源图集归档',
     source_archived: '已完成',
+    source_files_removing: '移除已入库源图片',
+    source_files_removed: '已完成',
     done: '完成',
     failed: '失败',
     conflict: '发生冲突',
@@ -525,8 +529,17 @@ export function CommitPage({
 
         {plan && (
           <div className="commit-confirm">
-            <StatusBanner tone="warning" title="开始后将写入文件系统与数据库">
-              发布成功并完成完整性校验前不会归档源图集；取消后可能需要通过恢复页继续处理。
+            <StatusBanner
+              tone="warning"
+              title={
+                plan.source_file_mode === 'move_selected_without_backup'
+                  ? '移动入库已启用：源图片无备份'
+                  : '开始后将写入文件系统与数据库'
+              }
+            >
+              {plan.source_file_mode === 'move_selected_without_backup'
+                ? '发布、manifest 与数据库证据全部校验通过后，只会删除 frozen plan 中已入库的源图片；目录、sidecar 和排除图片保持原位。'
+                : '发布成功并完成完整性校验前不会归档源图集；取消后可能需要通过恢复页继续处理。'}
             </StatusBanner>
             <div className="import-plan-summary">
               <div className="import-plan-stats">

@@ -19,6 +19,10 @@ import type {
   ReviewCandidateSummary,
   ReviewCandidateDetail,
   ReviewProgress,
+  ReviewGroupSummary,
+  ReviewGroupDetail,
+  ReviewGroupMemberDecision,
+  SourceFileMode,
   ImportPlan,
   ImagePreview,
   ReviewDecision,
@@ -129,6 +133,15 @@ export const api = {
   getReviewProgress: (importRunId: string) =>
     invoke<ReviewProgress>('get_review_progress', { importRunId }),
 
+  getReviewGroups: (importRunId: string) =>
+    invoke<ReviewGroupSummary[]>('get_review_groups', { importRunId }),
+
+  getReviewGroupDetail: (groupId: string) =>
+    invoke<ReviewGroupDetail>('get_review_group_detail', { groupId }),
+
+  submitReviewGroupDecision: (groupId: string, decisions: ReviewGroupMemberDecision[]) =>
+    invoke<void>('submit_review_group_decision', { groupId, decisions }),
+
   generateImportPlan: (importRunId: string) =>
     invoke<ImportPlan>('generate_import_plan', { importRunId }),
 
@@ -157,6 +170,9 @@ export const api = {
       included,
     }),
 
+  setImportPlanSourceFileMode: (importRunId: string, sourceFileMode: SourceFileMode) =>
+    invoke<ImportPlan>('set_import_plan_source_file_mode', { importRunId, sourceFileMode }),
+
   getLatestCompletedImportRun: () => invoke<string | null>('get_latest_completed_import_run'),
 
   getLatestReviewableImportRun: () => invoke<string | null>('get_latest_reviewable_import_run'),
@@ -168,6 +184,9 @@ export const api = {
 
   getImportPlanImagePreview: (importRunId: string, imageId: string) =>
     invoke<ImagePreview>('get_import_plan_image_preview', { importRunId, imageId }),
+
+  getReviewGroupMemberPreview: (groupId: string, imageId: string, imageSource: string) =>
+    invoke<ImagePreview>('get_review_group_member_preview', { groupId, imageId, imageSource }),
 
   startImportCommit: (importRunId: string, expectedPlanHash: string) =>
     invoke<string>('start_import_commit', { importRunId, expectedPlanHash }),

@@ -21,6 +21,8 @@ const MIGRATION_0013: &str =
 const MIGRATION_0014: &str =
     include_str!("../../../migrations/0014_candidate_review_semantics_and_abandoned_filters.sql");
 const MIGRATION_0015: &str = include_str!("../../../migrations/0015_fingerprint_v2.sql");
+const MIGRATION_0016: &str =
+    include_str!("../../../migrations/0016_group_review_large_image_move_import.sql");
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_initial", MIGRATION_0001),
@@ -44,9 +46,13 @@ const MIGRATIONS: &[(&str, &str)] = &[
         MIGRATION_0014,
     ),
     ("0015_fingerprint_v2", MIGRATION_0015),
+    ("0016_group_review_large_image_move_import", MIGRATION_0016),
 ];
 
 const RESET_DROP_SQL: &str = "
+    DROP TABLE IF EXISTS source_file_cleanup_operations;
+    DROP TABLE IF EXISTS review_group_members;
+    DROP TABLE IF EXISTS review_groups;
     DROP TABLE IF EXISTS review_decisions;
     DROP TABLE IF EXISTS duplicate_candidates;
     DROP TABLE IF EXISTS file_operations;
@@ -411,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_migrations_embedded() {
-        assert_eq!(MIGRATIONS.len(), 15);
+        assert_eq!(MIGRATIONS.len(), 16);
         assert!(MIGRATION_0001.contains("CREATE TABLE app_meta"));
         assert!(MIGRATION_0002.contains("CREATE INDEX"));
         assert!(MIGRATION_0003.contains("idx_library_albums_root_path"));
@@ -434,6 +440,9 @@ mod tests {
         assert!(MIGRATION_0015.contains("double_gradient_distance_ratio"));
         assert!(MIGRATION_0015.contains("double_gradient_hash_32 IS NOT NULL"));
         assert!(MIGRATION_0015.contains("DROP INDEX IF EXISTS idx_import_images_blake3"));
+        assert!(MIGRATION_0016.contains("CREATE TABLE review_groups"));
+        assert!(MIGRATION_0016.contains("source_file_cleanup_operations"));
+        assert!(MIGRATION_0016.contains("move_selected_without_backup"));
     }
 
     #[test]
@@ -455,10 +464,14 @@ mod tests {
                 "0012_album_workflow_repair",
                 "0013_workflow_escape_and_candidate_uniqueness",
                 "0014_candidate_review_semantics_and_abandoned_filters",
-                "0015_fingerprint_v2"
+                "0015_fingerprint_v2",
+                "0016_group_review_large_image_move_import"
             ]
         );
-        assert_eq!(MigrationRunner::latest_version(), "0015_fingerprint_v2");
+        assert_eq!(
+            MigrationRunner::latest_version(),
+            "0016_group_review_large_image_move_import"
+        );
     }
 
     #[test]
@@ -675,7 +688,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            3
+            4
         );
         for selected in [import_a, library_source] {
             let row = client
@@ -1063,7 +1076,8 @@ mod tests {
                 "0012_album_workflow_repair",
                 "0013_workflow_escape_and_candidate_uniqueness",
                 "0014_candidate_review_semantics_and_abandoned_filters",
-                "0015_fingerprint_v2"
+                "0015_fingerprint_v2",
+                "0016_group_review_large_image_move_import"
             ]
         );
 

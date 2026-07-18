@@ -1,6 +1,7 @@
 use crate::domain::import_state::{
     ImportPlan, ReviewCandidateDetail, ReviewCandidateSummary, ReviewDecisionAction,
-    ReviewProgress, REVIEW_DECISION_VALUES,
+    ReviewGroupDetail, ReviewGroupMemberDecision, ReviewGroupSummary, ReviewProgress,
+    SourceFileMode, REVIEW_DECISION_VALUES,
 };
 use crate::services::review_service;
 use crate::state::AppState;
@@ -9,6 +10,58 @@ use uuid::Uuid;
 
 fn parse_uuid(s: &str) -> Result<Uuid, String> {
     Uuid::parse_str(s).map_err(|e| format!("invalid UUID: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_review_groups(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<Vec<ReviewGroupSummary>, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::get_review_groups(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn get_review_group_detail(
+    state: State<'_, AppState>,
+    group_id: String,
+) -> Result<ReviewGroupDetail, String> {
+    let group_id = parse_uuid(&group_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::get_review_group_detail(&client, group_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn submit_review_group_decision(
+    state: State<'_, AppState>,
+    group_id: String,
+    decisions: Vec<ReviewGroupMemberDecision>,
+) -> Result<(), String> {
+    let group_id = parse_uuid(&group_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::submit_review_group_decision(&client, group_id, &decisions)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
 }
 
 #[tauri::command]
@@ -252,6 +305,26 @@ pub async fn set_import_plan_image_included(
 }
 
 #[tauri::command]
+pub async fn set_import_plan_source_file_mode(
+    state: State<'_, AppState>,
+    import_run_id: String,
+    source_file_mode: String,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let mode = SourceFileMode::from_str_opt(&source_file_mode)
+        .ok_or_else(|| format!("invalid source_file_mode: {source_file_mode}"))?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::set_plan_source_file_mode(&client, run_id, mode)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
 pub async fn get_latest_completed_import_run(
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
@@ -354,6 +427,32 @@ pub async fn get_image_preview(
         .map_err(|e| format!("{e}"))?;
     handle.abort();
     Ok(ImagePreview { data_url })
+}
+
+#[tauri::command]
+pub async fn get_review_group_member_preview(
+    state: State<'_, AppState>,
+    group_id: String,
+    image_id: String,
+    image_source: String,
+) -> Result<ImagePreview, String> {
+    let group_id = parse_uuid(&group_id)?;
+    let image_id = parse_uuid(&image_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::load_review_group_member_preview(
+        &client,
+        group_id,
+        image_id,
+        &image_source,
+    )
+    .await
+    .map(|data_url| ImagePreview { data_url })
+    .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
 }
 
 #[tauri::command]

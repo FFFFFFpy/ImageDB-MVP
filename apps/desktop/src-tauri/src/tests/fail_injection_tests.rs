@@ -21,7 +21,7 @@
 //!       -- --ignored --test-threads=1
 #![cfg(test)]
 #![cfg(feature = "fail-injection")]
-use crate::domain::import_state::{DecodeState, ImportImageState, ImportRunState};
+use crate::domain::import_state::{DecodeState, ImportImageState, ImportRunState, SourceFileMode};
 use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
 use crate::infrastructure::storage_capabilities::{probe_storage_capabilities, PublishStrategy};
 use crate::repositories::import_repository::{ImportRepository, NewImportImage};
@@ -49,6 +49,48 @@ async fn setup_full_env() -> (
     std::path::PathBuf,
 ) {
     setup_full_env_with_roots(None, None).await
+}
+
+/// Reuse the normal fixture, then bind the destructive source mode into the
+/// still-unconsumed frozen plan and recompute its immutable hash.
+async fn setup_move_selected_env() -> (
+    TempDir,
+    Arc<Mutex<PostgresManager>>,
+    Uuid,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let fixture = setup_full_env().await;
+    let (_tmp, pg, run_id, _library_root, _album_path) = &fixture;
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let plan_id: Uuid = client
+        .query_one(
+            "UPDATE import_plans
+             SET source_file_mode = $1
+             WHERE import_run_id = $2 AND state = 'frozen'
+             RETURNING id",
+            &[
+                &SourceFileMode::MoveSelectedWithoutBackup.to_string(),
+                run_id,
+            ],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let frozen = ImportRepository::load_frozen_plan(&client, *run_id)
+        .await
+        .unwrap()
+        .expect("move-mode frozen plan");
+    let hash = commit_service::compute_plan_hash(&frozen).unwrap();
+    ImportRepository::set_plan_hash(&client, plan_id, &hash)
+        .await
+        .unwrap();
+    drop(client);
+    handle.abort();
+    fixture
 }
 
 async fn setup_full_env_with_roots(
@@ -336,6 +378,72 @@ async fn assert_recovered(pg_manager: Arc<Mutex<PostgresManager>>, library_root:
         .unwrap()
         .get(0);
     assert_eq!(lib_count, 2, "exactly two library images after recovery");
+    drop(client);
+    handle.abort();
+}
+
+async fn assert_move_selected_completed(
+    pg_manager: Arc<Mutex<PostgresManager>>,
+    library_root: &std::path::Path,
+    album_path: &std::path::Path,
+) {
+    let (client, handle) = {
+        let manager = pg_manager.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let transaction = client
+        .query_one(
+            "SELECT id, state, source_file_mode, last_error
+             FROM file_transactions
+             WHERE import_album_id = (
+                 SELECT id FROM import_albums WHERE source_name = 'album_a' LIMIT 1
+             )
+             ORDER BY started_at DESC LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let transaction_id: Uuid = transaction.get("id");
+    assert_eq!(
+        transaction.get::<_, String>("state"),
+        "source_files_removed"
+    );
+    assert_eq!(
+        transaction.get::<_, String>("source_file_mode"),
+        "move_selected_without_backup"
+    );
+    assert_eq!(transaction.get::<_, Option<String>>("last_error"), None);
+
+    let cleanup_rows = client
+        .query(
+            "SELECT state, source_path
+             FROM source_file_cleanup_operations
+             WHERE transaction_id = $1
+             ORDER BY source_path",
+            &[&transaction_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleanup_rows.len(), 2);
+    assert!(cleanup_rows
+        .iter()
+        .all(|row| row.get::<_, String>("state") == "removed"));
+
+    assert!(!album_path.join("photo1.png").exists());
+    assert!(!album_path.join("photo2.png").exists());
+    assert!(album_path.join("description.txt").exists());
+    assert!(album_path.join("sub/meta.xmp").exists());
+    assert!(album_path.exists(), "source album directory must remain");
+    assert!(library_root.join("Albums/album_a/photo1.png").exists());
+    assert!(library_root.join("Albums/album_a/photo2.png").exists());
+    assert!(
+        !album_path
+            .parent()
+            .unwrap()
+            .join(".imagedb-processed")
+            .exists(),
+        "move-selected mode must not archive the source album"
+    );
     drop(client);
     handle.abort();
 }
@@ -1362,6 +1470,120 @@ async fn fail_injection_after_db_commit() {
     assert_recovered(pg.clone(), &lib_root).await;
     let mut m = pg.lock().await;
     m.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn fail_injection_move_selected_normal_and_idempotent() {
+    let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
+    let result = commit_service::run_import_commit(
+        pg.clone(),
+        library_root.display().to_string(),
+        run_id,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(
+            crate::domain::import_state::CommitProgress::idle(&run_id.to_string()),
+        )),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.state, "completed");
+    assert_eq!(
+        result.source_file_mode,
+        SourceFileMode::MoveSelectedWithoutBackup
+    );
+    assert_move_selected_completed(pg.clone(), &library_root, &album_path).await;
+
+    let rerun = commit_service::run_import_commit(
+        pg.clone(),
+        library_root.display().to_string(),
+        run_id,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(
+            crate::domain::import_state::CommitProgress::idle(&run_id.to_string()),
+        )),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rerun.albums_committed, 0);
+    assert_eq!(rerun.albums_skipped, 1);
+    assert_move_selected_completed(pg.clone(), &library_root, &album_path).await;
+
+    let mut manager = pg.lock().await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn fail_injection_move_selected_recovers_after_db_commit() {
+    let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
+    run_commit_with_fault(
+        pg.clone(),
+        &library_root,
+        run_id,
+        CommitFaultPoint::AfterDbCommit,
+    )
+    .await;
+    assert!(album_path.join("photo1.png").exists());
+    assert!(album_path.join("photo2.png").exists());
+
+    drive_recovery(pg.clone(), run_id).await;
+    assert_move_selected_completed(pg.clone(), &library_root, &album_path).await;
+    // A second recovery pass must be a no-op.
+    assert!(drive_recovery(pg.clone(), run_id).await.is_empty());
+
+    let mut manager = pg.lock().await;
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn fail_injection_move_selected_source_change_becomes_conflict_without_deletion() {
+    let (_tmp, pg, run_id, library_root, album_path) = setup_move_selected_env().await;
+    run_commit_with_fault(
+        pg.clone(),
+        &library_root,
+        run_id,
+        CommitFaultPoint::AfterDbCommit,
+    )
+    .await;
+    std::fs::write(
+        album_path.join("photo1.png"),
+        b"changed after database commit",
+    )
+    .unwrap();
+
+    let outcomes = drive_recovery(pg.clone(), run_id).await;
+    assert!(outcomes
+        .iter()
+        .any(|outcome| outcome.final_state == "conflict"));
+    assert!(album_path.join("photo1.png").exists());
+    assert!(album_path.join("photo2.png").exists());
+    assert!(album_path.join("description.txt").exists());
+    assert!(album_path.join("sub/meta.xmp").exists());
+
+    let (client, handle) = {
+        let manager = pg.lock().await;
+        manager.connect().await.unwrap()
+    };
+    let row = client
+        .query_one(
+            "SELECT state, last_error FROM file_transactions
+             WHERE import_run_id = $1 ORDER BY started_at DESC LIMIT 1",
+            &[&run_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("state"), "conflict");
+    assert!(row
+        .get::<_, Option<String>>("last_error")
+        .unwrap_or_default()
+        .contains("snapshot"));
+    drop(client);
+    handle.abort();
+
+    let mut manager = pg.lock().await;
+    manager.shutdown().await.unwrap();
 }
 
 #[tokio::test]

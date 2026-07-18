@@ -24,11 +24,14 @@ MVP2 不是 SQL 控制台、表浏览器，也不是新匹配算法或图集级 
 - Dashboard 的主 CTA 由后端根据 run、frozen plan 和 file transaction 事实返回显式 `next_action`，前端不再拼凑工作流状态。
 - Dashboard 区分可恢复事务、终态未解决事务和 frozen plan 尚未创建事务的图集；事务预写前 / 图集间崩溃回到幂等 Commit，终态失败进入人工处置。
 - Commit 仍保持 run 级 frozen plan / commit 主链。
+- 重复候选按连通分量持久化为审核组；人工组默认全保留，用户对组内每张导入图明确 keep / exclude，图库成员只读且始终 keep。
+- frozen plan 只读取审核组成员的最终动作；旧的未完成 pair 审核任务没有自动回填，必须重新分析。
+- frozen plan 可选择默认关闭的“移动选中源文件（无备份）”；该模式逐文件校验并删除选中图片，不删除源图集目录、sidecar、嵌套文件或排除图片。
 
 当前数据库 migration head：
 
 ```text
-0014_candidate_review_semantics_and_abandoned_filters
+0016_group_review_large_image_move_import
 ```
 
 从 0012 升级时，0013 会先校验人工审核结构与规范化最终选择，再对方向无关的候选 pair 去重；0014 为后续写入增加审核语义约束。曾运行旧开发版 0013 的测试库无法由 0014 恢复已经删除的行，需要从 0012 fixture 或全新数据库重建后验证迁移语义。
@@ -40,10 +43,12 @@ MVP2 不是 SQL 控制台、表浏览器，也不是新匹配算法或图集级 
 | [`ALBUM_WORKFLOW.md`](ALBUM_WORKFLOW.md) | 图集级状态、断点续跑和 retry 行为 |
 | [`ACCEPTANCE.md`](ACCEPTANCE.md)         | MVP2.1 / MVP2.2 验收项            |
 
+0016 新增持久化审核组、源文件模式和逐文件清理操作日志，不回填旧的未完成审核任务。
+
 ## 非目标
 
 - 不新增 SQL 控制台或表浏览器。
 - 不新增图集级 Commit。
-- 不重写 Commit / Recovery 文件事务链。
+- 不改变 staging → 校验 → 发布 → 数据库提交的安全顺序；移动模式只在其后增加可恢复的逐文件清理阶段。
 - 不引入 Plus 版模型网关、标注 DAG 或搜索平台。
 - 不用 mock 假装真实断点续跑。

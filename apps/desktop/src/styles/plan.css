@@ -180,3 +180,122 @@
     white-space: normal;
   }
 }
+
+.plan-source-mode {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-3) var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+}
+
+.plan-source-mode--danger {
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-soft);
+}
+
+.plan-source-mode h2,
+.plan-source-mode p {
+  margin: 0;
+}
+
+.plan-source-mode p {
+  margin-top: var(--space-1);
+  color: var(--color-ink-muted);
+}
+
+.plan-source-mode__toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 650;
+}
+
+.plan-source-mode__toggle input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--color-danger);
+}
+
+.plan-source-mode .imagedb-status-banner {
+  grid-column: 1 / -1;
+}
+
+.plan-album-list,
+.plan-footer-actions {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.plan-album-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+}
+
+.plan-album-card > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+}
+
+.plan-album-card > summary > span {
+  display: grid;
+  gap: 2px;
+}
+
+.plan-album-card small {
+  color: var(--color-ink-muted);
+}
+
+.plan-image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1px;
+  padding: 1px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-border);
+}
+
+.plan-image-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  overflow: hidden;
+  border: 0;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  text-align: left;
+}
+
+.plan-image-row span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-image-row--excluded {
+  background: var(--color-danger-soft);
+  color: var(--color-ink-muted);
+  text-decoration: line-through;
+}
+
+.plan-footer-actions {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+@media (max-width: 700px) {
+  .plan-source-mode {
+    grid-template-columns: 1fr;
+  }
+
+  .plan-source-mode .imagedb-status-banner {
+    grid-column: 1;
+  }
+}

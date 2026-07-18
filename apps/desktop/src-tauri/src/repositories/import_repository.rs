@@ -2,7 +2,8 @@
 
 use crate::domain::import_state::{
     Decision, DecisionSource, DecodeState, DuplicateScope, ImportAlbumState, ImportImageState,
-    ImportPlan, ImportPlanAlbum, ImportPlanImage, ImportRunState, MatchType, SCAN_POLICY_VERSION,
+    ImportPlan, ImportPlanAlbum, ImportPlanImage, ImportRunState, MatchType, SourceFileMode,
+    SCAN_POLICY_VERSION,
 };
 use crate::domain::state_machine::{FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
@@ -297,6 +298,51 @@ pub struct ReviewProgressRow {
     pub decided: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReviewGroupSummaryRow {
+    pub group_id: Uuid,
+    pub state: String,
+    pub requires_manual_review: bool,
+    pub member_count: i64,
+    pub import_member_count: i64,
+    pub library_member_count: i64,
+    pub kept_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewGroupMemberRow {
+    pub image_id: Uuid,
+    pub image_source: String,
+    pub final_action: String,
+    pub decision_source: String,
+    pub source_path: String,
+    pub relative_path: String,
+    pub album_name: String,
+    pub file_size: i64,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewGroupEvidenceRow {
+    pub candidate_id: Uuid,
+    pub source_image_id: Uuid,
+    pub candidate_image_id: Uuid,
+    pub candidate_image_source: String,
+    pub scope: String,
+    pub match_type: String,
+    pub blake3_equal: bool,
+    pub pixel_hash_equal: bool,
+    pub block_distance: Option<i32>,
+    pub double_gradient_distance: Option<i32>,
+    pub block_distance_ratio: Option<f64>,
+    pub double_gradient_distance_ratio: Option<f64>,
+    pub transform_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub automatic: bool,
+}
+
 pub struct ImportPlanCandidateRow {
     pub candidate_id: Uuid,
     pub source_image_id: Uuid,
@@ -407,6 +453,7 @@ pub struct FrozenPlanRow {
     pub plan_state: String,
     pub plan_hash: Option<Vec<u8>>,
     pub policy_version: String,
+    pub source_file_mode: SourceFileMode,
     pub albums: Vec<(PlanAlbumRow, Vec<PlanImageRow>)>,
 }
 
@@ -424,6 +471,18 @@ pub struct FileTransactionFullRow {
     pub manifest_path: Option<String>,
     pub plan_hash: Option<Vec<u8>>,
     pub manifest_hash: Option<Vec<u8>>,
+    pub source_file_mode: SourceFileMode,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceFileCleanupOperationRow {
+    pub id: Uuid,
+    pub transaction_id: Uuid,
+    pub source_path: String,
+    pub expected_size: i64,
+    pub expected_blake3: Vec<u8>,
+    pub state: String,
     pub last_error: Option<String>,
 }
 
@@ -751,12 +810,19 @@ impl ImportRepository {
                 "SELECT
                     COUNT(*) FILTER (WHERE state IN ('pending', 'analyzing', 'scanning', 'fingerprinting'))::BIGINT AS unfinished,
                     COUNT(*) FILTER (WHERE state = 'failed')::BIGINT AS failed,
-                    (SELECT COUNT(*)
-                     FROM duplicate_candidates dc
-                     LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
-                     WHERE dc.import_run_id = $1
-                       AND dc.decision IS NULL
-                       AND rd.id IS NULL)::BIGINT AS pending_reviews
+                    (SELECT CASE
+                        WHEN EXISTS (SELECT 1 FROM review_groups WHERE import_run_id = $1)
+                        THEN (SELECT COUNT(*) FROM review_groups
+                              WHERE import_run_id = $1
+                                AND requires_manual_review
+                                AND state = 'pending')
+                        ELSE (SELECT COUNT(*)
+                              FROM duplicate_candidates dc
+                              LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                              WHERE dc.import_run_id = $1
+                                AND dc.decision IS NULL
+                                AND rd.id IS NULL)
+                     END)::BIGINT AS pending_reviews
                  FROM import_albums
                  WHERE import_run_id = $1",
                 &[&id],
@@ -957,12 +1023,19 @@ impl ImportRepository {
                         WHERE import_run_id = $1 AND state = 'failed'
                     )::BIGINT AS failed_album_count,
                     (
-                        SELECT COUNT(*)
-                        FROM duplicate_candidates dc
-                        LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
-                        WHERE dc.import_run_id = $1
-                          AND dc.decision IS NULL
-                          AND rd.id IS NULL
+                        SELECT CASE
+                            WHEN EXISTS (SELECT 1 FROM review_groups WHERE import_run_id = $1)
+                            THEN (SELECT COUNT(*) FROM review_groups
+                                  WHERE import_run_id = $1
+                                    AND requires_manual_review
+                                    AND state = 'pending')
+                            ELSE (SELECT COUNT(*)
+                                  FROM duplicate_candidates dc
+                                  LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                                  WHERE dc.import_run_id = $1
+                                    AND dc.decision IS NULL
+                                    AND rd.id IS NULL)
+                        END
                     )::BIGINT AS pending_review_count",
                 &[&id],
             )
@@ -1199,6 +1272,46 @@ impl ImportRepository {
         })?;
         Self::refresh_import_run_statistics(client, import_run_id).await?;
         Ok(status)
+    }
+
+    pub async fn refresh_group_review_summaries(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "WITH album_groups AS (
+                    SELECT ia.id AS album_id,
+                           COUNT(DISTINCT rg.id) FILTER (
+                               WHERE rg.requires_manual_review AND rg.state = 'pending'
+                           )::INTEGER AS pending_group_count
+                    FROM import_albums ia
+                    LEFT JOIN import_images ii ON ii.import_album_id = ia.id
+                    LEFT JOIN review_group_members rgm
+                      ON rgm.image_source = 'import' AND rgm.image_id = ii.id
+                    LEFT JOIN review_groups rg ON rg.id = rgm.group_id
+                    WHERE ia.import_run_id = $1
+                    GROUP BY ia.id
+                 )
+                 UPDATE import_albums ia
+                 SET review_candidate_count = album_groups.pending_group_count,
+                     state = CASE
+                         WHEN ia.state IN ('analyzed', 'review_required') THEN
+                             CASE WHEN album_groups.pending_group_count > 0
+                                  THEN 'review_required' ELSE 'analyzed' END
+                         ELSE ia.state
+                     END,
+                     updated_at = now()
+                 FROM album_groups
+                 WHERE ia.id = album_groups.album_id",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to refresh group review summaries: {e}"))
+            })?;
+        Self::refresh_import_run_statistics(client, import_run_id).await?;
+        Ok(())
     }
 
     pub async fn reset_failed_album_for_retry(
@@ -2126,33 +2239,187 @@ impl ImportRepository {
         client: &Client,
         import_run_id: Uuid,
     ) -> Result<ReviewProgressRow, AppError> {
-        let total_row = client
+        let row = client
             .query_one(
-                "SELECT COUNT(*) AS total
-                 FROM duplicate_candidates
-                 WHERE import_run_id = $1 AND decision IS NULL",
+                "SELECT COUNT(*)::BIGINT AS total,
+                        COUNT(*) FILTER (WHERE state = 'resolved')::BIGINT AS decided
+                 FROM review_groups
+                 WHERE import_run_id = $1 AND requires_manual_review",
                 &[&import_run_id],
             )
             .await
-            .map_err(|e| AppError::Internal(format!("failed to count review candidates: {e}")))?;
-        let total: i64 = total_row.get("total");
-
-        let decided_row = client
-            .query_one(
-                "SELECT COUNT(*) AS decided
-                 FROM review_decisions rd
-                 JOIN duplicate_candidates dc ON rd.candidate_id = dc.id
-                 WHERE dc.import_run_id = $1 AND dc.decision IS NULL",
-                &[&import_run_id],
-            )
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to count decided reviews: {e}")))?;
-        let decided: i64 = decided_row.get("decided");
+            .map_err(|e| AppError::Internal(format!("failed to count review groups: {e}")))?;
+        let total: i64 = row.get("total");
+        let decided: i64 = row.get("decided");
 
         Ok(ReviewProgressRow {
             total: total as u32,
             decided: decided as u32,
         })
+    }
+
+    pub async fn has_review_groups(client: &Client, import_run_id: Uuid) -> Result<bool, AppError> {
+        client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM review_groups WHERE import_run_id = $1)",
+                &[&import_run_id],
+            )
+            .await
+            .map(|row| row.get(0))
+            .map_err(|e| AppError::Internal(format!("failed to query review groups: {e}")))
+    }
+
+    pub async fn get_review_groups(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Vec<ReviewGroupSummaryRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT rg.id AS group_id, rg.state, rg.requires_manual_review,
+                        COUNT(rgm.id)::BIGINT AS member_count,
+                        COUNT(rgm.id) FILTER (WHERE rgm.image_source = 'import')::BIGINT AS import_member_count,
+                        COUNT(rgm.id) FILTER (WHERE rgm.image_source = 'library')::BIGINT AS library_member_count,
+                        COUNT(rgm.id) FILTER (WHERE rgm.final_action = 'keep')::BIGINT AS kept_count
+                 FROM review_groups rg
+                 JOIN review_group_members rgm ON rgm.group_id = rg.id
+                 WHERE rg.import_run_id = $1
+                 GROUP BY rg.id
+                 ORDER BY (rg.state = 'resolved'), rg.created_at, rg.id",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query review groups: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| ReviewGroupSummaryRow {
+                group_id: row.get("group_id"),
+                state: row.get("state"),
+                requires_manual_review: row.get("requires_manual_review"),
+                member_count: row.get("member_count"),
+                import_member_count: row.get("import_member_count"),
+                library_member_count: row.get("library_member_count"),
+                kept_count: row.get("kept_count"),
+            })
+            .collect())
+    }
+
+    pub async fn get_review_group_members(
+        client: &Client,
+        group_id: Uuid,
+    ) -> Result<Vec<ReviewGroupMemberRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT rgm.image_id, rgm.image_source, rgm.final_action, rgm.decision_source,
+                        ii.source_path,
+                        ii.relative_path,
+                        ia.source_name AS album_name,
+                        ii.file_size, ii.width, ii.height, ii.format
+                 FROM review_group_members rgm
+                 JOIN import_images ii ON rgm.image_source = 'import' AND ii.id = rgm.image_id
+                 JOIN import_albums ia ON ia.id = ii.import_album_id
+                 WHERE rgm.group_id = $1
+                 UNION ALL
+                 SELECT rgm.image_id, rgm.image_source, rgm.final_action, rgm.decision_source,
+                        concat_ws('\\', lr.path, NULLIF(la.relative_path, ''), li.relative_path) AS source_path,
+                        li.relative_path,
+                        la.display_name AS album_name,
+                        li.file_size, li.width, li.height, li.format
+                 FROM review_group_members rgm
+                 JOIN library_images li ON rgm.image_source = 'library' AND li.id = rgm.image_id
+                 JOIN library_albums la ON la.id = li.album_id
+                 JOIN library_roots lr ON lr.id = la.library_root_id
+                 WHERE rgm.group_id = $1
+                 ORDER BY image_source DESC, album_name, relative_path, image_id",
+                &[&group_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query review group members: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| ReviewGroupMemberRow {
+                image_id: row.get("image_id"),
+                image_source: row.get("image_source"),
+                final_action: row.get("final_action"),
+                decision_source: row.get("decision_source"),
+                source_path: row.get("source_path"),
+                relative_path: row.get("relative_path"),
+                album_name: row.get("album_name"),
+                file_size: row.get("file_size"),
+                width: row.get("width"),
+                height: row.get("height"),
+                format: row.get("format"),
+            })
+            .collect())
+    }
+
+    pub async fn get_review_group_evidence(
+        client: &Client,
+        group_id: Uuid,
+    ) -> Result<Vec<ReviewGroupEvidenceRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT dc.id AS candidate_id, dc.source_image_id,
+                        COALESCE(dc.candidate_source_image_id, dc.candidate_library_image_id) AS candidate_image_id,
+                        CASE WHEN dc.candidate_library_image_id IS NULL THEN 'import' ELSE 'library' END AS candidate_image_source,
+                        dc.scope, dc.match_type, dc.blake3_equal, dc.pixel_hash_equal,
+                        dc.block_distance, dc.double_gradient_distance,
+                        dc.block_distance_ratio, dc.double_gradient_distance_ratio,
+                        dc.transform_type, dc.confidence,
+                        COALESCE(dc.decision = 'auto_duplicate', FALSE) AS automatic
+                 FROM duplicate_candidates dc
+                 JOIN review_group_members source_member
+                   ON source_member.group_id = $1
+                  AND source_member.image_source = 'import'
+                  AND source_member.image_id = dc.source_image_id
+                 JOIN review_group_members candidate_member
+                   ON candidate_member.group_id = $1
+                  AND candidate_member.image_id = COALESCE(dc.candidate_source_image_id, dc.candidate_library_image_id)
+                  AND candidate_member.image_source = CASE
+                        WHEN dc.candidate_library_image_id IS NULL THEN 'import' ELSE 'library' END
+                 ORDER BY dc.created_at, dc.id",
+                &[&group_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query review group evidence: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|row| ReviewGroupEvidenceRow {
+                candidate_id: row.get("candidate_id"),
+                source_image_id: row.get("source_image_id"),
+                candidate_image_id: row.get("candidate_image_id"),
+                candidate_image_source: row.get("candidate_image_source"),
+                scope: row.get("scope"),
+                match_type: row.get("match_type"),
+                blake3_equal: row.get("blake3_equal"),
+                pixel_hash_equal: row.get("pixel_hash_equal"),
+                block_distance: row.get("block_distance"),
+                double_gradient_distance: row.get("double_gradient_distance"),
+                block_distance_ratio: row.get("block_distance_ratio"),
+                double_gradient_distance_ratio: row.get("double_gradient_distance_ratio"),
+                transform_type: row.get("transform_type"),
+                confidence: row.get("confidence"),
+                automatic: row.get("automatic"),
+            })
+            .collect())
+    }
+
+    pub async fn get_review_group_excluded_import_ids(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<HashSet<Uuid>, AppError> {
+        let rows = client
+            .query(
+                "SELECT rgm.image_id
+                 FROM review_group_members rgm
+                 JOIN review_groups rg ON rg.id = rgm.group_id
+                 WHERE rg.import_run_id = $1
+                   AND rgm.image_source = 'import'
+                   AND rgm.final_action = 'exclude'",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to load group exclusions: {e}")))?;
+        Ok(rows.iter().map(|row| row.get("image_id")).collect())
     }
 
     pub async fn get_all_candidates_for_import_plan(
@@ -2683,12 +2950,23 @@ impl ImportRepository {
                     (SELECT COUNT(*) FROM import_albums)::BIGINT AS import_album_count,
                     (SELECT COUNT(*) FROM import_images)::BIGINT AS import_image_count,
                     (
-                        SELECT COUNT(*)
-                        FROM duplicate_candidates dc
-                        JOIN import_runs r ON r.id = dc.import_run_id
-                        LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
-                        WHERE r.state <> 'abandoned'
-                          AND dc.decision IS NULL AND rd.id IS NULL
+                        (SELECT COUNT(*)
+                         FROM review_groups rg
+                         JOIN import_runs r ON r.id = rg.import_run_id
+                         WHERE r.state <> 'abandoned'
+                           AND rg.requires_manual_review
+                           AND rg.state = 'pending')
+                        +
+                        (SELECT COUNT(*)
+                         FROM duplicate_candidates dc
+                         JOIN import_runs r ON r.id = dc.import_run_id
+                         LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
+                         WHERE r.state <> 'abandoned'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM review_groups rg
+                               WHERE rg.import_run_id = dc.import_run_id
+                           )
+                           AND dc.decision IS NULL AND rd.id IS NULL)
                     )::BIGINT AS pending_review_count,
                     (
                         SELECT COUNT(*) FROM import_albums a
@@ -2790,12 +3068,22 @@ impl ImportRepository {
                  WHERE state <> 'abandoned'
                    AND (state IN ('review_required', 'ready_to_commit')
                     OR EXISTS (
+                        SELECT 1 FROM review_groups rg
+                        WHERE rg.import_run_id = import_runs.id
+                          AND rg.requires_manual_review
+                          AND rg.state = 'pending'
+                    )
+                    OR EXISTS (
                         SELECT 1
                         FROM duplicate_candidates dc
                         JOIN import_images ii ON ii.id = dc.source_image_id
                         JOIN import_albums ia ON ia.id = ii.import_album_id
                         LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
                         WHERE ia.import_run_id = import_runs.id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM review_groups rg
+                              WHERE rg.import_run_id = import_runs.id
+                          )
                           AND dc.decision IS NULL
                           AND rd.id IS NULL
                     ))
@@ -3071,6 +3359,7 @@ impl ImportRepository {
         staging_path: &str,
         target_path: &str,
         plan_hash: &[u8],
+        source_file_mode: SourceFileMode,
         operations: &[NewFileOperation],
     ) -> Result<Vec<Uuid>, AppError> {
         let transaction = client.transaction().await.map_err(|e| {
@@ -3084,8 +3373,8 @@ impl ImportRepository {
                 .execute(
                     "INSERT INTO file_transactions
                      (id, import_run_id, import_album_id, state, staging_path, target_path,
-                      manifest_path, plan_hash)
-                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)",
+                      manifest_path, plan_hash, source_file_mode)
+                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8)",
                     &[
                         &transaction_id,
                         &import_run_id,
@@ -3094,6 +3383,7 @@ impl ImportRepository {
                         &staging_path,
                         &target_path,
                         &plan_hash,
+                        &source_file_mode.to_string(),
                     ],
                 )
                 .await
@@ -3126,6 +3416,27 @@ impl ImportRepository {
                         AppError::Internal(format!("failed to prewrite file operation: {e}"))
                     })?;
                 operation_ids.push(operation_id);
+                if source_file_mode == SourceFileMode::MoveSelectedWithoutBackup {
+                    transaction
+                        .execute(
+                            "INSERT INTO source_file_cleanup_operations
+                             (id, transaction_id, source_path, expected_size, expected_blake3, state)
+                             VALUES ($1, $2, $3, $4, $5, 'pending')",
+                            &[
+                                &Uuid::new_v4(),
+                                &transaction_id,
+                                &operation.source_path,
+                                &operation.expected_size,
+                                &operation.expected_blake3,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            AppError::Internal(format!(
+                                "failed to prewrite source cleanup operation: {e}"
+                            ))
+                        })?;
+                }
             }
             Ok(operation_ids)
         }
@@ -3187,9 +3498,9 @@ impl ImportRepository {
     ) -> Result<(), AppError> {
         let state_str = state.to_string();
         let completed_at = match *state {
-            TransactionState::SourceArchived | TransactionState::LibraryCommitted => {
-                Some(chrono::Utc::now())
-            }
+            TransactionState::SourceArchived
+            | TransactionState::SourceFilesRemoved
+            | TransactionState::LibraryCommitted => Some(chrono::Utc::now()),
             _ => None,
         };
         client
@@ -3749,6 +4060,7 @@ impl ImportRepository {
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>()
             }),
+            source_file_mode: frozen.source_file_mode,
             total_albums: total_albums as u32,
             total_images: total_images as u32,
             kept_images,
@@ -3790,7 +4102,8 @@ impl ImportRepository {
     ) -> Result<Option<FrozenPlanRow>, AppError> {
         let header = client
             .query_opt(
-                "SELECT id, import_run_id, library_root_id, state, plan_hash, policy_version
+                "SELECT id, import_run_id, library_root_id, state, plan_hash, policy_version,
+                        source_file_mode
                  FROM import_plans
                  WHERE import_run_id = $1 AND state = $2
                  ORDER BY version DESC LIMIT 1",
@@ -3861,6 +4174,12 @@ impl ImportRepository {
             plan_state: header.get("state"),
             plan_hash,
             policy_version: header.get("policy_version"),
+            source_file_mode: SourceFileMode::from_str_opt(
+                &header.get::<_, String>("source_file_mode"),
+            )
+            .ok_or_else(|| {
+                AppError::Internal("invalid import plan source_file_mode".to_string())
+            })?,
             albums,
         }))
     }
@@ -3874,7 +4193,7 @@ impl ImportRepository {
         let row = client
             .query_opt(
                 "SELECT id, import_run_id, import_album_id, state, staging_path, target_path,
-                        manifest_path, plan_hash, manifest_hash, last_error
+                        manifest_path, plan_hash, manifest_hash, source_file_mode, last_error
                  FROM file_transactions WHERE id = $1",
                 &[&transaction_id],
             )
@@ -3890,6 +4209,8 @@ impl ImportRepository {
             manifest_path: r.get("manifest_path"),
             plan_hash: r.get("plan_hash"),
             manifest_hash: r.get("manifest_hash"),
+            source_file_mode: SourceFileMode::from_str_opt(&r.get::<_, String>("source_file_mode"))
+                .expect("source_file_mode database constraint"),
             last_error: r.get("last_error"),
         }))
     }
@@ -3905,10 +4226,10 @@ impl ImportRepository {
             .query(
                 "SELECT ft.id, ft.import_run_id, ft.import_album_id, ft.state,
                         ft.staging_path, ft.target_path, ft.manifest_path,
-                        ft.plan_hash, ft.manifest_hash, ft.last_error
+                        ft.plan_hash, ft.manifest_hash, ft.source_file_mode, ft.last_error
                  FROM file_transactions ft
                  JOIN import_runs r ON r.id = ft.import_run_id
-                 WHERE ft.state <> 'source_archived'
+                 WHERE ft.state NOT IN ('source_archived', 'source_files_removed')
                    AND r.state NOT IN ('abandoned', 'completed')
                  ORDER BY ft.started_at",
                 &[],
@@ -3929,6 +4250,10 @@ impl ImportRepository {
                 manifest_path: r.get("manifest_path"),
                 plan_hash: r.get("plan_hash"),
                 manifest_hash: r.get("manifest_hash"),
+                source_file_mode: SourceFileMode::from_str_opt(
+                    &r.get::<_, String>("source_file_mode"),
+                )
+                .expect("source_file_mode database constraint"),
                 last_error: r.get("last_error"),
             })
             .collect())
@@ -3997,6 +4322,57 @@ impl ImportRepository {
             .collect())
     }
 
+    pub async fn get_source_file_cleanup_operations(
+        client: &Client,
+        transaction_id: Uuid,
+    ) -> Result<Vec<SourceFileCleanupOperationRow>, AppError> {
+        let rows = client
+            .query(
+                "SELECT id, transaction_id, source_path, expected_size, expected_blake3,
+                        state, last_error
+                 FROM source_file_cleanup_operations
+                 WHERE transaction_id = $1
+                 ORDER BY source_path",
+                &[&transaction_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query source cleanup operations: {e}"))
+            })?;
+        Ok(rows
+            .iter()
+            .map(|row| SourceFileCleanupOperationRow {
+                id: row.get("id"),
+                transaction_id: row.get("transaction_id"),
+                source_path: row.get("source_path"),
+                expected_size: row.get("expected_size"),
+                expected_blake3: row.get("expected_blake3"),
+                state: row.get("state"),
+                last_error: row.get("last_error"),
+            })
+            .collect())
+    }
+
+    pub async fn update_source_file_cleanup_operation(
+        client: &Client,
+        operation_id: Uuid,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), AppError> {
+        client
+            .execute(
+                "UPDATE source_file_cleanup_operations
+                 SET state = $1, last_error = $2, updated_at = now()
+                 WHERE id = $3",
+                &[&state, &last_error, &operation_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to update source cleanup operation: {e}"))
+            })?;
+        Ok(())
+    }
+
     /// Persist the plan hash and manifest hash on the transaction.
     pub async fn set_transaction_hashes(
         client: &Client,
@@ -4042,7 +4418,7 @@ impl ImportRepository {
         let row = client
             .query_opt(
                 "SELECT id, import_run_id, import_album_id, state, staging_path, target_path,
-                        manifest_path, plan_hash, manifest_hash, last_error
+                        manifest_path, plan_hash, manifest_hash, source_file_mode, last_error
                  FROM file_transactions
                  WHERE import_album_id = $1
                  ORDER BY started_at DESC LIMIT 1",
@@ -4062,6 +4438,8 @@ impl ImportRepository {
             manifest_path: r.get("manifest_path"),
             plan_hash: r.get("plan_hash"),
             manifest_hash: r.get("manifest_hash"),
+            source_file_mode: SourceFileMode::from_str_opt(&r.get::<_, String>("source_file_mode"))
+                .expect("source_file_mode database constraint"),
             last_error: r.get("last_error"),
         }))
     }

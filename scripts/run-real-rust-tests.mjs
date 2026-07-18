@@ -33,6 +33,10 @@ const suites = [
   { name: 'album workflow migration repair', filter: 'real_migration_0012_' },
   { name: 'candidate review semantics migration', filter: 'real_migration_0013_' },
   { name: 'Fingerprint V2 constraints and indexes', filter: 'real_migration_0015_' },
+  {
+    name: '15001-square large-image decode and Fingerprint V2 regression',
+    filter: 'fingerprints_15001_square_png_without_decoder_limit_failure',
+  },
   { name: 'abandoned workflow isolation', filter: 'real_abandoned_' },
   { name: 'scan persistence', filter: 'real_scan_' },
   { name: 'source snapshot verification', filter: 'real_snapshot_' },

@@ -46,6 +46,8 @@ pub enum TransactionState {
     LibraryCommitted,
     SourceArchiving,
     SourceArchived,
+    SourceFilesRemoving,
+    SourceFilesRemoved,
     CleanupRequired,
     Conflict,
     Failed,
@@ -65,6 +67,8 @@ impl fmt::Display for TransactionState {
             Self::LibraryCommitted => write!(f, "library_committed"),
             Self::SourceArchiving => write!(f, "source_archiving"),
             Self::SourceArchived => write!(f, "source_archived"),
+            Self::SourceFilesRemoving => write!(f, "source_files_removing"),
+            Self::SourceFilesRemoved => write!(f, "source_files_removed"),
             Self::CleanupRequired => write!(f, "cleanup_required"),
             Self::Conflict => write!(f, "conflict"),
             Self::Failed => write!(f, "failed"),
@@ -89,6 +93,8 @@ impl TransactionState {
             "library_committed" => Ok(Self::LibraryCommitted),
             "source_archiving" => Ok(Self::SourceArchiving),
             "source_archived" => Ok(Self::SourceArchived),
+            "source_files_removing" => Ok(Self::SourceFilesRemoving),
+            "source_files_removed" => Ok(Self::SourceFilesRemoved),
             "cleanup_required" => Ok(Self::CleanupRequired),
             "conflict" => Ok(Self::Conflict),
             "failed" => Ok(Self::Failed),
@@ -102,7 +108,10 @@ impl TransactionState {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::SourceArchived | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::SourceArchived | Self::SourceFilesRemoved | Self::Failed | Self::Cancelled
+        )
     }
 }
 
@@ -270,6 +279,8 @@ pub fn next_transaction_state(current: &str, action: &str) -> Result<&'static st
         ("db_committing", "library_committed") => Ok("library_committed"),
         ("library_committed", "archive") => Ok("source_archiving"),
         ("source_archiving", "archived") => Ok("source_archived"),
+        ("library_committed", "remove_source_files") => Ok("source_files_removing"),
+        ("source_files_removing", "removed") => Ok("source_files_removed"),
         // Error transitions
         (_, "fail") => Ok("failed"),
         (_, "cancel") => Ok("cancelled"),
@@ -282,8 +293,10 @@ pub fn next_transaction_state(current: &str, action: &str) -> Result<&'static st
         ("library_committed", "retry") => Ok("library_committed"),
         ("source_archiving", "retry") => Ok("source_archiving"),
         ("source_archiving", "retry_archive") => Ok("source_archiving"),
+        ("source_files_removing", "retry_source_removal") => Ok("source_files_removing"),
         ("cleanup_required", "clean") => Ok("cleanup_required"),
         ("cleanup_required", "cleaned") => Ok("source_archived"),
+        ("cleanup_required", "cleaned_move") => Ok("source_files_removed"),
         _ => Err(StateError {
             current: current.to_string(),
             action: action.to_string(),
@@ -445,6 +458,14 @@ mod tests {
             next_transaction_state("source_archiving", "archived").unwrap(),
             "source_archived"
         );
+        assert_eq!(
+            next_transaction_state("library_committed", "remove_source_files").unwrap(),
+            "source_files_removing"
+        );
+        assert_eq!(
+            next_transaction_state("source_files_removing", "removed").unwrap(),
+            "source_files_removed"
+        );
     }
 
     #[test]
@@ -459,6 +480,7 @@ mod tests {
             "db_committing",
             "library_committed",
             "source_archiving",
+            "source_files_removing",
         ] {
             assert_eq!(next_transaction_state(state, "fail").unwrap(), "failed");
         }

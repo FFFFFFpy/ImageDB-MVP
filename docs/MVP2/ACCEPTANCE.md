@@ -25,6 +25,24 @@
 - [x] 0014 校验剩余审核结构并约束后续 review decision 写入。
 - [ ] 手工审核后 Dashboard / Scan / Review 计数同步复验通过。
 
+## 持久化多图审核组
+
+- [x] duplicate candidate 图按连通分量生成稳定审核组，跨图集与图库成员可处于同一组。
+- [x] 人工组默认所有成员 keep；图库成员只读且不可 exclude。
+- [x] 提交时必须携带组内全部导入成员，并保证至少保留一张图片。
+- [x] 自动组保留图库成员或一个稳定导入代表。
+- [x] frozen plan 只读取成员最终动作，不再由 pair decision 临场推导。
+- [x] 未物化审核组的旧未完成任务明确要求重新分析，不做危险回填。
+
+## 移动选中源文件（无备份）
+
+- [x] 默认保持复制/归档模式，危险模式必须在计划页显式勾选。
+- [x] source mode 进入 plan hash、manifest、file transaction、Recovery、结果与日志。
+- [x] 发布文件、manifest、operation journal 和数据库记录复验完成后才允许源文件清理。
+- [x] 只为 frozen plan 图片预写 cleanup operation，并逐文件校验路径、大小和 BLAKE3。
+- [x] 源图集目录、sidecar、嵌套文件和排除图片不删除。
+- [x] 正常完成、数据库提交后中断恢复、重复恢复幂等和源内容变化零删除冲突均由真实 PostgreSQL / 文件系统测试覆盖。
+
 ## MVP2.3 Database Info Dashboard
 
 - [x] 后端 `get_database_info_dashboard` IPC 已实现。
@@ -46,6 +64,7 @@
 - [x] Recovery / file transaction schema 未被重写。
 - [x] Scan 未结束或有失败图集时不能冻结部分计划。
 - [x] File transaction 与全部 operations 原子预写；Recovery 拒绝不完整预写证据。
+- [x] 移动模式的 selected-source cleanup operations 与 file transaction 原子预写。
 
 ## 验证
 
@@ -60,6 +79,8 @@
 - [ ] pnpm release:install-gate（本轮未运行）
 - [x] pnpm release:dataset
 - [x] pnpm release:performance
+
+2026-07-18 多图审核与移动入库任务包自动验证：`pnpm check` 通过（15 个前端测试文件、115 项测试；Rust 244 项通过、4 项真实/大内存用例按设计忽略）；`pnpm rust:test:real` 的 23 组、109 项真实 PostgreSQL / 文件系统 / 故障注入测试全部通过，耗时 567.4 秒，其中包含移动模式正常完成与幂等、数据库提交后中断恢复、源内容变化时零删除并进入 conflict。`pnpm --filter @imagedb/desktop build:web` 与 `pnpm build` 通过，生成 NSIS 安装包 `ImageDB_0.1.0_x64-setup.exe`。
 
 2026-07-12 自动验证结果：51 项前端测试通过；Rust 默认测试 212 项通过、3 项真实测试按设计 ignored；`rust:test:real` 的 22 组、99 项真实 PostgreSQL / 文件系统 / 故障注入测试全部通过。Dashboard 真实库测试覆盖 abandoned 历史隔离、审核完成后生成计划、待审核路由、cancelled frozen plan 续提交、committing active transaction 恢复、首事务预写前续提交、source_archived 图集后的缺失事务续提交，以及 failed/cancelled 终态事务人工处置。`format:check`、`typecheck`、`rust:clippy`、生产构建和 release artifacts 验证通过，生成的应用迁移 head 为 `0014_candidate_review_semantics_and_abandoned_filters`。验收数据集为 8 个源图集、44 个源文件和 1 张历史图；120 图性能门禁总耗时 6.999 秒，scan 67.49 images/s，commit 118.81 images/s。
 

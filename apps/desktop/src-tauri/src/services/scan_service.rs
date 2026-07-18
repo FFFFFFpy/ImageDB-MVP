@@ -5,9 +5,10 @@ use crate::domain::import_state::{
 use crate::error::AppError;
 use crate::infrastructure::image_fingerprint_v2::{
     compute_double_gradient_for_transform, fingerprint_image, fingerprint_worker_count,
-    hamming_distance, recall_radius, weighted_similarity, BlockHashVariant,
-    BLOCK_AUTO_DISTANCE_RATIO, BLOCK_REVIEW_DISTANCE_RATIO, DOUBLE_GRADIENT_AUTO_DISTANCE_RATIO,
-    DOUBLE_GRADIENT_REVIEW_DISTANCE_RATIO, FINGERPRINT_VERSION,
+    hamming_distance, inspect_image_dimensions, recall_radius, weighted_similarity,
+    BlockHashVariant, BLOCK_AUTO_DISTANCE_RATIO, BLOCK_REVIEW_DISTANCE_RATIO,
+    DOUBLE_GRADIENT_AUTO_DISTANCE_RATIO, DOUBLE_GRADIENT_REVIEW_DISTANCE_RATIO,
+    FINGERPRINT_VERSION, LARGE_IMAGE_PIXEL_THRESHOLD,
 };
 use crate::infrastructure::library_fingerprint_index::{
     BlockTransformMatches, HammingBkTree, LibraryFingerprintIndex, LibraryRecallMatch,
@@ -67,9 +68,36 @@ fn fingerprint_worker_limit() -> Arc<Semaphore> {
         .clone()
 }
 
+fn large_image_decode_limit() -> Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
+}
+
+fn requires_serial_large_image_decode(pixel_count: u64) -> bool {
+    pixel_count >= LARGE_IMAGE_PIXEL_THRESHOLD
+}
+
 async fn fingerprint_scanned_image(
     img: ScannedImage,
 ) -> Result<(ScannedImage, Result<FingerprintedData, AppError>), AppError> {
+    let inspect_path = img.source_path.clone();
+    let inspected = tokio::task::spawn_blocking(move || inspect_image_dimensions(&inspect_path))
+        .await
+        .map_err(|e| AppError::Internal(format!("image dimension worker failed: {e}")))?;
+    let pixel_count = match inspected {
+        Ok((_, _, pixels)) => pixels,
+        Err(error) => return Ok((img, Err(error))),
+    };
+    let large_permit = if requires_serial_large_image_decode(pixel_count) {
+        Some(
+            large_image_decode_limit()
+                .acquire_owned()
+                .await
+                .map_err(|e| AppError::Internal(format!("large image decode limit closed: {e}")))?,
+        )
+    } else {
+        None
+    };
     let permit = fingerprint_worker_limit()
         .acquire_owned()
         .await
@@ -77,6 +105,7 @@ async fn fingerprint_scanned_image(
     let path = img.source_path.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _large_permit = large_permit;
         fingerprint_image_sync(&path)
     })
     .await
@@ -1544,6 +1573,28 @@ async fn run_scan_inner(
         );
     }
 
+    // Group membership is frozen only after every album has reached a complete
+    // analysis state. A late cancellation after the last checkpoint is safe:
+    // the same persisted facts produce the complete group set before the run
+    // state is reconciled.
+    let incomplete_album_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM import_albums
+             WHERE import_run_id = $1
+               AND state NOT IN ('analyzed', 'review_required')",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "failed to check group materialization readiness: {e}"
+            ))
+        })?
+        .get(0);
+    if incomplete_album_count == 0 {
+        crate::services::review_service::materialize_review_groups(&client, import_run_id).await?;
+    }
+
     if cancelled.load(Ordering::Relaxed) {
         ImportRepository::refresh_import_run_statistics(&client, import_run_id).await?;
         let final_state =
@@ -2030,6 +2081,17 @@ mod tests {
         assert_eq!(fp.block_hash_16.len(), 32);
         assert_eq!(fp.double_gradient_hash_32.len(), 68);
         assert_eq!(fp.block_variants.len(), 8);
+    }
+
+    #[test]
+    fn large_image_decode_policy_is_single_slot_at_the_product_threshold() {
+        assert!(!requires_serial_large_image_decode(
+            LARGE_IMAGE_PIXEL_THRESHOLD - 1
+        ));
+        assert!(requires_serial_large_image_decode(
+            LARGE_IMAGE_PIXEL_THRESHOLD
+        ));
+        assert_eq!(large_image_decode_limit().available_permits(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

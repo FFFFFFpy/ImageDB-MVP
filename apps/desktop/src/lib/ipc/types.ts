@@ -351,11 +351,71 @@ export interface ReviewCandidateDetail {
 
 export interface ReviewProgress {
   import_run_id: string;
-  total_review_candidates: number;
-  decided_count: number;
+  total_review_groups: number;
+  resolved_count: number;
   remaining_count: number;
   all_decided: boolean;
 }
+
+export interface ReviewGroupSummary {
+  group_id: string;
+  state: 'pending' | 'resolved';
+  requires_manual_review: boolean;
+  member_count: number;
+  import_member_count: number;
+  library_member_count: number;
+  kept_count: number;
+}
+
+export type ReviewGroupMemberAction = 'keep' | 'exclude';
+
+export interface ReviewGroupMember {
+  image_id: string;
+  image_source: 'import' | 'library';
+  final_action: ReviewGroupMemberAction;
+  decision_source: 'automatic' | 'user';
+  source_path: string;
+  relative_path: string;
+  album_name: string;
+  file_size: number;
+  width: number | null;
+  height: number | null;
+  format: string | null;
+}
+
+export interface ReviewGroupEvidence {
+  candidate_id: string;
+  source_image_id: string;
+  candidate_image_id: string;
+  candidate_image_source: 'import' | 'library';
+  scope: string;
+  match_type: string;
+  blake3_equal: boolean;
+  pixel_hash_equal: boolean;
+  block_distance: number | null;
+  double_gradient_distance: number | null;
+  block_distance_ratio: number | null;
+  double_gradient_distance_ratio: number | null;
+  transform_type: string | null;
+  confidence: number | null;
+  automatic: boolean;
+}
+
+export interface ReviewGroupDetail {
+  group_id: string;
+  state: 'pending' | 'resolved';
+  requires_manual_review: boolean;
+  members: ReviewGroupMember[];
+  evidence: ReviewGroupEvidence[];
+}
+
+export interface ReviewGroupMemberDecision {
+  image_id: string;
+  image_source: 'import';
+  final_action: ReviewGroupMemberAction;
+}
+
+export type SourceFileMode = 'copy_and_archive' | 'move_selected_without_backup';
 
 export interface ImportPlanImage {
   image_id: string;
@@ -380,6 +440,7 @@ export interface ImportPlanAlbum {
 export interface ImportPlan {
   import_run_id: string;
   plan_hash: string | null;
+  source_file_mode: SourceFileMode;
   total_albums: number;
   total_images: number;
   kept_images: ImportPlanImage[];
@@ -456,6 +517,7 @@ export interface CommitAlbumResult {
 
 export interface CommitResult {
   import_run_id: string;
+  source_file_mode: SourceFileMode;
   albums_total: number;
   albums_committed: number;
   albums_skipped: number;
@@ -471,6 +533,7 @@ export interface RecoveryDiagnostic {
   import_run_id: string;
   import_album_id: string;
   current_state: string;
+  source_file_mode: SourceFileMode;
   staging_path: string | null;
   target_path: string | null;
   manifest_path: string | null;

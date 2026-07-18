@@ -12,7 +12,7 @@
 //! unknown published directory — a mismatch surfaces as a `conflict` with
 //! full diagnostics instead of an automatic fix.
 #![allow(dead_code)]
-use crate::domain::import_state::ImportRunState;
+use crate::domain::import_state::{ImportRunState, SourceFileMode};
 use crate::domain::state_machine::{self, FileOpState, TransactionState};
 use crate::error::AppError;
 use crate::infrastructure::postgres::{DatabaseOperationLock, PostgresManager};
@@ -26,10 +26,11 @@ use crate::services::commit_service::{
     build_manifest, commit_library_records_transaction, detect_extra_published_files,
     ensure_no_symlink_or_reparse_escape, normalize_relative_path, path_eq,
     publish_verified_staging, read_commit_marker, read_manifest_with_hash,
-    select_commit_publish_strategy, stream_copy_with_hash, sync_parent_dir,
-    validate_and_hash_frozen_plan, validate_commit_marker, verify_published_file_set,
-    verify_source_snapshot_or_conflict, verify_staging_set, write_commit_marker,
-    write_synced_then_rename, LIBRARY_ROOT_LEASE_TTL_SECS,
+    remove_selected_source_files, select_commit_publish_strategy, stream_copy_with_hash,
+    sync_parent_dir, validate_and_hash_frozen_plan, validate_commit_marker,
+    validate_snapshot_album_path_identity, verify_committed_evidence_before_source_cleanup,
+    verify_published_file_set, verify_source_snapshot_or_conflict, verify_staging_set,
+    write_commit_marker, write_synced_then_rename, IdempotencyVerdict, LIBRARY_ROOT_LEASE_TTL_SECS,
 };
 use crate::services::source_snapshot_service::load_source_album_snapshot;
 use serde::Serialize;
@@ -48,6 +49,7 @@ pub struct RecoveryDiagnostic {
     pub import_run_id: Uuid,
     pub import_album_id: Uuid,
     pub current_state: String,
+    pub source_file_mode: SourceFileMode,
     pub staging_path: Option<String>,
     pub target_path: Option<String>,
     pub manifest_path: Option<String>,
@@ -119,8 +121,14 @@ pub async fn scan_recoverable_transactions(
             "published" | "db_committing" => {
                 diags.push("published: retry database commit".to_string());
             }
-            "library_committed" | "source_archiving" => {
-                diags.push("library committed: resume source archive".to_string());
+            "library_committed" | "source_archiving" | "source_files_removing" => {
+                let action = match tx.source_file_mode {
+                    SourceFileMode::CopyAndArchive => "resume source archive",
+                    SourceFileMode::MoveSelectedWithoutBackup => {
+                        "resume verified selected-source removal"
+                    }
+                };
+                diags.push(format!("library committed: {action}"));
             }
             "cleanup_required" => {
                 diags.push("cleanup required: staging dir left behind".to_string());
@@ -144,6 +152,7 @@ pub async fn scan_recoverable_transactions(
             import_run_id: tx.import_run_id,
             import_album_id: tx.import_album_id,
             current_state: tx.state.clone(),
+            source_file_mode: tx.source_file_mode,
             staging_path: tx.staging_path.clone(),
             target_path: tx.target_path.clone(),
             manifest_path: tx.manifest_path.clone(),
@@ -344,6 +353,7 @@ pub async fn reconcile_import_run_state(
                 | TransactionState::DbCommitting
                 | TransactionState::LibraryCommitted
                 | TransactionState::SourceArchiving
+                | TransactionState::SourceFilesRemoving
                 | TransactionState::CleanupRequired)
         )
     });
@@ -363,23 +373,24 @@ pub async fn reconcile_import_run_state(
     }
 
     // Rule 5: every frozen-plan album must have reached source_archived.
-    let archived_album_ids: std::collections::HashSet<Uuid> = transactions
+    let completed_album_ids: std::collections::HashSet<Uuid> = transactions
         .iter()
         .filter(|t| {
-            matches!(
-                TransactionState::parse(&t.state),
-                Ok(TransactionState::SourceArchived)
-            )
+            let expected = match frozen.source_file_mode {
+                SourceFileMode::CopyAndArchive => TransactionState::SourceArchived,
+                SourceFileMode::MoveSelectedWithoutBackup => TransactionState::SourceFilesRemoved,
+            };
+            TransactionState::parse(&t.state).is_ok_and(|state| state == expected)
         })
         .map(|t| t.import_album_id)
         .collect();
 
-    let all_archived = frozen
+    let all_completed = frozen
         .albums
         .iter()
-        .all(|(a, _)| archived_album_ids.contains(&a.import_album_id));
+        .all(|(a, _)| completed_album_ids.contains(&a.import_album_id));
 
-    if all_archived {
+    if all_completed {
         complete_run_if_needed(client, import_run_id, current).await
     } else {
         // Some plan album has no transaction at all — commit was aborted
@@ -547,9 +558,9 @@ async fn recover_transaction_with_client(
     // `source_archived` is a genuine "already done, nothing to do" success.
     let outcome: Result<(String, bool, bool, String), AppError> = if current.is_terminal() {
         let (recovered, msg) = match current {
-            TransactionState::SourceArchived => (
+            TransactionState::SourceArchived | TransactionState::SourceFilesRemoved => (
                 true,
-                "transaction already source_archived".to_string(),
+                format!("transaction already {current}"),
             ),
             TransactionState::Failed | TransactionState::Cancelled => (
                 false,
@@ -628,6 +639,21 @@ async fn recover_active_transaction(
             ))
         })?
         .clone();
+
+    if tx.source_file_mode != frozen.source_file_mode {
+        let message = format!(
+            "transaction {} source file mode {} does not match frozen plan {}",
+            tx.id, tx.source_file_mode, frozen.source_file_mode
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&message),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, message));
+    }
 
     let album_relative_path = normalize_relative_path(&plan_album.target_relative_path)?;
     let library_root_id = frozen.library_root_id;
@@ -778,7 +804,37 @@ async fn recover_active_transaction(
             .await
         }
         TransactionState::LibraryCommitted | TransactionState::SourceArchiving => {
-            resume_source_archive(client, tx, &library_root, &album_relative_path).await
+            match tx.source_file_mode {
+                SourceFileMode::CopyAndArchive => {
+                    resume_source_archive(client, tx, &library_root, &album_relative_path).await
+                }
+                SourceFileMode::MoveSelectedWithoutBackup => {
+                    resume_source_removal(
+                        client,
+                        tx,
+                        &library_root,
+                        library_root_id,
+                        frozen.plan_id,
+                        &validated_plan_hash,
+                        &album_relative_path,
+                        &plan_images,
+                    )
+                    .await
+                }
+            }
+        }
+        TransactionState::SourceFilesRemoving => {
+            resume_source_removal(
+                client,
+                tx,
+                &library_root,
+                library_root_id,
+                frozen.plan_id,
+                &validated_plan_hash,
+                &album_relative_path,
+                &plan_images,
+            )
+            .await
         }
         TransactionState::CleanupRequired => resume_cleanup(client, tx, &library_root).await,
         _ => Ok((
@@ -1467,6 +1523,7 @@ async fn publish_from_staging(
         tx.import_album_id,
         library_root_id,
         album_relative_path,
+        tx.source_file_mode,
         plan_images,
     );
     let manifest_json = serde_json::to_string_pretty(&manifest)
@@ -1665,6 +1722,20 @@ async fn resume_db_commit(
         let msg = format!(
             "manifest album_relative_path '{}' != expected '{}'",
             manifest.album_relative_path, album_relative_path
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+    if manifest.source_file_mode != tx.source_file_mode {
+        let msg = format!(
+            "manifest source_file_mode {} != transaction {}",
+            manifest.source_file_mode, tx.source_file_mode
         );
         ImportRepository::update_file_transaction_state(
             client,
@@ -1965,7 +2036,187 @@ async fn resume_db_commit(
                 tx.id
             ))
         })?;
-    resume_source_archive(client, &refreshed_tx, library_root, album_relative_path).await
+    match refreshed_tx.source_file_mode {
+        SourceFileMode::CopyAndArchive => {
+            resume_source_archive(client, &refreshed_tx, library_root, album_relative_path).await
+        }
+        SourceFileMode::MoveSelectedWithoutBackup => {
+            resume_source_removal(
+                client,
+                &refreshed_tx,
+                library_root,
+                library_root_id,
+                *plan_id,
+                plan_hash,
+                album_relative_path,
+                plan_images,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_source_removal(
+    client: &mut Client,
+    tx: &FileTransactionFullRow,
+    library_root: &Path,
+    library_root_id: Uuid,
+    plan_id: Uuid,
+    plan_hash: &[u8],
+    album_relative_path: &str,
+    plan_images: &[PlanImageRow],
+) -> Result<(String, bool, String), AppError> {
+    if tx.source_file_mode != SourceFileMode::MoveSelectedWithoutBackup {
+        let msg = format!(
+            "transaction {} cannot remove selected sources in mode {}",
+            tx.id, tx.source_file_mode
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+
+    match verify_committed_evidence_before_source_cleanup(
+        client,
+        library_root,
+        library_root_id,
+        tx,
+        plan_id,
+        plan_hash,
+        album_relative_path,
+        plan_images,
+    )
+    .await?
+    {
+        IdempotencyVerdict::AlreadyCommitted => {}
+        IdempotencyVerdict::Conflict(msg) => {
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+        IdempotencyVerdict::Resume { .. } => {
+            return Err(AppError::Internal(format!(
+                "complete evidence verifier unexpectedly requested another recovery for {}",
+                tx.id
+            )));
+        }
+    }
+
+    let import_album = ImportRepository::get_import_album_by_id(client, tx.import_album_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::Internal(format!("import album {} not found", tx.import_album_id))
+        })?;
+    let source_album_dir = PathBuf::from(&import_album.source_path);
+    let Some((snapshot, snapshot_files)) =
+        load_source_album_snapshot(client, tx.import_album_id).await?
+    else {
+        let msg = format!(
+            "no source snapshot for album {}; selected sources cannot be removed safely",
+            tx.import_album_id
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    };
+    if let Err(error) =
+        validate_snapshot_album_path_identity(&snapshot.source_album_path, &source_album_dir)
+    {
+        let msg = error.to_string();
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, msg));
+    }
+
+    let current = TransactionState::parse(&tx.state)?;
+    let removing = match current {
+        TransactionState::LibraryCommitted => {
+            state_machine::transition_transaction(current, "remove_source_files")?
+        }
+        TransactionState::SourceFilesRemoving => {
+            state_machine::transition_transaction(current, "retry_source_removal")?
+        }
+        other => {
+            let msg = format!("cannot resume selected source removal from state {other}");
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx.id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Ok((TransactionState::Conflict.to_string(), false, msg));
+        }
+    };
+    ImportRepository::update_file_transaction_state(client, tx.id, &removing, None).await?;
+    if let Err(error) = remove_selected_source_files(
+        client,
+        tx.id,
+        &source_album_dir,
+        &snapshot.snapshot_hash,
+        &snapshot_files,
+        plan_images,
+    )
+    .await
+    {
+        let message = error.to_string();
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx.id,
+            &TransactionState::Conflict,
+            Some(&message),
+        )
+        .await?;
+        return Ok((TransactionState::Conflict.to_string(), false, message));
+    }
+    let removed = state_machine::transition_transaction(removing, "removed")?;
+    ImportRepository::update_file_transaction_state(client, tx.id, &removed, None).await?;
+
+    if let Some(staging) = &tx.staging_path {
+        let staging_base = Path::new(staging)
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(staging));
+        if staging_base.exists() {
+            if let Err(error) = tokio::fs::remove_dir_all(&staging_base).await {
+                let msg = format!("staging cleanup failed after source removal: {error}");
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx.id,
+                    &TransactionState::CleanupRequired,
+                    Some(&msg),
+                )
+                .await?;
+                return Ok((TransactionState::CleanupRequired.to_string(), false, msg));
+            }
+        }
+    }
+    Ok((
+        TransactionState::SourceFilesRemoved.to_string(),
+        true,
+        "published album verified; frozen-plan source files removed".to_string(),
+    ))
 }
 
 /// Outcome of [`resolve_archive_entry_transition`].
@@ -2285,14 +2536,14 @@ async fn resume_cleanup(
             }
         }
     }
-    let archived =
-        state_machine::transition_transaction(TransactionState::CleanupRequired, "cleaned")?;
-    ImportRepository::update_file_transaction_state(client, tx.id, &archived, None).await?;
-    Ok((
-        TransactionState::SourceArchived.to_string(),
-        true,
-        "cleanup complete".to_string(),
-    ))
+    let terminal_action = match tx.source_file_mode {
+        SourceFileMode::CopyAndArchive => "cleaned",
+        SourceFileMode::MoveSelectedWithoutBackup => "cleaned_move",
+    };
+    let terminal =
+        state_machine::transition_transaction(TransactionState::CleanupRequired, terminal_action)?;
+    ImportRepository::update_file_transaction_state(client, tx.id, &terminal, None).await?;
+    Ok((terminal.to_string(), true, "cleanup complete".to_string()))
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use crate::domain::import_state::TransformType;
 use crate::error::AppError;
 use exif::{In, Reader, Tag};
 use image::imageops::FilterType as ImageFilterType;
-use image::{DynamicImage, GrayImage, ImageFormat, RgbaImage};
+use image::{DynamicImage, GrayImage, ImageFormat, ImageReader, Limits, RgbaImage};
 use image_hasher::{FilterType as HashFilterType, HashAlg, HasherConfig};
 use serde::Serialize;
 use std::io::Cursor;
@@ -20,6 +20,8 @@ pub const DOUBLE_GRADIENT_REVIEW_DISTANCE_RATIO: f64 = 0.08;
 pub const BLOCK_DISTANCE_WEIGHT: f64 = 0.40;
 pub const DOUBLE_GRADIENT_DISTANCE_WEIGHT: f64 = 0.60;
 pub const MAX_RECALL_CANDIDATES_PER_IMAGE: usize = 256;
+pub const LARGE_IMAGE_PIXEL_THRESHOLD: u64 = 100_000_000;
+pub const MAX_DECODED_IMAGE_PIXELS: u64 = 500_000_000;
 
 const MIN_GRAYSCALE_STDDEV: f64 = 8.0;
 const MIN_EFFECTIVE_GRAYSCALE_BINS: usize = 4;
@@ -132,6 +134,24 @@ pub fn fingerprint_image(path: &Path) -> Result<ImageFingerprintV2, AppError> {
     fingerprint_bytes(path, &file_bytes)
 }
 
+pub fn inspect_image_dimensions(path: &Path) -> Result<(u32, u32, u64), AppError> {
+    let reader = ImageReader::open(path)
+        .map_err(|error| {
+            AppError::IoError(format!("cannot open image {}: {error}", path.display()))
+        })?
+        .with_guessed_format()
+        .map_err(|error| AppError::ImageError(format!("cannot inspect image format: {error}")))?;
+    if reader.format().is_none() {
+        return Err(AppError::ImageError(format!(
+            "unsupported image format: {}",
+            path.display()
+        )));
+    }
+    let (width, height) = reader.into_dimensions().map_err(classify_decode_error)?;
+    let pixels = checked_pixel_count(width, height)?;
+    Ok((width, height, pixels))
+}
+
 pub fn run_probe(fixture_dir: &Path) -> ImageFingerprintProbeResult {
     let mut diagnostics = Vec::new();
     let mut fingerprints = Vec::new();
@@ -219,13 +239,32 @@ pub fn generate_test_samples(dir: &Path) -> Result<Vec<String>, AppError> {
 fn fingerprint_bytes(path: &Path, file_bytes: &[u8]) -> Result<ImageFingerprintV2, AppError> {
     let file_size = file_bytes.len() as u64;
     let blake3 = blake3::hash(file_bytes).as_bytes().to_vec();
-    let format = detect_format(file_bytes);
+    let guessed_format = image::guess_format(file_bytes).map_err(|error| {
+        AppError::ImageError(format!(
+            "unsupported image format for {}: {error}",
+            path.display()
+        ))
+    })?;
+    let format = format_name(guessed_format);
+
+    let dimension_reader = ImageReader::with_format(Cursor::new(file_bytes), guessed_format);
+    let (source_width, source_height) = dimension_reader
+        .into_dimensions()
+        .map_err(classify_decode_error)?;
+    let pixel_count = checked_pixel_count(source_width, source_height)?;
+    if pixel_count > MAX_DECODED_IMAGE_PIXELS {
+        return Err(AppError::ImageError(format!(
+            "image pixel count exceeds product limit: {source_width}x{source_height} = {pixel_count} pixels (limit {MAX_DECODED_IMAGE_PIXELS})"
+        )));
+    }
 
     // The source is decoded exactly once. EXIF is parsed from the already-read
     // byte buffer, so orientation handling never performs a second file read.
-    let decoded = image::load_from_memory(file_bytes)?;
+    let mut decode_reader = ImageReader::with_format(Cursor::new(file_bytes), guessed_format);
+    decode_reader.limits(Limits::no_limits());
+    let decoded = decode_reader.decode().map_err(classify_decode_error)?;
     let orientation = read_exif_orientation(file_bytes, path);
-    let oriented_rgba = apply_orientation(decoded.to_rgba8(), orientation);
+    let oriented_rgba = apply_orientation(decoded.into_rgba8(), orientation);
     let (width, height) = oriented_rgba.dimensions();
     let pixel_hash = compute_pixel_hash(&oriented_rgba);
 
@@ -396,14 +435,55 @@ fn compute_pixel_hash(rgba: &RgbaImage) -> Vec<u8> {
     hasher.finalize().as_bytes().to_vec()
 }
 
-fn detect_format(bytes: &[u8]) -> String {
-    match image::guess_format(bytes) {
-        Ok(ImageFormat::Jpeg) => "JPEG".to_string(),
-        Ok(ImageFormat::Png) => "PNG".to_string(),
-        Ok(ImageFormat::WebP) => "WebP".to_string(),
-        Ok(format) => format!("{format:?}"),
-        Err(_) => "unknown".to_string(),
+fn checked_pixel_count(width: u32, height: u32) -> Result<u64, AppError> {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| {
+            AppError::ImageError(format!(
+                "image dimension multiplication overflow: {width}x{height}"
+            ))
+        })
+}
+
+fn classify_decode_error(error: image::ImageError) -> AppError {
+    match error {
+        image::ImageError::Unsupported(error) => {
+            AppError::ImageError(format!("unsupported image format: {error}"))
+        }
+        image::ImageError::Limits(error) => {
+            let message = error.to_string();
+            if message.to_ascii_lowercase().contains("memory")
+                || message.to_ascii_lowercase().contains("allocation")
+            {
+                AppError::ImageError(format!("image memory allocation failed: {message}"))
+            } else {
+                AppError::ImageError(format!("image decode limit error: {message}"))
+            }
+        }
+        image::ImageError::Decoding(error) => {
+            AppError::ImageError(format!("corrupt or undecodable image: {error}"))
+        }
+        image::ImageError::IoError(error) => {
+            AppError::IoError(format!("image read failed: {error}"))
+        }
+        other => AppError::ImageError(format!("image decode failed: {other}")),
     }
+}
+
+fn format_name(format: ImageFormat) -> String {
+    match format {
+        ImageFormat::Jpeg => "JPEG".to_string(),
+        ImageFormat::Png => "PNG".to_string(),
+        ImageFormat::WebP => "WebP".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+fn detect_format(bytes: &[u8]) -> String {
+    image::guess_format(bytes)
+        .map(format_name)
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn read_exif_orientation(bytes: &[u8], path: &Path) -> u32 {
@@ -441,7 +521,11 @@ fn apply_orientation(source: RgbaImage, orientation: u32) -> RgbaImage {
         8 => TransformType::Rot270,
         _ => TransformType::Identity,
     };
-    transform_rgba(&source, transform)
+    if transform == TransformType::Identity {
+        source
+    } else {
+        transform_rgba(&source, transform)
+    }
 }
 
 fn transform_gray(source: &GrayImage, transform: TransformType) -> GrayImage {
@@ -507,6 +591,7 @@ mod tests {
     use image::codecs::jpeg::JpegEncoder;
     use image::{ImageBuffer, Rgb};
     use std::fs;
+    use std::io::Write;
     use tempfile::TempDir;
 
     fn patterned_rgba(width: u32, height: u32) -> RgbaImage {
@@ -563,6 +648,100 @@ mod tests {
         let second = fingerprint_image(&path).unwrap();
         assert_eq!(first.blake3, second.blake3);
         assert_eq!(first.blake3.len(), 32);
+    }
+
+    #[test]
+    fn fingerprint_v2_golden_hashes_are_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("golden.png");
+        write_png(&path, &patterned_rgba(37, 23));
+        let fingerprint = fingerprint_image(&path).unwrap();
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(&fingerprint.pixel_hash),
+            "5a850f440d66c44be7b4151ad9ceb0d54c1a2eb3d964dfc4f1512724119802be"
+        );
+        assert_eq!(
+            hex(&fingerprint.block_hash_16),
+            "e083f0e07cf01e7e073fc30fe083f0f07cf01e78071f830fe083f0c07ae81f78"
+        );
+        assert_eq!(
+            hex(&fingerprint.double_gradient_hash_32),
+            "77b937b817bb873ba39bb1c3bad1fbd81bdc8b5d831dd1cfd8e1dce07dec0d6ecd2e9fcf8fe7cff3e7f3e7f9f378f13c793e7c9e3c9f1ecf9fc7cfe7cff3e7f1f379f33c"
+        );
+        assert_eq!(fingerprint.width, 37);
+        assert_eq!(fingerprint.height, 23);
+    }
+
+    #[test]
+    fn identity_orientation_reuses_the_owned_pixel_buffer() {
+        let source = patterned_rgba(37, 23);
+        let original_ptr = source.as_raw().as_ptr();
+        let oriented = apply_orientation(source, 1);
+        assert_eq!(original_ptr, oriented.as_raw().as_ptr());
+    }
+
+    #[test]
+    fn product_pixel_limit_rejects_before_full_decode() {
+        let width = 30_000u32;
+        let height = 30_000u32;
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let writer = encoder.write_header().unwrap();
+            writer.finish().unwrap();
+        }
+        // `into_dimensions` requires the structural presence of IDAT but does
+        // not inflate it. Insert an empty IDAT before IEND so the test proves
+        // the product limit is evaluated from the header before full decode.
+        let iend = bytes.split_off(bytes.len() - 12);
+        bytes.extend_from_slice(&[0, 0, 0, 0, b'I', b'D', b'A', b'T', 0x35, 0xaf, 0x06, 0x1e]);
+        bytes.extend_from_slice(&iend);
+        let error = fingerprint_bytes(Path::new("over-limit.png"), &bytes).unwrap_err();
+        assert!(error.to_string().contains("product limit"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "large-memory integration: decodes and fingerprints a 15001x15001 PNG"]
+    fn fingerprints_15001_square_png_without_decoder_limit_failure() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("15001-square.png");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = png::Encoder::new(file, 15_001, 15_001);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        {
+            let mut stream = writer.stream_writer_with_size(1024 * 1024).unwrap();
+            let row = vec![0x80; 15_001];
+            for y in 0..15_001u32 {
+                let mut varied = row.clone();
+                let index = (y as usize * 97) % varied.len();
+                varied[index] = (y % 251) as u8;
+                stream.write_all(&varied).unwrap();
+            }
+            stream.finish().unwrap();
+        }
+        writer.finish().unwrap();
+
+        let fingerprint = fingerprint_image(&path).unwrap();
+        assert_eq!((fingerprint.width, fingerprint.height), (15_001, 15_001));
+        assert_eq!(fingerprint.pixel_hash.len(), 32);
+        assert_eq!(
+            fingerprint.block_hash_16.len() * 8,
+            BLOCK_HASH_BIT_LENGTH as usize
+        );
+        assert_eq!(
+            fingerprint.double_gradient_hash_32.len() * 8,
+            DOUBLE_GRADIENT_HASH_BIT_LENGTH as usize
+        );
     }
 
     #[test]

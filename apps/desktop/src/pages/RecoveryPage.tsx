@@ -46,6 +46,8 @@ function formatState(state: string): string {
     library_committed: '已正式入库',
     source_archiving: '源图集归档',
     source_archived: '已完成',
+    source_files_removing: '移除已入库源图片',
+    source_files_removed: '已完成',
     cleanup_required: '等待恢复',
     conflict: '发生冲突',
     failed: '失败',
@@ -249,6 +251,14 @@ function RecoveryCard({ tx, recovering, reverifying, onRecover, onReverify }: Re
             <div>
               <dt>计划哈希</dt>
               <dd className="mono">{tx.plan_hash ? `${tx.plan_hash.slice(0, 12)}…` : '缺失'}</dd>
+            </div>
+            <div>
+              <dt>源文件模式</dt>
+              <dd>
+                {tx.source_file_mode === 'move_selected_without_backup'
+                  ? '移动已选（无备份）'
+                  : '复制并归档'}
+              </dd>
             </div>
           </dl>
         </div>

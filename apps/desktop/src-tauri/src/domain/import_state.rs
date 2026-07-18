@@ -310,6 +310,94 @@ impl ReviewDecisionAction {
 
 pub const REVIEW_DECISION_VALUES: &str = "keep_source, keep_candidate, keep_all, skip_album";
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFileMode {
+    #[default]
+    CopyAndArchive,
+    MoveSelectedWithoutBackup,
+}
+
+impl fmt::Display for SourceFileMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CopyAndArchive => write!(f, "copy_and_archive"),
+            Self::MoveSelectedWithoutBackup => write!(f, "move_selected_without_backup"),
+        }
+    }
+}
+
+impl SourceFileMode {
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "copy_and_archive" => Some(Self::CopyAndArchive),
+            "move_selected_without_backup" => Some(Self::MoveSelectedWithoutBackup),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewGroupSummary {
+    pub group_id: String,
+    pub state: String,
+    pub requires_manual_review: bool,
+    pub member_count: u32,
+    pub import_member_count: u32,
+    pub library_member_count: u32,
+    pub kept_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewGroupMember {
+    pub image_id: String,
+    pub image_source: String,
+    pub final_action: String,
+    pub decision_source: String,
+    pub source_path: String,
+    pub relative_path: String,
+    pub album_name: String,
+    pub file_size: i64,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewGroupEvidence {
+    pub candidate_id: String,
+    pub source_image_id: String,
+    pub candidate_image_id: String,
+    pub candidate_image_source: String,
+    pub scope: String,
+    pub match_type: String,
+    pub blake3_equal: bool,
+    pub pixel_hash_equal: bool,
+    pub block_distance: Option<i32>,
+    pub double_gradient_distance: Option<i32>,
+    pub block_distance_ratio: Option<f64>,
+    pub double_gradient_distance_ratio: Option<f64>,
+    pub transform_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub automatic: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewGroupDetail {
+    pub group_id: String,
+    pub state: String,
+    pub requires_manual_review: bool,
+    pub members: Vec<ReviewGroupMember>,
+    pub evidence: Vec<ReviewGroupEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewGroupMemberDecision {
+    pub image_id: String,
+    pub image_source: String,
+    pub final_action: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewCandidateSummary {
     pub candidate_id: String,
@@ -360,8 +448,8 @@ pub struct ReviewCandidateDetail {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewProgress {
     pub import_run_id: String,
-    pub total_review_candidates: u32,
-    pub decided_count: u32,
+    pub total_review_groups: u32,
+    pub resolved_count: u32,
     pub remaining_count: u32,
     pub all_decided: bool,
 }
@@ -392,6 +480,7 @@ pub struct ImportPlanAlbum {
 pub struct ImportPlan {
     pub import_run_id: String,
     pub plan_hash: Option<String>,
+    pub source_file_mode: SourceFileMode,
     pub total_albums: u32,
     pub total_images: u32,
     pub kept_images: Vec<ImportPlanImage>,
@@ -528,6 +617,7 @@ pub struct CommitAlbumResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitResult {
     pub import_run_id: String,
+    pub source_file_mode: SourceFileMode,
     pub albums_total: u32,
     pub albums_committed: u32,
     pub albums_skipped: u32,
@@ -642,6 +732,18 @@ mod tests {
             );
         }
         assert_eq!(ReviewDecisionAction::from_str_opt("bogus"), None);
+    }
+
+    #[test]
+    fn source_file_mode_round_trip_and_default_are_safe() {
+        assert_eq!(SourceFileMode::default(), SourceFileMode::CopyAndArchive);
+        for mode in [
+            SourceFileMode::CopyAndArchive,
+            SourceFileMode::MoveSelectedWithoutBackup,
+        ] {
+            assert_eq!(SourceFileMode::from_str_opt(&mode.to_string()), Some(mode));
+        }
+        assert_eq!(SourceFileMode::from_str_opt("unknown"), None);
     }
 
     #[test]

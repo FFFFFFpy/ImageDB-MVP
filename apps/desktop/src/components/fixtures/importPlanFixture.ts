@@ -43,6 +43,7 @@ export function createLargeImportPlanFixture(albumCount = 1_000, imagesPerAlbum 
   return {
     import_run_id: 'fixture-run-stress-plan',
     plan_hash: 'fixture-stress-plan-hash',
+    source_file_mode: 'copy_and_archive',
     total_albums: albumCount,
     total_images: albumCount * imagesPerAlbum,
     kept_images: largeAlbums.flatMap((album) => album.images),
@@ -67,6 +68,7 @@ const albums: ImportPlanAlbum[] = albumDefinitions.map(([albumId, albumName, cou
 export const importPlanFixture: ImportPlan = {
   import_run_id: 'fixture-run-plan',
   plan_hash: 'fixture-plan-hash',
+  source_file_mode: 'copy_and_archive',
   total_albums: 6,
   total_images: 808,
   kept_images: albums.flatMap((album) => album.images),

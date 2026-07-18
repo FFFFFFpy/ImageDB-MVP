@@ -1,7 +1,9 @@
 use crate::domain::duplicate_group::{build_duplicate_groups, compute_excluded_ids, DuplicateEdge};
 use crate::domain::import_state::{
     ImportAlbumState, ImportPlan, ImportPlanAlbum, ImportPlanImage, ImportRunState,
-    ReviewCandidateDetail, ReviewCandidateSummary, ReviewDecisionAction, ReviewProgress,
+    ReviewCandidateDetail, ReviewCandidateSummary, ReviewDecisionAction, ReviewGroupDetail,
+    ReviewGroupEvidence, ReviewGroupMember, ReviewGroupMemberDecision, ReviewGroupSummary,
+    ReviewProgress, SourceFileMode,
 };
 use crate::domain::state_machine::PlanState;
 use crate::error::AppError;
@@ -14,6 +16,366 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio_postgres::Client;
 use uuid::Uuid;
+
+/// Materialize the final connected-component review model after every album
+/// in the run has finished analysis. This is intentionally never invoked by
+/// Freeze for an older run: legacy edge decisions cannot be converted without
+/// guessing, so those runs fail closed and must be re-analyzed.
+pub async fn materialize_review_groups(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<(), AppError> {
+    client.batch_execute("BEGIN").await.map_err(|e| {
+        AppError::Internal(format!("failed to begin review group materialization: {e}"))
+    })?;
+    let result = async {
+        lock_import_run_for_plan_access(client, import_run_id).await?;
+        if ImportRepository::has_review_groups(client, import_run_id).await? {
+            return Ok(());
+        }
+
+        let invalid_album = client
+            .query_opt(
+                "SELECT source_name, state FROM import_albums
+                 WHERE import_run_id = $1
+                   AND state NOT IN ('analyzed', 'review_required')
+                 ORDER BY source_name LIMIT 1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to validate review group readiness: {e}"))
+            })?;
+        if let Some(row) = invalid_album {
+            return Err(AppError::Internal(format!(
+                "cannot materialize review groups while album '{}' is in state '{}'",
+                row.get::<_, String>("source_name"),
+                row.get::<_, String>("state")
+            )));
+        }
+
+        let candidates =
+            ImportRepository::get_all_candidates_for_import_plan(client, import_run_id).await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let edges: Vec<DuplicateEdge> = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let candidate_id = candidate
+                    .candidate_source_image_id
+                    .or(candidate.candidate_library_image_id)?;
+                Some(DuplicateEdge {
+                    image_a: candidate.source_image_id,
+                    image_b: candidate_id,
+                    a_is_import: true,
+                    b_is_import: candidate.candidate_library_image_id.is_none(),
+                    confidence: candidate.confidence.unwrap_or(0.0),
+                    blake3_equal: candidate.blake3_equal,
+                    pixel_hash_equal: candidate.pixel_hash_equal,
+                })
+            })
+            .collect();
+        let groups = build_duplicate_groups(&edges);
+
+        let mut source_by_image: HashMap<Uuid, &'static str> = HashMap::new();
+        for candidate in &candidates {
+            source_by_image.insert(candidate.source_image_id, "import");
+            if let Some(id) = candidate.candidate_source_image_id {
+                source_by_image.insert(id, "import");
+            }
+            if let Some(id) = candidate.candidate_library_image_id {
+                source_by_image.insert(id, "library");
+            }
+        }
+
+        for group in groups {
+            let member_ids: HashSet<Uuid> = group.image_ids.iter().copied().collect();
+            let requires_manual_review = candidates.iter().any(|candidate| {
+                member_ids.contains(&candidate.source_image_id)
+                    && candidate.candidate_decision.as_deref() != Some("auto_duplicate")
+            });
+            let group_id = Uuid::new_v4();
+            let state = if requires_manual_review {
+                "pending"
+            } else {
+                "resolved"
+            };
+            let resolved_at = (!requires_manual_review).then(chrono::Utc::now);
+            client
+                .execute(
+                    "INSERT INTO review_groups
+                        (id, import_run_id, state, requires_manual_review, resolved_at)
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[
+                        &group_id,
+                        &import_run_id,
+                        &state,
+                        &requires_manual_review,
+                        &resolved_at,
+                    ],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to insert review group: {e}")))?;
+
+            let has_library = group
+                .image_ids
+                .iter()
+                .any(|id| source_by_image.get(id) == Some(&"library"));
+            for image_id in group.image_ids {
+                let image_source = source_by_image.get(&image_id).copied().ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "review group image {image_id} has no source classification"
+                    ))
+                })?;
+                let final_action = initial_review_group_action(
+                    image_source,
+                    requires_manual_review,
+                    has_library,
+                    image_id == group.representative_id,
+                );
+                client
+                    .execute(
+                        "INSERT INTO review_group_members
+                            (id, group_id, image_id, image_source, final_action, decision_source)
+                         VALUES ($1, $2, $3, $4, $5, 'automatic')",
+                        &[
+                            &Uuid::new_v4(),
+                            &group_id,
+                            &image_id,
+                            &image_source,
+                            &final_action,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!("failed to insert review group member: {e}"))
+                    })?;
+            }
+        }
+        ImportRepository::refresh_group_review_summaries(client, import_run_id).await?;
+        Ok(())
+    }
+    .await;
+    finish_plan_transaction(client, result, "review group materialization").await
+}
+
+fn initial_review_group_action(
+    image_source: &str,
+    requires_manual_review: bool,
+    has_library_member: bool,
+    is_representative: bool,
+) -> &'static str {
+    if image_source == "library"
+        || requires_manual_review
+        || (!has_library_member && is_representative)
+    {
+        "keep"
+    } else {
+        "exclude"
+    }
+}
+
+pub async fn get_review_groups(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<Vec<ReviewGroupSummary>, AppError> {
+    let rows = ImportRepository::get_review_groups(client, import_run_id).await?;
+    if rows.is_empty()
+        && ImportRepository::count_duplicates_for_run(client, import_run_id).await? > 0
+    {
+        return Err(AppError::Internal(
+            "this unfinished review task predates group-level review and cannot be converted safely; re-analyze the source directory"
+                .to_string(),
+        ));
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| ReviewGroupSummary {
+            group_id: row.group_id.to_string(),
+            state: row.state,
+            requires_manual_review: row.requires_manual_review,
+            member_count: row.member_count as u32,
+            import_member_count: row.import_member_count as u32,
+            library_member_count: row.library_member_count as u32,
+            kept_count: row.kept_count as u32,
+        })
+        .collect())
+}
+
+pub async fn get_review_group_detail(
+    client: &Client,
+    group_id: Uuid,
+) -> Result<ReviewGroupDetail, AppError> {
+    let header = client
+        .query_opt(
+            "SELECT state, requires_manual_review FROM review_groups WHERE id = $1",
+            &[&group_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query review group: {e}")))?
+        .ok_or_else(|| AppError::Internal(format!("review group {group_id} not found")))?;
+    let members = ImportRepository::get_review_group_members(client, group_id)
+        .await?
+        .into_iter()
+        .map(|row| ReviewGroupMember {
+            image_id: row.image_id.to_string(),
+            image_source: row.image_source,
+            final_action: row.final_action,
+            decision_source: row.decision_source,
+            source_path: row.source_path,
+            relative_path: row.relative_path,
+            album_name: row.album_name,
+            file_size: row.file_size,
+            width: row.width,
+            height: row.height,
+            format: row.format,
+        })
+        .collect();
+    let evidence = ImportRepository::get_review_group_evidence(client, group_id)
+        .await?
+        .into_iter()
+        .map(|row| ReviewGroupEvidence {
+            candidate_id: row.candidate_id.to_string(),
+            source_image_id: row.source_image_id.to_string(),
+            candidate_image_id: row.candidate_image_id.to_string(),
+            candidate_image_source: row.candidate_image_source,
+            scope: row.scope,
+            match_type: row.match_type,
+            blake3_equal: row.blake3_equal,
+            pixel_hash_equal: row.pixel_hash_equal,
+            block_distance: row.block_distance,
+            double_gradient_distance: row.double_gradient_distance,
+            block_distance_ratio: row.block_distance_ratio,
+            double_gradient_distance_ratio: row.double_gradient_distance_ratio,
+            transform_type: row.transform_type,
+            confidence: row.confidence,
+            automatic: row.automatic,
+        })
+        .collect();
+    Ok(ReviewGroupDetail {
+        group_id: group_id.to_string(),
+        state: header.get("state"),
+        requires_manual_review: header.get("requires_manual_review"),
+        members,
+        evidence,
+    })
+}
+
+pub async fn submit_review_group_decision(
+    client: &Client,
+    group_id: Uuid,
+    decisions: &[ReviewGroupMemberDecision],
+) -> Result<(), AppError> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin group review decision: {e}")))?;
+    let result = async {
+        let header = client
+            .query_opt(
+                "SELECT import_run_id, state, requires_manual_review
+                 FROM review_groups WHERE id = $1 FOR UPDATE",
+                &[&group_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to lock review group: {e}")))?
+            .ok_or_else(|| AppError::Internal(format!("review group {group_id} not found")))?;
+        let import_run_id: Uuid = header.get("import_run_id");
+        let state: String = header.get("state");
+        let requires_manual_review: bool = header.get("requires_manual_review");
+        if !requires_manual_review || state != "pending" {
+            return Err(AppError::Internal(format!(
+                "review group {group_id} is not a pending manual-review group"
+            )));
+        }
+
+        let members = ImportRepository::get_review_group_members(client, group_id).await?;
+        let expected_import_ids: HashSet<Uuid> = members
+            .iter()
+            .filter(|member| member.image_source == "import")
+            .map(|member| member.image_id)
+            .collect();
+        let mut submitted = HashMap::new();
+        for decision in decisions {
+            if decision.image_source != "import" {
+                return Err(AppError::Internal(
+                    "library members are read-only and must not be submitted".to_string(),
+                ));
+            }
+            let image_id = Uuid::parse_str(&decision.image_id).map_err(|e| {
+                AppError::Internal(format!(
+                    "invalid review group image id '{}': {e}",
+                    decision.image_id
+                ))
+            })?;
+            if !matches!(decision.final_action.as_str(), "keep" | "exclude") {
+                return Err(AppError::Internal(format!(
+                    "invalid final_action '{}' for image {image_id}",
+                    decision.final_action
+                )));
+            }
+            if submitted
+                .insert(image_id, decision.final_action.as_str())
+                .is_some()
+            {
+                return Err(AppError::Internal(format!(
+                    "duplicate decision for image {image_id}"
+                )));
+            }
+        }
+        if submitted.keys().copied().collect::<HashSet<_>>() != expected_import_ids {
+            return Err(AppError::Internal(
+                "group decision must include every import member exactly once".to_string(),
+            ));
+        }
+        let library_keep_count = members
+            .iter()
+            .filter(|member| member.image_source == "library")
+            .count();
+        let import_keep_count = submitted
+            .values()
+            .filter(|&&action| action == "keep")
+            .count();
+        if library_keep_count + import_keep_count == 0 {
+            return Err(AppError::Internal(
+                "a review group must keep at least one image".to_string(),
+            ));
+        }
+
+        for (image_id, final_action) in submitted {
+            client
+                .execute(
+                    "UPDATE review_group_members
+                     SET final_action = $1, decision_source = 'user', updated_at = now()
+                     WHERE group_id = $2 AND image_source = 'import' AND image_id = $3",
+                    &[&final_action, &group_id, &image_id],
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to update group member: {e}")))?;
+        }
+        client
+            .execute(
+                "UPDATE review_groups SET state = 'resolved', resolved_at = now() WHERE id = $1",
+                &[&group_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to resolve review group: {e}")))?;
+        ImportRepository::refresh_group_review_summaries(client, import_run_id).await?;
+        let remaining = ImportRepository::get_review_progress(client, import_run_id).await?;
+        if remaining.total == remaining.decided {
+            ImportRepository::update_import_run_state(
+                client,
+                import_run_id,
+                &ImportRunState::ReadyToCommit,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    finish_plan_transaction(client, result, "group review decision").await
+}
 
 pub async fn get_review_queue(
     client: &Client,
@@ -165,8 +527,8 @@ pub async fn get_review_progress(
 
     Ok(ReviewProgress {
         import_run_id: import_run_id.to_string(),
-        total_review_candidates: row.total,
-        decided_count: row.decided,
+        total_review_groups: row.total,
+        resolved_count: row.decided,
         remaining_count: remaining,
         all_decided: remaining == 0,
     })
@@ -214,23 +576,52 @@ pub async fn freeze_import_plan(
         // still being analyzed. Never let that transiently-empty review queue
         // create a partial commit set.
         let import_run = require_freezable_import_run(client, import_run_id).await?;
+        let candidate_count = ImportRepository::count_duplicates_for_run(client, import_run_id).await?;
+        if candidate_count > 0
+            && !ImportRepository::has_review_groups(client, import_run_id).await?
+        {
+            return Err(AppError::Internal(
+                "this unfinished import predates group review and cannot be converted safely; re-analyze the source directory"
+                    .to_string(),
+            ));
+        }
         let progress = ImportRepository::get_review_progress(client, import_run_id).await?;
         let remaining = progress.total.saturating_sub(progress.decided);
         if remaining > 0 {
             return Err(AppError::Internal(format!(
-                "cannot freeze import plan while {remaining} review candidates remain undecided"
+                "cannot freeze import plan while {remaining} review groups remain unresolved"
+            )));
+        }
+        let invalid_group = client
+            .query_opt(
+                "SELECT rg.id
+                 FROM review_groups rg
+                 WHERE rg.import_run_id = $1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM review_group_members rgm
+                       WHERE rgm.group_id = rg.id AND rgm.final_action = 'keep'
+                   )
+                 LIMIT 1",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to validate review group selections: {e}")))?;
+        if let Some(row) = invalid_group {
+            return Err(AppError::Internal(format!(
+                "review group {} has no kept member; refusing to freeze the plan",
+                row.get::<_, Uuid>("id")
             )));
         }
 
         let all_images =
             ImportRepository::get_all_import_images_with_album(client, import_run_id).await?;
-        let all_candidates =
-            ImportRepository::get_all_candidates_for_import_plan(client, import_run_id).await?;
         let albums = ImportRepository::get_albums_for_run(client, import_run_id).await?;
-        let plan = build_import_plan(
+        let excluded_ids =
+            ImportRepository::get_review_group_excluded_import_ids(client, import_run_id).await?;
+        let plan = build_import_plan_from_group_actions(
             import_run_id.to_string(),
             &all_images,
-            &all_candidates,
+            &excluded_ids,
             &albums,
         );
 
@@ -467,6 +858,36 @@ pub async fn set_plan_image_included(
                 .map_err(|e| AppError::Internal(format!("failed to skip plan image: {e}")))?;
             delete_empty_plan_albums(client, frozen.plan_id).await?;
         }
+        refresh_plan_hash(client, import_run_id).await
+    }
+    .await;
+
+    finish_plan_edit_transaction(client, result).await?;
+    get_frozen_plan_summary(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
+}
+
+pub async fn set_plan_source_file_mode(
+    client: &Client,
+    import_run_id: Uuid,
+    source_file_mode: SourceFileMode,
+) -> Result<ImportPlan, AppError> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin plan mode edit: {e}")))?;
+
+    let result = async {
+        ensure_plan_mutation_allowed(client, import_run_id, "change source file mode").await?;
+        let frozen = require_frozen_plan(client, import_run_id).await?;
+        client
+            .execute(
+                "UPDATE import_plans SET source_file_mode = $1 WHERE id = $2",
+                &[&source_file_mode.to_string(), &frozen.plan_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to update source file mode: {e}")))?;
         refresh_plan_hash(client, import_run_id).await
     }
     .await;
@@ -783,6 +1204,7 @@ fn synthesize_draft_for_hash(
         plan_state: PlanState::Draft.to_string(),
         plan_hash: None,
         policy_version: import_run.policy_version.clone(),
+        source_file_mode: SourceFileMode::CopyAndArchive,
         albums: album_rows,
     }
 }
@@ -814,6 +1236,89 @@ fn target_relative_path_for_album(
     crate::services::commit_service::normalize_relative_path(rel)
 }
 
+/// Build the initial frozen plan exclusively from persisted group-member
+/// final actions. Candidate-edge decisions are evidence only and never enter
+/// this calculation.
+pub fn build_import_plan_from_group_actions(
+    import_run_id: String,
+    all_images: &[ImportPlanImageRow],
+    excluded_image_ids: &HashSet<Uuid>,
+    albums: &[AlbumRow],
+) -> ImportPlan {
+    let kept_images: Vec<ImportPlanImage> = all_images
+        .iter()
+        .filter(|image| !excluded_image_ids.contains(&image.id))
+        .map(|image| ImportPlanImage {
+            image_id: image.id.to_string(),
+            source_path: image.source_path.clone(),
+            relative_path: image.relative_path.clone(),
+            file_size: image.file_size,
+            album_name: image.album_name.clone(),
+            album_id: image.album_id.to_string(),
+            source_album_id: image.album_id.to_string(),
+            included: true,
+        })
+        .collect();
+    let kept_ids: HashSet<Uuid> = kept_images
+        .iter()
+        .filter_map(|image| Uuid::parse_str(&image.image_id).ok())
+        .collect();
+    let mut albums_out: Vec<ImportPlanAlbum> = albums
+        .iter()
+        .map(|album| {
+            let mut images: Vec<ImportPlanImage> = all_images
+                .iter()
+                .filter(|image| image.album_id == album.id)
+                .map(|image| ImportPlanImage {
+                    image_id: image.id.to_string(),
+                    source_path: image.source_path.clone(),
+                    relative_path: image.relative_path.clone(),
+                    file_size: image.file_size,
+                    album_name: album.source_name.clone(),
+                    album_id: album.id.to_string(),
+                    source_album_id: image.album_id.to_string(),
+                    included: kept_ids.contains(&image.id),
+                })
+                .collect();
+            images.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            let image_count = images.iter().filter(|image| image.included).count() as u32;
+            let total_size = images
+                .iter()
+                .filter(|image| image.included)
+                .map(|image| image.file_size)
+                .sum();
+            ImportPlanAlbum {
+                album_id: album.id.to_string(),
+                album_name: album.source_name.clone(),
+                included: image_count > 0,
+                image_count,
+                total_size,
+                images,
+            }
+        })
+        .collect();
+    albums_out.sort_by(|left, right| left.album_name.cmp(&right.album_name));
+    let mut skipped_albums: Vec<String> = albums_out
+        .iter()
+        .filter(|album| !album.included)
+        .map(|album| album.album_name.clone())
+        .collect();
+    skipped_albums.sort();
+    let total_images = all_images.len() as u32;
+    ImportPlan {
+        import_run_id,
+        plan_hash: None,
+        source_file_mode: SourceFileMode::CopyAndArchive,
+        total_albums: albums.len() as u32,
+        total_images,
+        excluded_count: total_images.saturating_sub(kept_images.len() as u32),
+        kept_images,
+        skipped_albums,
+        albums: albums_out,
+    }
+}
+
+#[allow(dead_code)] // Legacy edge-decision oracle retained only for regression tests.
 pub fn build_import_plan(
     import_run_id: String,
     all_images: &[ImportPlanImageRow],
@@ -953,6 +1458,7 @@ pub fn build_import_plan(
     ImportPlan {
         import_run_id,
         plan_hash: None,
+        source_file_mode: SourceFileMode::CopyAndArchive,
         total_albums: albums.len() as u32,
         total_images,
         excluded_count: total_images.saturating_sub(kept_images.len() as u32),
@@ -962,11 +1468,13 @@ pub fn build_import_plan(
     }
 }
 
+#[allow(dead_code)]
 struct DuplicateAlbumResolution {
     skipped_album_ids: HashSet<Uuid>,
     skipped_image_ids: HashSet<Uuid>,
 }
 
+#[allow(dead_code)]
 impl DuplicateAlbumResolution {
     fn empty() -> Self {
         Self {
@@ -986,6 +1494,7 @@ impl DuplicateAlbumResolution {
     }
 }
 
+#[allow(dead_code)]
 fn detect_covered_import_albums(
     all_images: &[ImportPlanImageRow],
     all_candidates: &[ImportPlanCandidateRow],
@@ -1094,6 +1603,7 @@ fn detect_covered_import_albums(
     }
 }
 
+#[allow(dead_code)]
 fn exact_match_count_between_albums(
     images_a: &[Uuid],
     images_b: &[Uuid],
@@ -1110,6 +1620,7 @@ fn exact_match_count_between_albums(
     maximum_bipartite_matches(&adjacency, images_b.len())
 }
 
+#[allow(dead_code)]
 fn maximum_bipartite_matches(adjacency: &[Vec<usize>], right_len: usize) -> usize {
     fn try_match(
         left_idx: usize,
@@ -1151,6 +1662,7 @@ fn maximum_bipartite_matches(adjacency: &[Vec<usize>], right_len: usize) -> usiz
     count
 }
 
+#[allow(dead_code)]
 fn preferred_album_for_equal_content(
     album_a: Uuid,
     album_b: Uuid,
@@ -1165,6 +1677,7 @@ fn preferred_album_for_equal_content(
     }
 }
 
+#[allow(dead_code)]
 fn ordered_uuid_pair(a: Uuid, b: Uuid) -> (Uuid, Uuid) {
     if a <= b {
         (a, b)
@@ -1211,21 +1724,25 @@ fn render_thumbnail(
 
     let bytes = std::fs::read(path)
         .map_err(|e| AppError::IoError(format!("failed to read image {}: {e}", path.display())))?;
-    let reader = std::io::Cursor::new(bytes);
-    let img = image::ImageReader::new(reader)
-        .with_guessed_format()
-        .map_err(|e| AppError::ImageError(format!("cannot inspect image: {e}")))?
-        .decode()
-        .map_err(|e| AppError::ImageError(format!("corrupt or undecodable image: {e}")))?;
-
-    // Cap decoded pixels so a maliciously huge-but-valid image cannot exhaust
-    // memory during the resize.
-    let (w, h) = (img.width() as u64, img.height() as u64);
-    if w.saturating_mul(h) > max_pixels {
+    let guessed = image::guess_format(&bytes)
+        .map_err(|e| AppError::ImageError(format!("unsupported image format: {e}")))?;
+    let dimensions = image::ImageReader::with_format(std::io::Cursor::new(&bytes), guessed)
+        .into_dimensions()
+        .map_err(|e| AppError::ImageError(format!("cannot inspect image dimensions: {e}")))?;
+    let pixels = u64::from(dimensions.0)
+        .checked_mul(u64::from(dimensions.1))
+        .ok_or_else(|| AppError::ImageError("preview pixel count overflow".to_string()))?;
+    if pixels > max_pixels {
         return Err(AppError::ImageError(format!(
-            "decoded image too large for preview: {w}x{h} (>{max_pixels} pixels)"
+            "decoded image too large for preview: {}x{} (>{max_pixels} pixels)",
+            dimensions.0, dimensions.1
         )));
     }
+    let mut decoder = image::ImageReader::with_format(std::io::Cursor::new(bytes), guessed);
+    decoder.limits(image::Limits::no_limits());
+    let img = decoder
+        .decode()
+        .map_err(|e| AppError::ImageError(format!("corrupt or undecodable image: {e}")))?;
 
     // Downscale so neither dimension exceeds max_dim.
     let thumb = if img.width() > max_dim || img.height() > max_dim {
@@ -1409,17 +1926,147 @@ pub async fn load_image_preview_by_import_image(
     )
 }
 
+pub async fn load_review_group_member_preview(
+    client: &Client,
+    group_id: Uuid,
+    image_id: Uuid,
+    image_source: &str,
+) -> Result<String, AppError> {
+    if !matches!(image_source, "import" | "library") {
+        return Err(AppError::Internal(format!(
+            "invalid review group image source '{image_source}'"
+        )));
+    }
+    let members = ImportRepository::get_review_group_members(client, group_id).await?;
+    let member = members
+        .into_iter()
+        .find(|member| member.image_id == image_id && member.image_source == image_source)
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "image {image_id} ({image_source}) is not a member of review group {group_id}"
+            ))
+        })?;
+    let path = PathBuf::from(&member.source_path);
+    let allowed_root: String = if image_source == "import" {
+        client
+            .query_one(
+                "SELECT ir.source_root
+                 FROM review_groups rg
+                 JOIN import_runs ir ON ir.id = rg.import_run_id
+                 WHERE rg.id = $1",
+                &[&group_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to query review group source root: {e}"))
+            })?
+            .get("source_root")
+    } else {
+        client
+            .query_one(
+                "SELECT lr.path
+                 FROM library_images li
+                 JOIN library_albums la ON la.id = li.album_id
+                 JOIN library_roots lr ON lr.id = la.library_root_id
+                 WHERE li.id = $1",
+                &[&image_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to query library root: {e}")))?
+            .get("path")
+    };
+    path_within_allowed_roots(&path, &[PathBuf::from(allowed_root)])?;
+    if !path.exists() {
+        return Err(AppError::IoError(format!(
+            "image file not found: {}",
+            path.display()
+        )));
+    }
+    render_thumbnail(
+        &path,
+        PREVIEW_MAX_DIMENSION,
+        PREVIEW_MAX_PIXELS,
+        PREVIEW_MAX_SOURCE_BYTES,
+    )
+}
+
 /// Maximum dimension (px) of a generated preview thumbnail.
 const PREVIEW_MAX_DIMENSION: u32 = 800;
 /// Maximum decoded pixel count for a preview source.
-const PREVIEW_MAX_PIXELS: u64 = 50_000_000;
+const PREVIEW_MAX_PIXELS: u64 =
+    crate::infrastructure::image_fingerprint_v2::MAX_DECODED_IMAGE_PIXELS;
 /// Maximum source file size (bytes) for a preview.
-const PREVIEW_MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
+const PREVIEW_MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn manual_group_with_three_imports_and_library_defaults_every_member_to_keep() {
+        assert_eq!(
+            initial_review_group_action("library", true, true, false),
+            "keep"
+        );
+        for is_representative in [false, true] {
+            assert_eq!(
+                initial_review_group_action("import", true, true, is_representative),
+                "keep"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_group_keeps_library_or_single_import_representative() {
+        assert_eq!(
+            initial_review_group_action("library", false, true, true),
+            "keep"
+        );
+        assert_eq!(
+            initial_review_group_action("import", false, true, false),
+            "exclude"
+        );
+        assert_eq!(
+            initial_review_group_action("import", false, false, true),
+            "keep"
+        );
+        assert_eq!(
+            initial_review_group_action("import", false, false, false),
+            "exclude"
+        );
+    }
+
+    #[test]
+    fn group_member_actions_are_the_only_frozen_plan_truth() {
+        let album_id = Uuid::new_v4();
+        let kept = Uuid::new_v4();
+        let excluded_a = Uuid::new_v4();
+        let excluded_b = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        let images = vec![
+            make_image(kept, album_id, "keep.jpg"),
+            make_image(excluded_a, album_id, "exclude-a.jpg"),
+            make_image(excluded_b, album_id, "exclude-b.jpg"),
+            make_image(unrelated, album_id, "unrelated.jpg"),
+        ];
+        let excluded = HashSet::from([excluded_a, excluded_b]);
+        let plan = build_import_plan_from_group_actions(
+            "run".to_string(),
+            &images,
+            &excluded,
+            &[make_album(album_id, "album_a")],
+        );
+        let kept_ids: HashSet<_> = plan
+            .kept_images
+            .iter()
+            .map(|image| image.image_id.as_str())
+            .collect();
+        assert_eq!(kept_ids.len(), 2);
+        assert!(kept_ids.contains(kept.to_string().as_str()));
+        assert!(kept_ids.contains(unrelated.to_string().as_str()));
+        assert_eq!(plan.excluded_count, 2);
+    }
 
     #[test]
     fn path_within_allowed_roots_rejects_escape() {
@@ -2071,7 +2718,7 @@ mod tests {
         .await
         .unwrap();
 
-        let review_candidate_id = ImportRepository::insert_duplicate_candidate(
+        let _review_candidate_id = ImportRepository::insert_duplicate_candidate(
             &client,
             NewDuplicateCandidate {
                 import_run_id,
@@ -2258,102 +2905,49 @@ mod tests {
                 .unwrap();
         }
 
-        let queue = get_review_queue(&client, import_run_id).await.unwrap();
-        assert_eq!(queue.len(), 2);
-        assert!(!queue[0].has_decision);
-
-        let blocked_plan = generate_import_plan(&client, import_run_id).await;
-        assert!(blocked_plan.is_err());
-
-        submit_decision(
-            &client,
-            review_candidate_id,
-            ReviewDecisionAction::KeepSource,
-        )
-        .await
-        .unwrap();
-        let album_a_status = ImportRepository::get_import_album_status_by_id(&client, album_id)
+        let legacy_freeze = generate_import_plan(&client, import_run_id)
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(album_a_status.review_candidate_count, 0);
-        assert_eq!(album_a_status.state, "analyzed");
-        submit_decision(
-            &client,
-            review_candidate_id,
-            ReviewDecisionAction::KeepSource,
-        )
-        .await
-        .unwrap();
-        let conflicting = submit_decision(
-            &client,
-            review_candidate_id,
-            ReviewDecisionAction::KeepCandidate,
-        )
-        .await;
-        assert!(conflicting.is_err());
+            .expect_err("legacy edge rows must never be guessed into group decisions");
+        assert!(legacy_freeze.to_string().contains("re-analyze"));
 
-        client
-            .batch_execute(
-                "CREATE FUNCTION imagedb_test_reject_skip() RETURNS trigger LANGUAGE plpgsql AS $$
-                 BEGIN
-                     RAISE EXCEPTION 'injected skip failure';
-                 END $$;
-                 CREATE TRIGGER imagedb_test_reject_skip_trigger
-                 BEFORE INSERT ON review_decisions
-                 FOR EACH ROW WHEN (NEW.decision = 'skip_album')
-                 EXECUTE FUNCTION imagedb_test_reject_skip();",
+        materialize_review_groups(&client, import_run_id)
+            .await
+            .unwrap();
+        let groups = get_review_groups(&client, import_run_id).await.unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| group.state == "pending"));
+        assert!(groups.iter().all(|group| group.kept_count == 2));
+
+        for group in &groups {
+            let detail =
+                get_review_group_detail(&client, Uuid::parse_str(&group.group_id).unwrap())
+                    .await
+                    .unwrap();
+            assert_eq!(detail.members.len(), 2);
+            let decisions: Vec<ReviewGroupMemberDecision> = detail
+                .members
+                .iter()
+                .filter(|member| member.image_source == "import")
+                .enumerate()
+                .map(|(index, member)| ReviewGroupMemberDecision {
+                    image_id: member.image_id.clone(),
+                    image_source: "import".to_string(),
+                    final_action: if index == 0 { "keep" } else { "exclude" }.to_string(),
+                })
+                .collect();
+            submit_review_group_decision(
+                &client,
+                Uuid::parse_str(&group.group_id).unwrap(),
+                &decisions,
             )
             .await
             .unwrap();
-        let injected = skip_album_candidates(&client, import_run_id, album_b_id).await;
-        assert!(injected.is_err(), "injected skip failure must surface");
-        let decisions_after_rollback: i64 = client
-            .query_one(
-                "SELECT COUNT(*)
-                 FROM review_decisions rd
-                 JOIN duplicate_candidates dc ON dc.id = rd.candidate_id
-                 JOIN import_images ii ON ii.id = dc.source_image_id
-                 WHERE ii.import_album_id = $1",
-                &[&album_b_id],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(decisions_after_rollback, 0);
-        let album_b_after_rollback =
-            ImportRepository::get_import_album_status_by_id(&client, album_b_id)
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(album_b_after_rollback.review_candidate_count, 1);
-        client
-            .batch_execute(
-                "DROP TRIGGER imagedb_test_reject_skip_trigger ON review_decisions;
-                 DROP FUNCTION imagedb_test_reject_skip();",
-            )
-            .await
-            .unwrap();
-
-        let skipped = skip_album_candidates(&client, import_run_id, album_b_id)
-            .await
-            .unwrap();
-        assert_eq!(skipped, 1);
-        let album_b_status = ImportRepository::get_import_album_status_by_id(&client, album_b_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(album_b_status.review_candidate_count, 0);
-        assert_eq!(album_b_status.state, "analyzed");
+        }
 
         let progress = get_review_progress(&client, import_run_id).await.unwrap();
-        assert_eq!(progress.total_review_candidates, 2);
-        assert_eq!(progress.decided_count, 2);
+        assert_eq!(progress.total_review_groups, 2);
+        assert_eq!(progress.resolved_count, 2);
         assert!(progress.all_decided);
-
-        let queue = get_review_queue(&client, import_run_id).await.unwrap();
-        assert_eq!(queue.len(), 2);
-        assert!(queue[0].has_decision);
 
         let (freeze_client_a, freeze_handle_a) = manager.connect().await.unwrap();
         let (freeze_client_b, freeze_handle_b) = manager.connect().await.unwrap();
@@ -2390,9 +2984,16 @@ mod tests {
                 .all(|image| image.image_id != failed_image_id.to_string()),
             "failed images without a fingerprint must not enter the frozen plan"
         );
-        assert_eq!(plan.kept_images.len(), 1);
-        assert_eq!(plan.kept_images[0].image_id, source_id.to_string());
-        assert_eq!(plan.excluded_count, 3);
+        assert_eq!(plan.kept_images.len(), 2);
+        assert!(plan
+            .kept_images
+            .iter()
+            .any(|image| image.album_id == album_id.to_string()));
+        assert!(plan
+            .kept_images
+            .iter()
+            .any(|image| image.album_id == album_b_id.to_string()));
+        assert_eq!(plan.excluded_count, 2);
 
         let reloaded_plan = get_frozen_plan_summary(&client, import_run_id)
             .await

@@ -12,11 +12,11 @@ MVP1 已定性为：
 
 当前 canonical 文档入口：[`docs/MVP1/README.md`](docs/MVP1/README.md)
 
-当前显式任务包：MVP4 / Fingerprint V2 与高效重复检测引擎，文档入口为 [`docs/MVP4/README.md`](docs/MVP4/README.md)。
+当前显式任务包：多图审核、大分辨率解码与移动入库；横跨 MVP2 审核/入库体验和 MVP4 Fingerprint V2 解码边界。
 
-当前工作分支：`main`
+当前工作分支：`codex/group-review-large-image-move-import`
 
-当前实施阶段：Fingerprint V2 审查修复完成，完整质量门已通过。固定方案为完整文件/像素 BLAKE3、BlockHash 16×16、DoubleGradient 32×32、Triangle、8 种几何变换、低信息量感知资格门禁、并列粗距离变换精排、图集内与图库内存 BK-tree、import run 级代表边精确去重、缓存批量 upsert、候选批量读写及 `fingerprint_version = 2`。主线同时包含 Debug 用的“清空历史数据库并重新开始”危险操作：不迁移旧数据、不删除磁盘文件，在存在未完成文件事务或有效图库租约时拒绝执行；重置与 schema 初始化通过 PostgreSQL advisory lock 跨实例独占，扫描、提交、恢复遵守同一共享锁协议，并由真实 PostgreSQL 并发与 fresh-vs-reset schema 等价测试守护。MVP4 不增加算法设置 UI，不改变审核动作、frozen plan、Commit、文件事务或 Recovery 状态机。
+当前实施阶段：任务包实现完成并通过自动质量门。审核由 pair 决策升级为持久化连通组，组内逐图 keep/exclude 是 frozen plan 的唯一审核事实；大图解码保持 Fingerprint V2 算法、哈希和阈值不变，产品像素上限提高到 5 亿并对 1 亿像素以上解码实行单槽限流；导入计划新增默认关闭的 `move_selected_without_backup`，模式绑定 plan hash、manifest、文件事务、恢复和结果，且仅在发布与数据库证据复验后逐文件删除 frozen plan 选中源图。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。除 M3.8 明确授权的 `abandoned` / `invalidated` 外，M3 不修改 frozen plan、Commit、Recovery、数据库 migration、匹配算法或文件事务语义。
 
@@ -58,7 +58,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
 - MVP3 UI 重设计：M3.0–M3.8 已进入审查修复与验证收口；Windows 100% / 150% 系统缩放不是本轮完成门禁或阻塞项。
-- MVP4 Fingerprint V2：实现与审查修复完成，完整质量门通过，待分支提交交付。
+- 多图审核 / 大图解码 / 移动入库：实现完成；默认 Rust、前端、真实 PostgreSQL / 文件系统 / 故障注入门禁通过，待分支审查与提交。
 
 ## 文档入口
 

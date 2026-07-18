@@ -14,7 +14,7 @@
 //! hash, manifest hash, the on-disk directory + manifest, every file's path /
 //! size / BLAKE3, and the DB album + image records — not just a row count.
 use crate::domain::import_state::{
-    CommitAlbumResult, CommitProgress, CommitResult, ImportRunState,
+    CommitAlbumResult, CommitProgress, CommitResult, ImportRunState, SourceFileMode,
 };
 use crate::domain::state_machine::{self, FileOpState, PlanState, TransactionState};
 use crate::error::AppError;
@@ -28,12 +28,13 @@ use crate::repositories::import_repository::{
 };
 use crate::services::recovery_service::reconcile_import_run_state;
 use crate::services::source_snapshot_service::{
-    load_source_album_snapshot, verify_source_snapshot_files_async,
+    load_source_album_snapshot, verify_source_snapshot_files_allowing_missing_async,
+    verify_source_snapshot_files_async,
 };
 #[cfg(feature = "fail-injection")]
 use crate::tests::fail_injection::{maybe_fault, CommitFaultPoint};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,6 +98,8 @@ pub struct AlbumManifest {
     pub import_album_id: String,
     pub library_root_id: String,
     pub album_relative_path: String,
+    #[serde(default)]
+    pub source_file_mode: SourceFileMode,
     pub image_count: u32,
     pub images: Vec<AlbumManifestImage>,
 }
@@ -501,6 +504,7 @@ async fn execute_commit_pipeline(
         %import_run_id,
         plan_id = %frozen.plan_id,
         plan_state = %frozen.plan_state,
+        source_file_mode = %frozen.source_file_mode,
         album_count = frozen.albums.len(),
         "commit frozen plan loaded"
     );
@@ -524,6 +528,7 @@ async fn execute_commit_pipeline(
         };
         return Ok(CommitResult {
             import_run_id: import_run_id.to_string(),
+            source_file_mode: frozen.source_file_mode,
             albums_total: 0,
             albums_committed: 0,
             albums_skipped: 0,
@@ -541,6 +546,7 @@ async fn execute_commit_pipeline(
     tracing::info!(
         %import_run_id,
         plan_id = %frozen.plan_id,
+        source_file_mode = %frozen.source_file_mode,
         publish_strategy = ?publish_strategy,
         album_count = frozen.albums.len(),
         "commit immutable plan validated"
@@ -615,6 +621,7 @@ async fn execute_commit_pipeline(
             import_run_id,
             frozen.plan_id,
             &validated_plan_hash,
+            frozen.source_file_mode,
             cancelled,
             lease_token,
             commit,
@@ -823,6 +830,7 @@ async fn execute_commit_pipeline(
 
     Ok(CommitResult {
         import_run_id: import_run_id.to_string(),
+        source_file_mode: frozen.source_file_mode,
         albums_total: frozen.albums.len() as u32,
         albums_committed,
         albums_skipped,
@@ -911,6 +919,7 @@ pub(crate) fn compute_plan_hash(frozen: &FrozenPlanRow) -> Result<Vec<u8>, AppEr
     canonical.extend_from_slice(frozen.import_run_id.as_bytes());
     canonical.extend_from_slice(frozen.library_root_id.as_bytes());
     canonical.extend_from_slice(frozen.policy_version.as_bytes());
+    canonical.extend_from_slice(frozen.source_file_mode.to_string().as_bytes());
 
     // Albums + images sorted by normalized target path.
     let mut albums: Vec<&(PlanAlbumRow, Vec<PlanImageRow>)> = frozen.albums.iter().collect();
@@ -1014,6 +1023,7 @@ async fn commit_single_album(
     import_run_id: Uuid,
     plan_id: Uuid,
     plan_hash: &[u8],
+    source_file_mode: SourceFileMode,
     cancelled: &Arc<AtomicBool>,
     lease_token: Uuid,
     commit: PlanAlbumCommit,
@@ -1029,6 +1039,12 @@ async fn commit_single_album(
     if let Some(existing_tx) =
         ImportRepository::find_latest_file_transaction(client, plan_album.import_album_id).await?
     {
+        if existing_tx.source_file_mode != source_file_mode {
+            return Err(AppError::Internal(format!(
+                "source file mode mismatch for existing transaction {}: stored {}, frozen plan {}",
+                existing_tx.id, existing_tx.source_file_mode, source_file_mode
+            )));
+        }
         match verify_complete_evidence(
             client,
             library_root,
@@ -1062,7 +1078,10 @@ async fn commit_single_album(
                 // transaction (source_archived) is already complete and should
                 // not be disturbed.
                 let tx_state = TransactionState::parse(&existing_tx.state).ok();
-                if !matches!(tx_state, Some(TransactionState::SourceArchived)) {
+                if !matches!(
+                    tx_state,
+                    Some(TransactionState::SourceArchived | TransactionState::SourceFilesRemoved)
+                ) {
                     ImportRepository::update_file_transaction_state(
                         client,
                         existing_tx.id,
@@ -1138,6 +1157,7 @@ async fn commit_single_album(
         &staging_dir.display().to_string(),
         &publish_dir.display().to_string(),
         plan_hash,
+        source_file_mode,
         &operations,
     )
     .await?;
@@ -1297,6 +1317,7 @@ async fn commit_single_album(
         plan_album.import_album_id,
         library_root_id,
         &album_relative_path,
+        source_file_mode,
         &images,
     );
     let manifest_json = serde_json::to_string_pretty(&manifest)
@@ -1493,6 +1514,113 @@ async fn commit_single_album(
         return Err(e);
     }
 
+    if source_file_mode == SourceFileMode::MoveSelectedWithoutBackup {
+        // The destructive stage is allowed only after the already-published
+        // files, manifest, file-operation journal and committed DB records
+        // have all been re-verified from persisted evidence. This mirrors the
+        // recovery gate and keeps the direct path from relying only on the
+        // success of the immediately preceding calls.
+        let persisted_tx = ImportRepository::get_file_transaction(client, tx_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "file transaction {tx_id} disappeared before source cleanup"
+                ))
+            })?;
+        match verify_committed_evidence_before_source_cleanup(
+            client,
+            library_root,
+            library_root_id,
+            &persisted_tx,
+            plan_id,
+            plan_hash,
+            &album_relative_path,
+            &images,
+        )
+        .await?
+        {
+            IdempotencyVerdict::AlreadyCommitted => {}
+            IdempotencyVerdict::Conflict(message) => {
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx_id,
+                    &TransactionState::Conflict,
+                    Some(&message),
+                )
+                .await?;
+                return Err(AppError::Internal(format!(
+                    "refusing source cleanup because committed evidence conflicts: {message}"
+                )));
+            }
+            IdempotencyVerdict::Resume { .. } => {
+                return Err(AppError::Internal(
+                    "committed evidence verifier unexpectedly requested recovery before source cleanup"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let removing = state_machine::transition_transaction(
+            TransactionState::LibraryCommitted,
+            "remove_source_files",
+        )?;
+        ImportRepository::update_file_transaction_state(client, tx_id, &removing, None).await?;
+        if let Err(error) = remove_selected_source_files(
+            client,
+            tx_id,
+            &source_album_dir,
+            &snapshot.snapshot_hash,
+            &snapshot_files,
+            &images,
+        )
+        .await
+        {
+            let message = error.to_string();
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&message),
+            )
+            .await?;
+            return Err(error);
+        }
+        let removed = state_machine::transition_transaction(
+            TransactionState::SourceFilesRemoving,
+            "removed",
+        )?;
+        ImportRepository::update_file_transaction_state(client, tx_id, &removed, None).await?;
+
+        if let Err(error) = tokio::fs::remove_dir_all(&staging_base).await {
+            if staging_base.exists() {
+                let msg = format!("staging cleanup failed: {error}");
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx_id,
+                    &TransactionState::CleanupRequired,
+                    Some(&msg),
+                )
+                .await?;
+                return Ok(CommitAlbumResult {
+                    album_name: album_relative_path,
+                    status: "cleanup_required".to_string(),
+                    images_committed: image_count,
+                    target_path: Some(publish_dir.display().to_string()),
+                    manifest_path: Some(published_manifest_path.display().to_string()),
+                    error: Some(msg),
+                });
+            }
+        }
+        return Ok(CommitAlbumResult {
+            album_name: album_relative_path,
+            status: "committed".to_string(),
+            images_committed: image_count,
+            target_path: Some(publish_dir.display().to_string()),
+            manifest_path: Some(published_manifest_path.display().to_string()),
+            error: None,
+        });
+    }
+
     // Phase 4: archive root is derived from the **persisted
     // import_runs.source_root** — never from `source_album_dir.parent()`
     // (which can be empty / `.` for root-level albums) and never from a
@@ -1667,6 +1795,324 @@ async fn commit_single_album(
         manifest_path: Some(published_manifest_path.display().to_string()),
         error: None,
     })
+}
+
+/// Remove only frozen-plan source files after publish and library DB evidence
+/// have succeeded. The persisted cleanup rows are the sole deletion set.
+/// Directories, sidecars, excluded images, and other snapshot members are
+/// never deletion targets. A crash after unlink but before the operation row
+/// is updated is recovered from the `removing` state.
+pub(crate) async fn remove_selected_source_files(
+    client: &Client,
+    tx_id: Uuid,
+    source_album_dir: &Path,
+    snapshot_hash: &[u8],
+    snapshot_files: &[SnapshotFileRecord],
+    images: &[PlanImageRow],
+) -> Result<(), AppError> {
+    validate_plan_image_sources(source_album_dir, images)?;
+    let operations = ImportRepository::get_source_file_cleanup_operations(client, tx_id).await?;
+    if operations.len() != images.len() {
+        let msg = format!(
+            "source cleanup set mismatch for transaction {tx_id}: {} rows for {} frozen images",
+            operations.len(),
+            images.len()
+        );
+        ImportRepository::update_file_transaction_state(
+            client,
+            tx_id,
+            &TransactionState::Conflict,
+            Some(&msg),
+        )
+        .await?;
+        return Err(AppError::Internal(msg));
+    }
+
+    let plan_by_source: HashMap<&str, &PlanImageRow> = images
+        .iter()
+        .map(|image| (image.source_path.as_str(), image))
+        .collect();
+    if plan_by_source.len() != images.len() {
+        return Err(AppError::Internal(format!(
+            "frozen plan for transaction {tx_id} contains duplicate source paths"
+        )));
+    }
+    for operation in &operations {
+        let Some(image) = plan_by_source.get(operation.source_path.as_str()) else {
+            let msg = format!(
+                "cleanup operation {} is not a frozen-plan source: {}",
+                operation.id, operation.source_path
+            );
+            ImportRepository::update_source_file_cleanup_operation(
+                client,
+                operation.id,
+                "conflict",
+                Some(&msg),
+            )
+            .await?;
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Err(AppError::Internal(msg));
+        };
+        if operation.expected_size != image.expected_file_size
+            || operation.expected_blake3 != image.expected_blake3
+        {
+            let msg = format!(
+                "cleanup evidence mismatch for frozen source {}",
+                operation.source_path
+            );
+            ImportRepository::update_source_file_cleanup_operation(
+                client,
+                operation.id,
+                "conflict",
+                Some(&msg),
+            )
+            .await?;
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Err(AppError::Internal(msg));
+        }
+    }
+
+    let relative_for = |source_path: &str| -> Result<String, AppError> {
+        let relative = Path::new(source_path)
+            .strip_prefix(source_album_dir)
+            .map_err(|_| {
+                AppError::Internal(format!(
+                    "cleanup source {source_path} is outside album {}",
+                    source_album_dir.display()
+                ))
+            })?;
+        normalize_relative_path(&relative.to_string_lossy())
+    };
+    let mut allowed_missing = HashSet::new();
+    for operation in &operations {
+        if matches!(operation.state.as_str(), "removing" | "removed") {
+            allowed_missing.insert(relative_for(&operation.source_path)?);
+        }
+    }
+    if allowed_missing.is_empty() {
+        if let Some(msg) = verify_source_snapshot_or_conflict(
+            client,
+            tx_id,
+            source_album_dir,
+            snapshot_hash,
+            snapshot_files,
+            "source album before selected-file removal",
+        )
+        .await?
+        {
+            return Err(AppError::Internal(msg));
+        }
+    } else {
+        let errors = verify_source_snapshot_files_allowing_missing_async(
+            source_album_dir,
+            snapshot_files.to_vec(),
+            allowed_missing,
+        )
+        .await?;
+        if !errors.is_empty() {
+            let msg = format!(
+                "source album changed during selected-file recovery: {}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Err(AppError::Internal(msg));
+        }
+    }
+
+    for operation in operations {
+        let source_path = PathBuf::from(&operation.source_path);
+        let metadata = tokio::fs::symlink_metadata(&source_path).await;
+        match metadata {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if matches!(operation.state.as_str(), "removing" | "removed") {
+                    ImportRepository::update_source_file_cleanup_operation(
+                        client,
+                        operation.id,
+                        "removed",
+                        None,
+                    )
+                    .await?;
+                    continue;
+                }
+                let msg = format!(
+                    "selected source disappeared before removal: {}",
+                    source_path.display()
+                );
+                ImportRepository::update_source_file_cleanup_operation(
+                    client,
+                    operation.id,
+                    "conflict",
+                    Some(&msg),
+                )
+                .await?;
+                ImportRepository::update_file_transaction_state(
+                    client,
+                    tx_id,
+                    &TransactionState::Conflict,
+                    Some(&msg),
+                )
+                .await?;
+                return Err(AppError::Internal(msg));
+            }
+            Err(error) => {
+                return Err(AppError::IoError(format!(
+                    "cannot inspect selected source {}: {error}",
+                    source_path.display()
+                )));
+            }
+            Ok(metadata) => {
+                if operation.state == "removed" {
+                    let msg = format!(
+                        "selected source reappeared after persisted removal: {}",
+                        source_path.display()
+                    );
+                    ImportRepository::update_file_transaction_state(
+                        client,
+                        tx_id,
+                        &TransactionState::Conflict,
+                        Some(&msg),
+                    )
+                    .await?;
+                    return Err(AppError::Internal(msg));
+                }
+                if operation.state == "conflict"
+                    || !matches!(
+                        operation.state.as_str(),
+                        "pending" | "verifying" | "removing"
+                    )
+                {
+                    return Err(AppError::Internal(format!(
+                        "invalid source cleanup state '{}' for {}",
+                        operation.state,
+                        source_path.display()
+                    )));
+                }
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    let msg = format!(
+                        "selected source is not a regular file: {}",
+                        source_path.display()
+                    );
+                    ImportRepository::update_source_file_cleanup_operation(
+                        client,
+                        operation.id,
+                        "conflict",
+                        Some(&msg),
+                    )
+                    .await?;
+                    ImportRepository::update_file_transaction_state(
+                        client,
+                        tx_id,
+                        &TransactionState::Conflict,
+                        Some(&msg),
+                    )
+                    .await?;
+                    return Err(AppError::Internal(msg));
+                }
+                if metadata.len() as i64 != operation.expected_size {
+                    let msg = format!(
+                        "selected source size changed before removal: {}",
+                        source_path.display()
+                    );
+                    ImportRepository::update_source_file_cleanup_operation(
+                        client,
+                        operation.id,
+                        "conflict",
+                        Some(&msg),
+                    )
+                    .await?;
+                    ImportRepository::update_file_transaction_state(
+                        client,
+                        tx_id,
+                        &TransactionState::Conflict,
+                        Some(&msg),
+                    )
+                    .await?;
+                    return Err(AppError::Internal(msg));
+                }
+            }
+        }
+
+        ImportRepository::update_source_file_cleanup_operation(
+            client,
+            operation.id,
+            "verifying",
+            None,
+        )
+        .await?;
+        let actual_hash = hash_existing_file(&source_path).await?;
+        if actual_hash != operation.expected_blake3 {
+            let msg = format!(
+                "selected source BLAKE3 changed before removal: {}",
+                source_path.display()
+            );
+            ImportRepository::update_source_file_cleanup_operation(
+                client,
+                operation.id,
+                "conflict",
+                Some(&msg),
+            )
+            .await?;
+            ImportRepository::update_file_transaction_state(
+                client,
+                tx_id,
+                &TransactionState::Conflict,
+                Some(&msg),
+            )
+            .await?;
+            return Err(AppError::Internal(msg));
+        }
+        ImportRepository::update_source_file_cleanup_operation(
+            client,
+            operation.id,
+            "removing",
+            None,
+        )
+        .await?;
+        tracing::info!(
+            transaction_id = %tx_id,
+            source_path = %source_path.display(),
+            "removing verified frozen-plan source file"
+        );
+        tokio::fs::remove_file(&source_path)
+            .await
+            .map_err(|error| {
+                AppError::IoError(format!(
+                    "cannot remove selected source {}: {error}",
+                    source_path.display()
+                ))
+            })?;
+        sync_parent_dir(&source_path).await?;
+        ImportRepository::update_source_file_cleanup_operation(
+            client,
+            operation.id,
+            "removed",
+            None,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn verify_source_snapshot_or_conflict(
@@ -2615,6 +3061,7 @@ pub(crate) fn build_manifest(
     import_album_id: Uuid,
     library_root_id: Uuid,
     album_relative_path: &str,
+    source_file_mode: SourceFileMode,
     images: &[PlanImageRow],
 ) -> AlbumManifest {
     AlbumManifest {
@@ -2626,6 +3073,7 @@ pub(crate) fn build_manifest(
         import_album_id: import_album_id.to_string(),
         library_root_id: library_root_id.to_string(),
         album_relative_path: album_relative_path.to_string(),
+        source_file_mode,
         image_count: images.len() as u32,
         images: images
             .iter()
@@ -2832,6 +3280,41 @@ pub enum IdempotencyVerdict {
     Resume { transaction_id: Uuid },
 }
 
+/// Run the same complete publish/manifest/file-operation/database evidence
+/// validation while a transaction is between `library_committed` and its
+/// source-file terminal state. The verifier normally gates on the terminal
+/// state for commit idempotency; recovery uses this view only to prove that
+/// deleting frozen source files is safe before it resumes cleanup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn verify_committed_evidence_before_source_cleanup(
+    client: &Client,
+    library_root: &Path,
+    library_root_id: Uuid,
+    existing_tx: &crate::repositories::import_repository::FileTransactionFullRow,
+    plan_id: Uuid,
+    plan_hash: &[u8],
+    album_relative_path: &str,
+    images: &[PlanImageRow],
+) -> Result<IdempotencyVerdict, AppError> {
+    let mut terminal_view = existing_tx.clone();
+    terminal_view.state = match existing_tx.source_file_mode {
+        SourceFileMode::CopyAndArchive => TransactionState::SourceArchived,
+        SourceFileMode::MoveSelectedWithoutBackup => TransactionState::SourceFilesRemoved,
+    }
+    .to_string();
+    verify_complete_evidence(
+        client,
+        library_root,
+        library_root_id,
+        &terminal_view,
+        plan_id,
+        plan_hash,
+        album_relative_path,
+        images,
+    )
+    .await
+}
+
 /// Rule 12: complete idempotency verification. Returns `AlreadyCommitted`
 /// only when every piece of evidence matches — transaction id, plan id, plan
 /// hash, the raw-byte manifest hash, schema version, every identity field
@@ -2871,7 +3354,11 @@ pub async fn verify_complete_evidence(
     // than creating a second active file_transaction for the same album.
     // Only SourceArchived can possibly be AlreadyCommitted (full evidence
     // check below).
-    if !matches!(tx_state, TransactionState::SourceArchived) {
+    let expected_terminal = match existing_tx.source_file_mode {
+        SourceFileMode::CopyAndArchive => TransactionState::SourceArchived,
+        SourceFileMode::MoveSelectedWithoutBackup => TransactionState::SourceFilesRemoved,
+    };
+    if tx_state != expected_terminal {
         return Ok(IdempotencyVerdict::Resume {
             transaction_id: existing_tx.id,
         });
@@ -2894,8 +3381,9 @@ pub async fn verify_complete_evidence(
         // SourceArchived without the published dir is evidence tampering:
         // surface as conflict rather than auto-resuming.
         return Ok(IdempotencyVerdict::Conflict(format!(
-            "transaction {} is source_archived but published dir {} is missing",
+            "transaction {} is {} but published dir {} is missing",
             existing_tx.id,
+            expected_terminal,
             publish_dir.display()
         )));
     }
@@ -2976,6 +3464,12 @@ pub async fn verify_complete_evidence(
         return Ok(IdempotencyVerdict::Conflict(format!(
             "manifest album_relative_path '{}' != expected '{}'",
             manifest.album_relative_path, album_relative_path
+        )));
+    }
+    if manifest.source_file_mode != existing_tx.source_file_mode {
+        return Ok(IdempotencyVerdict::Conflict(format!(
+            "manifest source_file_mode {} != transaction {}",
+            manifest.source_file_mode, existing_tx.source_file_mode
         )));
     }
     if manifest.image_count != images.len() as u32 {
@@ -3460,7 +3954,17 @@ mod tests {
         let album = Uuid::new_v4();
         let root = Uuid::new_v4();
         let images = vec![plan_image("a/1.jpg", &[7; 32])];
-        let m = build_manifest(&tx, plan, &[1; 32], run, album, root, "a", &images);
+        let m = build_manifest(
+            &tx,
+            plan,
+            &[1; 32],
+            run,
+            album,
+            root,
+            "a",
+            SourceFileMode::CopyAndArchive,
+            &images,
+        );
         let json = serde_json::to_string_pretty(&m).unwrap();
         let back: AlbumManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.schema_version, MANIFEST_SCHEMA_VERSION);
@@ -3604,11 +4108,38 @@ mod tests {
             plan_state: "frozen".to_string(),
             plan_hash: None,
             policy_version: "2.0".to_string(),
+            source_file_mode: SourceFileMode::CopyAndArchive,
             albums: vec![(album, vec![img])],
         };
         let h1 = compute_plan_hash(&frozen).unwrap();
         let h2 = compute_plan_hash(&frozen).unwrap();
         assert_eq!(h1, h2, "plan hash must be deterministic");
+    }
+
+    #[test]
+    fn source_file_mode_is_bound_into_frozen_plan_hash() {
+        let album_id = Uuid::new_v4();
+        let album = PlanAlbumRow {
+            plan_album_id: Uuid::new_v4(),
+            import_album_id: album_id,
+            target_relative_path: "album".to_string(),
+            expected_image_count: 1,
+            album_plan_hash: None,
+        };
+        let mut frozen = FrozenPlanRow {
+            plan_id: Uuid::new_v4(),
+            import_run_id: Uuid::new_v4(),
+            library_root_id: Uuid::new_v4(),
+            plan_state: "frozen".to_string(),
+            plan_hash: None,
+            policy_version: "2.0".to_string(),
+            source_file_mode: SourceFileMode::CopyAndArchive,
+            albums: vec![(album, vec![plan_image("image.jpg", &[1; 32])])],
+        };
+        let copy_hash = compute_plan_hash(&frozen).unwrap();
+        frozen.source_file_mode = SourceFileMode::MoveSelectedWithoutBackup;
+        let move_hash = compute_plan_hash(&frozen).unwrap();
+        assert_ne!(copy_hash, move_hash);
     }
 
     /// Real PostgreSQL + filesystem integration test for the full new commit

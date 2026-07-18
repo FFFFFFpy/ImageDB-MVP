@@ -2224,6 +2224,7 @@ dependencies = [
  "kamadak-exif",
  "keyring",
  "native-tls",
+ "png 0.18.1",
  "postgres-native-tls",
  "rand 0.8.6",
  "rfd",

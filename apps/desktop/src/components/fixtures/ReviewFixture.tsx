@@ -72,8 +72,8 @@ const detail: ReviewCandidateDetail = {
 
 const progress: ReviewProgress = {
   import_run_id: importRunId,
-  total_review_candidates: 34,
-  decided_count: 2,
+  total_review_groups: 12,
+  resolved_count: 2,
   remaining_count: 32,
   all_decided: false,
 };

@@ -2,15 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
-import { PLAN_ALBUM_BATCH_SIZE, PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
 import type { Route } from '../hooks/use-router';
 import type {
-  ReviewCandidateDetail,
-  ReviewCandidateSummary,
-  ReviewDecision,
   ImportPlan,
   ImportPlanAlbum,
   ImportPlanImage,
+  ReviewGroupDetail,
+  ReviewGroupMember,
+  ReviewGroupMemberAction,
+  ReviewGroupMemberDecision,
+  SourceFileMode,
 } from '../lib/ipc/types';
 import {
   AppIcon,
@@ -43,30 +44,6 @@ interface ViewState {
 
 export type PreviewState = 'idle' | 'loading' | 'success' | 'error';
 
-interface PreviewEvidence {
-  candidateId: string | null;
-  state: PreviewState;
-  dataUrl: string | null;
-  error: string | null;
-}
-
-interface ReviewMutationError {
-  message: string;
-  retryHint: string;
-  mayBeSaved: boolean;
-}
-
-function ReviewMutationErrorBanner({ error }: { error: ReviewMutationError }) {
-  return (
-    <StatusBanner
-      tone={error.mayBeSaved ? 'warning' : 'danger'}
-      title={error.mayBeSaved ? '审核操作可能已保存' : '审核操作未保存'}
-    >
-      {error.message} {error.retryHint}
-    </StatusBanner>
-  );
-}
-
 export interface ImportPlanAlbumGroup {
   albumId: string;
   albumName: string;
@@ -77,7 +54,12 @@ export interface ImportPlanAlbumGroup {
   images: ImportPlanImage[];
 }
 
-const DEFAULT_VIEW: ViewState = { scale: 1, offsetX: 0, offsetY: 0 };
+/** Kept for fixture/test compatibility; group review no longer submits pair decisions. */
+export const REVIEW_DECISION_OPTIONS = [
+  { decision: 'keep_source', label: '保留来源图' },
+  { decision: 'keep_candidate', label: '保留候选图' },
+  { decision: 'keep_all', label: '全部保留' },
+] as const;
 
 export function zoomViewAtPointer(
   view: ViewState,
@@ -115,372 +97,279 @@ export function shouldIgnoreReviewShortcut(event: KeyboardEvent, previewOpen: bo
     target instanceof HTMLTextAreaElement ||
     target instanceof HTMLSelectElement ||
     (target instanceof HTMLElement &&
-      (target.isContentEditable ||
-        target.getAttribute('contenteditable') === 'true' ||
-        target.closest('[contenteditable="true"]') !== null))
+      (target.isContentEditable || target.closest('[contenteditable="true"]') !== null))
   );
 }
 
-export function useNonPassiveWheelZoom(
-  ref: React.RefObject<HTMLElement | null>,
-  onWheel: (event: WheelEvent) => void,
+export async function invalidateReviewWorkflowQueries(
+  queryClient: QueryClient,
+  importRunId?: string,
 ) {
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-
-    element.addEventListener('wheel', onWheel, { passive: false });
-    return () => element.removeEventListener('wheel', onWheel);
-  }, [onWheel, ref]);
-}
-
-export const REVIEW_DECISION_OPTIONS: ReadonlyArray<{
-  decision: ReviewDecision;
-  shortcut: string;
-  label: string;
-}> = [
-  { decision: 'keep_source', shortcut: '1', label: '保留源图片' },
-  { decision: 'keep_candidate', shortcut: '2', label: '保留候选图片' },
-  { decision: 'keep_all', shortcut: '3', label: '全部保留' },
-];
-
-type ReviewInvalidationClient = Pick<QueryClient, 'invalidateQueries'>;
-
-export async function invalidateReviewWorkflowQueries(queryClient: ReviewInvalidationClient) {
-  const options = { throwOnError: true } as const;
   await Promise.all([
-    queryClient.invalidateQueries({ queryKey: ['reviewQueue'] }, options),
-    queryClient.invalidateQueries({ queryKey: ['reviewProgress'] }, options),
-    queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }, options),
-    queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }, options),
-    queryClient.invalidateQueries({ queryKey: ['import-run-albums'] }, options),
+    queryClient.invalidateQueries({ queryKey: ['reviewGroups', importRunId] }),
+    queryClient.invalidateQueries({ queryKey: ['reviewProgress', importRunId] }),
+    queryClient.invalidateQueries({ queryKey: ['reviewGroupDetail'] }),
+    queryClient.invalidateQueries({ queryKey: ['reviewFrozenImportPlanSummary', importRunId] }),
+    queryClient.invalidateQueries({ queryKey: ['frozenImportPlanSummary', importRunId] }),
   ]);
-}
-
-function useReviewPreviewEvidence(
-  candidateId: string | null,
-  detailReady: boolean,
-  side: 'source' | 'candidate',
-  initialDataUrl: string | null,
-) {
-  const [attempt, setAttempt] = useState(0);
-  const [evidence, setEvidence] = useState<PreviewEvidence>({
-    candidateId: null,
-    state: 'idle',
-    dataUrl: null,
-    error: null,
-  });
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!candidateId || !detailReady) {
-      setEvidence({ candidateId, state: 'idle', dataUrl: null, error: null });
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    const candidateAtRequest = candidateId;
-    const suppliedPreview = attempt === 0 ? initialDataUrl : null;
-    setEvidence({
-      candidateId: candidateAtRequest,
-      state: 'loading',
-      dataUrl: suppliedPreview,
-      error: null,
-    });
-
-    if (suppliedPreview) {
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    api
-      .getImagePreview(candidateAtRequest, side)
-      .then((preview) => {
-        if (cancelled) return;
-        if (!preview.data_url) {
-          setEvidence({
-            candidateId: candidateAtRequest,
-            state: 'error',
-            dataUrl: null,
-            error: '预览服务返回了空图片数据。',
-          });
-          return;
-        }
-        setEvidence({
-          candidateId: candidateAtRequest,
-          state: 'loading',
-          dataUrl: preview.data_url,
-          error: null,
-        });
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        setEvidence({
-          candidateId: candidateAtRequest,
-          state: 'error',
-          dataUrl: null,
-          error: String(error),
-        });
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [attempt, candidateId, detailReady, initialDataUrl, side]);
-
-  const currentEvidence =
-    evidence.candidateId === candidateId
-      ? evidence
-      : {
-          candidateId,
-          state: detailReady ? ('loading' as const) : ('idle' as const),
-          dataUrl: null,
-          error: null,
-        };
-
-  const markLoaded = useCallback(() => {
-    setEvidence((current) =>
-      current.candidateId === candidateId && current.dataUrl
-        ? { ...current, state: 'success', error: null }
-        : current,
-    );
-  }, [candidateId]);
-
-  const markFailed = useCallback(() => {
-    setEvidence((current) =>
-      current.candidateId === candidateId
-        ? {
-            ...current,
-            state: 'error',
-            dataUrl: null,
-            error: '图片数据无法显示。',
-          }
-        : current,
-    );
-  }, [candidateId]);
-
-  const retry = useCallback(() => {
-    if (!candidateId || !detailReady) return;
-    setEvidence({ candidateId, state: 'loading', dataUrl: null, error: null });
-    setAttempt((current) => current + 1);
-  }, [candidateId, detailReady]);
-
-  return { evidence: currentEvidence, markLoaded, markFailed, retry };
-}
-
-interface ReviewImageContainerProps {
-  children: React.ReactNode;
-  onWheelZoom: (event: WheelEvent) => void;
-}
-
-function ReviewImageContainer({ children, onWheelZoom }: ReviewImageContainerProps) {
-  const ref = useRef<HTMLDivElement>(null);
-  useNonPassiveWheelZoom(ref, onWheelZoom);
-  return (
-    <div className="review-image-container" ref={ref}>
-      {children}
-    </div>
-  );
-}
-
-interface ReviewPreviewContentProps {
-  evidence: PreviewEvidence;
-  label: string;
-  alt: string;
-  style: React.CSSProperties;
-  onLoaded: () => void;
-  onFailed: () => void;
-  onRetry: () => void;
-}
-
-function ReviewPreviewContent({
-  evidence,
-  label,
-  alt,
-  style,
-  onLoaded,
-  onFailed,
-  onRetry,
-}: ReviewPreviewContentProps) {
-  if (evidence.state === 'idle') {
-    return (
-      <div className="review-image-placeholder" role="status">
-        等待加载{label}预览…
-      </div>
-    );
-  }
-
-  if (evidence.state === 'error') {
-    return (
-      <div className="review-image-placeholder review-image-placeholder--error" role="alert">
-        <strong>无法加载{label}预览</strong>
-        <span>{evidence.error}</span>
-        <Button variant="quiet" onMouseDown={(event) => event.stopPropagation()} onClick={onRetry}>
-          重试{label}预览
-        </Button>
-      </div>
-    );
-  }
-
-  if (!evidence.dataUrl) {
-    return (
-      <div className="review-image-placeholder" role="status">
-        正在加载{label}预览…
-      </div>
-    );
-  }
-
-  return (
-    <>
-      <img
-        src={evidence.dataUrl}
-        alt={alt}
-        style={style}
-        draggable={false}
-        onLoad={onLoaded}
-        onError={onFailed}
-      />
-      {evidence.state === 'loading' && (
-        <span className="review-image-loading-label" role="status">
-          正在加载{label}预览…
-        </span>
-      )}
-    </>
-  );
-}
-
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function groupImportPlanImagesByAlbum(images: ImportPlanImage[]): ImportPlanAlbumGroup[] {
   const groups = new Map<string, ImportPlanAlbumGroup>();
-
-  images.forEach((image) => {
-    const albumId = image.album_id || image.album_name || 'unknown';
-    const albumName = image.album_name || '未命名图集';
-    const existing = groups.get(albumId);
-    if (existing) {
-      existing.imageCount += image.included ? 1 : 0;
-      existing.skippedImageCount += image.included ? 0 : 1;
-      existing.totalSize += image.included ? image.file_size : 0;
-      existing.images.push(image);
-      existing.included = existing.included || image.included;
-      return;
-    }
-
-    groups.set(albumId, {
-      albumId,
-      albumName,
-      included: image.included,
-      imageCount: image.included ? 1 : 0,
-      skippedImageCount: image.included ? 0 : 1,
-      totalSize: image.included ? image.file_size : 0,
-      images: [image],
-    });
-  });
-
-  return Array.from(groups.values());
+  for (const image of images) {
+    const current = groups.get(image.album_id) ?? {
+      albumId: image.album_id,
+      albumName: image.album_name,
+      included: true,
+      imageCount: 0,
+      skippedImageCount: 0,
+      totalSize: 0,
+      images: [],
+    };
+    current.images.push(image);
+    current.imageCount += image.included ? 1 : 0;
+    current.skippedImageCount += image.included ? 0 : 1;
+    current.totalSize += image.included ? image.file_size : 0;
+    current.included = current.images.some((item) => item.included);
+    groups.set(image.album_id, current);
+  }
+  return [...groups.values()];
 }
 
 function planAlbumsForDisplay(plan: ImportPlan): ImportPlanAlbumGroup[] {
-  if (plan.albums?.length) {
+  if (plan.albums.length > 0) {
     return plan.albums.map((album: ImportPlanAlbum) => ({
       albumId: album.album_id,
       albumName: album.album_name,
       included: album.included,
-      imageCount: album.image_count,
+      imageCount: album.images.filter((image) => image.included).length,
       skippedImageCount: album.images.filter((image) => !image.included).length,
-      totalSize: album.total_size,
+      totalSize: album.images
+        .filter((image) => image.included)
+        .reduce((sum, image) => sum + image.file_size, 0),
       images: album.images,
     }));
   }
   return groupImportPlanImagesByAlbum(plan.kept_images);
 }
 
-interface PlanImageThumbnailProps {
-  importRunId: string;
-  image: ImportPlanImage;
-  onOpen: (image: ImportPlanImage, dataUrl: string | null) => void;
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
-function PlanImageThumbnail({ importRunId, image, onOpen }: PlanImageThumbnailProps) {
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getImportPlanImagePreview(importRunId, image.image_id)
-      .then((preview) => {
-        if (!cancelled) setDataUrl(preview.data_url);
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [image.image_id, importRunId]);
-
+function GroupMemberCard({
+  groupId,
+  member,
+  action,
+  keepCount,
+  onChange,
+  onOpen,
+}: {
+  groupId: string;
+  member: ReviewGroupMember;
+  action: ReviewGroupMemberAction;
+  keepCount: number;
+  onChange: (action: ReviewGroupMemberAction) => void;
+  onOpen: (member: ReviewGroupMember, dataUrl: string | null) => void;
+}) {
+  const preview = useQuery({
+    queryKey: ['reviewGroupMemberPreview', groupId, member.image_source, member.image_id],
+    queryFn: () => api.getReviewGroupMemberPreview(groupId, member.image_id, member.image_source),
+    staleTime: Infinity,
+  });
+  const readonly = member.image_source === 'library';
+  const cannotExcludeLast = action === 'keep' && keepCount <= 1;
   return (
-    <button
-      type="button"
-      className="import-plan-thumb"
-      onClick={() => onOpen(image, dataUrl)}
-      aria-label={`预览 ${image.relative_path}`}
-    >
-      {dataUrl ? (
-        <img src={dataUrl} alt="" loading="lazy" />
-      ) : (
-        <span>{failed ? '无预览' : '加载中'}</span>
-      )}
-    </button>
+    <article className={`review-group-member review-group-member--${action}`}>
+      <button
+        className="review-group-member__preview"
+        type="button"
+        onClick={() => onOpen(member, preview.data?.data_url ?? null)}
+        aria-label={`查看 ${member.relative_path}`}
+      >
+        {preview.data?.data_url ? (
+          <img src={preview.data.data_url} alt="" />
+        ) : preview.isError ? (
+          <span>预览不可用</span>
+        ) : (
+          <Skeleton width="100%" height="100%" />
+        )}
+      </button>
+      <div className="review-group-member__body">
+        <div className="review-group-member__heading">
+          <strong title={member.relative_path}>{member.relative_path}</strong>
+          <StatusBadge tone={readonly ? 'info' : action === 'keep' ? 'success' : 'neutral'}>
+            {readonly ? '库内图片' : action === 'keep' ? '保留' : '排除'}
+          </StatusBadge>
+        </div>
+        <p>{member.album_name}</p>
+        <p>
+          {member.width && member.height ? `${member.width} × ${member.height}` : '尺寸未知'} ·{' '}
+          {formatBytes(member.file_size)} · {member.format ?? '格式未知'}
+        </p>
+        <div className="review-group-member__actions" role="group" aria-label="入库处理">
+          <Button
+            variant={action === 'keep' ? 'primary' : 'secondary'}
+            disabled={readonly}
+            onClick={() => onChange('keep')}
+          >
+            保留
+          </Button>
+          <Button
+            variant={action === 'exclude' ? 'danger' : 'secondary'}
+            disabled={readonly || cannotExcludeLast}
+            onClick={() => onChange('exclude')}
+          >
+            排除
+          </Button>
+        </div>
+        {readonly && <small>库内成员只读，并始终保留。</small>}
+      </div>
+    </article>
   );
 }
 
-function formatDistance(val: number | null, bitLength: number, ratio: number | null): string {
-  if (val === null) return '无';
-  const normalized = ratio ?? val / bitLength;
-  return `${val} / ${bitLength}（距离 ${(normalized * 100).toFixed(1)}%）`;
+function GroupEvidence({ detail }: { detail: ReviewGroupDetail }) {
+  return (
+    <details className="review-group-evidence">
+      <summary>匹配证据（{detail.evidence.length} 条边）</summary>
+      <div className="review-group-evidence__list">
+        {detail.evidence.map((edge) => (
+          <div key={edge.candidate_id}>
+            <strong>{edge.match_type}</strong>
+            <span>{edge.scope === 'library' ? '与库内图片匹配' : '本批图片互相匹配'}</span>
+            <span>
+              {edge.blake3_equal
+                ? '文件哈希相同'
+                : edge.pixel_hash_equal
+                  ? '像素哈希相同'
+                  : '感知相似'}
+              {edge.confidence !== null ? ` · 置信度 ${(edge.confidence * 100).toFixed(1)}%` : ''}
+            </span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
 }
 
-function formatMatchType(t: string): string {
-  const map: Record<string, string> = {
-    file_exact: '文件完全一致',
-    pixel_exact: '像素完全一致',
-    perceptual_near: '感知近似',
-    perceptual_similar: '感知相似',
-  };
-  return map[t] ?? t;
-}
+function PlanView({
+  plan,
+  busy,
+  onEditAlbum,
+  onEditImage,
+  onMode,
+  onCommit,
+  onAbandon,
+}: {
+  plan: ImportPlan;
+  busy: boolean;
+  onEditAlbum: (album: ImportPlanAlbumGroup) => void;
+  onEditImage: (album: ImportPlanAlbumGroup, image: ImportPlanImage) => void;
+  onMode: (mode: SourceFileMode) => void;
+  onCommit: () => void;
+  onAbandon: () => void;
+}) {
+  const [visibleAlbums, setVisibleAlbums] = useState(50);
+  const albums = useMemo(() => planAlbumsForDisplay(plan), [plan]);
+  const displayed = albums.slice(0, visibleAlbums);
+  const moveMode = plan.source_file_mode === 'move_selected_without_backup';
+  return (
+    <div className="review-page plan-page--m3">
+      <PageHeader
+        title="审核"
+        description={`确认导入计划：冻结计划包含 ${plan.total_albums} 个图集、${plan.total_images} 张图片。提交只读取此计划。`}
+        meta={<StatusBadge tone="success">计划已冻结</StatusBadge>}
+        actions={
+          <Button variant="primary" onClick={onCommit} disabled={busy || !plan.plan_hash}>
+            前往提交
+          </Button>
+        }
+      />
 
-function formatScope(s: string): string {
-  const map: Record<string, string> = {
-    intra_album: '图集内',
-    cross_album: '跨图集',
-    library: '历史图库',
-  };
-  return map[s] ?? s;
-}
+      <section className={`plan-source-mode ${moveMode ? 'plan-source-mode--danger' : ''}`}>
+        <div>
+          <h2>源文件处理</h2>
+          <p>
+            {moveMode
+              ? '移动入库：发布并写入数据库成功后，仅删除冻结计划中已入库的源图片，不创建备份。'
+              : '复制并归档：保留默认安全行为，整图集完成后归档源目录。'}
+          </p>
+        </div>
+        <label className="plan-source-mode__toggle">
+          <input
+            type="checkbox"
+            checked={moveMode}
+            disabled={busy}
+            onChange={(event) =>
+              onMode(event.target.checked ? 'move_selected_without_backup' : 'copy_and_archive')
+            }
+          />
+          <span>移动已选源图片（无备份）</span>
+        </label>
+        {moveMode && (
+          <StatusBanner tone="warning" title="不可撤销的源文件操作">
+            仅在发布文件、manifest 和数据库记录全部校验通过后执行。排除图片、sidecar
+            和目录不会删除。
+          </StatusBanner>
+        )}
+      </section>
 
-function formatTransform(t: string | null): string {
-  if (!t) return '无';
-  const map: Record<string, string> = {
-    identity: '原方向',
-    rot90: '旋转 90°',
-    rot180: '旋转 180°',
-    rot270: '旋转 270°',
-    flip_h: '水平翻转',
-    flip_v: '垂直翻转',
-    transpose: '主对角线翻转',
-    transverse: '副对角线翻转',
-  };
-  return map[t] ?? t;
+      <section className="plan-album-list" aria-label="冻结计划图集">
+        {displayed.map((album) => (
+          <details className="plan-album-card" key={album.albumId}>
+            <summary>
+              <span>
+                <strong>{album.albumName}</strong>
+                <small>
+                  {album.imageCount} 张保留 · {album.skippedImageCount} 张排除 ·{' '}
+                  {formatBytes(album.totalSize)}
+                </small>
+              </span>
+              <Button
+                variant={album.included ? 'secondary' : 'primary'}
+                disabled={busy}
+                onClick={(event) => {
+                  event.preventDefault();
+                  onEditAlbum(album);
+                }}
+              >
+                {album.included ? '排除整组' : '恢复整组'}
+              </Button>
+            </summary>
+            <div className="plan-image-grid">
+              {album.images.slice(0, 100).map((image) => (
+                <button
+                  type="button"
+                  className={`plan-image-row ${image.included ? '' : 'plan-image-row--excluded'}`}
+                  key={image.image_id}
+                  disabled={busy}
+                  onClick={() => onEditImage(album, image)}
+                >
+                  <span>{image.relative_path}</span>
+                  <span>{image.included ? '保留' : '排除'}</span>
+                </button>
+              ))}
+            </div>
+          </details>
+        ))}
+      </section>
+      {visibleAlbums < albums.length && (
+        <Button onClick={() => setVisibleAlbums((count) => count + 50)}>加载更多图集</Button>
+      )}
+      <div className="plan-footer-actions">
+        <Button variant="danger" disabled={busy} onClick={onAbandon}>
+          放弃此冻结计划
+        </Button>
+        <Button variant="primary" disabled={busy || !plan.plan_hash} onClick={onCommit}>
+          确认并前往提交
+        </Button>
+      </div>
+    </div>
+  );
 }
 
 export function ReviewPage({
@@ -489,1174 +378,326 @@ export function ReviewPage({
   onWorkflowAbandoned,
   onPlanEditPendingChange,
   initialImportRunId = null,
-  initialPreviews = null,
   initialPlan = null,
   initialShowPlan = false,
   enablePolling = true,
 }: ReviewPageProps) {
   const queryClient = useQueryClient();
-
   const [importRunId, setImportRunId] = useState<string | null>(initialImportRunId);
-  const [currentIndex, setCurrentIndex] = useState(0);
-  const [overlayMode, setOverlayMode] = useState(false);
-  const [overlayOpacity, setOverlayOpacity] = useState(0.5);
-  const [view, setView] = useState<ViewState>(DEFAULT_VIEW);
-  const [isPanning, setIsPanning] = useState(false);
-  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
-  const [importPlan, setImportPlan] = useState<ImportPlan | null>(initialPlan);
-  const [showPlan, setShowPlan] = useState(initialShowPlan);
-  const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
-  const [planImageLimits, setPlanImageLimits] = useState<Record<string, number>>({});
-  const [planAlbumLimit, setPlanAlbumLimit] = useState(PLAN_ALBUM_BATCH_SIZE);
-  const [planEditError, setPlanEditError] = useState<string | null>(null);
-  const [planEditPending, setPlanEditPending] = useState(false);
-  const [previewModal, setPreviewModal] = useState<{
-    image: ImportPlanImage;
+  const [plan, setPlan] = useState<ImportPlan | null>(initialPlan);
+  const [showPlan, setShowPlan] = useState(initialShowPlan || initialPlan !== null);
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [actions, setActions] = useState<Record<string, ReviewGroupMemberAction>>({});
+  const [message, setMessage] = useState<string | null>(null);
+  const [planBusy, setPlanBusy] = useState(false);
+  const planEditActive = useRef(false);
+  const [preview, setPreview] = useState<{
+    member: ReviewGroupMember;
     dataUrl: string | null;
   } | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [submissionAction, setSubmissionAction] = useState<ReviewDecision | 'skip_album' | null>(
-    null,
-  );
-  const [decisionError, setDecisionError] = useState<ReviewMutationError | null>(null);
-  const submissionLockRef = useRef(false);
-  const submittedCandidateIdsRef = useRef(new Set<string>());
-  const skippedAlbumIdsRef = useRef(new Set<string>());
-  const activeCandidateIdRef = useRef<string | null>(null);
-  const initialPreviewCandidateIdRef = useRef<string | null>(null);
-  const [planGenerationPending, setPlanGenerationPending] = useState(false);
-  const [planGenerationError, setPlanGenerationError] = useState<string | null>(null);
-  const [workflowAbandonConfirm, setWorkflowAbandonConfirm] = useState(false);
-  const [workflowAbandonPending, setWorkflowAbandonPending] = useState(false);
-  const [workflowAbandonError, setWorkflowAbandonError] = useState<string | null>(null);
 
-  useEffect(() => {
-    onPlanEditPendingChange?.(planEditPending || planGenerationPending || workflowAbandonPending);
-  }, [onPlanEditPendingChange, planEditPending, planGenerationPending, workflowAbandonPending]);
-
-  useEffect(
-    () => () => {
-      onPlanEditPendingChange?.(false);
-    },
-    [onPlanEditPendingChange],
-  );
-
-  const runQuery = useQuery({
+  const latestRun = useQuery({
     queryKey: ['latestReviewableImportRun'],
-    queryFn: () => api.getLatestReviewableImportRun(),
-    enabled: !importRunId,
+    queryFn: api.getLatestReviewableImportRun,
+    enabled: !importRunId && !initialPlan,
+    refetchInterval: enablePolling ? 2000 : false,
   });
-
   useEffect(() => {
-    if (runQuery.data && !importRunId) {
-      setImportRunId(runQuery.data);
-    }
-  }, [runQuery.data, importRunId]);
+    if (!importRunId && latestRun.data) setImportRunId(latestRun.data);
+  }, [importRunId, latestRun.data]);
 
-  const queueQuery = useQuery({
-    queryKey: ['reviewQueue', importRunId],
-    queryFn: () => api.getReviewQueue(importRunId!),
-    enabled: !!importRunId,
+  const groupsQuery = useQuery({
+    queryKey: ['reviewGroups', importRunId],
+    queryFn: () => api.getReviewGroups(importRunId!),
+    enabled: !!importRunId && !showPlan,
+    refetchInterval: enablePolling ? 1500 : false,
   });
-
   const progressQuery = useQuery({
     queryKey: ['reviewProgress', importRunId],
     queryFn: () => api.getReviewProgress(importRunId!),
-    enabled: !!importRunId,
-    refetchInterval: enablePolling ? 5000 : false,
+    enabled: !!importRunId && !showPlan,
+    refetchInterval: enablePolling ? 1500 : false,
   });
-
-  const frozenPlanQuery = useQuery({
+  const frozenQuery = useQuery({
     queryKey: ['reviewFrozenImportPlanSummary', importRunId],
     queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
-    enabled: !!importRunId && !showPlan && !importPlan && !initialPlan,
+    enabled: !!importRunId && !initialPlan,
   });
-
   useEffect(() => {
-    if (frozenPlanQuery.data && !showPlan && !importPlan) {
-      setImportPlan(frozenPlanQuery.data);
+    if (frozenQuery.data) {
+      setPlan(frozenQuery.data);
       setShowPlan(true);
-      setOpenPlanAlbums(new Set());
-      setPlanEditError(null);
     }
-  }, [frozenPlanQuery.data, importPlan, showPlan]);
+  }, [frozenQuery.data]);
 
-  const queue = queueQuery.data ?? [];
-  const undecidedQueue = useMemo(() => queue.filter((c) => !c.has_decision), [queue]);
-  const reviewAlbumCount = useMemo(
-    () => new Set(undecidedQueue.map((candidate) => candidate.album_name)).size,
-    [undecidedQueue],
+  const manualGroups = useMemo(
+    () => (groupsQuery.data ?? []).filter((group) => group.requires_manual_review),
+    [groupsQuery.data],
   );
-
-  const currentCandidate: ReviewCandidateSummary | undefined = undecidedQueue[currentIndex];
+  useEffect(() => {
+    if (!selectedGroupId || !manualGroups.some((group) => group.group_id === selectedGroupId)) {
+      setSelectedGroupId(
+        manualGroups.find((group) => group.state === 'pending')?.group_id ??
+          manualGroups[0]?.group_id ??
+          null,
+      );
+    }
+  }, [manualGroups, selectedGroupId]);
 
   const detailQuery = useQuery({
-    queryKey: ['reviewDetail', currentCandidate?.candidate_id],
-    queryFn: () => api.getReviewCandidateDetail(currentCandidate!.candidate_id),
-    enabled: !!currentCandidate,
+    queryKey: ['reviewGroupDetail', selectedGroupId],
+    queryFn: () => api.getReviewGroupDetail(selectedGroupId!),
+    enabled: !!selectedGroupId && !showPlan,
   });
-
-  const currentCandidateId = currentCandidate?.candidate_id ?? null;
-  activeCandidateIdRef.current = currentCandidateId;
-  if (initialPreviews && currentCandidateId && !initialPreviewCandidateIdRef.current) {
-    initialPreviewCandidateIdRef.current = currentCandidateId;
-  }
-  const initialPreviewsMatchCurrent =
-    initialPreviewCandidateIdRef.current === currentCandidateId ? initialPreviews : null;
-  const detail = detailQuery.data?.candidate_id === currentCandidateId ? detailQuery.data : null;
-  const detailCandidateMismatch =
-    detailQuery.isSuccess &&
-    detailQuery.data !== undefined &&
-    detailQuery.data.candidate_id !== currentCandidateId;
-  const detailReady = detailQuery.isSuccess && detail !== null && currentCandidateId !== null;
-  const sourcePreview = useReviewPreviewEvidence(
-    currentCandidateId,
-    detailReady,
-    'source',
-    initialPreviewsMatchCurrent?.left ?? null,
-  );
-  const candidatePreview = useReviewPreviewEvidence(
-    currentCandidateId,
-    detailReady,
-    'candidate',
-    initialPreviewsMatchCurrent?.right ?? null,
-  );
-  const currentCandidateAlreadySubmitted = currentCandidateId
-    ? submittedCandidateIdsRef.current.has(currentCandidateId)
-    : false;
-  const currentAlbumAlreadySkipped = detail
-    ? skippedAlbumIdsRef.current.has(detail.album_id)
-    : false;
-  const decisionReady =
-    detailReady &&
-    sourcePreview.evidence.state === 'success' &&
-    candidatePreview.evidence.state === 'success' &&
-    !currentCandidateAlreadySubmitted &&
-    !currentAlbumAlreadySkipped &&
-    !submitting;
-  const skipAlbumReady =
-    detailReady && !currentCandidateAlreadySubmitted && !currentAlbumAlreadySkipped && !submitting;
-
   useEffect(() => {
-    setView(DEFAULT_VIEW);
-    setOverlayMode(false);
-    setDecisionError(null);
-  }, [currentCandidateId]);
+    if (!detailQuery.data) return;
+    setActions(
+      Object.fromEntries(
+        detailQuery.data.members.map((member) => [member.image_id, member.final_action]),
+      ),
+    );
+  }, [detailQuery.data]);
 
-  useEffect(() => {
-    setCurrentIndex((current) => Math.max(0, Math.min(current, undecidedQueue.length - 1)));
-  }, [undecidedQueue.length]);
-
-  const submitDecision = useMutation({
-    mutationFn: ({ candidateId, decision }: { candidateId: string; decision: ReviewDecision }) =>
-      api.submitReviewDecision(candidateId, decision),
-  });
-
-  const handleDecision = useCallback(
-    async (decision: ReviewDecision) => {
-      if (!currentCandidate || !decisionReady || submissionLockRef.current) return;
-      const candidateIdAtSubmit = currentCandidate.candidate_id;
-      submissionLockRef.current = true;
-      setSubmitting(true);
-      setSubmissionAction(decision);
-      setDecisionError(null);
-      let decisionSaved = false;
-      try {
-        await submitDecision.mutateAsync({
-          candidateId: currentCandidate.candidate_id,
-          decision,
-        });
-        decisionSaved = true;
-        submittedCandidateIdsRef.current.add(currentCandidate.candidate_id);
-        await invalidateReviewWorkflowQueries(queryClient);
-        if (currentIndex >= undecidedQueue.length - 1) {
-          setCurrentIndex(Math.max(0, undecidedQueue.length - 2));
-        }
-      } catch (error) {
-        if (activeCandidateIdRef.current === candidateIdAtSubmit) {
-          setDecisionError({
-            message: String(error),
-            retryHint: decisionSaved
-              ? '审核决定可能已经保存，但队列刷新失败。请重新加载审核页确认，不要重复提交。'
-              : '决定没有从当前页面移除。请重新点击刚才的审核决定重试。',
-            mayBeSaved: decisionSaved,
-          });
-        }
-      } finally {
-        submissionLockRef.current = false;
-        setSubmitting(false);
-        setSubmissionAction(null);
-      }
+  const submit = useMutation({
+    mutationFn: async (detail: ReviewGroupDetail) => {
+      const decisions: ReviewGroupMemberDecision[] = detail.members
+        .filter((member) => member.image_source === 'import')
+        .map((member) => ({
+          image_id: member.image_id,
+          image_source: 'import',
+          final_action: actions[member.image_id] ?? member.final_action,
+        }));
+      await api.submitReviewGroupDecision(detail.group_id, decisions);
     },
-    [
-      currentCandidate,
-      currentIndex,
-      decisionReady,
-      queryClient,
-      submitDecision,
-      undecidedQueue.length,
-    ],
-  );
+    onSuccess: async () => {
+      setMessage(null);
+      await invalidateReviewWorkflowQueries(queryClient, importRunId ?? undefined);
+      setSelectedGroupId(null);
+    },
+    onError: (error) => setMessage(String(error)),
+  });
 
-  const handleSkipAlbum = useCallback(async () => {
-    if (
-      !detail ||
-      !currentCandidateId ||
-      !importRunId ||
-      !skipAlbumReady ||
-      submissionLockRef.current
-    )
-      return;
-    const candidateIdAtSubmit = currentCandidateId;
-    submissionLockRef.current = true;
-    setSubmitting(true);
-    setSubmissionAction('skip_album');
-    setDecisionError(null);
-    let albumSkipped = false;
-    try {
-      await api.skipReviewAlbum(importRunId, detail.album_id);
-      albumSkipped = true;
-      skippedAlbumIdsRef.current.add(detail.album_id);
-      await invalidateReviewWorkflowQueries(queryClient);
-      setCurrentIndex(0);
-    } catch (error) {
-      if (activeCandidateIdRef.current === candidateIdAtSubmit) {
-        setDecisionError({
-          message: String(error),
-          retryHint: albumSkipped
-            ? '跳过请求可能已经保存，但队列刷新失败。请重新加载审核页确认，不要重复提交。'
-            : '图集仍保留在审核队列中。请再次点击“跳过图集”重试。',
-          mayBeSaved: albumSkipped,
-        });
-      }
-    } finally {
-      submissionLockRef.current = false;
-      setSubmitting(false);
-      setSubmissionAction(null);
-    }
-  }, [currentCandidateId, detail, importRunId, queryClient, skipAlbumReady]);
-
-  const handleGeneratePlan = useCallback(async () => {
-    if (!importRunId || planGenerationPending) return;
-    setPlanGenerationPending(true);
-    setPlanGenerationError(null);
-    try {
-      // Freeze the plan as a single atomic transaction so the commit page
-      // can read the frozen summary without re-deriving from candidates.
-      const plan = await api.freezeImportPlan(importRunId);
-      setImportPlan(plan);
+  const freeze = useMutation({
+    mutationFn: () => api.freezeImportPlan(importRunId!),
+    onSuccess: (nextPlan) => {
+      setPlan(nextPlan);
       setShowPlan(true);
-      setOpenPlanAlbums(new Set());
-      setPlanEditError(null);
-      queryClient.setQueryData(['reviewFrozenImportPlanSummary', importRunId], plan);
-      queryClient.setQueryData(['frozenImportPlanSummary', importRunId], plan);
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
-        queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
-      ]);
-    } catch (error) {
-      setPlanGenerationError(String(error));
-    } finally {
-      setPlanGenerationPending(false);
-    }
-  }, [importRunId, planGenerationPending, queryClient]);
+      queryClient.setQueryData(['reviewFrozenImportPlanSummary', nextPlan.import_run_id], nextPlan);
+      queryClient.setQueryData(['frozenImportPlanSummary', nextPlan.import_run_id], nextPlan);
+    },
+    onError: (error) => setMessage(String(error)),
+  });
 
   const applyPlanEdit = useCallback(
     async (edit: () => Promise<ImportPlan>) => {
-      if (planEditPending) return;
-      setPlanEditPending(true);
-      setPlanEditError(null);
+      if (planEditActive.current) return;
+      planEditActive.current = true;
+      setPlanBusy(true);
+      onPlanEditPendingChange?.(true);
+      setMessage(null);
       try {
-        const nextPlan = await edit();
-        setImportPlan(nextPlan);
-        queryClient.setQueryData(
-          ['reviewFrozenImportPlanSummary', nextPlan.import_run_id],
-          nextPlan,
-        );
-        queryClient.setQueryData(['frozenImportPlanSummary', nextPlan.import_run_id], nextPlan);
-        await Promise.all([
-          queryClient.invalidateQueries({
-            queryKey: ['reviewFrozenImportPlanSummary', nextPlan.import_run_id],
-          }),
-          queryClient.invalidateQueries({
-            queryKey: ['frozenImportPlanSummary', nextPlan.import_run_id],
-          }),
-          queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
-          queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
-        ]);
+        const next = await edit();
+        setPlan(next);
+        queryClient.setQueryData(['reviewFrozenImportPlanSummary', next.import_run_id], next);
+        queryClient.setQueryData(['frozenImportPlanSummary', next.import_run_id], next);
       } catch (error) {
-        setPlanEditError(String(error));
+        setMessage(String(error));
       } finally {
-        setPlanEditPending(false);
+        planEditActive.current = false;
+        setPlanBusy(false);
+        onPlanEditPendingChange?.(false);
       }
     },
-    [planEditPending, queryClient],
+    [onPlanEditPendingChange, queryClient],
   );
 
-  const handleAbandonWorkflow = useCallback(async () => {
-    if (!importPlan || planEditPending || workflowAbandonPending) return;
-    const runId = importPlan.import_run_id;
-    setWorkflowAbandonPending(true);
-    setWorkflowAbandonError(null);
-    try {
-      await api.abandonFrozenImportWorkflow(runId);
-      queryClient.setQueryData(['reviewFrozenImportPlanSummary', runId], null);
-      queryClient.setQueryData(['frozenImportPlanSummary', runId], null);
-      setImportPlan(null);
-      setShowPlan(false);
-      setWorkflowAbandonConfirm(false);
-      setOpenPlanAlbums(new Set());
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ['reviewFrozenImportPlanSummary', runId] }),
-        queryClient.invalidateQueries({ queryKey: ['frozenImportPlanSummary', runId] }),
-        queryClient.invalidateQueries({ queryKey: ['reviewQueue', runId] }),
-        queryClient.invalidateQueries({ queryKey: ['reviewProgress', runId] }),
-        queryClient.invalidateQueries({ queryKey: ['latestReviewableImportRun'] }),
-        queryClient.invalidateQueries({ queryKey: ['latestCommittableImportRun'] }),
-        queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
-        queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
-      ]);
-      if (onWorkflowAbandoned) onWorkflowAbandoned();
-      else onNavigate('dashboard');
-    } catch (error) {
-      setWorkflowAbandonError(String(error));
-    } finally {
-      setWorkflowAbandonPending(false);
-    }
-  }, [
-    importPlan,
-    onNavigate,
-    onWorkflowAbandoned,
-    planEditPending,
-    queryClient,
-    workflowAbandonPending,
-  ]);
-
-  const togglePlanAlbum = useCallback(
-    (album: ImportPlanAlbumGroup) => {
-      if (!importPlan) return;
-      applyPlanEdit(() =>
-        api.setImportPlanAlbumIncluded(importPlan.import_run_id, album.albumId, !album.included),
-      );
-    },
-    [applyPlanEdit, importPlan],
-  );
-
-  const togglePlanImage = useCallback(
-    (album: ImportPlanAlbumGroup, image: ImportPlanImage) => {
-      if (!importPlan) return;
-      applyPlanEdit(() =>
-        api.setImportPlanImageIncluded(
-          importPlan.import_run_id,
-          image.image_id,
-          album.albumId,
-          !image.included,
-        ),
-      );
-    },
-    [applyPlanEdit, importPlan],
-  );
-
-  const openPlanImagePreview = useCallback(
-    (image: ImportPlanImage, dataUrl: string | null) => {
-      setPreviewModal({ image, dataUrl });
-      if (dataUrl || !importPlan) return;
-      api
-        .getImportPlanImagePreview(importPlan.import_run_id, image.image_id)
-        .then((preview) => {
-          setPreviewModal((current) =>
-            current?.image.image_id === image.image_id
-              ? { image, dataUrl: preview.data_url }
-              : current,
-          );
-        })
-        .catch(() => {
-          setPreviewModal((current) =>
-            current?.image.image_id === image.image_id ? { image, dataUrl: null } : current,
-          );
-        });
-    },
-    [importPlan],
-  );
-
-  const handlePrev = useCallback(() => {
-    if (submissionLockRef.current) return;
-    setCurrentIndex((i) => Math.max(0, i - 1));
-  }, []);
-
-  const handleNext = useCallback(() => {
-    if (submissionLockRef.current) return;
-    setCurrentIndex((i) => Math.min(undecidedQueue.length - 1, i + 1));
-  }, [undecidedQueue.length]);
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (shouldIgnoreReviewShortcut(e, previewModal !== null)) return;
-      switch (e.key) {
-        case '1':
-          handleDecision('keep_source');
-          break;
-        case '2':
-          handleDecision('keep_candidate');
-          break;
-        case '3':
-          handleDecision('keep_all');
-          break;
-        case '4':
-          handleSkipAlbum();
-          break;
-        case 'ArrowLeft':
-          e.preventDefault();
-          handlePrev();
-          break;
-        case 'ArrowRight':
-          e.preventDefault();
-          handleNext();
-          break;
-        case 'o':
-        case 'O':
-          setOverlayMode((m) => !m);
-          break;
-        case 'r':
-        case 'R':
-          setView(DEFAULT_VIEW);
-          break;
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [handleDecision, handleSkipAlbum, handlePrev, handleNext, previewModal]);
-
-  const handleWheel = useCallback((event: WheelEvent) => {
-    event.preventDefault();
-    const element = event.currentTarget;
-    if (!(element instanceof HTMLElement)) return;
-    const rect = element.getBoundingClientRect();
-    setView((current) =>
-      zoomViewAtPointer(current, event.clientX, event.clientY, rect, event.deltaY),
+  if (plan && showPlan) {
+    return (
+      <>
+        {message && (
+          <StatusBanner tone="danger" title="计划更新失败">
+            {message}
+          </StatusBanner>
+        )}
+        <PlanView
+          plan={plan}
+          busy={planBusy}
+          onEditAlbum={(album) =>
+            void applyPlanEdit(() =>
+              api.setImportPlanAlbumIncluded(plan.import_run_id, album.albumId, !album.included),
+            )
+          }
+          onEditImage={(album, image) =>
+            void applyPlanEdit(() =>
+              api.setImportPlanImageIncluded(
+                plan.import_run_id,
+                image.image_id,
+                album.albumId,
+                !image.included,
+              ),
+            )
+          }
+          onMode={(mode) =>
+            void applyPlanEdit(() => api.setImportPlanSourceFileMode(plan.import_run_id, mode))
+          }
+          onCommit={() => (onGoCommit ? onGoCommit(plan.import_run_id) : onNavigate('commit'))}
+          onAbandon={() => {
+            void api
+              .abandonFrozenImportWorkflow(plan.import_run_id)
+              .then(() => {
+                setPlan(null);
+                setShowPlan(false);
+                onWorkflowAbandoned?.();
+                onNavigate('dashboard');
+              })
+              .catch((error) => setMessage(String(error)));
+          }}
+        />
+      </>
     );
-  }, []);
+  }
 
-  const handleMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      if (e.button !== 0) return;
-      setIsPanning(true);
-      setPanStart({ x: e.clientX - view.offsetX, y: e.clientY - view.offsetY });
-    },
-    [view.offsetX, view.offsetY],
-  );
-
-  const handleMouseMove = useCallback(
-    (e: React.MouseEvent) => {
-      if (!isPanning) return;
-      setView((v) => ({
-        ...v,
-        offsetX: e.clientX - panStart.x,
-        offsetY: e.clientY - panStart.y,
-      }));
-    },
-    [isPanning, panStart],
-  );
-
-  const handleMouseUp = useCallback(() => {
-    setIsPanning(false);
-  }, []);
-
+  if (!importRunId && latestRun.isLoading) {
+    return (
+      <div className="review-page review-page--m3">
+        <PageHeader title="重复图片审核" description="正在查找可审核任务。" />
+        <Skeleton width="100%" height={280} />
+      </div>
+    );
+  }
   if (!importRunId) {
     return (
       <div className="review-page review-page--m3">
-        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
-        {runQuery.isLoading ? (
-          <div className="review-loading-panel" role="status" aria-label="正在加载最近的导入任务">
-            <Skeleton height={28} width="38%" />
-            <Skeleton height={18} width="62%" />
-          </div>
-        ) : runQuery.isError ? (
-          <StatusBanner tone="danger" title="无法查询可审核任务">
-            {String(runQuery.error)}
-          </StatusBanner>
-        ) : (
-          <EmptyState
-            title="没有可审核的导入"
-            description="请先完成一次扫描，然后回来审核重复候选。"
-            action={<Button onClick={() => onNavigate('scan')}>前往扫描</Button>}
-          />
-        )}
-      </div>
-    );
-  }
-
-  const progress = progressQuery.data;
-  const totalCandidates = progress?.total_review_candidates ?? 0;
-  const allDecided =
-    (progress?.all_decided ?? false) ||
-    (queueQuery.isSuccess && undecidedQueue.length === 0 && totalCandidates > 0);
-
-  if (showPlan && importPlan) {
-    const albumGroups = planAlbumsForDisplay(importPlan);
-    const keptAlbums = albumGroups.filter((album) => album.included).length;
-
-    return (
-      <div className="review-page plan-page--m3">
-        <PageHeader
-          title="导入计划"
-          description="这是当前已冻结的入库清单；在正式提交前仍可调整，所有修改都会更新同一份 frozen plan。"
-          meta={<StatusBadge tone="success">计划已冻结</StatusBadge>}
-          actions={
-            <>
-              <Button
-                variant="danger"
-                disabled={planEditPending || workflowAbandonPending}
-                onClick={() => setWorkflowAbandonConfirm(true)}
-              >
-                撤销这次导入
-              </Button>
-              <Button
-                variant="quiet"
-                disabled={planEditPending || workflowAbandonPending}
-                onClick={() => setShowPlan(false)}
-              >
-                返回审核
-              </Button>
-              <Button
-                variant="primary"
-                disabled={planEditPending || workflowAbandonPending || workflowAbandonConfirm}
-                loading={planEditPending}
-                loadingLabel="正在保存计划…"
-                onClick={() =>
-                  onGoCommit ? onGoCommit(importPlan.import_run_id) : onNavigate('commit')
-                }
-              >
-                前往提交确认
-              </Button>
-            </>
-          }
-        />
-        <StatusBanner tone="info" title="计划与入库是两个步骤">
-          此页只调整并保存计划；下一页会重新读取这份 frozen plan，再由你确认开始文件事务。
-        </StatusBanner>
-        {workflowAbandonConfirm && (
-          <StatusBanner
-            tone="warning"
-            title="确认撤销这次导入任务？"
-            actions={
-              <>
-                <Button
-                  variant="danger"
-                  loading={workflowAbandonPending}
-                  loadingLabel="正在撤销任务…"
-                  onClick={handleAbandonWorkflow}
-                >
-                  撤销并返回工作台
-                </Button>
-                <Button
-                  variant="quiet"
-                  disabled={workflowAbandonPending}
-                  onClick={() => setWorkflowAbandonConfirm(false)}
-                >
-                  继续保留任务
-                </Button>
-              </>
-            }
-          >
-            这会结束当前导入任务并回到可新建导入的状态。已经完成的扫描、审核和计划将不再继续；源图片和图库内容不会被删除，任务记录仍会保留用于审计。
-          </StatusBanner>
-        )}
-        {workflowAbandonError && (
-          <StatusBanner tone="danger" title="撤销导入任务失败">
-            {workflowAbandonError}
-          </StatusBanner>
-        )}
-        <div className="import-plan-summary">
-          <div className="import-plan-stats">
-            <div className="plan-stat">
-              <span>图集数</span>
-              <strong>{importPlan.total_albums}</strong>
-            </div>
-            <div className="plan-stat">
-              <span>图片总数</span>
-              <strong>{importPlan.total_images}</strong>
-            </div>
-            <div className="plan-stat plan-stat--success">
-              <span>计划导入</span>
-              <strong>{importPlan.kept_images.length}</strong>
-            </div>
-            <div className="plan-stat plan-stat--warning">
-              <span>计划排除</span>
-              <strong>{importPlan.excluded_count}</strong>
-            </div>
-          </div>
-          {planEditError && <div className="commit-error-msg">{planEditError}</div>}
-          <div className="import-plan-kept">
-            <div className="plan-list-heading">
-              <div>
-                <h2>图集清单</h2>
-                <p>仅展开图集时加载图片行与预览，避免长清单一次渲染全部内容。</p>
-              </div>
-              <StatusBadge>
-                {keptAlbums} 个图集 · {importPlan.kept_images.length} 张图片
-              </StatusBadge>
-            </div>
-            <div className="import-plan-albums">
-              {albumGroups.slice(0, planAlbumLimit).map((album) => {
-                const isOpen = openPlanAlbums.has(album.albumId);
-                return (
-                  <details
-                    className={`import-plan-album ${album.included ? 'included' : 'skipped'}`}
-                    key={album.albumId}
-                    open={isOpen}
-                    onToggle={(event) => {
-                      const nextOpen = event.currentTarget.open;
-                      setOpenPlanAlbums((current) => {
-                        const next = new Set(current);
-                        if (nextOpen) next.add(album.albumId);
-                        else next.delete(album.albumId);
-                        return next;
-                      });
-                    }}
-                  >
-                    <summary>
-                      <span
-                        className={`import-plan-album-title ${album.included ? '' : 'is-skipped'}`}
-                      >
-                        {album.albumName}
-                      </span>
-                      <span className="import-plan-album-meta">
-                        导入 {album.imageCount} 张 / 跳过 {album.skippedImageCount} 张 ·{' '}
-                        {formatFileSize(album.totalSize)}
-                      </span>
-                    </summary>
-                    <button
-                      type="button"
-                      className={`plan-toggle plan-album-toggle ${album.included ? 'is-on' : 'is-off'}`}
-                      disabled={planEditPending || workflowAbandonPending || workflowAbandonConfirm}
-                      onClick={() => togglePlanAlbum(album)}
-                    >
-                      {album.included ? '导入' : '跳过'}
-                    </button>
-                    {isOpen && (
-                      <div className="import-plan-image-list">
-                        {album.images
-                          .slice(0, planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE)
-                          .map((img) => (
-                            <div
-                              className={`import-plan-image-row ${img.included ? 'included' : 'skipped'}`}
-                              key={img.image_id}
-                            >
-                              <PlanImageThumbnail
-                                importRunId={importPlan.import_run_id}
-                                image={img}
-                                onOpen={openPlanImagePreview}
-                              />
-                              <button
-                                type="button"
-                                className="import-plan-image-info"
-                                onClick={() => openPlanImagePreview(img, null)}
-                              >
-                                <span className="mono">{img.relative_path}</span>
-                                <span>{formatFileSize(img.file_size)}</span>
-                              </button>
-                              <button
-                                type="button"
-                                className={`plan-toggle ${img.included ? 'is-on' : 'is-off'}`}
-                                disabled={
-                                  planEditPending ||
-                                  workflowAbandonPending ||
-                                  workflowAbandonConfirm
-                                }
-                                onClick={() => togglePlanImage(album, img)}
-                              >
-                                {img.included ? '导入' : '跳过'}
-                              </button>
-                            </div>
-                          ))}
-                        {album.images.length >
-                          (planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE) && (
-                          <Button
-                            variant="quiet"
-                            className="plan-load-more"
-                            onClick={() =>
-                              setPlanImageLimits((current) => ({
-                                ...current,
-                                [album.albumId]:
-                                  (current[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE) +
-                                  PLAN_IMAGE_BATCH_SIZE,
-                              }))
-                            }
-                          >
-                            再显示 {PLAN_IMAGE_BATCH_SIZE} 张（剩余{' '}
-                            {album.images.length -
-                              (planImageLimits[album.albumId] ?? PLAN_IMAGE_BATCH_SIZE)}{' '}
-                            张）
-                          </Button>
-                        )}
-                      </div>
-                    )}
-                  </details>
-                );
-              })}
-              {albumGroups.length > planAlbumLimit && (
-                <Button
-                  variant="quiet"
-                  className="plan-load-more"
-                  onClick={() => setPlanAlbumLimit((current) => current + PLAN_ALBUM_BATCH_SIZE)}
-                >
-                  再显示 {PLAN_ALBUM_BATCH_SIZE} 个图集（剩余 {albumGroups.length - planAlbumLimit}{' '}
-                  个）
-                </Button>
-              )}
-            </div>
-          </div>
-        </div>
-        {previewModal && (
-          <ImagePreviewDialog
-            dataUrl={previewModal.dataUrl}
-            path={previewModal.image.relative_path}
-            onClose={() => setPreviewModal(null)}
-          />
-        )}
-      </div>
-    );
-  }
-
-  const reviewQueriesLoading =
-    progressQuery.isLoading || queueQuery.isLoading || frozenPlanQuery.isLoading;
-  const reviewQueryError = progressQuery.error ?? queueQuery.error ?? frozenPlanQuery.error;
-
-  if (reviewQueryError) {
-    return (
-      <div className="review-page review-page--m3">
-        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
-        {decisionError && <ReviewMutationErrorBanner error={decisionError} />}
-        <StatusBanner
-          tone="danger"
-          title="无法加载审核数据"
-          actions={
-            <Button
-              variant="secondary"
-              loading={
-                queueQuery.isFetching || progressQuery.isFetching || frozenPlanQuery.isFetching
-              }
-              loadingLabel="正在重新加载…"
-              onClick={() =>
-                void Promise.all([
-                  queueQuery.refetch(),
-                  progressQuery.refetch(),
-                  frozenPlanQuery.refetch(),
-                ])
-              }
-            >
-              重新加载审核数据
-            </Button>
-          }
-        >
-          {String(reviewQueryError)}
-        </StatusBanner>
-      </div>
-    );
-  }
-
-  if (reviewQueriesLoading) {
-    return (
-      <div className="review-page review-page--m3">
-        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
-        <div className="review-loading-panel" role="status" aria-label="正在加载审核数据">
-          <Skeleton height={420} radius="var(--radius-image)" />
-        </div>
-      </div>
-    );
-  }
-
-  if (totalCandidates === 0) {
-    return (
-      <div className="review-page review-page--m3">
-        <PageHeader title="审核" description="逐一确认无法自动判断的相似图片。" />
+        <PageHeader title="重复图片审核" />
         <EmptyState
-          title="没有待审核候选"
-          description="该导入任务没有需要人工确认的重复候选，可以直接生成导入计划。"
-          action={
-            <div className="review-empty-actions">
-              <Button
-                variant="primary"
-                onClick={handleGeneratePlan}
-                loading={planGenerationPending}
-                loadingLabel="正在生成…"
-              >
-                生成导入计划
-              </Button>
-              <Button
-                variant="quiet"
-                disabled={planGenerationPending}
-                onClick={() => onNavigate('dashboard')}
-              >
-                返回工作台
-              </Button>
-            </div>
-          }
+          icon={<AppIcon name="review" size={30} />}
+          title="暂无待审核任务"
+          description="完成一次导入分析后，包含不确定重复关系的图片组会出现在这里。"
+          action={<Button onClick={() => onNavigate('scan')}>开始导入</Button>}
         />
-        {planGenerationError && (
-          <StatusBanner tone="danger" title="生成导入计划失败">
-            {planGenerationError}
-          </StatusBanner>
-        )}
       </div>
     );
   }
 
-  if (allDecided) {
-    return (
-      <div className="review-page review-page--m3">
-        <PageHeader title="审核完成" description="人工判断已经全部保存。" />
-        <EmptyState
-          title="所有候选已审核"
-          description={`已处理 ${progress?.decided_count ?? 0} / ${progress?.total_review_candidates ?? 0} 个候选。`}
-          action={
-            <Button
-              variant="primary"
-              onClick={handleGeneratePlan}
-              loading={planGenerationPending}
-              loadingLabel="正在生成…"
-            >
-              生成导入计划
-            </Button>
-          }
-        />
-        {planGenerationError && (
-          <StatusBanner tone="danger" title="生成导入计划失败">
-            {planGenerationError}
-          </StatusBanner>
-        )}
-      </div>
-    );
-  }
-
-  const imageStyle: React.CSSProperties = {
-    transform: `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`,
-    transformOrigin: 'center center',
-    transition: isPanning ? 'none' : 'transform var(--motion-fast) var(--ease-out)',
-  };
+  const detail = detailQuery.data;
+  const keepCount = detail
+    ? detail.members.filter(
+        (member) => (actions[member.image_id] ?? member.final_action) === 'keep',
+      ).length
+    : 0;
+  const allResolved = progressQuery.data?.all_decided ?? false;
+  const error = groupsQuery.error ?? progressQuery.error ?? detailQuery.error;
 
   return (
     <div className="review-page review-page--m3">
       <PageHeader
-        title={`审核：${currentCandidate?.album_name ?? '待审核图集'}`}
-        description={`当前有 ${reviewAlbumCount} 个图集包含待审核候选，可在整批分析结束前先处理。`}
+        title="按组审核重复图片"
+        description="同一连通重复关系中的所有图片一次展示；每张导入图片都可独立保留或排除。"
         meta={
-          <div className="review-header-meta">
-            <StatusBadge tone="info">
-              {currentIndex + 1} / {undecidedQueue.length} 个待定
-            </StatusBadge>
-            {detail && <StatusBadge>{formatMatchType(detail.match_type)}</StatusBadge>}
-            {detail && <StatusBadge>{formatScope(detail.scope)}</StatusBadge>}
-          </div>
+          <StatusBadge tone={allResolved ? 'success' : 'warning'}>
+            {progressQuery.data?.resolved_count ?? 0} /{' '}
+            {progressQuery.data?.total_review_groups ?? 0} 组已完成
+          </StatusBadge>
         }
         actions={
-          <>
-            <Button
-              variant="quiet"
-              className={overlayMode ? 'is-active' : undefined}
-              disabled={!detailReady}
-              onClick={() => setOverlayMode((mode) => !mode)}
-              title="切换叠加模式 (O)"
-              aria-pressed={overlayMode}
-            >
-              叠加比较
+          allResolved ? (
+            <Button variant="primary" loading={freeze.isPending} onClick={() => freeze.mutate()}>
+              生成并冻结导入计划
             </Button>
-            <Button
-              variant="quiet"
-              disabled={!detailReady}
-              onClick={() => setView(DEFAULT_VIEW)}
-              title="重置缩放 (R)"
-            >
-              重置视图
-            </Button>
-          </>
+          ) : undefined
         }
       />
+      {(message || error) && (
+        <StatusBanner tone="danger" title="审核操作未完成">
+          {message ?? String(error)}
+        </StatusBanner>
+      )}
 
-      {decisionError && <ReviewMutationErrorBanner error={decisionError} />}
-
-      {detailQuery.isError ? (
-        <StatusBanner
-          tone="danger"
-          title="无法加载当前候选详情"
-          actions={
-            <Button
-              variant="secondary"
-              loading={detailQuery.isFetching}
-              loadingLabel="正在重新加载…"
-              onClick={() => void detailQuery.refetch()}
+      {manualGroups.length > 0 && (
+        <nav className="review-group-tabs" aria-label="审核组">
+          {manualGroups.map((group, index) => (
+            <button
+              type="button"
+              key={group.group_id}
+              className={group.group_id === selectedGroupId ? 'is-active' : ''}
+              onClick={() => setSelectedGroupId(group.group_id)}
             >
-              重新加载详情
-            </Button>
-          }
-        >
-          {String(detailQuery.error)}
-        </StatusBanner>
-      ) : detailCandidateMismatch ? (
-        <StatusBanner
-          tone="danger"
-          title="候选详情与当前审核项不匹配"
-          actions={
-            <Button variant="secondary" onClick={() => void detailQuery.refetch()}>
-              重新加载详情
-            </Button>
-          }
-        >
-          为避免误审，当前详情已被拒绝使用。请重新加载后再作决定。
-        </StatusBanner>
-      ) : detailQuery.isLoading || !detail ? (
-        <div className="review-loading-panel" role="status" aria-label="正在加载候选">
-          <Skeleton height={420} radius="var(--radius-image)" />
-        </div>
-      ) : (
-        <>
-          <div
-            className={`review-images ${overlayMode ? 'overlay-mode' : 'side-by-side'}`}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseUp}
-          >
-            <div className="review-image-panel left-panel">
-              <div className="review-image-label">
-                <span>源图片</span>
-                <kbd>1</kbd>
-              </div>
-              <ReviewImageContainer onWheelZoom={handleWheel}>
-                <ReviewPreviewContent
-                  evidence={sourcePreview.evidence}
-                  label="源图片"
-                  alt="源图片"
-                  style={imageStyle}
-                  onLoaded={sourcePreview.markLoaded}
-                  onFailed={sourcePreview.markFailed}
-                  onRetry={sourcePreview.retry}
-                />
-              </ReviewImageContainer>
-            </div>
-            <div className="review-image-panel right-panel">
-              <div className="review-image-label">
-                <span>{detail.scope === 'library' ? '历史图库匹配' : '候选图片'}</span>
-                <kbd>2</kbd>
-              </div>
-              <ReviewImageContainer onWheelZoom={handleWheel}>
-                <ReviewPreviewContent
-                  evidence={candidatePreview.evidence}
-                  label={detail.scope === 'library' ? '历史图库图片' : '候选图片'}
-                  alt="候选图片"
-                  style={
-                    overlayMode
-                      ? {
-                          ...imageStyle,
-                          opacity: overlayOpacity,
-                          position: 'absolute',
-                          top: 0,
-                          left: 0,
-                        }
-                      : imageStyle
-                  }
-                  onLoaded={candidatePreview.markLoaded}
-                  onFailed={candidatePreview.markFailed}
-                  onRetry={candidatePreview.retry}
-                />
-              </ReviewImageContainer>
-            </div>
-          </div>
+              <span>组 {index + 1}</span>
+              <small>{group.member_count} 张</small>
+              <StatusBadge tone={group.state === 'resolved' ? 'success' : 'warning'}>
+                {group.state === 'resolved' ? '已完成' : '待审核'}
+              </StatusBadge>
+            </button>
+          ))}
+        </nav>
+      )}
 
-          {overlayMode && (
-            <div className="overlay-opacity-control">
-              <label>叠加透明度: {Math.round(overlayOpacity * 100)}%</label>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                value={overlayOpacity * 100}
-                onChange={(e) => setOverlayOpacity(Number(e.target.value) / 100)}
+      {detailQuery.isLoading ? (
+        <Skeleton width="100%" height={420} />
+      ) : detail ? (
+        <main className="review-group-workspace">
+          <div className="review-group-heading">
+            <div>
+              <h2>{detail.members.length} 张关联图片</h2>
+              <p>默认全部保留。库内图片为只读；组内至少需要保留一张图片。</p>
+            </div>
+            <StatusBadge tone={detail.state === 'resolved' ? 'success' : 'warning'}>
+              {detail.state === 'resolved' ? '已提交' : '尚未提交'}
+            </StatusBadge>
+          </div>
+          <section className="review-group-grid" aria-label="重复图片组成员">
+            {detail.members.map((member) => (
+              <GroupMemberCard
+                key={`${member.image_source}-${member.image_id}`}
+                groupId={detail.group_id}
+                member={member}
+                action={actions[member.image_id] ?? member.final_action}
+                keepCount={keepCount}
+                onChange={(action) =>
+                  setActions((current) => ({ ...current, [member.image_id]: action }))
+                }
+                onOpen={(nextMember, dataUrl) => setPreview({ member: nextMember, dataUrl })}
               />
-            </div>
-          )}
-
-          <details className="review-metadata">
-            <summary>查看图片与匹配详情</summary>
-            <div className="review-info-grid">
-              <div className="review-info-card">
-                <h3>源图片</h3>
-                <table>
-                  <tbody>
-                    <tr>
-                      <td>尺寸</td>
-                      <td>
-                        {detail.source_image_width && detail.source_image_height
-                          ? `${detail.source_image_width} x ${detail.source_image_height}`
-                          : '无'}
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>文件大小</td>
-                      <td>{formatFileSize(detail.source_image_file_size)}</td>
-                    </tr>
-                    <tr>
-                      <td>路径</td>
-                      <td className="mono">{detail.source_image_path}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div className="review-info-card">
-                <h3>{detail.scope === 'library' ? '历史图库匹配' : '候选图片'}</h3>
-                <table>
-                  <tbody>
-                    <tr>
-                      <td>尺寸</td>
-                      <td>
-                        {detail.scope === 'library'
-                          ? detail.candidate_library_image_width &&
-                            detail.candidate_library_image_height
-                            ? `${detail.candidate_library_image_width} x ${detail.candidate_library_image_height}`
-                            : '无'
-                          : detail.candidate_source_image_width &&
-                              detail.candidate_source_image_height
-                            ? `${detail.candidate_source_image_width} x ${detail.candidate_source_image_height}`
-                            : '无'}
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>文件大小</td>
-                      <td>
-                        {detail.scope === 'library'
-                          ? detail.candidate_library_image_file_size
-                            ? formatFileSize(detail.candidate_library_image_file_size)
-                            : '无'
-                          : detail.candidate_source_image_file_size
-                            ? formatFileSize(detail.candidate_source_image_file_size)
-                            : '无'}
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>路径</td>
-                      <td className="mono">
-                        {detail.candidate_source_image_path ??
-                          detail.candidate_library_image_path ??
-                          '无'}
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <div className="review-info-card">
-                <h3>匹配详情</h3>
-                <table>
-                  <tbody>
-                    <tr>
-                      <td>图集</td>
-                      <td>{detail.album_name}</td>
-                    </tr>
-                    <tr>
-                      <td>范围</td>
-                      <td>{formatScope(detail.scope)}</td>
-                    </tr>
-                    <tr>
-                      <td>匹配类型</td>
-                      <td>{formatMatchType(detail.match_type)}</td>
-                    </tr>
-                    <tr>
-                      <td>变换</td>
-                      <td>{formatTransform(detail.transform_type)}</td>
-                    </tr>
-                    <tr>
-                      <td>BLAKE3 相同</td>
-                      <td>{detail.blake3_equal ? '是' : '否'}</td>
-                    </tr>
-                    <tr>
-                      <td>像素哈希相同</td>
-                      <td>{detail.pixel_hash_equal ? '是' : '否'}</td>
-                    </tr>
-                    <tr>
-                      <td>BlockHash 距离</td>
-                      <td>
-                        {formatDistance(detail.block_distance, 256, detail.block_distance_ratio)}
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>DoubleGradient 距离</td>
-                      <td>
-                        {formatDistance(
-                          detail.double_gradient_distance,
-                          544,
-                          detail.double_gradient_distance_ratio,
-                        )}
-                      </td>
-                    </tr>
-                    {detail.confidence !== null && (
-                      <tr>
-                        <td>综合相似度</td>
-                        <td>{(detail.confidence * 100).toFixed(1)}%</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </details>
-
-          <div className="review-actions">
-            <div className="review-nav">
-              <Button
-                variant="quiet"
-                onClick={handlePrev}
-                disabled={currentIndex === 0 || submitting}
-              >
-                ← 上一个
-              </Button>
-              <Button
-                variant="quiet"
-                onClick={handleNext}
-                disabled={currentIndex >= undecidedQueue.length - 1 || submitting}
-              >
-                下一个 →
-              </Button>
-            </div>
-            <div className="review-decision-buttons">
-              {REVIEW_DECISION_OPTIONS.map((option) => {
-                const label =
-                  option.decision === 'keep_candidate' && detail.scope === 'library'
-                    ? '保留历史图库图片'
-                    : option.label;
-                return (
-                  <Button
-                    key={option.decision}
-                    variant={option.decision === 'keep_all' ? 'secondary' : 'primary'}
-                    className={option.decision === 'keep_all' ? undefined : 'review-choice'}
-                    onClick={() => handleDecision(option.decision)}
-                    disabled={!decisionReady}
-                    loading={submitting && submissionAction === option.decision}
-                    loadingLabel="正在保存…"
-                    title={`${label} (${option.shortcut})`}
-                  >
-                    {label} <kbd>{option.shortcut}</kbd>
-                  </Button>
-                );
-              })}
-              <Button
-                variant="quiet"
-                className="review-skip-album"
-                onClick={handleSkipAlbum}
-                disabled={!skipAlbumReady}
-                loading={submitting && submissionAction === 'skip_album'}
-                loadingLabel="正在跳过图集…"
-                title="跳过该图集的所有候选 (4)"
-              >
-                跳过图集 <kbd>4</kbd>
-              </Button>
-            </div>
+            ))}
+          </section>
+          <GroupEvidence detail={detail} />
+          <div className="review-group-submit">
+            <span>
+              当前保留 {keepCount} 张，排除 {detail.members.length - keepCount} 张
+            </span>
+            <Button
+              variant="primary"
+              loading={submit.isPending}
+              disabled={detail.state === 'resolved' || keepCount === 0}
+              onClick={() => submit.mutate(detail)}
+            >
+              提交整组决定
+            </Button>
           </div>
+        </main>
+      ) : allResolved ? (
+        <EmptyState
+          title="所有审核组均已完成"
+          description="现在可以生成并冻结导入计划。"
+          action={
+            <Button variant="primary" loading={freeze.isPending} onClick={() => freeze.mutate()}>
+              生成并冻结导入计划
+            </Button>
+          }
+        />
+      ) : (
+        <EmptyState
+          title="正在等待分析完成"
+          description="审核组会在整批重复关系构建完成后一次生成。"
+        />
+      )}
 
-          <p className="review-shortcuts-hint">
-            <AppIcon name="review" size={16} />
-            快捷键：1–4 作出决定，方向键切换，O 叠加，R 重置；滚轮缩放，拖拽平移。
-          </p>
-        </>
+      {preview && (
+        <ImagePreviewDialog
+          dataUrl={preview.dataUrl}
+          path={preview.member.source_path}
+          onClose={() => setPreview(null)}
+        />
       )}
     </div>
   );

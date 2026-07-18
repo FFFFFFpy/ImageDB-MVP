@@ -10,8 +10,8 @@ export function StressPlanFixture() {
     const stressPlan = createLargeImportPlanFixture();
     const progress: ReviewProgress = {
       import_run_id: stressPlan.import_run_id,
-      total_review_candidates: 10_000,
-      decided_count: 10_000,
+      total_review_groups: 10_000,
+      resolved_count: 10_000,
       remaining_count: 0,
       all_decided: true,
     };
