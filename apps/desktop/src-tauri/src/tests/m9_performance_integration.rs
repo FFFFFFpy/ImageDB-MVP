@@ -93,6 +93,10 @@ async fn m9_performance_gate_records_thresholds() {
             .unwrap();
     let plan_ms = elapsed_ms(plan_started);
     assert_eq!(plan.kept_images.len(), image_count);
+    assert!(plan.plan_hash.is_none());
+    crate::commands::freeze_import_plan_for_state(&app_state, import_run_id.to_string())
+        .await
+        .unwrap();
 
     let commit_started = Instant::now();
     crate::commands::start_import_commit_for_state(&app_state, import_run_id.to_string())

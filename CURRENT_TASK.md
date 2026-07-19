@@ -32,8 +32,9 @@ MVP1 本地主链已人工验收通过：
 → 选择源目录
 → 导入 / 分析
 → 审核
-→ 生成 / 冻结导入计划
-→ 提交入库
+→ 人工复核导入计划（draft，可调整）
+→ 锁定导入计划（frozen，此时生成 hash）
+→ 确认并开始入库
 → 本地目录正式入库
 ```
 
@@ -58,7 +59,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
 - MVP3 UI 重设计：M3.0–M3.8 已进入审查修复与验证收口；Windows 100% / 150% 系统缩放不是本轮完成门禁或阻塞项。
-- 多图审核 / 大图解码 / 移动入库：实现完成；审查发现的 Dashboard 恢复路由、临时删除错误分类、删除 TOCTOU 已修复。本轮进一步把 resolved 从界面只读终态改为 frozen plan 前可编辑草稿，并补充增量分组与构建版本诊断；默认前端 / Rust 门禁、Web 构建以及相关真实 PostgreSQL 扫描与审核用例已通过，完整 release gate 未重跑。
+- 多图审核 / 大图解码 / 移动入库：实现完成；审查发现的 Dashboard 恢复路由、临时删除错误分类、删除 TOCTOU 已修复。本轮进一步把 resolved 从界面只读终态改为 frozen plan 前可编辑草稿，并拆分“人工复核 draft”与“锁定 frozen plan”：导入 / 跳过切换不计算 hash，只有锁定时才生成 `plan_hash`；同时补充增量分组与构建版本诊断。
 
 ## 文档入口
 

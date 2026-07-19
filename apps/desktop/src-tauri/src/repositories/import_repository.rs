@@ -3784,6 +3784,34 @@ impl ImportRepository {
 
     // ── Frozen plan full load (immutable commit source of truth) ──────
 
+    /// Persist the editable plan projection without a hash. The caller owns
+    /// the import-run row lock and has already validated that review is
+    /// complete. Repeated generation reuses the same draft.
+    pub async fn write_draft_import_plan_in_transaction(
+        client: &Client,
+        import_run_id: Uuid,
+        albums: &[AlbumRow],
+        kept_images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+        policy_version: &str,
+        library_root_id: Uuid,
+    ) -> Result<Uuid, AppError> {
+        if let Some(existing) = Self::load_draft_plan(client, import_run_id).await? {
+            return Ok(existing.plan_id);
+        }
+
+        let version = Self::next_import_plan_version(client, import_run_id).await?;
+        let plan_id = Self::create_import_plan(
+            client,
+            import_run_id,
+            version,
+            policy_version,
+            library_root_id,
+        )
+        .await?;
+        Self::populate_import_plan(client, plan_id, albums, kept_images_by_album).await?;
+        Ok(plan_id)
+    }
+
     /// Write every frozen-plan row inside the caller's open transaction.
     /// The caller must already hold the parent `import_runs` row lock; this
     /// keeps candidate/image reads, hash computation, writes, and summary
@@ -3818,6 +3846,30 @@ impl ImportRepository {
         )
         .await?;
 
+        Self::populate_import_plan(client, plan_id, albums, kept_images_by_album).await?;
+
+        Self::set_plan_hash(client, plan_id, plan_hash).await?;
+        Self::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
+
+        // The service validated the pre-freeze state while holding the same
+        // row lock. A no-review run may already be ready_to_commit.
+        let run = Self::get_import_run_by_id(client, import_run_id)
+            .await?
+            .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+        if run.state != ImportRunState::ReadyToCommit.to_string() {
+            Self::update_import_run_state(client, import_run_id, &ImportRunState::ReadyToCommit)
+                .await?;
+        }
+
+        Ok(plan_id)
+    }
+
+    async fn populate_import_plan(
+        client: &Client,
+        plan_id: Uuid,
+        albums: &[AlbumRow],
+        kept_images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+    ) -> Result<(), AppError> {
         for album in albums {
             let Some(images) = kept_images_by_album.get(&album.id) else {
                 continue;
@@ -3860,20 +3912,7 @@ impl ImportRepository {
             }
         }
 
-        Self::set_plan_hash(client, plan_id, plan_hash).await?;
-        Self::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
-
-        // The service validated the pre-freeze state while holding the same
-        // row lock. A no-review run may already be ready_to_commit.
-        let run = Self::get_import_run_by_id(client, import_run_id)
-            .await?
-            .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
-        if run.state != ImportRunState::ReadyToCommit.to_string() {
-            Self::update_import_run_state(client, import_run_id, &ImportRunState::ReadyToCommit)
-                .await?;
-        }
-
-        Ok(plan_id)
+        Ok(())
     }
 
     /// Next 1-based version number for a new import plan on this run.
@@ -3906,7 +3945,29 @@ impl ImportRepository {
         client: &Client,
         import_run_id: Uuid,
     ) -> Result<Option<ImportPlan>, AppError> {
-        let Some(frozen) = Self::load_frozen_plan(client, import_run_id).await? else {
+        Self::load_plan_summary(client, import_run_id, false).await
+    }
+
+    /// Read the latest editable draft projection. Drafts deliberately have
+    /// no plan hash; the hash is created only by the atomic freeze step.
+    pub async fn load_draft_plan_summary(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Option<ImportPlan>, AppError> {
+        Self::load_plan_summary(client, import_run_id, true).await
+    }
+
+    async fn load_plan_summary(
+        client: &Client,
+        import_run_id: Uuid,
+        draft: bool,
+    ) -> Result<Option<ImportPlan>, AppError> {
+        let plan = if draft {
+            Self::load_draft_plan(client, import_run_id).await?
+        } else {
+            Self::load_frozen_plan(client, import_run_id).await?
+        };
+        let Some(frozen) = plan else {
             return Ok(None);
         };
 

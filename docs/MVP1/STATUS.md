@@ -26,15 +26,16 @@ MVP1 已完成并通过本地人工验收的主链：
 → 选择源目录
 → 导入 / 分析
 → 审核重复 / 相似候选
-→ 生成 / 冻结导入计划
-→ 提交入库
+→ 人工复核导入计划（draft，可调整导入 / 跳过）
+→ 锁定导入计划（frozen，生成 plan hash）
+→ 确认并开始入库
 → 本地目录正式入库
 ```
 
 关键状态口径：
 
 - `review_required`：需要人工审核。
-- `ready_to_commit`：已经可以进入入库审核 / 生成冻结计划，不直接跳 Commit。
+- `ready_to_commit`：已经可以生成并人工复核 draft 计划，不直接跳 Commit。
 - Commit 页面只接受已有 frozen / consumed plan 且 `plan_hash` 非空的 run。
 - `completed` 不再进入默认 Commit 页。
 
@@ -48,7 +49,7 @@ MVP1 已完成并通过本地人工验收的主链：
 | 指纹与重复检测       | 完成   | BLAKE3、像素 hash、感知 hash、旋转/镜像变换比较。                               |
 | 历史图库比较         | 完成   | 新导入图片可与历史图库比较，历史图库不被分析阶段修改。                          |
 | 审核 GUI             | 完成   | 支持候选查看、双图对比、叠加、缩放、保留/跳过决策。                             |
-| 冻结导入计划         | 完成   | Review 生成 frozen plan，Commit 读取同一 frozen summary。                       |
+| 复核与锁定导入计划 | 完成   | Review 先持久化可编辑 draft；锁定时才生成 hash 并转为 frozen，Commit 只读。 |
 | 正式入库             | 完成   | staging、逐文件校验、发布目录、DB 确认、源图集归档。                            |
 | 中断恢复             | 完成   | 文件事务和 recovery 路径已实现并有测试覆盖。                                    |
 | 挂载共享目录能力判断 | 完成   | 支持能力探测、保守发布策略、断连恢复路径。                                      |

@@ -351,7 +351,7 @@ test('keeps the dashboard-selected review run when a newer second run exists', a
 
   fireEvent.click(await screen.findByRole('button', { name: '继续审核' }));
 
-  expect(await screen.findByRole('heading', { name: '审核' })).toBeInTheDocument();
+  expect(await screen.findByRole('heading', { name: '入库计划已锁定' })).toBeInTheDocument();
   await waitFor(() => expect(mockState.requestedReviewRunIds).toContain('run-older-a'));
   expect(mockState.requestedReviewRunIds).not.toContain('run-newer-b');
 });

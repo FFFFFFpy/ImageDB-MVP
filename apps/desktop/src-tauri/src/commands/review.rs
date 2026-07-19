@@ -243,6 +243,32 @@ pub(crate) async fn get_frozen_import_plan_summary_for_state(
     result
 }
 
+/// Read the persisted editable draft shown by the manual plan-review page.
+/// Drafts carry no plan hash and cannot be committed.
+#[tauri::command]
+pub async fn get_import_plan_draft_summary(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<Option<ImportPlan>, String> {
+    get_import_plan_draft_summary_for_state(&state, import_run_id).await
+}
+
+pub(crate) async fn get_import_plan_draft_summary_for_state(
+    state: &AppState,
+    import_run_id: String,
+) -> Result<Option<ImportPlan>, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::get_draft_plan_summary(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
 /// Abandon the entire frozen import workflow only while it is still before
 /// transaction prewrite. The service owns the row lock and safety checks.
 #[tauri::command]

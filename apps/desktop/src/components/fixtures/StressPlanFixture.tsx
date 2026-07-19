@@ -7,7 +7,7 @@ import { createLargeImportPlanFixture } from './importPlanFixture';
 
 export function StressPlanFixture() {
   const { plan, client } = useMemo(() => {
-    const stressPlan = createLargeImportPlanFixture();
+    const stressPlan = { ...createLargeImportPlanFixture(), plan_hash: null };
     const progress: ReviewProgress = {
       import_run_id: stressPlan.import_run_id,
       total_review_groups: 10_000,
@@ -21,7 +21,7 @@ export function StressPlanFixture() {
     queryClient.setQueryData(['reviewQueue', stressPlan.import_run_id], []);
     queryClient.setQueryData(['reviewProgress', stressPlan.import_run_id], progress);
     queryClient.setQueryData(
-      ['reviewFrozenImportPlanSummary', stressPlan.import_run_id],
+      ['reviewImportPlanDraftSummary', stressPlan.import_run_id],
       stressPlan,
     );
     queryClient.setQueryData(['database-info-dashboard'], {

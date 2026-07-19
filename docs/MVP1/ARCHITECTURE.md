@@ -51,7 +51,7 @@ Filesystem
 | Onboarding | 初始化托管数据库或连接外部 PostgreSQL。    |
 | Dashboard  | 展示数据库状态和导入入口。                 |
 | Scan       | 选择源目录、验证图集、启动扫描、展示进度。 |
-| Review     | 审核候选、生成 / 冻结导入计划。            |
+| Review     | 审核候选、复核 draft 计划、显式锁定 frozen plan。 |
 | Commit     | 展示 frozen plan summary，执行正式入库。   |
 | Recovery   | 扫描并恢复未完成文件事务。                 |
 | Settings   | 数据库模式、图库根目录、诊断相关设置。     |
@@ -138,7 +138,7 @@ Filesystem
 - 不确定候选：进入审核队列。
 - 历史图库只参与比较，不在导入分析阶段被修改。
 - 完整被覆盖图集：入库计划阶段可跳过被覆盖图集，保留完整图集或超集图集。
-- 用户审核后生成 frozen import plan。
+- 用户审核后先生成可编辑 draft import plan，复核完成后再显式锁定。
 
 ## 8. Frozen Import Plan
 
@@ -149,7 +149,9 @@ MVP1 中，Commit 不再临场重算计划。
 ```text
 Scan
 → Review
-→ freezeImportPlan
+→ generateImportPlan（持久化 draft，不生成 hash）
+→ 人工调整图集 / 图片的导入或跳过
+→ freezeImportPlan（锁定当前 draft）
 → import_plans / import_plan_albums / import_plan_images
 → plan_hash
 → Commit 读取 frozen summary
@@ -158,7 +160,8 @@ Scan
 
 关键规则：
 
-- Review 页负责生成 / 冻结计划。
+- Review 页先生成并人工复核 draft；每次导入 / 跳过切换只更新 draft，不计算 hash。
+- 用户显式“锁定导入计划”时才计算 `plan_hash` 并将计划转为 frozen。
 - Commit 页只读取 frozen plan summary。
 - Commit service 读取同一 frozen plan。
 - post-freeze 的候选 / 审核变化不能改变 commit set。

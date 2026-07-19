@@ -150,6 +150,10 @@
   background: var(--color-canvas);
 }
 
+.app-main--review {
+  overflow: visible;
+}
+
 @media (max-width: 959px) {
   .app-shell {
     grid-template-columns: 72px minmax(0, 1fr);

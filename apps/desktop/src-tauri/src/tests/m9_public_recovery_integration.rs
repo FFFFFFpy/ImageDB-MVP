@@ -244,6 +244,10 @@ impl PublicRecoveryFixture {
                 .await
                 .unwrap();
         assert_eq!(plan.kept_images.len(), 1);
+        assert!(plan.plan_hash.is_none());
+        crate::commands::freeze_import_plan_for_state(&app_state, import_run_id.to_string())
+            .await
+            .unwrap();
 
         Self {
             _tmp: tmp,

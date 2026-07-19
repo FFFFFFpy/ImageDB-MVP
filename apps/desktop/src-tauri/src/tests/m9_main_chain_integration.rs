@@ -89,6 +89,29 @@ async fn m9_public_command_main_chain_first_run_to_completed_import() {
     assert_eq!(plan.total_images, 2);
     assert_eq!(plan.excluded_count, 1);
     assert_eq!(plan.kept_images.len(), 1);
+    assert!(plan.plan_hash.is_none());
+
+    let no_frozen_summary = crate::commands::get_frozen_import_plan_summary_for_state(
+        &app_state,
+        import_run_id.to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(no_frozen_summary.is_none());
+    let draft = crate::commands::get_import_plan_draft_summary_for_state(
+        &app_state,
+        import_run_id.to_string(),
+    )
+    .await
+    .unwrap()
+    .expect("generated draft must be reloadable before freeze");
+    assert!(draft.plan_hash.is_none());
+
+    let frozen_plan =
+        crate::commands::freeze_import_plan_for_state(&app_state, import_run_id.to_string())
+            .await
+            .unwrap();
+    assert!(frozen_plan.plan_hash.is_some());
 
     let latest_committable =
         crate::commands::get_latest_committable_import_run_for_state(&app_state)
@@ -103,7 +126,7 @@ async fn m9_public_command_main_chain_first_run_to_completed_import() {
     let frozen = ImportRepository::load_frozen_plan(&client, import_run_id)
         .await
         .unwrap()
-        .expect("generate_import_plan must freeze the command-visible plan");
+        .expect("freeze_import_plan must lock the reviewed draft");
     assert_eq!(frozen.albums.len(), 1);
     assert_eq!(frozen.albums[0].1.len(), 1);
     drop(client);
@@ -460,6 +483,10 @@ async fn m9_freeze_plan_idempotent_and_summary_matches_commit_set() {
     );
     let import_run_id = uuid::Uuid::parse_str(scan.import_run_id.as_deref().unwrap()).unwrap();
 
+    crate::commands::generate_import_plan_for_state(&app_state, import_run_id.to_string())
+        .await
+        .unwrap();
+
     // First freeze.
     let first =
         crate::commands::freeze_import_plan_for_state(&app_state, import_run_id.to_string())
@@ -579,6 +606,9 @@ async fn m9_committable_run_prefers_ready_over_old_completed() {
         .unwrap();
     let scan_a = wait_for_scan_terminal(&app_state).await;
     let run_a = uuid::Uuid::parse_str(scan_a.import_run_id.as_deref().unwrap()).unwrap();
+    crate::commands::generate_import_plan_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
     crate::commands::freeze_import_plan_for_state(&app_state, run_a.to_string())
         .await
         .unwrap();
@@ -597,6 +627,9 @@ async fn m9_committable_run_prefers_ready_over_old_completed() {
         .unwrap();
     let scan_b = wait_for_scan_terminal(&app_state).await;
     let run_b = uuid::Uuid::parse_str(scan_b.import_run_id.as_deref().unwrap()).unwrap();
+    crate::commands::generate_import_plan_for_state(&app_state, run_b.to_string())
+        .await
+        .unwrap();
     crate::commands::freeze_import_plan_for_state(&app_state, run_b.to_string())
         .await
         .unwrap();

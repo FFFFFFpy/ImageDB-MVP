@@ -784,45 +784,30 @@ pub async fn generate_import_plan(
     client: &Client,
     import_run_id: Uuid,
 ) -> Result<ImportPlan, AppError> {
-    // `freeze_import_plan` owns both the undecided-review guard and the
-    // idempotent frozen-plan fast path. Keeping a single gate matters after
-    // Commit advances the run: a second Generate request must return the
-    // persisted projection instead of re-evaluating mutable review rows.
-    freeze_import_plan(client, import_run_id).await
-}
-
-/// Freeze the import plan for a run in a single database transaction. Reads
-/// the current review/candidate state, builds the plan, writes the three
-/// plan tables + plan_hash + plan state `frozen`, and advances the run to
-/// `ready_to_commit` — all atomically. Idempotent: a second call with an
-/// existing frozen plan reuses it without rewriting rows. This is the
-/// `freeze_import_plan` IPC entry point and the public main-chain freeze.
-pub async fn freeze_import_plan(
-    client: &Client,
-    import_run_id: Uuid,
-) -> Result<ImportPlan, AppError> {
     client
         .batch_execute("BEGIN")
         .await
-        .map_err(|e| AppError::Internal(format!("failed to begin plan freeze: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to begin plan generation: {e}")))?;
 
     let result = async {
-        // The run row is the serialization point shared by Freeze, plan
-        // editors, summary readers, and Commit. Re-check the idempotent path
-        // only after taking it so a concurrent freeze/edit cannot interleave
-        // the summary's multiple reads.
         lock_import_run_for_plan_access(client, import_run_id).await?;
         if let Some(existing) =
             ImportRepository::load_frozen_plan_summary(client, import_run_id).await?
         {
             return Ok(existing);
         }
+        if let Some(existing) =
+            ImportRepository::load_draft_plan_summary(client, import_run_id).await?
+        {
+            return Ok(existing);
+        }
 
         // Async review may expose candidates while the rest of the run is
-        // still being analyzed. Never let that transiently-empty review queue
-        // create a partial commit set.
+        // still being analyzed. Never create a partial draft from that
+        // transient state.
         let import_run = require_freezable_import_run(client, import_run_id).await?;
-        let candidate_count = ImportRepository::count_duplicates_for_run(client, import_run_id).await?;
+        let candidate_count =
+            ImportRepository::count_duplicates_for_run(client, import_run_id).await?;
         if candidate_count > 0
             && !ImportRepository::has_review_groups(client, import_run_id).await?
         {
@@ -835,7 +820,7 @@ pub async fn freeze_import_plan(
         let remaining = progress.total.saturating_sub(progress.decided);
         if remaining > 0 {
             return Err(AppError::Internal(format!(
-                "cannot freeze import plan while {remaining} review groups remain unresolved"
+                "cannot generate import plan while {remaining} review groups remain unresolved"
             )));
         }
         let invalid_group = client
@@ -851,10 +836,12 @@ pub async fn freeze_import_plan(
                 &[&import_run_id],
             )
             .await
-            .map_err(|e| AppError::Internal(format!("failed to validate review group selections: {e}")))?;
+            .map_err(|e| {
+                AppError::Internal(format!("failed to validate review group selections: {e}"))
+            })?;
         if let Some(row) = invalid_group {
             return Err(AppError::Internal(format!(
-                "review group {} has no kept member; refusing to freeze the plan",
+                "review group {} has no kept member; refusing to generate the plan",
                 row.get::<_, Uuid>("id")
             )));
         }
@@ -887,21 +874,90 @@ pub async fn freeze_import_plan(
             }
         }
 
-        // Compute the hash from the same draft shape Commit validates, then
-        // write and re-read the frozen projection before releasing the lock.
-        let draft =
-            synthesize_draft_for_hash(import_run_id, &import_run, &albums, &kept_images_by_album);
-        let plan_hash = crate::services::commit_service::compute_plan_hash(&draft)?;
-        ImportRepository::write_frozen_import_plan_in_transaction(
+        ImportRepository::write_draft_import_plan_in_transaction(
             client,
             import_run_id,
             &albums,
             &kept_images_by_album,
             &import_run.policy_version,
             import_run.library_root_id,
-            &plan_hash,
         )
         .await?;
+
+        ImportRepository::load_draft_plan_summary(client, import_run_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "generation did not produce a draft plan for run {import_run_id}"
+                ))
+            })
+    }
+    .await;
+
+    finish_plan_transaction(client, result, "plan generation").await
+}
+
+/// Freeze the reviewed draft in a single transaction. No review rows are
+/// re-read here: the exact draft the user reviewed receives its hash and is
+/// transitioned to `frozen`, after which plan editors reject further changes.
+pub async fn freeze_import_plan(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<ImportPlan, AppError> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin plan freeze: {e}")))?;
+
+    let result = async {
+        // The run row is the serialization point shared by Freeze, plan
+        // editors, summary readers, and Commit. Re-check the idempotent path
+        // only after taking it so a concurrent freeze/edit cannot interleave
+        // the summary's multiple reads.
+        lock_import_run_for_plan_access(client, import_run_id).await?;
+        if let Some(existing) =
+            ImportRepository::load_frozen_plan_summary(client, import_run_id).await?
+        {
+            return Ok(existing);
+        }
+
+        require_freezable_import_run(client, import_run_id).await?;
+        let draft = ImportRepository::load_draft_plan(client, import_run_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "cannot freeze import plan before generating and reviewing its draft"
+                        .to_string(),
+                )
+            })?;
+        if draft.albums.iter().all(|(_, images)| images.is_empty()) {
+            return Err(AppError::Internal(
+                "cannot freeze an import plan with no included images".to_string(),
+            ));
+        }
+        for (album, _) in &draft.albums {
+            refresh_plan_album_count(client, album.plan_album_id).await?;
+        }
+        let draft = ImportRepository::load_draft_plan(client, import_run_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal("draft plan disappeared during freeze".to_string())
+            })?;
+        let plan_hash = crate::services::commit_service::compute_plan_hash(&draft)?;
+        ImportRepository::set_plan_hash(client, draft.plan_id, &plan_hash).await?;
+        ImportRepository::update_import_plan_state(client, draft.plan_id, &PlanState::Frozen)
+            .await?;
+        let run = ImportRepository::get_import_run_by_id(client, import_run_id)
+            .await?
+            .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+        if run.state != ImportRunState::ReadyToCommit.to_string() {
+            ImportRepository::update_import_run_state(
+                client,
+                import_run_id,
+                &ImportRunState::ReadyToCommit,
+            )
+            .await?;
+        }
 
         ImportRepository::load_frozen_plan_summary(client, import_run_id)
             .await?
@@ -1000,6 +1056,24 @@ pub async fn get_frozen_plan_summary(
     finish_plan_transaction(client, result, "frozen plan read").await
 }
 
+/// Read the editable plan draft used by the manual plan-review page. Drafts
+/// never carry a plan hash and are never eligible for Commit.
+pub async fn get_draft_plan_summary(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<Option<ImportPlan>, AppError> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin draft plan read: {e}")))?;
+    let result = async {
+        lock_import_run_for_plan_access(client, import_run_id).await?;
+        ImportRepository::load_draft_plan_summary(client, import_run_id).await
+    }
+    .await;
+    finish_plan_transaction(client, result, "draft plan read").await
+}
+
 /// Abandon the entire pending import workflow before any file transaction has
 /// been created.
 ///
@@ -1018,9 +1092,14 @@ pub async fn abandon_frozen_import_workflow(
         .map_err(|e| AppError::Internal(format!("failed to begin workflow abandon: {e}")))?;
 
     let result = async {
-        let run_state =
-            ensure_plan_mutation_allowed(client, import_run_id, "abandon import workflow").await?;
-        let frozen = require_frozen_plan(client, import_run_id).await?;
+        let run_state = ensure_workflow_abandon_allowed(client, import_run_id).await?;
+        let plan = if let Some(frozen) =
+            ImportRepository::load_frozen_plan(client, import_run_id).await?
+        {
+            frozen
+        } else {
+            require_draft_plan(client, import_run_id).await?
+        };
         let next =
             crate::domain::state_machine::next_import_run_state(&run_state, "abandon_workflow")?;
         let next_state = ImportRunState::from_str_opt(next).ok_or_else(|| {
@@ -1029,7 +1108,7 @@ pub async fn abandon_frozen_import_workflow(
             ))
         })?;
 
-        ImportRepository::update_import_plan_state(client, frozen.plan_id, &PlanState::Invalidated)
+        ImportRepository::update_import_plan_state(client, plan.plan_id, &PlanState::Invalidated)
             .await?;
         ImportRepository::update_import_run_state(client, import_run_id, &next_state).await?;
 
@@ -1053,26 +1132,26 @@ pub async fn set_plan_album_included(
 
     let result = async {
         ensure_plan_mutation_allowed(client, import_run_id, "edit import plan").await?;
-        let frozen = require_frozen_plan(client, import_run_id).await?;
+        let draft = require_draft_plan(client, import_run_id).await?;
         if included {
-            include_album_images(client, frozen.plan_id, album_id).await?;
+            include_album_images(client, draft.plan_id, album_id).await?;
         } else {
             client
                 .execute(
                     "DELETE FROM import_plan_albums WHERE plan_id = $1 AND import_album_id = $2",
-                    &[&frozen.plan_id, &album_id],
+                    &[&draft.plan_id, &album_id],
                 )
                 .await
                 .map_err(|e| AppError::Internal(format!("failed to skip plan album: {e}")))?;
         }
-        refresh_plan_hash(client, import_run_id).await
+        Ok(())
     }
     .await;
 
     finish_plan_edit_transaction(client, result).await?;
-    get_frozen_plan_summary(client, import_run_id)
+    get_draft_plan_summary(client, import_run_id)
         .await?
-        .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
+        .ok_or_else(|| AppError::Internal(format!("draft plan {import_run_id} not found")))
 }
 
 pub async fn set_plan_image_included(
@@ -1089,29 +1168,29 @@ pub async fn set_plan_image_included(
 
     let result = async {
         ensure_plan_mutation_allowed(client, import_run_id, "edit import plan").await?;
-        let frozen = require_frozen_plan(client, import_run_id).await?;
+        let draft = require_draft_plan(client, import_run_id).await?;
         if included {
-            include_image_in_album(client, frozen.plan_id, image_id, target_album_id).await?;
+            include_image_in_album(client, draft.plan_id, image_id, target_album_id).await?;
         } else {
             client
                 .execute(
                     "DELETE FROM import_plan_images WHERE import_image_id = $1 AND plan_album_id IN (
                         SELECT id FROM import_plan_albums WHERE plan_id = $2
                     )",
-                    &[&image_id, &frozen.plan_id],
+                    &[&image_id, &draft.plan_id],
                 )
                 .await
                 .map_err(|e| AppError::Internal(format!("failed to skip plan image: {e}")))?;
-            delete_empty_plan_albums(client, frozen.plan_id).await?;
+            delete_empty_plan_albums(client, draft.plan_id).await?;
         }
-        refresh_plan_hash(client, import_run_id).await
+        Ok(())
     }
     .await;
 
     finish_plan_edit_transaction(client, result).await?;
-    get_frozen_plan_summary(client, import_run_id)
+    get_draft_plan_summary(client, import_run_id)
         .await?
-        .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
+        .ok_or_else(|| AppError::Internal(format!("draft plan {import_run_id} not found")))
 }
 
 pub async fn set_plan_source_file_mode(
@@ -1126,22 +1205,22 @@ pub async fn set_plan_source_file_mode(
 
     let result = async {
         ensure_plan_mutation_allowed(client, import_run_id, "change source file mode").await?;
-        let frozen = require_frozen_plan(client, import_run_id).await?;
+        let draft = require_draft_plan(client, import_run_id).await?;
         client
             .execute(
                 "UPDATE import_plans SET source_file_mode = $1 WHERE id = $2",
-                &[&source_file_mode.to_string(), &frozen.plan_id],
+                &[&source_file_mode.to_string(), &draft.plan_id],
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to update source file mode: {e}")))?;
-        refresh_plan_hash(client, import_run_id).await
+        Ok(())
     }
     .await;
 
     finish_plan_edit_transaction(client, result).await?;
-    get_frozen_plan_summary(client, import_run_id)
+    get_draft_plan_summary(client, import_run_id)
         .await?
-        .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))
+        .ok_or_else(|| AppError::Internal(format!("draft plan {import_run_id} not found")))
 }
 
 async fn ensure_plan_mutation_allowed(
@@ -1161,7 +1240,7 @@ async fn ensure_plan_mutation_allowed(
         .map_err(|e| AppError::Internal(format!("failed to lock import run to {operation}: {e}")))?
         .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
     let run_state: String = row.get("state");
-    if !matches!(run_state.as_str(), "ready_to_commit" | "cancelled") {
+    if !matches!(run_state.as_str(), "review_required" | "ready_to_commit") {
         return Err(AppError::Internal(format!(
             "cannot {operation} while run is in state '{run_state}'"
         )));
@@ -1180,23 +1259,62 @@ async fn ensure_plan_mutation_allowed(
             "cannot {operation} after commit transactions have been created"
         )));
     }
-    require_frozen_plan(client, import_run_id).await?;
+    require_draft_plan(client, import_run_id).await?;
     Ok(run_state)
 }
 
-async fn require_frozen_plan(
+async fn ensure_workflow_abandon_allowed(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<String, AppError> {
+    let row = client
+        .query_opt(
+            "SELECT state FROM import_runs WHERE id = $1 FOR UPDATE",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "failed to lock import run to abandon workflow: {e}"
+            ))
+        })?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    let run_state: String = row.get("state");
+    if !matches!(run_state.as_str(), "ready_to_commit" | "cancelled") {
+        return Err(AppError::Internal(format!(
+            "cannot abandon import workflow while run is in state '{run_state}'"
+        )));
+    }
+    let active_transactions: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to check plan transactions: {e}")))?
+        .get(0);
+    if active_transactions > 0 {
+        return Err(AppError::Internal(
+            "cannot abandon import workflow after commit transactions have been created"
+                .to_string(),
+        ));
+    }
+    Ok(run_state)
+}
+
+async fn require_draft_plan(
     client: &Client,
     import_run_id: Uuid,
 ) -> Result<crate::repositories::import_repository::FrozenPlanRow, AppError> {
-    let frozen = ImportRepository::load_frozen_plan(client, import_run_id)
+    let draft = ImportRepository::load_draft_plan(client, import_run_id)
         .await?
-        .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))?;
-    if frozen.plan_state != PlanState::Frozen.to_string() {
+        .ok_or_else(|| AppError::Internal(format!("draft plan {import_run_id} not found")))?;
+    if draft.plan_state != PlanState::Draft.to_string() {
         return Err(AppError::Internal(format!(
-            "plan for run {import_run_id} is not frozen"
+            "plan for run {import_run_id} is not an editable draft"
         )));
     }
-    Ok(frozen)
+    Ok(draft)
 }
 
 async fn include_album_images(
@@ -1354,16 +1472,6 @@ async fn delete_empty_plan_albums(client: &Client, plan_id: Uuid) -> Result<(), 
     Ok(())
 }
 
-async fn refresh_plan_hash(client: &Client, import_run_id: Uuid) -> Result<(), AppError> {
-    let frozen = require_frozen_plan(client, import_run_id).await?;
-    for (album, _) in &frozen.albums {
-        refresh_plan_album_count(client, album.plan_album_id).await?;
-    }
-    let refreshed = require_frozen_plan(client, import_run_id).await?;
-    let plan_hash = crate::services::commit_service::compute_plan_hash(&refreshed)?;
-    ImportRepository::set_plan_hash(client, refreshed.plan_id, &plan_hash).await
-}
-
 async fn finish_plan_edit_transaction(
     client: &Client,
     result: Result<(), AppError>,
@@ -1388,70 +1496,6 @@ async fn finish_plan_transaction<T>(
             let _ = client.batch_execute("ROLLBACK").await;
             Err(e)
         }
-    }
-}
-
-/// Build a transient `FrozenPlanRow` purely to compute the plan hash with
-/// the same `compute_plan_hash` the commit pipeline uses for validation.
-/// This keeps the freeze-time hash and commit-time validation identical
-/// without persisting a draft first.
-fn synthesize_draft_for_hash(
-    import_run_id: Uuid,
-    import_run: &crate::repositories::import_repository::ImportRunRecord,
-    albums: &[AlbumRow],
-    kept_images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
-) -> crate::repositories::import_repository::FrozenPlanRow {
-    use crate::repositories::import_repository::{PlanAlbumRow, PlanImageRow};
-
-    let plan_id = Uuid::nil();
-    let mut album_rows: Vec<(PlanAlbumRow, Vec<PlanImageRow>)> = Vec::new();
-    for album in albums {
-        let Some(images) = kept_images_by_album.get(&album.id) else {
-            continue;
-        };
-        if images.is_empty() {
-            continue;
-        }
-        let plan_album_id = Uuid::nil();
-        let plan_album = PlanAlbumRow {
-            plan_album_id,
-            import_album_id: album.id,
-            target_relative_path: album.source_name.clone(),
-            expected_image_count: images.len() as i32,
-            album_plan_hash: None,
-        };
-        let mut plan_images: Vec<PlanImageRow> = Vec::new();
-        for img in images {
-            let target_relative_path =
-                target_relative_path_for_album(&album.source_name, &img.relative_path)
-                    .unwrap_or_else(|_| img.relative_path.clone());
-            let expected_blake3 = img.blake3.clone().unwrap_or_default();
-            plan_images.push(PlanImageRow {
-                id: Uuid::nil(),
-                plan_album_id,
-                import_image_id: img.id,
-                source_path: img.source_path.clone(),
-                source_relative_path: img.relative_path.clone(),
-                target_relative_path,
-                expected_file_size: img.file_size,
-                expected_blake3,
-                width: img.width,
-                height: img.height,
-                format: img.format.clone(),
-            });
-        }
-        album_rows.push((plan_album, plan_images));
-    }
-
-    crate::repositories::import_repository::FrozenPlanRow {
-        plan_id,
-        import_run_id,
-        library_root_id: import_run.library_root_id,
-        plan_state: PlanState::Draft.to_string(),
-        plan_hash: None,
-        policy_version: import_run.policy_version.clone(),
-        source_file_mode: SourceFileMode::CopyAndArchive,
-        albums: album_rows,
     }
 }
 
@@ -1482,7 +1526,7 @@ fn target_relative_path_for_album(
     crate::services::commit_service::normalize_relative_path(rel)
 }
 
-/// Build the initial frozen plan exclusively from persisted group-member
+/// Build the initial draft plan exclusively from persisted group-member
 /// final actions. Candidate-edge decisions are evidence only and never enter
 /// this calculation.
 pub fn build_import_plan_from_group_actions(
@@ -3299,8 +3343,11 @@ mod tests {
         drop(freeze_client_b);
         freeze_handle_a.abort();
         freeze_handle_b.abort();
-        let plan = plan_a.expect("first concurrent freeze must succeed");
-        let concurrent_plan = plan_b.expect("second concurrent freeze must reuse the frozen plan");
+        let plan = plan_a.expect("first concurrent generation must succeed");
+        let concurrent_plan =
+            plan_b.expect("second concurrent generation must reuse the draft plan");
+        assert!(plan.plan_hash.is_none());
+        assert!(concurrent_plan.plan_hash.is_none());
         assert_eq!(concurrent_plan.total_images, plan.total_images);
         assert_eq!(concurrent_plan.excluded_count, plan.excluded_count);
         assert_eq!(concurrent_plan.kept_images, plan.kept_images);
@@ -3314,7 +3361,7 @@ mod tests {
             .get(0);
         assert_eq!(
             frozen_plan_count, 1,
-            "concurrent freeze calls must persist exactly one plan"
+            "concurrent generation calls must persist exactly one draft plan"
         );
         assert_eq!(plan.total_images, 4);
         assert!(
@@ -3335,10 +3382,41 @@ mod tests {
             .any(|image| image.album_id == album_b_id.to_string()));
         assert_eq!(plan.excluded_count, 0);
 
+        let reloaded_draft = get_draft_plan_summary(&client, import_run_id)
+            .await
+            .unwrap()
+            .expect("generated draft must be reloadable");
+        assert!(reloaded_draft.plan_hash.is_none());
+        assert_eq!(reloaded_draft.total_images, plan.total_images);
+        assert_eq!(reloaded_draft.excluded_count, plan.excluded_count);
+        assert_eq!(reloaded_draft.kept_images, plan.kept_images);
+
+        let edited_draft = set_plan_source_file_mode(
+            &client,
+            import_run_id,
+            SourceFileMode::MoveSelectedWithoutBackup,
+        )
+        .await
+        .expect("draft source mode must remain editable before freeze");
+        assert!(edited_draft.plan_hash.is_none());
+        assert_eq!(
+            edited_draft.source_file_mode,
+            SourceFileMode::MoveSelectedWithoutBackup
+        );
+
+        let plan = freeze_import_plan(&client, import_run_id)
+            .await
+            .expect("reviewed draft must freeze");
+        assert!(plan.plan_hash.is_some());
+        let locked_edit =
+            set_plan_source_file_mode(&client, import_run_id, SourceFileMode::CopyAndArchive)
+                .await
+                .expect_err("a frozen plan must reject further edits");
+        assert!(locked_edit.to_string().contains("draft plan"));
         let reloaded_plan = get_frozen_plan_summary(&client, import_run_id)
             .await
             .unwrap()
-            .expect("generated plan must be reloadable");
+            .expect("frozen plan must be reloadable");
         assert_eq!(reloaded_plan.total_images, plan.total_images);
         assert_eq!(reloaded_plan.excluded_count, plan.excluded_count);
         assert_eq!(reloaded_plan.kept_images, plan.kept_images);

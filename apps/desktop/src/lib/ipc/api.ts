@@ -154,6 +154,9 @@ export const api = {
   getFrozenImportPlanSummary: (importRunId: string) =>
     invoke<ImportPlan | null>('get_frozen_import_plan_summary', { importRunId }),
 
+  getImportPlanDraftSummary: (importRunId: string) =>
+    invoke<ImportPlan | null>('get_import_plan_draft_summary', { importRunId }),
+
   abandonFrozenImportWorkflow: (importRunId: string) =>
     invoke<void>('abandon_frozen_import_workflow', { importRunId }),
 

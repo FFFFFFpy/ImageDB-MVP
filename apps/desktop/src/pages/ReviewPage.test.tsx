@@ -51,8 +51,8 @@ const detail: ReviewGroupDetail = {
       relative_path: 'a.jpg',
       album_name: '来源图集',
       file_size: 100,
-      width: 100,
-      height: 80,
+      width: 4480,
+      height: 6720,
       format: 'jpeg',
     },
     {
@@ -152,6 +152,7 @@ function setupReviewMocks(
   vi.spyOn(api, 'getReviewProgress').mockResolvedValue(reviewProgress);
   vi.spyOn(api, 'getReviewGroupDetail').mockResolvedValue(groupDetail);
   vi.spyOn(api, 'getFrozenImportPlanSummary').mockResolvedValue(null);
+  vi.spyOn(api, 'getImportPlanDraftSummary').mockResolvedValue(null);
   vi.spyOn(api, 'getReviewGroupMemberPreview').mockResolvedValue({
     data_url: 'data:image/png;base64,AA==',
   });
@@ -209,9 +210,15 @@ test('renders every group member and submits one action for every import member'
   renderReview();
 
   await screen.findByText('4 张关联图片');
-  expect(screen.getByText('Albums/existing/a.jpg')).toBeInTheDocument();
+  expect(screen.getByTitle('Albums/existing/a.jpg')).toBeInTheDocument();
+  const groupHeading = document.querySelector('.review-group-heading') as HTMLElement;
+  expect(within(groupHeading).getByRole('button', { name: '保存整组决定' })).toBeInTheDocument();
+  expect(within(groupHeading).getByText('保留 4 张 · 排除 0 张')).toBeInTheDocument();
   const cards = document.querySelectorAll('.review-group-member');
   expect(cards).toHaveLength(4);
+  expect(within(cards[0] as HTMLElement).getByRole('button', { name: '查看 a.jpg' })).toHaveStyle({
+    aspectRatio: '4480 / 6720',
+  });
 
   fireEvent.click(within(cards[0] as HTMLElement).getByRole('button', { name: '排除' }));
   expect(cards[0]).toHaveClass('review-group-member--exclude');
@@ -227,6 +234,27 @@ test('renders every group member and submits one action for every import member'
   );
 });
 
+test('restores complete image metadata and fingerprint evidence for group review', async () => {
+  setupReviewMocks();
+  renderReview();
+
+  await screen.findByText('4 张关联图片');
+  const cards = document.querySelectorAll('.review-group-member');
+  fireEvent.click(within(cards[0] as HTMLElement).getByText('查看完整图片信息'));
+  expect(within(cards[0] as HTMLElement).getByText('D:/source/a.jpg')).toBeInTheDocument();
+  expect(within(cards[0] as HTMLElement).getByText('import-a')).toBeInTheDocument();
+  expect(within(cards[0] as HTMLElement).getByText('系统默认')).toBeInTheDocument();
+
+  expect(screen.getByText('感知近似')).toBeInTheDocument();
+  expect(screen.getByText('跨图集')).toBeInTheDocument();
+  expect(screen.getByText('需人工审核')).toBeInTheDocument();
+  expect(screen.getByText('96.0%')).toBeInTheDocument();
+  expect(screen.getByText('原方向')).toBeInTheDocument();
+  expect(screen.getByText('3 / 256（差异 1.0%）')).toBeInTheDocument();
+  expect(screen.getByText('6 / 544（差异 1.0%）')).toBeInTheDocument();
+  expect(screen.getByText('edge-a')).toBeInTheDocument();
+});
+
 test('allows a resolved group draft to be adjusted until the plan is frozen', async () => {
   const resolvedDetail = { ...detail, state: 'resolved' as const };
   const resolvedGroups = [{ ...groups[0], state: 'resolved' as const }];
@@ -240,12 +268,15 @@ test('allows a resolved group draft to be adjusted until the plan is frozen', as
   expect(
     await screen.findByText('该审核组已有已保存草稿；冻结导入计划前仍可继续调整。'),
   ).toBeInTheDocument();
+  const groupHeading = document.querySelector('.review-group-heading') as HTMLElement;
+  expect(within(groupHeading).getByText('草稿已保存')).toBeInTheDocument();
   const cards = document.querySelectorAll('.review-group-member');
   for (const card of Array.from(cards).slice(0, 3)) {
     expect(within(card as HTMLElement).getByRole('button', { name: '保留' })).toBeEnabled();
     expect(within(card as HTMLElement).getByRole('button', { name: '排除' })).toBeEnabled();
   }
   fireEvent.click(within(cards[0] as HTMLElement).getByRole('button', { name: '排除' }));
+  expect(within(groupHeading).getByText('有未保存修改')).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: '更新整组决定' }));
   await waitFor(() => expect(api.submitReviewGroupDecision).toHaveBeenCalledTimes(1));
 });
@@ -278,21 +309,50 @@ test('keeps resolved answers as drafts while analysis is still incomplete', asyn
   renderReview({ onNavigate });
 
   expect(await screen.findByText('当前审核答案已保存，分析尚未完成')).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: '生成并冻结导入计划' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '生成人工复核入库计划' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: '继续分析' }));
   expect(onNavigate).toHaveBeenCalledWith('scan');
 });
 
-test('shows frozen source mode as an explicit, default-off destructive toggle', async () => {
-  const movedPlan = {
-    ...importPlanFixture,
+test('generates an editable draft before the plan can be locked', async () => {
+  const resolvedDetail = { ...detail, state: 'resolved' as const };
+  const resolvedGroups = [{ ...groups[0], state: 'resolved' as const }];
+  setupReviewMocks(
+    resolvedDetail,
+    resolvedGroups,
+    progress({ resolved_count: 1, remaining_count: 0, all_decided: true }),
+  );
+  const draftPlan = { ...importPlanFixture, plan_hash: null };
+  vi.spyOn(api, 'generateImportPlan').mockResolvedValue(draftPlan);
+  renderReview();
+
+  fireEvent.click(await screen.findByRole('button', { name: '生成人工复核入库计划' }));
+
+  expect(await screen.findByRole('heading', { name: '人工复核入库计划' })).toBeVisible();
+  expect(screen.getByText('尚未锁定')).toBeVisible();
+  expect(screen.getAllByRole('button', { name: '锁定入库计划' })[0]).toBeEnabled();
+  expect(draftPlan.plan_hash).toBeNull();
+});
+
+test('edits the draft without a hash and creates the hash only when locking', async () => {
+  const draftPlan = { ...importPlanFixture, plan_hash: null };
+  const editedDraft = {
+    ...draftPlan,
     source_file_mode: 'move_selected_without_backup' as const,
   };
-  vi.spyOn(api, 'setImportPlanSourceFileMode').mockResolvedValue(movedPlan);
-  renderReview({ initialPlan: importPlanFixture, initialShowPlan: true });
+  const frozenPlan = { ...editedDraft, plan_hash: 'locked-plan-hash' };
+  vi.spyOn(api, 'setImportPlanSourceFileMode').mockResolvedValue(editedDraft);
+  vi.spyOn(api, 'freezeImportPlan').mockResolvedValue(frozenPlan);
+  const onGoCommit = vi.fn();
+  renderReview({
+    initialImportRunId: draftPlan.import_run_id,
+    initialPlan: draftPlan,
+    initialShowPlan: true,
+    onGoCommit,
+  });
 
   const toggle = screen.getByRole('checkbox', { name: '移动已选源图片（无备份）' });
-  expect(toggle).not.toBeChecked();
+  expect(toggle).toBeEnabled();
   fireEvent.click(toggle);
   await waitFor(() =>
     expect(api.setImportPlanSourceFileMode).toHaveBeenCalledWith(
@@ -300,7 +360,23 @@ test('shows frozen source mode as an explicit, default-off destructive toggle', 
       'move_selected_without_backup',
     ),
   );
-  expect(await screen.findByText('不可撤销的源文件操作')).toBeInTheDocument();
+  expect(await screen.findByText('不可撤销的源文件操作')).toBeVisible();
+  expect(screen.queryByText(/计划哈希/)).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getAllByRole('button', { name: '锁定入库计划' })[0]);
+  await waitFor(() => expect(api.freezeImportPlan).toHaveBeenCalledWith(draftPlan.import_run_id));
+  await waitFor(() => expect(onGoCommit).toHaveBeenCalledWith(draftPlan.import_run_id));
+});
+
+test('makes every plan adjustment read-only after locking', () => {
+  renderReview({ initialPlan: importPlanFixture, initialShowPlan: true });
+
+  expect(screen.getByRole('heading', { name: '入库计划已锁定' })).toBeVisible();
+  const toggle = screen.getByRole('checkbox', { name: '移动已选源图片（无备份）' });
+  expect(toggle).toBeDisabled();
+  for (const button of screen.getAllByRole('button', { name: '排除整组' })) {
+    expect(button).toBeDisabled();
+  }
 });
 
 test('invalidates group-level review workflow queries', async () => {
@@ -309,6 +385,9 @@ test('invalidates group-level review workflow queries', async () => {
   await invalidateReviewWorkflowQueries(client, runId);
   expect(invalidate).toHaveBeenCalledWith({ queryKey: ['reviewGroups', runId] });
   expect(invalidate).toHaveBeenCalledWith({ queryKey: ['reviewProgress', runId] });
+  expect(invalidate).toHaveBeenCalledWith({
+    queryKey: ['reviewImportPlanDraftSummary', runId],
+  });
 });
 
 test('shortcut guard ignores form editing and preview overlays', () => {

@@ -397,7 +397,7 @@ export function CommitPage({
                       : onNavigate('review')
                   }
                 >
-                  退回导入计划
+                  查看锁定计划
                 </Button>
                 <Button
                   variant="primary"
