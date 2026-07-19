@@ -522,7 +522,10 @@ function PlanView({
         )}
       </section>
 
-      <section className="plan-album-list" aria-label={locked ? '已锁定计划图集' : '待复核计划图集'}>
+      <section
+        className="plan-album-list"
+        aria-label={locked ? '已锁定计划图集' : '待复核计划图集'}
+      >
         {displayed.map((album) => (
           <details className="plan-album-card" key={album.albumId}>
             <summary>
@@ -611,6 +614,11 @@ export function ReviewPage({
   const planEditActive = useRef(false);
   const actionsGroupIdRef = useRef<string | null>(null);
   const actionsDirtyRef = useRef(false);
+  const reviewRefreshBoundaryRef = useRef<{
+    importRunId: string;
+    state: string;
+    analysisComplete: boolean;
+  } | null>(null);
   const [preview, setPreview] = useState<{
     member: ReviewGroupMember;
     dataUrl: string | null;
@@ -647,6 +655,14 @@ export function ReviewPage({
     enabled: !!importRunId && !showPlan,
     refetchInterval: enablePolling ? 1500 : false,
   });
+  const activeRun = runsQuery.data?.find((run) => run.import_run_id === importRunId) ?? null;
+  const analysisComplete = Boolean(
+    activeRun &&
+    activeRun.pending_albums === 0 &&
+    activeRun.analyzing_albums === 0 &&
+    activeRun.failed_albums === 0 &&
+    activeRun.analyzed_albums + activeRun.review_required_albums === activeRun.total_albums,
+  );
   const frozenQuery = useQuery({
     queryKey: ['reviewFrozenImportPlanSummary', importRunId],
     queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
@@ -690,6 +706,44 @@ export function ReviewPage({
     enabled: !!selectedGroupId && !showPlan,
   });
   useEffect(() => {
+    const currentBoundary = activeRun
+      ? {
+          importRunId: activeRun.import_run_id,
+          state: activeRun.state,
+          analysisComplete,
+        }
+      : null;
+    const previousBoundary = reviewRefreshBoundaryRef.current;
+    reviewRefreshBoundaryRef.current = currentBoundary;
+
+    if (
+      !currentBoundary ||
+      !previousBoundary ||
+      previousBoundary.importRunId !== currentBoundary.importRunId
+    ) {
+      return;
+    }
+
+    const leftAnalyzing =
+      previousBoundary.state === 'analyzing' && currentBoundary.state !== 'analyzing';
+    const completedAnalysis =
+      !previousBoundary.analysisComplete && currentBoundary.analysisComplete;
+    if (!leftAnalyzing && !completedAnalysis) return;
+
+    void Promise.all([
+      groupsQuery.refetch(),
+      progressQuery.refetch(),
+      selectedGroupId ? detailQuery.refetch() : Promise.resolve(),
+    ]);
+  }, [
+    activeRun,
+    analysisComplete,
+    detailQuery.refetch,
+    groupsQuery.refetch,
+    progressQuery.refetch,
+    selectedGroupId,
+  ]);
+  useEffect(() => {
     if (!detailQuery.data) return;
     if (actionsGroupIdRef.current === detailQuery.data.group_id && actionsDirtyRef.current) {
       return;
@@ -731,10 +785,7 @@ export function ReviewPage({
     onSuccess: (nextPlan) => {
       setPlan(nextPlan);
       setShowPlan(true);
-      queryClient.setQueryData(
-        ['reviewImportPlanDraftSummary', nextPlan.import_run_id],
-        nextPlan,
-      );
+      queryClient.setQueryData(['reviewImportPlanDraftSummary', nextPlan.import_run_id], nextPlan);
     },
     onError: (error) => setMessage(String(error)),
   });
@@ -863,14 +914,6 @@ export function ReviewPage({
       )),
   );
   const allResolved = progressQuery.data?.all_decided ?? false;
-  const activeRun = runsQuery.data?.find((run) => run.import_run_id === importRunId) ?? null;
-  const analysisComplete = Boolean(
-    activeRun &&
-    activeRun.pending_albums === 0 &&
-    activeRun.analyzing_albums === 0 &&
-    activeRun.failed_albums === 0 &&
-    activeRun.analyzed_albums + activeRun.review_required_albums === activeRun.total_albums,
-  );
   const canFreeze = Boolean(
     allResolved &&
     analysisComplete &&
@@ -892,7 +935,11 @@ export function ReviewPage({
         }
         actions={
           canFreeze ? (
-            <Button variant="primary" loading={generate.isPending} onClick={() => generate.mutate()}>
+            <Button
+              variant="primary"
+              loading={generate.isPending}
+              onClick={() => generate.mutate()}
+            >
               生成人工复核入库计划
             </Button>
           ) : undefined
@@ -990,7 +1037,11 @@ export function ReviewPage({
           title="所有审核组均已完成"
           description="现在可以生成入库计划，并在锁定前进行人工复核。"
           action={
-            <Button variant="primary" loading={generate.isPending} onClick={() => generate.mutate()}>
+            <Button
+              variant="primary"
+              loading={generate.isPending}
+              onClick={() => generate.mutate()}
+            >
               生成人工复核入库计划
             </Button>
           }

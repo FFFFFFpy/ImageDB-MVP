@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { api } from '../lib/ipc/api';
 import { importPlanFixture } from '../components/fixtures/importPlanFixture';
@@ -163,7 +163,7 @@ function renderReview(props: Partial<React.ComponentProps<typeof ReviewPage>> = 
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
       <ReviewPage
         initialImportRunId={runId}
@@ -173,6 +173,7 @@ function renderReview(props: Partial<React.ComponentProps<typeof ReviewPage>> = 
       />
     </QueryClientProvider>,
   );
+  return { ...result, client };
 }
 
 describe('groupImportPlanImagesByAlbum', () => {
@@ -318,6 +319,56 @@ test('keeps resolved answers as drafts while analysis is still incomplete', asyn
   expect(screen.queryByRole('button', { name: '生成人工复核入库计划' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole('button', { name: '继续分析' }));
   expect(onNavigate).toHaveBeenCalledWith('scan');
+});
+
+test('refreshes review groups once when an analyzing run becomes reviewable', async () => {
+  setupReviewMocks();
+  const analyzingRun = {
+    import_run_id: runId,
+    source_root: 'D:/source',
+    state: 'analyzing',
+    total_albums: 2,
+    pending_albums: 1,
+    analyzing_albums: 0,
+    analyzed_albums: 0,
+    review_required_albums: 1,
+    failed_albums: 0,
+    total_images: 4,
+    pending_reviews: 1,
+    duplicate_candidates: 1,
+  };
+  const completedRun = {
+    ...analyzingRun,
+    state: 'review_required',
+    pending_albums: 0,
+    analyzed_albums: 1,
+  };
+  const newGroup = {
+    ...groups[0],
+    group_id: '33333333-3333-3333-3333-333333333333',
+    member_count: 2,
+    import_member_count: 2,
+    kept_count: 2,
+  };
+  vi.mocked(api.getImportRunsDashboard).mockResolvedValue([analyzingRun]);
+  vi.mocked(api.getReviewGroups)
+    .mockResolvedValueOnce(groups)
+    .mockResolvedValue([groups[0], newGroup]);
+
+  const { client } = renderReview();
+
+  expect(await screen.findByRole('button', { name: /组 1/ })).toBeVisible();
+  await waitFor(() => expect(api.getReviewGroups).toHaveBeenCalledTimes(1));
+  await waitFor(() =>
+    expect(client.getQueryData(['import-runs-dashboard'])).toEqual([analyzingRun]),
+  );
+
+  act(() => client.setQueryData(['import-runs-dashboard'], [completedRun]));
+
+  expect(await screen.findByRole('button', { name: /组 2/ })).toBeVisible();
+  await waitFor(() => expect(api.getReviewGroups).toHaveBeenCalledTimes(2));
+  expect(api.getReviewProgress).toHaveBeenCalledTimes(2);
+  expect(api.getReviewGroupDetail).toHaveBeenCalledTimes(2);
 });
 
 test('generates an editable draft before the plan can be locked', async () => {
