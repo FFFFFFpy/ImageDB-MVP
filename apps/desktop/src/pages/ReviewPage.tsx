@@ -178,6 +178,10 @@ function formatMatchType(matchType: string): string {
   return labels[matchType] ?? matchType;
 }
 
+function matchTypePriority(matchType: string): number {
+  return ['perceptual_similar', 'perceptual_near', 'pixel_exact', 'file_exact'].indexOf(matchType);
+}
+
 function formatScope(scope: string): string {
   const labels: Record<string, string> = {
     intra_album: '图集内',
@@ -339,9 +343,28 @@ function GroupMemberCard({
 
 function GroupEvidence({ detail }: { detail: ReviewGroupDetail }) {
   const memberById = new Map(detail.members.map((member) => [member.image_id, member]));
+  const strongest = detail.evidence.reduce<(typeof detail.evidence)[number] | null>(
+    (current, edge) =>
+      current === null || matchTypePriority(edge.match_type) > matchTypePriority(current.match_type)
+        ? edge
+        : current,
+    null,
+  );
+  const highestConfidence = detail.evidence.reduce<number | null>(
+    (highest, edge) =>
+      edge.confidence === null ? highest : Math.max(highest ?? edge.confidence, edge.confidence),
+    null,
+  );
   return (
-    <details className="review-group-evidence" open>
-      <summary>匹配证据（{detail.evidence.length} 条边）</summary>
+    <details className="review-group-evidence">
+      <summary>
+        <span>匹配证据</span>
+        <span className="review-group-evidence__summary">
+          {strongest ? formatMatchType(strongest.match_type) : '无匹配类型'} · 最高相似度{' '}
+          {highestConfidence === null ? '未计算' : `${(highestConfidence * 100).toFixed(1)}%`} ·{' '}
+          {detail.evidence.length} 条边
+        </span>
+      </summary>
       <div className="review-group-evidence__list">
         {detail.evidence.map((edge) => {
           const source = memberById.get(edge.source_image_id);
@@ -607,7 +630,10 @@ export function ReviewPage({
     queryKey: ['reviewGroups', importRunId],
     queryFn: () => api.getReviewGroups(importRunId!),
     enabled: !!importRunId && !showPlan,
-    refetchInterval: enablePolling ? 1500 : false,
+    // Loading groups is the explicit on-demand reconciliation boundary while
+    // analysis is active. Progress may poll, but the complete connected graph
+    // must not be rebuilt every 1.5 seconds.
+    refetchInterval: false,
   });
   const progressQuery = useQuery({
     queryKey: ['reviewProgress', importRunId],
@@ -690,6 +716,8 @@ export function ReviewPage({
     },
     onSuccess: async () => {
       setMessage(null);
+      setPlan(null);
+      setShowPlan(false);
       await invalidateReviewWorkflowQueries(queryClient, importRunId ?? undefined);
       actionsGroupIdRef.current = null;
       actionsDirtyRef.current = false;

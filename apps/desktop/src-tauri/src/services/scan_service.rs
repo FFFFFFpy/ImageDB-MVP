@@ -1544,7 +1544,6 @@ async fn run_scan_inner(
 
         let album_status =
             ImportRepository::finalize_import_album_analysis(&client, album_db_id).await?;
-        crate::services::review_service::materialize_review_groups(&client, import_run_id).await?;
         run_exact_index.add_album(album_db_id, &album_images);
         emit_progress(&progress, &progress_tracker).await;
         tracing::info!(
@@ -1574,9 +1573,10 @@ async fn run_scan_inner(
         );
     }
 
-    // Each completed album has already reconciled the mutable review graph.
-    // Repeat once when every album is complete so a late cancellation after
-    // the last checkpoint still observes the final persisted candidate set.
+    // Reconcile the complete mutable review graph once at the final scan
+    // boundary. Review opened during analysis performs the same operation on
+    // demand; doing it after every album would repeatedly rebuild every
+    // candidate prefix and turn multi-album scans into quadratic work.
     let incomplete_album_count: i64 = client
         .query_one(
             "SELECT COUNT(*)::BIGINT FROM import_albums

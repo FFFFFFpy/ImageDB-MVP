@@ -620,9 +620,18 @@
   display: flex;
   min-height: 48px;
   align-items: center;
+  gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
   cursor: pointer;
   font-weight: 650;
+}
+
+.review-group-evidence__summary {
+  margin-left: auto;
+  color: var(--color-ink-muted);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: right;
 }
 
 .review-group-evidence__list {
@@ -736,6 +745,17 @@
 }
 
 @media (max-width: 720px) {
+  .review-group-evidence summary {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .review-group-evidence__summary {
+    margin-left: 0;
+    text-align: left;
+  }
+
   .review-group-heading {
     align-items: stretch;
     flex-direction: column;

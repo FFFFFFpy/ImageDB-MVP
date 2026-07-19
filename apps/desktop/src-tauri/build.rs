@@ -16,72 +16,27 @@ fn git_output(manifest_dir: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn git_dirty(manifest_dir: &Path) -> Option<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(manifest_dir)
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .output()
-        .ok()?;
-    output.status.success().then_some(!output.stdout.is_empty())
-}
-
-fn git_dir(repo_root: &Path) -> Option<PathBuf> {
-    let dot_git = repo_root.join(".git");
-    if dot_git.is_dir() {
-        return Some(dot_git);
-    }
-    let pointer = std::fs::read_to_string(dot_git).ok()?;
-    let path = pointer.trim().strip_prefix("gitdir:")?.trim();
-    let path = PathBuf::from(path);
-    Some(if path.is_absolute() {
-        path
-    } else {
-        repo_root.join(path)
-    })
-}
-
-fn emit_tracked_file_rerun_paths(repo_root: &Path) {
-    let Ok(output) = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["ls-files", "-z"])
-        .output()
-    else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    for path in output.stdout.split(|byte| *byte == 0) {
-        if path.is_empty() {
-            continue;
-        }
-        let path = String::from_utf8_lossy(path);
-        println!(
-            "cargo:rerun-if-changed={}",
-            repo_root.join(path.as_ref()).display()
-        );
-    }
+fn git_path(manifest_dir: &Path, path: &str) -> Option<PathBuf> {
+    git_output(
+        manifest_dir,
+        &["rev-parse", "--path-format=absolute", "--git-path", path],
+    )
+    .map(PathBuf::from)
 }
 
 fn emit_git_rerun_paths(manifest_dir: &Path) {
-    let Some(repo_root) = manifest_dir.ancestors().nth(3) else {
+    let Some(head_path) = git_path(manifest_dir, "HEAD") else {
         return;
     };
-    let Some(git_dir) = git_dir(repo_root) else {
-        return;
-    };
-    emit_tracked_file_rerun_paths(repo_root);
-    let head_path = git_dir.join("HEAD");
     println!("cargo:rerun-if-changed={}", head_path.display());
-    println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
+    if let Some(packed_refs) = git_path(manifest_dir, "packed-refs") {
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
     if let Ok(head) = std::fs::read_to_string(&head_path) {
         if let Some(reference) = head.trim().strip_prefix("ref:") {
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir.join(reference.trim()).display()
-            );
+            if let Some(reference_path) = git_path(manifest_dir, reference.trim()) {
+                println!("cargo:rerun-if-changed={}", reference_path.display());
+            }
         }
     }
 }
@@ -101,11 +56,7 @@ fn main() {
     let dirty = std::env::var("IMAGEDB_GIT_DIRTY")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            git_dirty(&manifest_dir)
-                .map(|dirty| dirty.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        });
+        .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=IMAGEDB_GIT_COMMIT={commit}");
     println!("cargo:rustc-env=IMAGEDB_GIT_DIRTY={dirty}");

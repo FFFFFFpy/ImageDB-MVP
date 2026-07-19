@@ -245,6 +245,12 @@ test('restores complete image metadata and fingerprint evidence for group review
   expect(within(cards[0] as HTMLElement).getByText('import-a')).toBeInTheDocument();
   expect(within(cards[0] as HTMLElement).getByText('系统默认')).toBeInTheDocument();
 
+  const evidenceSummary = screen.getByText('感知近似 · 最高相似度 96.0% · 1 条边');
+  const evidenceDetails = evidenceSummary.closest('details');
+  expect(evidenceDetails).not.toHaveAttribute('open');
+  expect(screen.queryByText('跨图集')).not.toBeVisible();
+  fireEvent.click(evidenceSummary.closest('summary') as HTMLElement);
+
   expect(screen.getByText('感知近似')).toBeInTheDocument();
   expect(screen.getByText('跨图集')).toBeInTheDocument();
   expect(screen.getByText('需人工审核')).toBeInTheDocument();

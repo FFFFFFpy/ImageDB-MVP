@@ -3677,6 +3677,24 @@ impl ImportRepository {
         Ok(())
     }
 
+    /// Invalidate every editable draft for a run after its review facts
+    /// change. The caller must hold the parent import-run row lock and keep
+    /// this update in the same transaction as the review decision write.
+    pub async fn invalidate_draft_import_plans(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<u64, AppError> {
+        client
+            .execute(
+                "UPDATE import_plans
+                 SET state = 'invalidated'
+                 WHERE import_run_id = $1 AND state = 'draft'",
+                &[&import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to invalidate draft plan: {e}")))
+    }
+
     pub async fn get_frozen_plan_for_run(
         client: &Client,
         import_run_id: Uuid,

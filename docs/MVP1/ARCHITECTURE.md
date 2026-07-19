@@ -161,6 +161,7 @@ Scan
 关键规则：
 
 - Review 页先生成并人工复核 draft；每次导入 / 跳过切换只更新 draft，不计算 hash。
+- 任何审核组决定变更都在同一 `import_runs` 行锁事务内将已有 draft 标记为 `invalidated`；用户必须重新生成并复核完整计划。
 - 用户显式“锁定导入计划”时才计算 `plan_hash` 并将计划转为 frozen。
 - Commit 页只读取 frozen plan summary。
 - Commit service 读取同一 frozen plan。

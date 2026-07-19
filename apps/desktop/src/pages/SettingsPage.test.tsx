@@ -445,6 +445,18 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     expect(screen.getByText(/个人自用、非商业项目/)).toBeInTheDocument();
   });
 
+  test('labels release dirty state as tracked-file modifications', async () => {
+    mockedApi.getBuildInfo.mockResolvedValue({
+      app_version: '0.1.0',
+      git_commit: 'release-commit',
+      git_dirty: true,
+    });
+    renderSettingsPage();
+
+    expect(await screen.findByText(/含受跟踪文件修改/)).toBeInTheDocument();
+    expect(screen.queryByText(/含未提交更改/)).not.toBeInTheDocument();
+  });
+
   test('hydrates existing library and external settings before allowing save', async () => {
     mockedApi.getSettings.mockResolvedValue({
       database_mode: 'external',

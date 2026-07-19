@@ -16,7 +16,7 @@ MVP1 已定性为：
 
 当前工作分支：`codex/settings-build-info-review-diagnostic`
 
-当前实施阶段：任务包实现完成并进入审查修复收口。审核由 pair 决策升级为持久化连通组；扫描过程中按已完成图集增量生成审核组，组内逐图 keep/exclude 在 frozen plan 前只是可反复调整的持久化草稿。新增相似证据导致组合并或拆分时，按图片身份保留既有人工选择并重新要求确认；只有 frozen plan 才锁定审核事实。大图解码保持 Fingerprint V2 算法、哈希和阈值不变，产品像素上限提高到 5 亿并对 1 亿像素以上解码实行单槽限流；导入计划新增默认关闭的 `move_selected_without_backup`，模式绑定 plan hash、manifest、文件事务、恢复和结果，且仅在发布与数据库证据复验后，将 frozen plan 选中源图原子隔离到持久化同目录临时路径并验证删除。`source_files_removing` 统一进入 Dashboard Recovery；临时删除 I/O 错误保持可重试，证据冲突才进入永久 conflict。
+当前实施阶段：任务包实现完成并进入审查修复收口。审核由 pair 决策升级为持久化连通组；扫描完成时统一协调审核组，用户在分析期间打开 Review 时按需协调，不再每完成一个图集全量重算。组内逐图 keep/exclude 在 frozen plan 前只是可反复调整的持久化草稿。新增相似证据导致组合并或拆分时，按图片身份保留既有人工选择并重新要求确认；审核决定变更会在同一行锁事务内使旧 draft 失效，只有 frozen plan 才锁定审核事实。大图解码保持 Fingerprint V2 算法、哈希和阈值不变，产品像素上限提高到 5 亿并对 1 亿像素以上解码实行单槽限流；导入计划新增默认关闭的 `move_selected_without_backup`，模式绑定 plan hash、manifest、文件事务、恢复和结果，且仅在发布与数据库证据复验后，将 frozen plan 选中源图原子隔离到持久化同目录临时路径并验证删除。`source_files_removing` 统一进入 Dashboard Recovery；临时删除 I/O 错误保持可重试，证据冲突才进入永久 conflict。
 
 M3 固定边界：Dashboard 下一步继续由后端 `next_action` 统一路由；React 不根据零散计数猜测状态机。除 M3.8 明确授权的 `abandoned` / `invalidated` 外，M3 不修改 frozen plan、Commit、Recovery、数据库 migration、匹配算法或文件事务语义。
 
@@ -59,7 +59,7 @@ MVP1 主线仍不是继续扩功能阶段。当前 feature 分支额外接受用
 - 完整 clean Windows `pnpm release:gate`：未签字。
 - 正式 release publication：未发生。
 - MVP3 UI 重设计：M3.0–M3.8 已进入审查修复与验证收口；Windows 100% / 150% 系统缩放不是本轮完成门禁或阻塞项。
-- 多图审核 / 大图解码 / 移动入库：实现完成；审查发现的 Dashboard 恢复路由、临时删除错误分类、删除 TOCTOU 已修复。本轮进一步把 resolved 从界面只读终态改为 frozen plan 前可编辑草稿，并拆分“人工复核 draft”与“锁定 frozen plan”：导入 / 跳过切换不计算 hash，只有锁定时才生成 `plan_hash`；同时补充增量分组与构建版本诊断。
+- 多图审核 / 大图解码 / 移动入库：实现完成；审查发现的 Dashboard 恢复路由、临时删除错误分类、删除 TOCTOU 已修复。本轮进一步把 resolved 从界面只读终态改为 frozen plan 前可编辑草稿，并拆分“人工复核 draft”与“锁定 frozen plan”：导入 / 跳过切换不计算 hash，只有锁定时才生成 `plan_hash`。审核决定变更会原子失效旧 draft；审核组改为扫描终点一次协调与 Review 按需协调；构建版本由发布脚本显式注入。
 
 ## 文档入口
 

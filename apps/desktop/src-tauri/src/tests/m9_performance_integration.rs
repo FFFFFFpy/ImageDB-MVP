@@ -10,6 +10,93 @@ use uuid::Uuid;
 
 const COMMAND_TIMEOUT_SECS: u64 = 180;
 
+/// Multi-album coordination regression for the group-review graph.
+///
+/// The scanner may perform one full reconciliation at its terminal boundary,
+/// independent of album count. Opening Review during analysis is the separate
+/// on-demand path. This catches the former prefix-reconciliation loop without
+/// relying on noisy wall-clock thresholds.
+#[tokio::test]
+#[ignore]
+async fn m9_review_group_coordination_is_constant_for_many_albums() {
+    ensure_postgres_bin();
+
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let fixture_dir = tmp.path().join("fixtures");
+    let library_root = tmp.path().join("library");
+    std::fs::create_dir_all(&library_root).unwrap();
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+
+    let app_state = AppState::new(&app_data, fixture_dir).unwrap();
+    let database = crate::commands::initialize_managed_database_for_state(&app_state)
+        .await
+        .unwrap();
+    assert_eq!(database.status, DatabaseStatus::Connected);
+    crate::commands::update_settings_for_state(
+        &app_state,
+        crate::commands::SettingsDto {
+            database_mode: Some("managed".to_string()),
+            library_root: Some(library_root.display().to_string()),
+            external_host: None,
+            external_port: None,
+            external_database: None,
+            external_username: None,
+            external_tls_mode: None,
+            external_ca_cert_path: None,
+            external_client_cert_path: None,
+            external_client_key_path: None,
+            external_connect_timeout_secs: None,
+            external_query_timeout_secs: None,
+            external_profile_name: None,
+            first_run_completed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut metrics = Vec::new();
+    for album_count in [100usize, 500, 1_000] {
+        let source_root = tmp.path().join(format!("source-{album_count}"));
+        for album_index in 0..album_count {
+            let album_dir = source_root.join(format!("album-{album_index:04}"));
+            std::fs::create_dir_all(&album_dir).unwrap();
+            write_perf_png(
+                &album_dir.join("image.png"),
+                (album_count * 10_000 + album_index) as u32,
+            );
+        }
+
+        crate::services::review_service::reset_review_group_materialization_count();
+        let started = Instant::now();
+        crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+            .await
+            .unwrap();
+        let scan = wait_for_scan_terminal(&app_state).await;
+        let scan_ms = elapsed_ms(started);
+        assert_eq!(scan.state, ImportRunState::ReadyToCommit.to_string());
+        assert_eq!(scan.total_albums as usize, album_count);
+        assert_eq!(scan.total_images as usize, album_count);
+        assert_eq!(
+            crate::services::review_service::review_group_materialization_count(),
+            1,
+            "a {album_count}-album scan must perform one final full reconciliation"
+        );
+        metrics.push(json!({
+            "album_count": album_count,
+            "scan_ms": scan_ms,
+            "full_group_reconciliations": 1,
+        }));
+    }
+    println!(
+        "M9_MULTI_ALBUM_COORDINATION_METRICS_JSON={}",
+        json!(metrics)
+    );
+
+    let mut manager = app_state.postgres_manager.lock().await;
+    manager.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore]
 async fn m9_performance_gate_records_thresholds() {

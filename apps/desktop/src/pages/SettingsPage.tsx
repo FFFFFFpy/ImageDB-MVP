@@ -886,7 +886,8 @@ export function SettingsPage({
               <td>Git 提交</td>
               <td className="mono">
                 {buildInfo.data?.git_commit ?? (buildInfo.isError ? '不可用' : '读取中…')}
-                {buildInfo.data?.git_dirty === true ? '（含未提交更改）' : ''}
+                {buildInfo.data?.git_dirty === true ? '（含受跟踪文件修改）' : ''}
+                {buildInfo.data?.git_dirty === null ? '（工作区状态未知）' : ''}
               </td>
             </tr>
           </tbody>

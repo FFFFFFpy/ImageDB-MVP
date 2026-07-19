@@ -17,6 +17,20 @@ use std::path::{Path, PathBuf};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+#[cfg(all(test, feature = "real-db-tests"))]
+static REVIEW_GROUP_MATERIALIZATION_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, feature = "real-db-tests"))]
+pub(crate) fn reset_review_group_materialization_count() {
+    REVIEW_GROUP_MATERIALIZATION_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(test, feature = "real-db-tests"))]
+pub(crate) fn review_group_materialization_count() -> usize {
+    REVIEW_GROUP_MATERIALIZATION_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 type ReviewMemberKey = (String, Uuid);
 
 #[derive(Clone)]
@@ -52,6 +66,8 @@ pub async fn materialize_review_groups(
     client: &Client,
     import_run_id: Uuid,
 ) -> Result<(), AppError> {
+    #[cfg(all(test, feature = "real-db-tests"))]
+    REVIEW_GROUP_MATERIALIZATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     client.batch_execute("BEGIN").await.map_err(|e| {
         AppError::Internal(format!("failed to begin review group materialization: {e}"))
     })?;
@@ -375,6 +391,19 @@ pub async fn get_review_groups(
     import_run_id: Uuid,
 ) -> Result<Vec<ReviewGroupSummary>, AppError> {
     let mut rows = ImportRepository::get_review_groups(client, import_run_id).await?;
+    let run = ImportRepository::get_import_run_by_id(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    // Scanning no longer reconciles the complete connected graph after every
+    // album. Refresh it on demand when the user opens Review while analysis
+    // is still producing candidates. The final scan boundary performs one
+    // more reconciliation, so terminal runs do not pay this read-time cost.
+    let reconciled_on_demand = run.state == ImportRunState::Analyzing.to_string()
+        && is_native_group_review_run(client, import_run_id).await?;
+    if reconciled_on_demand {
+        materialize_review_groups(client, import_run_id).await?;
+        rows = ImportRepository::get_review_groups(client, import_run_id).await?;
+    }
     if rows.is_empty() {
         let candidate_count =
             ImportRepository::get_all_candidates_for_import_plan(client, import_run_id)
@@ -387,7 +416,9 @@ pub async fn get_review_groups(
                         .to_string(),
                 ));
             }
-            materialize_review_groups(client, import_run_id).await?;
+            if !reconciled_on_demand {
+                materialize_review_groups(client, import_run_id).await?;
+            }
             rows = ImportRepository::get_review_groups(client, import_run_id).await?;
             if rows.is_empty() {
                 return Err(AppError::Internal(format!(
@@ -593,6 +624,11 @@ pub async fn submit_review_group_decision(
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to resolve review group: {e}")))?;
+        // A draft is a reviewed projection of the group decisions, not a
+        // second mutable copy of them. Once any group decision changes, keep
+        // the old projection only as invalidated audit evidence and require
+        // the user to generate and review a fresh complete draft.
+        ImportRepository::invalidate_draft_import_plans(client, import_run_id).await?;
         ImportRepository::refresh_group_review_summaries(client, import_run_id).await?;
         let remaining = ImportRepository::get_review_progress(client, import_run_id).await?;
         let incomplete_album_count: i64 = client
@@ -3164,15 +3200,6 @@ mod tests {
         ImportRepository::finalize_import_album_analysis(&client, album_b_id)
             .await
             .unwrap();
-        materialize_review_groups(&client, import_run_id)
-            .await
-            .unwrap();
-        let incrementally_updated_groups = get_review_groups(&client, import_run_id).await.unwrap();
-        assert_eq!(incrementally_updated_groups.len(), 2);
-        assert!(incrementally_updated_groups.iter().any(|group| {
-            group.group_id == partial_group_id.to_string() && group.state == "resolved"
-        }));
-
         ImportRepository::update_import_run_state(
             &client,
             import_run_id,
@@ -3180,6 +3207,15 @@ mod tests {
         )
         .await
         .unwrap();
+        // Opening Review while scan analysis is active is the on-demand
+        // reconciliation boundary for candidates discovered since the prior
+        // page load.
+        let incrementally_updated_groups = get_review_groups(&client, import_run_id).await.unwrap();
+        assert_eq!(incrementally_updated_groups.len(), 2);
+        assert!(incrementally_updated_groups.iter().any(|group| {
+            group.group_id == partial_group_id.to_string() && group.state == "resolved"
+        }));
+
         let error = freeze_import_plan(&client, import_run_id)
             .await
             .expect_err("an in-flight run must block plan freezing");
@@ -3390,6 +3426,59 @@ mod tests {
         assert_eq!(reloaded_draft.total_images, plan.total_images);
         assert_eq!(reloaded_draft.excluded_count, plan.excluded_count);
         assert_eq!(reloaded_draft.kept_images, plan.kept_images);
+
+        // Changing a saved group decision must atomically invalidate the
+        // complete draft projection. Freeze may never lock a plan that was
+        // reviewed against older group facts.
+        let replacement_decisions: Vec<ReviewGroupMemberDecision> = resolved_detail
+            .members
+            .iter()
+            .filter(|member| member.image_source == "import")
+            .map(|member| ReviewGroupMemberDecision {
+                image_id: member.image_id.clone(),
+                image_source: "import".to_string(),
+                final_action: if member.image_id == candidate_b_id.to_string() {
+                    "keep"
+                } else {
+                    "exclude"
+                }
+                .to_string(),
+            })
+            .collect();
+        submit_review_group_decision(
+            &client,
+            Uuid::parse_str(&groups[0].group_id).unwrap(),
+            &replacement_decisions,
+        )
+        .await
+        .expect("changing a resolved group decision must succeed before Freeze");
+        assert!(
+            get_draft_plan_summary(&client, import_run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the old draft must no longer be readable after review facts change"
+        );
+        let invalidated_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM import_plans
+                 WHERE import_run_id = $1 AND state = 'invalidated'",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(invalidated_count, 1);
+
+        let regenerated_plan = generate_import_plan(&client, import_run_id)
+            .await
+            .expect("the updated review facts must produce a new draft");
+        assert!(regenerated_plan.plan_hash.is_none());
+        assert_eq!(regenerated_plan.kept_images.len(), 1);
+        assert_eq!(
+            regenerated_plan.kept_images[0].image_id,
+            candidate_b_id.to_string()
+        );
 
         let edited_draft = set_plan_source_file_mode(
             &client,
