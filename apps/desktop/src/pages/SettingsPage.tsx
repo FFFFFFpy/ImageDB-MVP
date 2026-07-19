@@ -118,6 +118,13 @@ export function SettingsPage({
     refetchInterval: enablePolling ? 5000 : false,
   });
 
+  const buildInfo = useQuery({
+    queryKey: ['build-info'],
+    queryFn: api.getBuildInfo,
+    staleTime: Infinity,
+    retry: false,
+  });
+
   const criticalGuardStatus = useQuery({
     queryKey: ['critical-operation-guard-status'],
     queryFn: api.getCriticalOperationGuardStatus,
@@ -869,6 +876,21 @@ export function SettingsPage({
           </div>
           <p>个人自用、非商业项目。</p>
         </div>
+        <table aria-label="应用构建信息">
+          <tbody>
+            <tr>
+              <td>应用版本</td>
+              <td className="mono">{buildInfo.data?.app_version ?? '读取中…'}</td>
+            </tr>
+            <tr>
+              <td>Git 提交</td>
+              <td className="mono">
+                {buildInfo.data?.git_commit ?? (buildInfo.isError ? '不可用' : '读取中…')}
+                {buildInfo.data?.git_dirty === true ? '（含未提交更改）' : ''}
+              </td>
+            </tr>
+          </tbody>
+        </table>
         <p>
           界面组件使用{' '}
           <a href="https://github.com/guokaigdg/animal-island-ui" target="_blank" rel="noreferrer">

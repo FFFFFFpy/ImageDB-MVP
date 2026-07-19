@@ -1544,6 +1544,7 @@ async fn run_scan_inner(
 
         let album_status =
             ImportRepository::finalize_import_album_analysis(&client, album_db_id).await?;
+        crate::services::review_service::materialize_review_groups(&client, import_run_id).await?;
         run_exact_index.add_album(album_db_id, &album_images);
         emit_progress(&progress, &progress_tracker).await;
         tracing::info!(
@@ -1573,10 +1574,9 @@ async fn run_scan_inner(
         );
     }
 
-    // Group membership is frozen only after every album has reached a complete
-    // analysis state. A late cancellation after the last checkpoint is safe:
-    // the same persisted facts produce the complete group set before the run
-    // state is reconciled.
+    // Each completed album has already reconciled the mutable review graph.
+    // Repeat once when every album is complete so a late cancellation after
+    // the last checkpoint still observes the final persisted candidate set.
     let incomplete_album_count: i64 = client
         .query_one(
             "SELECT COUNT(*)::BIGINT FROM import_albums

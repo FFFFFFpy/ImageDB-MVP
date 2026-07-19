@@ -64,6 +64,11 @@ const fixtureClient = new QueryClient({
 });
 
 fixtureClient.setQueryData(['settings'], settings);
+fixtureClient.setQueryData(['build-info'], {
+  app_version: '0.1.0',
+  git_commit: '80f8f0542321d4f9a0c58eb003fcfdc12b4efae4',
+  git_dirty: false,
+});
 fixtureClient.setQueryData(['database-status'], settingsDatabaseState);
 fixtureClient.setQueryData(['external-migration-progress'], migration);
 fixtureClient.setQueryData(['critical-operation-guard-status'], criticalOperationGuard);

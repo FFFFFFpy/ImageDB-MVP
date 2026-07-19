@@ -111,6 +111,7 @@ export async function invalidateReviewWorkflowQueries(
     queryClient.invalidateQueries({ queryKey: ['reviewGroupDetail'] }),
     queryClient.invalidateQueries({ queryKey: ['reviewFrozenImportPlanSummary', importRunId] }),
     queryClient.invalidateQueries({ queryKey: ['frozenImportPlanSummary', importRunId] }),
+    queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
   ]);
 }
 
@@ -183,7 +184,7 @@ function GroupMemberCard({
     staleTime: Infinity,
   });
   const libraryReadonly = member.image_source === 'library';
-  const readonly = libraryReadonly || groupResolved;
+  const readonly = libraryReadonly;
   const cannotExcludeLast = action === 'keep' && keepCount <= 1;
   return (
     <article className={`review-group-member review-group-member--${action}`}>
@@ -208,7 +209,9 @@ function GroupMemberCard({
             {libraryReadonly
               ? '库内图片'
               : groupResolved
-                ? '已提交'
+                ? action === 'keep'
+                  ? '草稿保留'
+                  : '草稿排除'
                 : action === 'keep'
                   ? '保留'
                   : '排除'}
@@ -238,7 +241,7 @@ function GroupMemberCard({
         {libraryReadonly ? (
           <small>库内成员只读，并始终保留。</small>
         ) : groupResolved ? (
-          <small>该审核组已提交，成员决定为只读。</small>
+          <small>这是已保存的草稿；冻结导入计划前仍可调整。</small>
         ) : null}
       </div>
     </article>
@@ -404,6 +407,8 @@ export function ReviewPage({
   const [message, setMessage] = useState<string | null>(null);
   const [planBusy, setPlanBusy] = useState(false);
   const planEditActive = useRef(false);
+  const actionsGroupIdRef = useRef<string | null>(null);
+  const actionsDirtyRef = useRef(false);
   const [preview, setPreview] = useState<{
     member: ReviewGroupMember;
     dataUrl: string | null;
@@ -428,6 +433,12 @@ export function ReviewPage({
   const progressQuery = useQuery({
     queryKey: ['reviewProgress', importRunId],
     queryFn: () => api.getReviewProgress(importRunId!),
+    enabled: !!importRunId && !showPlan,
+    refetchInterval: enablePolling ? 1500 : false,
+  });
+  const runsQuery = useQuery({
+    queryKey: ['import-runs-dashboard'],
+    queryFn: api.getImportRunsDashboard,
     enabled: !!importRunId && !showPlan,
     refetchInterval: enablePolling ? 1500 : false,
   });
@@ -464,6 +475,11 @@ export function ReviewPage({
   });
   useEffect(() => {
     if (!detailQuery.data) return;
+    if (actionsGroupIdRef.current === detailQuery.data.group_id && actionsDirtyRef.current) {
+      return;
+    }
+    actionsGroupIdRef.current = detailQuery.data.group_id;
+    actionsDirtyRef.current = false;
     setActions(
       Object.fromEntries(
         detailQuery.data.members.map((member) => [member.image_id, member.final_action]),
@@ -485,6 +501,8 @@ export function ReviewPage({
     onSuccess: async () => {
       setMessage(null);
       await invalidateReviewWorkflowQueries(queryClient, importRunId ?? undefined);
+      actionsGroupIdRef.current = null;
+      actionsDirtyRef.current = false;
       setSelectedGroupId(null);
     },
     onError: (error) => setMessage(String(error)),
@@ -599,7 +617,21 @@ export function ReviewPage({
       ).length
     : 0;
   const allResolved = progressQuery.data?.all_decided ?? false;
-  const error = groupsQuery.error ?? progressQuery.error ?? detailQuery.error;
+  const activeRun = runsQuery.data?.find((run) => run.import_run_id === importRunId) ?? null;
+  const analysisComplete = Boolean(
+    activeRun &&
+    activeRun.pending_albums === 0 &&
+    activeRun.analyzing_albums === 0 &&
+    activeRun.failed_albums === 0 &&
+    activeRun.analyzed_albums + activeRun.review_required_albums === activeRun.total_albums,
+  );
+  const canFreeze = Boolean(
+    allResolved &&
+    analysisComplete &&
+    activeRun &&
+    ['review_required', 'ready_to_commit'].includes(activeRun.state),
+  );
+  const error = groupsQuery.error ?? progressQuery.error ?? detailQuery.error ?? runsQuery.error;
 
   return (
     <div className="review-page review-page--m3">
@@ -613,7 +645,7 @@ export function ReviewPage({
           </StatusBadge>
         }
         actions={
-          allResolved ? (
+          canFreeze ? (
             <Button variant="primary" loading={freeze.isPending} onClick={() => freeze.mutate()}>
               生成并冻结导入计划
             </Button>
@@ -623,6 +655,15 @@ export function ReviewPage({
       {(message || error) && (
         <StatusBanner tone="danger" title="审核操作未完成">
           {message ?? String(error)}
+        </StatusBanner>
+      )}
+      {allResolved && !analysisComplete && (
+        <StatusBanner
+          tone="info"
+          title="当前审核答案已保存，分析尚未完成"
+          actions={<Button onClick={() => onNavigate('scan')}>继续分析</Button>}
+        >
+          后续发现的新相似项可能新增或合并审核组；已有图片选择会作为草稿保留。
         </StatusBanner>
       )}
 
@@ -638,7 +679,7 @@ export function ReviewPage({
               <span>组 {index + 1}</span>
               <small>{group.member_count} 张</small>
               <StatusBadge tone={group.state === 'resolved' ? 'success' : 'warning'}>
-                {group.state === 'resolved' ? '已完成' : '待审核'}
+                {group.state === 'resolved' ? '草稿已保存' : '待审核'}
               </StatusBadge>
             </button>
           ))}
@@ -654,12 +695,12 @@ export function ReviewPage({
               <h2>{detail.members.length} 张关联图片</h2>
               <p>
                 {detail.state === 'resolved'
-                  ? '该审核组已经提交，成员决定为只读。'
+                  ? '该审核组已有已保存草稿；冻结导入计划前仍可继续调整。'
                   : '默认全部保留。库内图片为只读；组内至少需要保留一张图片。'}
               </p>
             </div>
             <StatusBadge tone={detail.state === 'resolved' ? 'success' : 'warning'}>
-              {detail.state === 'resolved' ? '已提交' : '尚未提交'}
+              {detail.state === 'resolved' ? '草稿已保存' : '尚未保存'}
             </StatusBadge>
           </div>
           <section className="review-group-grid" aria-label="重复图片组成员">
@@ -671,9 +712,10 @@ export function ReviewPage({
                 action={actions[member.image_id] ?? member.final_action}
                 keepCount={keepCount}
                 groupResolved={detail.state === 'resolved'}
-                onChange={(action) =>
-                  setActions((current) => ({ ...current, [member.image_id]: action }))
-                }
+                onChange={(action) => {
+                  actionsDirtyRef.current = true;
+                  setActions((current) => ({ ...current, [member.image_id]: action }));
+                }}
                 onOpen={(nextMember, dataUrl) => setPreview({ member: nextMember, dataUrl })}
               />
             ))}
@@ -686,14 +728,14 @@ export function ReviewPage({
             <Button
               variant="primary"
               loading={submit.isPending}
-              disabled={detail.state === 'resolved' || keepCount === 0}
+              disabled={keepCount === 0}
               onClick={() => submit.mutate(detail)}
             >
-              提交整组决定
+              {detail.state === 'resolved' ? '更新整组决定' : '保存整组决定'}
             </Button>
           </div>
         </main>
-      ) : allResolved ? (
+      ) : canFreeze ? (
         <EmptyState
           title="所有审核组均已完成"
           description="现在可以生成并冻结导入计划。"
@@ -705,8 +747,8 @@ export function ReviewPage({
         />
       ) : (
         <EmptyState
-          title="正在等待分析完成"
-          description="审核组会在整批重复关系构建完成后一次生成。"
+          title="当前没有待审核组"
+          description="继续分析时，新发现的相似项会增量出现在这里。"
         />
       )}
 

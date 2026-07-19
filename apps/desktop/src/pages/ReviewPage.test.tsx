@@ -132,6 +132,22 @@ function setupReviewMocks(
   groupSummaries: ReviewGroupSummary[] = groups,
   reviewProgress: ReviewProgress = progress(),
 ) {
+  vi.spyOn(api, 'getImportRunsDashboard').mockResolvedValue([
+    {
+      import_run_id: runId,
+      source_root: 'D:/source',
+      state: 'review_required',
+      total_albums: 2,
+      pending_albums: 0,
+      analyzing_albums: 0,
+      analyzed_albums: 1,
+      review_required_albums: 1,
+      failed_albums: 0,
+      total_images: 4,
+      pending_reviews: reviewProgress.remaining_count,
+      duplicate_candidates: 1,
+    },
+  ]);
   vi.spyOn(api, 'getReviewGroups').mockResolvedValue(groupSummaries);
   vi.spyOn(api, 'getReviewProgress').mockResolvedValue(reviewProgress);
   vi.spyOn(api, 'getReviewGroupDetail').mockResolvedValue(groupDetail);
@@ -201,7 +217,7 @@ test('renders every group member and submits one action for every import member'
   expect(cards[0]).toHaveClass('review-group-member--exclude');
   expect(within(cards[3] as HTMLElement).getByRole('button', { name: '排除' })).toBeDisabled();
 
-  fireEvent.click(screen.getByRole('button', { name: '提交整组决定' }));
+  fireEvent.click(screen.getByRole('button', { name: '保存整组决定' }));
   await waitFor(() =>
     expect(api.submitReviewGroupDecision).toHaveBeenCalledWith(groupId, [
       { image_id: 'import-a', image_source: 'import', final_action: 'exclude' },
@@ -211,7 +227,7 @@ test('renders every group member and submits one action for every import member'
   );
 });
 
-test('keeps every member decision readonly after a review group is resolved', async () => {
+test('allows a resolved group draft to be adjusted until the plan is frozen', async () => {
   const resolvedDetail = { ...detail, state: 'resolved' as const };
   const resolvedGroups = [{ ...groups[0], state: 'resolved' as const }];
   setupReviewMocks(
@@ -221,13 +237,50 @@ test('keeps every member decision readonly after a review group is resolved', as
   );
   renderReview();
 
-  expect(await screen.findByText('该审核组已经提交，成员决定为只读。')).toBeInTheDocument();
+  expect(
+    await screen.findByText('该审核组已有已保存草稿；冻结导入计划前仍可继续调整。'),
+  ).toBeInTheDocument();
   const cards = document.querySelectorAll('.review-group-member');
-  for (const card of cards) {
-    expect(within(card as HTMLElement).getByRole('button', { name: '保留' })).toBeDisabled();
-    expect(within(card as HTMLElement).getByRole('button', { name: '排除' })).toBeDisabled();
+  for (const card of Array.from(cards).slice(0, 3)) {
+    expect(within(card as HTMLElement).getByRole('button', { name: '保留' })).toBeEnabled();
+    expect(within(card as HTMLElement).getByRole('button', { name: '排除' })).toBeEnabled();
   }
-  expect(screen.getByRole('button', { name: '提交整组决定' })).toBeDisabled();
+  fireEvent.click(within(cards[0] as HTMLElement).getByRole('button', { name: '排除' }));
+  fireEvent.click(screen.getByRole('button', { name: '更新整组决定' }));
+  await waitFor(() => expect(api.submitReviewGroupDecision).toHaveBeenCalledTimes(1));
+});
+
+test('keeps resolved answers as drafts while analysis is still incomplete', async () => {
+  const resolvedDetail = { ...detail, state: 'resolved' as const };
+  const resolvedGroups = [{ ...groups[0], state: 'resolved' as const }];
+  setupReviewMocks(
+    resolvedDetail,
+    resolvedGroups,
+    progress({ resolved_count: 1, remaining_count: 0, all_decided: true }),
+  );
+  vi.mocked(api.getImportRunsDashboard).mockResolvedValue([
+    {
+      import_run_id: runId,
+      source_root: 'D:/source',
+      state: 'analyzing',
+      total_albums: 2,
+      pending_albums: 1,
+      analyzing_albums: 0,
+      analyzed_albums: 0,
+      review_required_albums: 1,
+      failed_albums: 0,
+      total_images: 4,
+      pending_reviews: 0,
+      duplicate_candidates: 1,
+    },
+  ]);
+  const onNavigate = vi.fn();
+  renderReview({ onNavigate });
+
+  expect(await screen.findByText('当前审核答案已保存，分析尚未完成')).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '生成并冻结导入计划' })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: '继续分析' }));
+  expect(onNavigate).toHaveBeenCalledWith('scan');
 });
 
 test('shows frozen source mode as an explicit, default-off destructive toggle', async () => {

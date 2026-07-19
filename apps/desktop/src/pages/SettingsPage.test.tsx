@@ -6,6 +6,7 @@ import { api } from '../lib/ipc/api';
 
 vi.mock('../lib/ipc/api', () => ({
   api: {
+    getBuildInfo: vi.fn(),
     getSettings: vi.fn(),
     getDatabaseStatus: vi.fn(),
     getCriticalOperationGuardStatus: vi.fn(),
@@ -29,6 +30,11 @@ afterEach(() => cleanup());
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockedApi.getBuildInfo.mockResolvedValue({
+    app_version: '0.1.0',
+    git_commit: '80f8f0542321d4f9a0c58eb003fcfdc12b4efae4',
+    git_dirty: false,
+  });
   mockedApi.getSettings.mockResolvedValue({
     database_mode: 'managed_local',
     library_root: null,
@@ -428,6 +434,9 @@ describe('SettingsPage external PostgreSQL GUI', () => {
     renderSettingsPage();
 
     expect(await screen.findByRole('heading', { name: 'ImageDB M3' })).toBeInTheDocument();
+    expect(screen.getByRole('table', { name: '应用构建信息' })).toBeInTheDocument();
+    expect(await screen.findByText('0.1.0')).toBeInTheDocument();
+    expect(screen.getByText('80f8f0542321d4f9a0c58eb003fcfdc12b4efae4')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'animal-island-ui' })).toHaveAttribute(
       'href',
       'https://github.com/guokaigdg/animal-island-ui',

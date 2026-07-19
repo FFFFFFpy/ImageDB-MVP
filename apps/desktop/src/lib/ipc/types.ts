@@ -1,6 +1,12 @@
 export type TaggedStatus = string | Record<string, string>;
 export type DiagnosticItem = string | number | boolean | null | Record<string, unknown>;
 
+export interface BuildInfo {
+  app_version: string;
+  git_commit: string;
+  git_dirty: boolean | null;
+}
+
 export interface DatabaseState {
   mode: 'managed_local' | 'external' | null;
   status: TaggedStatus;

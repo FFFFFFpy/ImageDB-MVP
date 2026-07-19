@@ -2443,8 +2443,16 @@ impl ImportRepository {
                         dc.confidence
                  FROM duplicate_candidates dc
                  JOIN import_images si ON dc.source_image_id = si.id
+                 JOIN import_albums source_album ON source_album.id = si.import_album_id
+                 LEFT JOIN import_images csi ON csi.id = dc.candidate_source_image_id
+                 LEFT JOIN import_albums candidate_album ON candidate_album.id = csi.import_album_id
                  LEFT JOIN review_decisions rd ON rd.candidate_id = dc.id
-                 WHERE dc.import_run_id = $1",
+                 WHERE dc.import_run_id = $1
+                   AND source_album.state IN ('analyzed', 'review_required')
+                   AND (
+                       dc.candidate_source_image_id IS NULL
+                       OR candidate_album.state IN ('analyzed', 'review_required')
+                   )",
                 &[&import_run_id],
             )
             .await

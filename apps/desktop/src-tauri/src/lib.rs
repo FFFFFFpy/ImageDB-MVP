@@ -504,6 +504,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_status,
+            commands::get_build_info,
             commands::probe_postgres,
             commands::probe_image_fingerprint,
             commands::probe_file_transaction,
