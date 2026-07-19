@@ -551,6 +551,7 @@ pub fn run() {
             commands::get_frozen_import_plan_summary,
             commands::get_import_plan_draft_summary,
             commands::abandon_frozen_import_workflow,
+            commands::reopen_frozen_import_plan,
             commands::set_import_plan_album_included,
             commands::set_import_plan_image_included,
             commands::set_import_plan_source_file_mode,

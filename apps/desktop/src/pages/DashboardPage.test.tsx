@@ -93,6 +93,7 @@ function renderDashboard(
   onGoCommit = vi.fn(),
   onGoRecovery = vi.fn(),
   onGoLibrary = vi.fn(),
+  onGoPlan = vi.fn(),
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -101,6 +102,7 @@ function renderDashboard(
     client,
     onGoScan,
     onGoReview,
+    onGoPlan,
     onGoCommit,
     onGoRecovery,
     onGoLibrary,
@@ -111,6 +113,7 @@ function renderDashboard(
           onConfigureDatabase={vi.fn()}
           onGoScan={onGoScan}
           onGoReview={onGoReview}
+          onGoPlan={onGoPlan}
           onGoCommit={onGoCommit}
           onGoRecovery={onGoRecovery}
           onGoLibrary={onGoLibrary}
@@ -246,11 +249,10 @@ describe('DashboardPage database info', () => {
       },
       next_action: 'generate_plan',
     };
-    const onGoReview = vi.fn();
-    renderDashboard(vi.fn(), onGoReview);
+    const { onGoPlan } = renderDashboard();
 
-    fireEvent.click(await screen.findByRole('button', { name: '前往入库审核' }));
-    expect(onGoReview).toHaveBeenCalledOnce();
+    fireEvent.click(await screen.findByRole('button', { name: '前往入库调整' }));
+    expect(onGoPlan).toHaveBeenCalledOnce();
   });
 
   test('routes a fully reviewed review-required run to plan generation', async () => {
@@ -268,11 +270,10 @@ describe('DashboardPage database info', () => {
       },
       next_action: 'generate_plan',
     };
-    const onGoReview = vi.fn();
-    renderDashboard(vi.fn(), onGoReview);
+    const { onGoPlan } = renderDashboard();
 
-    fireEvent.click(await screen.findByRole('button', { name: '前往入库审核' }));
-    expect(onGoReview).toHaveBeenCalledOnce();
+    fireEvent.click(await screen.findByRole('button', { name: '前往入库调整' }));
+    expect(onGoPlan).toHaveBeenCalledOnce();
     expect(screen.queryByRole('button', { name: '开始导入' })).not.toBeInTheDocument();
   });
 
@@ -358,7 +359,7 @@ describe('DashboardPage next_action presentation', () => {
     ['recover', '前往恢复'],
     ['inspect_transaction_failure', '处理失败事务'],
     ['review', '继续审核'],
-    ['generate_plan', '前往入库审核'],
+    ['generate_plan', '前往入库调整'],
     ['resume_analysis', '继续分析'],
     ['inspect_failed', '查看失败图集'],
     ['resume_commit', '继续入库'],

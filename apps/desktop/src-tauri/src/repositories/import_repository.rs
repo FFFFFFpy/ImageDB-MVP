@@ -3830,6 +3830,84 @@ impl ImportRepository {
         Ok(plan_id)
     }
 
+    /// Preserve a frozen plan as audit evidence and copy its exact persisted
+    /// rows into a new editable draft. The caller must hold the parent run
+    /// lock and must have verified that Commit has not created any file
+    /// transactions. Copying in SQL avoids tens of thousands of IPC/database
+    /// round trips for large plans.
+    pub async fn clone_frozen_plan_to_draft_in_transaction(
+        client: &Client,
+        import_run_id: Uuid,
+        frozen_plan_id: Uuid,
+    ) -> Result<Uuid, AppError> {
+        let version = Self::next_import_plan_version(client, import_run_id).await?;
+        let new_plan_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_plans
+                    (id, import_run_id, version, state, policy_version, library_root_id,
+                     plan_hash, source_file_mode)
+                 SELECT $1, import_run_id, $2, 'draft', policy_version, library_root_id,
+                        NULL, source_file_mode
+                 FROM import_plans
+                 WHERE id = $3 AND import_run_id = $4 AND state = 'frozen'",
+                &[&new_plan_id, &version, &frozen_plan_id, &import_run_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to clone frozen plan header: {e}")))?;
+
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE imagedb_plan_album_clone_map (
+                    old_plan_album_id UUID PRIMARY KEY,
+                    new_plan_album_id UUID NOT NULL
+                 ) ON COMMIT DROP",
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to prepare plan album clone: {e}")))?;
+        client
+            .execute(
+                "INSERT INTO imagedb_plan_album_clone_map
+                    (old_plan_album_id, new_plan_album_id)
+                 SELECT id, gen_random_uuid()
+                 FROM import_plan_albums
+                 WHERE plan_id = $1",
+                &[&frozen_plan_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to map cloned plan albums: {e}")))?;
+        client
+            .execute(
+                "INSERT INTO import_plan_albums
+                    (id, plan_id, import_album_id, target_relative_path,
+                     expected_image_count, album_plan_hash)
+                 SELECT m.new_plan_album_id, $1, a.import_album_id,
+                        a.target_relative_path, a.expected_image_count, a.album_plan_hash
+                 FROM import_plan_albums a
+                 JOIN imagedb_plan_album_clone_map m ON m.old_plan_album_id = a.id",
+                &[&new_plan_id],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to clone plan albums: {e}")))?;
+        client
+            .execute(
+                "INSERT INTO import_plan_images
+                    (id, plan_album_id, import_image_id, source_path,
+                     source_relative_path, target_relative_path, expected_file_size,
+                     expected_blake3, width, height, format)
+                 SELECT gen_random_uuid(), m.new_plan_album_id, i.import_image_id,
+                        i.source_path, i.source_relative_path, i.target_relative_path,
+                        i.expected_file_size, i.expected_blake3, i.width, i.height, i.format
+                 FROM import_plan_images i
+                 JOIN imagedb_plan_album_clone_map m ON m.old_plan_album_id = i.plan_album_id",
+                &[],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to clone plan images: {e}")))?;
+
+        Ok(new_plan_id)
+    }
+
     /// Write every frozen-plan row inside the caller's open transaction.
     /// The caller must already hold the parent `import_runs` row lock; this
     /// keeps candidate/image reads, hash computation, writes, and summary

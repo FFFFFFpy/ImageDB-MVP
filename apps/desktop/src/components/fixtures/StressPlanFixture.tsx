@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReviewProgress } from '../../lib/ipc/types';
-import { ReviewPage } from '../../pages/ReviewPage';
+import { PlanPage } from '../../pages/PlanPage';
 import { Layout } from '../Layout';
 import { createLargeImportPlanFixture } from './importPlanFixture';
 
@@ -20,10 +20,7 @@ export function StressPlanFixture() {
     });
     queryClient.setQueryData(['reviewQueue', stressPlan.import_run_id], []);
     queryClient.setQueryData(['reviewProgress', stressPlan.import_run_id], progress);
-    queryClient.setQueryData(
-      ['reviewImportPlanDraftSummary', stressPlan.import_run_id],
-      stressPlan,
-    );
+    queryClient.setQueryData(['importPlanDraftSummary', stressPlan.import_run_id], stressPlan);
     queryClient.setQueryData(['database-info-dashboard'], {
       imports: { failed_album_count: 0, pending_review_count: 0, recovery_required_run_count: 0 },
     });
@@ -32,14 +29,8 @@ export function StressPlanFixture() {
 
   return (
     <QueryClientProvider client={client}>
-      <Layout currentRoute="review" onNavigate={() => undefined} enablePolling={false}>
-        <ReviewPage
-          initialImportRunId={plan.import_run_id}
-          initialPlan={plan}
-          initialShowPlan
-          enablePolling={false}
-          onNavigate={() => undefined}
-        />
+      <Layout currentRoute="plan" onNavigate={() => undefined} enablePolling={false}>
+        <PlanPage initialPlan={plan} enablePolling={false} onNavigate={() => undefined} />
       </Layout>
     </QueryClientProvider>
   );

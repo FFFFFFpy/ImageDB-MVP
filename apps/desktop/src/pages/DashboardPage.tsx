@@ -17,6 +17,7 @@ interface DashboardPageProps {
   onConfigureDatabase: () => void;
   onGoScan: (importRunId?: string | null) => void;
   onGoReview: (importRunId: string) => void;
+  onGoPlan: (importRunId: string) => void;
   onGoCommit: (importRunId: string) => void;
   onGoRecovery: () => void;
   onGoLibrary: () => void;
@@ -55,9 +56,9 @@ export function getNextActionPresentation(action: DashboardNextAction): NextActi
       };
     case 'generate_plan':
       return {
-        title: '生成导入计划',
-        description: '审核已经完成，下一步将生成并检查可冻结的导入计划。',
-        label: '前往入库审核',
+        title: '调整入库计划',
+        description: '审核已经完成，下一步生成草稿并检查清单；此操作不会锁定计划。',
+        label: '前往入库调整',
         tone: 'default',
       };
     case 'resume_analysis':
@@ -126,6 +127,7 @@ export function DashboardPage({
   onConfigureDatabase,
   onGoScan,
   onGoReview,
+  onGoPlan,
   onGoCommit,
   onGoRecovery,
   onGoLibrary,
@@ -195,8 +197,10 @@ export function DashboardPage({
         onGoRecovery();
         return;
       case 'review':
-      case 'generate_plan':
         if (actionableRun?.import_run_id) onGoReview(actionableRun.import_run_id);
+        return;
+      case 'generate_plan':
+        if (actionableRun?.import_run_id) onGoPlan(actionableRun.import_run_id);
         return;
       case 'resume_analysis':
       case 'inspect_failed':

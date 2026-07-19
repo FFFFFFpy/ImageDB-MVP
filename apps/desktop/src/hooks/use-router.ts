@@ -8,6 +8,7 @@ export type Route =
   | 'probes'
   | 'scan'
   | 'review'
+  | 'plan'
   | 'commit'
   | 'recovery';
 
@@ -26,6 +27,8 @@ function getRouteFromHash(): Route {
       return 'scan';
     case '/review':
       return 'review';
+    case '/plan':
+      return 'plan';
     case '/commit':
       return 'commit';
     case '/recovery':

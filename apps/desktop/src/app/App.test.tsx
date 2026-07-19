@@ -345,13 +345,13 @@ function setActionableDashboard(nextAction: 'review' | 'resume_commit', importRu
   };
 }
 
-test('keeps the dashboard-selected review run when a newer second run exists', async () => {
+test('keeps the dashboard-selected review run on the separate review page when a newer run exists', async () => {
   setActionableDashboard('review', 'run-older-a');
   renderApp();
 
   fireEvent.click(await screen.findByRole('button', { name: '继续审核' }));
 
-  expect(await screen.findByRole('heading', { name: '入库计划已锁定' })).toBeInTheDocument();
+  expect(await screen.findByRole('heading', { name: '按组审核重复图片' })).toBeInTheDocument();
   await waitFor(() => expect(mockState.requestedReviewRunIds).toContain('run-older-a'));
   expect(mockState.requestedReviewRunIds).not.toContain('run-newer-b');
 });

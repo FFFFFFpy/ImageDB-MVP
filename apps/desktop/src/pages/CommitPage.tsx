@@ -24,6 +24,7 @@ import {
 interface CommitPageProps {
   onNavigate: (route: Route) => void;
   onGoReview?: (importRunId: string) => void;
+  onGoPlan?: (importRunId: string) => void;
   onWorkflowAbandoned?: () => void;
   onNavigationBlockedChange?: (blocked: boolean) => void;
   initialPhase?: Phase;
@@ -203,6 +204,7 @@ function stageLabel(stage: string | undefined): string {
 export function CommitPage({
   onNavigate,
   onGoReview,
+  onGoPlan,
   onWorkflowAbandoned,
   onNavigationBlockedChange,
   initialPhase = 'confirm',
@@ -392,9 +394,7 @@ export function CommitPage({
                   variant="quiet"
                   disabled={commitMutation.isPending || abandonWorkflowMutation.isPending}
                   onClick={() =>
-                    committableRunId && onGoReview
-                      ? onGoReview(committableRunId)
-                      : onNavigate('review')
+                    committableRunId && onGoPlan ? onGoPlan(committableRunId) : onNavigate('plan')
                   }
                 >
                   查看锁定计划
@@ -508,7 +508,7 @@ export function CommitPage({
           <StatusBanner
             tone="danger"
             title="无法读取 frozen plan"
-            actions={<Button onClick={() => onNavigate('review')}>前往审核</Button>}
+            actions={<Button onClick={() => onNavigate('plan')}>前往入库调整</Button>}
           >
             {String(planQuery.error)}
           </StatusBanner>

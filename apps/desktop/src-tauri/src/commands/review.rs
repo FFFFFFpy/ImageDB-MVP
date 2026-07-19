@@ -288,6 +288,26 @@ pub async fn abandon_frozen_import_workflow(
     result
 }
 
+/// Return a locked plan to the editable planning stage only while Commit has
+/// not created any file transaction. The service preserves the old plan as
+/// invalidated audit evidence and returns the new draft.
+#[tauri::command]
+pub async fn reopen_frozen_import_plan(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::reopen_frozen_import_plan(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
 #[tauri::command]
 pub async fn set_import_plan_album_included(
     state: State<'_, AppState>,

@@ -3,14 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { api } from '../lib/ipc/api';
 import { importPlanFixture } from '../components/fixtures/importPlanFixture';
-import type {
-  ImportPlanImage,
-  ReviewGroupDetail,
-  ReviewGroupSummary,
-  ReviewProgress,
-} from '../lib/ipc/types';
+import type { ReviewGroupDetail, ReviewGroupSummary, ReviewProgress } from '../lib/ipc/types';
 import {
-  groupImportPlanImagesByAlbum,
   invalidateReviewWorkflowQueries,
   ReviewPage,
   shouldIgnoreReviewShortcut,
@@ -175,36 +169,6 @@ function renderReview(props: Partial<React.ComponentProps<typeof ReviewPage>> = 
   );
   return { ...result, client };
 }
-
-describe('groupImportPlanImagesByAlbum', () => {
-  test('groups images and preserves independent include decisions', () => {
-    const images: ImportPlanImage[] = [
-      {
-        image_id: 'a',
-        source_path: 'D:/a.jpg',
-        relative_path: 'a.jpg',
-        file_size: 10,
-        album_name: 'A',
-        album_id: 'album-a',
-        source_album_id: 'album-a',
-        included: true,
-      },
-      {
-        image_id: 'b',
-        source_path: 'D:/b.jpg',
-        relative_path: 'b.jpg',
-        file_size: 20,
-        album_name: 'A',
-        album_id: 'album-a',
-        source_album_id: 'album-a',
-        included: false,
-      },
-    ];
-    expect(groupImportPlanImagesByAlbum(images)).toMatchObject([
-      { albumId: 'album-a', imageCount: 1, skippedImageCount: 1, totalSize: 10 },
-    ]);
-  });
-});
 
 test('renders every group member and submits one action for every import member', async () => {
   setupReviewMocks();
@@ -371,7 +335,7 @@ test('refreshes review groups once when an analyzing run becomes reviewable', as
   expect(api.getReviewGroupDetail).toHaveBeenCalledTimes(2);
 });
 
-test('generates an editable draft before the plan can be locked', async () => {
+test('generates only an editable draft and routes to the separate planning page', async () => {
   const resolvedDetail = { ...detail, state: 'resolved' as const };
   const resolvedGroups = [{ ...groups[0], state: 'resolved' as const }];
   setupReviewMocks(
@@ -381,59 +345,15 @@ test('generates an editable draft before the plan can be locked', async () => {
   );
   const draftPlan = { ...importPlanFixture, plan_hash: null };
   vi.spyOn(api, 'generateImportPlan').mockResolvedValue(draftPlan);
-  renderReview();
+  const freeze = vi.spyOn(api, 'freezeImportPlan');
+  const onGoPlan = vi.fn();
+  renderReview({ onGoPlan });
 
   fireEvent.click(await screen.findByRole('button', { name: '生成人工复核入库计划' }));
 
-  expect(await screen.findByRole('heading', { name: '人工复核入库计划' })).toBeVisible();
-  expect(screen.getByText('尚未锁定')).toBeVisible();
-  expect(screen.getAllByRole('button', { name: '锁定入库计划' })[0]).toBeEnabled();
+  await waitFor(() => expect(onGoPlan).toHaveBeenCalledWith(draftPlan.import_run_id));
+  expect(freeze).not.toHaveBeenCalled();
   expect(draftPlan.plan_hash).toBeNull();
-});
-
-test('edits the draft without a hash and creates the hash only when locking', async () => {
-  const draftPlan = { ...importPlanFixture, plan_hash: null };
-  const editedDraft = {
-    ...draftPlan,
-    source_file_mode: 'move_selected_without_backup' as const,
-  };
-  const frozenPlan = { ...editedDraft, plan_hash: 'locked-plan-hash' };
-  vi.spyOn(api, 'setImportPlanSourceFileMode').mockResolvedValue(editedDraft);
-  vi.spyOn(api, 'freezeImportPlan').mockResolvedValue(frozenPlan);
-  const onGoCommit = vi.fn();
-  renderReview({
-    initialImportRunId: draftPlan.import_run_id,
-    initialPlan: draftPlan,
-    initialShowPlan: true,
-    onGoCommit,
-  });
-
-  const toggle = screen.getByRole('checkbox', { name: '移动已选源图片（无备份）' });
-  expect(toggle).toBeEnabled();
-  fireEvent.click(toggle);
-  await waitFor(() =>
-    expect(api.setImportPlanSourceFileMode).toHaveBeenCalledWith(
-      importPlanFixture.import_run_id,
-      'move_selected_without_backup',
-    ),
-  );
-  expect(await screen.findByText('不可撤销的源文件操作')).toBeVisible();
-  expect(screen.queryByText(/计划哈希/)).not.toBeInTheDocument();
-
-  fireEvent.click(screen.getAllByRole('button', { name: '锁定入库计划' })[0]);
-  await waitFor(() => expect(api.freezeImportPlan).toHaveBeenCalledWith(draftPlan.import_run_id));
-  await waitFor(() => expect(onGoCommit).toHaveBeenCalledWith(draftPlan.import_run_id));
-});
-
-test('makes every plan adjustment read-only after locking', () => {
-  renderReview({ initialPlan: importPlanFixture, initialShowPlan: true });
-
-  expect(screen.getByRole('heading', { name: '入库计划已锁定' })).toBeVisible();
-  const toggle = screen.getByRole('checkbox', { name: '移动已选源图片（无备份）' });
-  expect(toggle).toBeDisabled();
-  for (const button of screen.getAllByRole('button', { name: '排除整组' })) {
-    expect(button).toBeDisabled();
-  }
 });
 
 test('invalidates group-level review workflow queries', async () => {
@@ -443,7 +363,7 @@ test('invalidates group-level review workflow queries', async () => {
   expect(invalidate).toHaveBeenCalledWith({ queryKey: ['reviewGroups', runId] });
   expect(invalidate).toHaveBeenCalledWith({ queryKey: ['reviewProgress', runId] });
   expect(invalidate).toHaveBeenCalledWith({
-    queryKey: ['reviewImportPlanDraftSummary', runId],
+    queryKey: ['importPlanDraftSummary', runId],
   });
 });
 

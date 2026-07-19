@@ -1155,6 +1155,47 @@ pub async fn abandon_frozen_import_workflow(
     finish_plan_transaction(client, result, "workflow abandon").await
 }
 
+/// Reopen a frozen plan as a new editable draft before Commit has prewritten
+/// any file transaction. The old frozen rows and hash remain as invalidated
+/// audit evidence; no source or library files are touched.
+pub async fn reopen_frozen_import_plan(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<ImportPlan, AppError> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin plan reopen: {e}")))?;
+
+    let result = async {
+        let run_state = ensure_plan_reopen_allowed(client, import_run_id).await?;
+        let frozen = ImportRepository::load_frozen_plan(client, import_run_id)
+            .await?
+            .ok_or_else(|| AppError::Internal(format!("frozen plan {import_run_id} not found")))?;
+
+        ImportRepository::clone_frozen_plan_to_draft_in_transaction(
+            client,
+            import_run_id,
+            frozen.plan_id,
+        )
+        .await?;
+        ImportRepository::update_import_plan_state(client, frozen.plan_id, &PlanState::Invalidated)
+            .await?;
+
+        debug_assert_eq!(run_state, ImportRunState::ReadyToCommit.to_string());
+        ImportRepository::load_draft_plan_summary(client, import_run_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "reopening frozen plan did not produce a draft for run {import_run_id}"
+                ))
+            })
+    }
+    .await;
+
+    finish_plan_transaction(client, result, "plan reopen").await
+}
+
 pub async fn set_plan_album_included(
     client: &Client,
     import_run_id: Uuid,
@@ -1333,6 +1374,40 @@ async fn ensure_workflow_abandon_allowed(
         return Err(AppError::Internal(
             "cannot abandon import workflow after commit transactions have been created"
                 .to_string(),
+        ));
+    }
+    Ok(run_state)
+}
+
+async fn ensure_plan_reopen_allowed(
+    client: &Client,
+    import_run_id: Uuid,
+) -> Result<String, AppError> {
+    let row = client
+        .query_opt(
+            "SELECT state FROM import_runs WHERE id = $1 FOR UPDATE",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to lock import run to reopen plan: {e}")))?
+        .ok_or_else(|| AppError::Internal(format!("import run {import_run_id} not found")))?;
+    let run_state: String = row.get("state");
+    if run_state != ImportRunState::ReadyToCommit.to_string() {
+        return Err(AppError::Internal(format!(
+            "cannot reopen import plan while run is in state '{run_state}'"
+        )));
+    }
+    let transaction_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+            &[&import_run_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to check plan transactions: {e}")))?
+        .get(0);
+    if transaction_count > 0 {
+        return Err(AppError::Internal(
+            "cannot reopen import plan after commit transactions have been created".to_string(),
         ));
     }
     Ok(run_state)
@@ -3510,6 +3585,73 @@ mod tests {
         assert_eq!(reloaded_plan.excluded_count, plan.excluded_count);
         assert_eq!(reloaded_plan.kept_images, plan.kept_images);
 
+        // Before Commit prewrites any file transaction, a mistaken lock can
+        // be recovered without mutating the frozen evidence in place.
+        let frozen_evidence = client
+            .query_one(
+                "SELECT id, plan_hash FROM import_plans
+                 WHERE import_run_id = $1 AND state = 'frozen'",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap();
+        let frozen_evidence_id: Uuid = frozen_evidence.get("id");
+        let frozen_evidence_hash: Vec<u8> = frozen_evidence.get("plan_hash");
+        let reopened = reopen_frozen_import_plan(&client, import_run_id)
+            .await
+            .expect("a frozen plan with zero file transactions must reopen as a draft");
+        assert!(reopened.plan_hash.is_none());
+        assert_eq!(reopened.kept_images, plan.kept_images);
+        assert_eq!(reopened.source_file_mode, plan.source_file_mode);
+        assert!(get_frozen_plan_summary(&client, import_run_id)
+            .await
+            .unwrap()
+            .is_none());
+        let retained_evidence = client
+            .query_one(
+                "SELECT state, plan_hash FROM import_plans WHERE id = $1",
+                &[&frozen_evidence_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained_evidence.get::<_, String>("state"), "invalidated");
+        assert_eq!(
+            retained_evidence.get::<_, Vec<u8>>("plan_hash"),
+            frozen_evidence_hash
+        );
+        let plan = freeze_import_plan(&client, import_run_id)
+            .await
+            .expect("the reopened draft must freeze independently");
+        assert!(plan.plan_hash.is_some());
+        let transaction_evidence_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO file_transactions
+                    (id, import_run_id, import_album_id, state, plan_hash)
+                 VALUES ($1, $2, $3, 'planned', $4)",
+                &[
+                    &transaction_evidence_id,
+                    &import_run_id,
+                    &album_id,
+                    &vec![0x42u8; 32],
+                ],
+            )
+            .await
+            .unwrap();
+        let transaction_block = reopen_frozen_import_plan(&client, import_run_id)
+            .await
+            .expect_err("file transaction evidence must block reopening a frozen plan");
+        assert!(transaction_block
+            .to_string()
+            .contains("after commit transactions have been created"));
+        client
+            .execute(
+                "DELETE FROM file_transactions WHERE id = $1",
+                &[&transaction_evidence_id],
+            )
+            .await
+            .unwrap();
+
         // Commit and plan edits serialize on the import_run row. Simulate the
         // short Commit capture transaction holding that lock and publishing
         // the guarded state transition; a concurrent editor must wait, then
@@ -3561,6 +3703,10 @@ mod tests {
             .expect("plan edit task panicked")
             .expect_err("plan edit must reject the committed 'committing' state");
         assert!(edit_error.to_string().contains("state 'committing'"));
+        let reopen_error = reopen_frozen_import_plan(&client, import_run_id)
+            .await
+            .expect_err("a committing run must never reopen its frozen plan");
+        assert!(reopen_error.to_string().contains("state 'committing'"));
         let plan_image_count_after: i64 = client
             .query_one(
                 "SELECT COUNT(*) FROM import_plan_images ipi

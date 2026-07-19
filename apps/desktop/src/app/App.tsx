@@ -8,6 +8,7 @@ import { CommitPage } from '../pages/CommitPage';
 import { DashboardPage } from '../pages/DashboardPage';
 import { LibraryPage } from '../pages/LibraryPage';
 import { OnboardingPage } from '../pages/OnboardingPage';
+import { PlanPage } from '../pages/PlanPage';
 import { ProbesPage } from '../pages/ProbesPage';
 import { RecoveryPage } from '../pages/RecoveryPage';
 import { ReviewPage } from '../pages/ReviewPage';
@@ -29,7 +30,12 @@ export function App() {
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
   const handleLayoutNavigate = (nextRoute: Parameters<typeof navigate>[0]) => {
-    if (nextRoute === 'scan' || nextRoute === 'review' || nextRoute === 'commit') {
+    if (
+      nextRoute === 'scan' ||
+      nextRoute === 'review' ||
+      nextRoute === 'plan' ||
+      nextRoute === 'commit'
+    ) {
       setWorkflowImportRunId(null);
     }
     navigate(nextRoute);
@@ -84,6 +90,10 @@ export function App() {
                 setWorkflowImportRunId(importRunId);
                 navigate('review');
               }}
+              onGoPlan={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('plan');
+              }}
               onGoCommit={(importRunId) => {
                 setWorkflowImportRunId(importRunId);
                 navigate('commit');
@@ -107,6 +117,16 @@ export function App() {
             <ReviewPage
               initialImportRunId={workflowImportRunId}
               onNavigate={navigate}
+              onGoPlan={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('plan');
+              }}
+            />
+          )}
+          {route === 'plan' && (
+            <PlanPage
+              initialImportRunId={workflowImportRunId}
+              onNavigate={navigate}
               onGoCommit={(importRunId) => {
                 setWorkflowImportRunId(importRunId);
                 navigate('commit');
@@ -122,6 +142,10 @@ export function App() {
               onGoReview={(importRunId) => {
                 setWorkflowImportRunId(importRunId);
                 navigate('review');
+              }}
+              onGoPlan={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('plan');
               }}
               onWorkflowAbandoned={handleWorkflowAbandoned}
               onNavigationBlockedChange={setWorkflowNavigationBlocked}

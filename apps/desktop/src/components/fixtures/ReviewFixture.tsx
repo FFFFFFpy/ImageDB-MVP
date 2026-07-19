@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReviewGroupDetail, ReviewGroupSummary, ReviewProgress } from '../../lib/ipc/types';
 import { ReviewPage } from '../../pages/ReviewPage';
+import { PlanPage } from '../../pages/PlanPage';
 import { Layout } from '../Layout';
 import { importPlanFixture } from './importPlanFixture';
 
@@ -175,7 +176,7 @@ fixtureClient.setQueryData(['reviewProgress', importPlanFixture.import_run_id], 
 });
 const draftPlanFixture = { ...importPlanFixture, plan_hash: null };
 fixtureClient.setQueryData(
-  ['reviewImportPlanDraftSummary', importPlanFixture.import_run_id],
+  ['importPlanDraftSummary', importPlanFixture.import_run_id],
   draftPlanFixture,
 );
 fixtureClient.setQueryData(['database-info-dashboard'], {
@@ -190,14 +191,24 @@ export function ReviewFixture({ view = 'review' }: ReviewFixtureProps) {
   const showPlan = view === 'plan';
   return (
     <QueryClientProvider client={fixtureClient}>
-      <Layout currentRoute="review" onNavigate={() => undefined} enablePolling={false}>
-        <ReviewPage
-          initialImportRunId={showPlan ? importPlanFixture.import_run_id : importRunId}
-          initialPlan={showPlan ? draftPlanFixture : null}
-          initialShowPlan={showPlan}
-          enablePolling={false}
-          onNavigate={() => undefined}
-        />
+      <Layout
+        currentRoute={showPlan ? 'plan' : 'review'}
+        onNavigate={() => undefined}
+        enablePolling={false}
+      >
+        {showPlan ? (
+          <PlanPage
+            initialPlan={draftPlanFixture}
+            enablePolling={false}
+            onNavigate={() => undefined}
+          />
+        ) : (
+          <ReviewPage
+            initialImportRunId={importRunId}
+            enablePolling={false}
+            onNavigate={() => undefined}
+          />
+        )}
       </Layout>
     </QueryClientProvider>
   );

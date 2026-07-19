@@ -88,6 +88,7 @@ export function DashboardFixture() {
           onConfigureDatabase={() => undefined}
           onGoScan={() => undefined}
           onGoReview={() => undefined}
+          onGoPlan={() => undefined}
           onGoCommit={() => undefined}
           onGoRecovery={() => undefined}
           onGoLibrary={() => undefined}

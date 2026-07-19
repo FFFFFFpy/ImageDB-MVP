@@ -16,6 +16,7 @@ const NAV_ITEMS: { route: Route; label: string; icon: AppIconName }[] = [
   { route: 'dashboard', label: '工作台', icon: 'dashboard' },
   { route: 'scan', label: '新建导入', icon: 'import' },
   { route: 'review', label: '审核', icon: 'review' },
+  { route: 'plan', label: '入库调整', icon: 'commit' },
   { route: 'commit', label: '入库', icon: 'commit' },
   { route: 'recovery', label: '恢复', icon: 'recovery' },
 ];
