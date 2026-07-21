@@ -7,6 +7,7 @@ mod recovery;
 pub mod review;
 pub mod scan;
 mod settings_cmd;
+pub mod workflow;
 
 pub use commit::*;
 pub use database::*;
@@ -17,6 +18,7 @@ pub use recovery::*;
 pub use review::*;
 pub use scan::*;
 pub use settings_cmd::*;
+pub use workflow::*;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BuildInfo {

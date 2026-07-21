@@ -567,3 +567,21 @@ export interface ReverifyResult {
   verdict: 'already_committed' | 'conflict' | 'resume' | string;
   message: string;
 }
+
+export type WorkflowStageName =
+  | 'idle'
+  | 'analysis'
+  | 'review'
+  | 'generate_plan'
+  | 'plan_draft'
+  | 'commit_confirm'
+  | 'committing'
+  | 'recovery'
+  | 'completed'
+  | 'failed'
+  | 'abandoned';
+
+export interface WorkflowStage {
+  stage: WorkflowStageName;
+  import_run_id: string | null;
+}

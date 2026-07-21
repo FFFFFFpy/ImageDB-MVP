@@ -23,7 +23,6 @@ import {
 
 interface CommitPageProps {
   onNavigate: (route: Route) => void;
-  onGoReview?: (importRunId: string) => void;
   onWorkflowAbandoned?: () => void;
   onNavigationBlockedChange?: (blocked: boolean) => void;
   initialPhase?: Phase;
@@ -202,7 +201,6 @@ function stageLabel(stage: string | undefined): string {
 
 export function CommitPage({
   onNavigate,
-  onGoReview,
   onWorkflowAbandoned,
   onNavigationBlockedChange,
   initialPhase = 'confirm',
@@ -391,11 +389,7 @@ export function CommitPage({
                 <Button
                   variant="quiet"
                   disabled={commitMutation.isPending || abandonWorkflowMutation.isPending}
-                  onClick={() =>
-                    committableRunId && onGoReview
-                      ? onGoReview(committableRunId)
-                      : onNavigate('review')
-                  }
+                  onClick={() => onNavigate('plan')}
                 >
                   查看锁定计划
                 </Button>
@@ -483,13 +477,9 @@ export function CommitPage({
                 <div className="commit-empty-actions">
                   <Button
                     variant="primary"
-                    onClick={() =>
-                      committableRunId && onGoReview
-                        ? onGoReview(committableRunId)
-                        : onNavigate('review')
-                    }
+                    onClick={() => onNavigate('plan')}
                   >
-                    前往审核 / 生成计划
+                    前往复核入库计划
                   </Button>
                   <Button variant="quiet" onClick={() => onNavigate('scan')}>
                     前往扫描

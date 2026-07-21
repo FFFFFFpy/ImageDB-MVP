@@ -1,17 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { Route } from '../hooks/use-router';
 import type {
-  ImportPlan,
-  ImportPlanAlbum,
   ImportPlanImage,
   ReviewGroupDetail,
   ReviewGroupMember,
   ReviewGroupMemberAction,
   ReviewGroupMemberDecision,
-  SourceFileMode,
 } from '../lib/ipc/types';
 import {
   AppIcon,
@@ -26,13 +23,9 @@ import {
 
 interface ReviewPageProps {
   onNavigate: (route: Route) => void;
-  onGoCommit?: (importRunId: string) => void;
+  onGoPlan?: (importRunId: string) => void;
   onWorkflowAbandoned?: () => void;
-  onPlanEditPendingChange?: (pending: boolean) => void;
   initialImportRunId?: string | null;
-  initialPreviews?: { left: string; right: string } | null;
-  initialPlan?: ImportPlan | null;
-  initialShowPlan?: boolean;
   enablePolling?: boolean;
 }
 
@@ -136,23 +129,6 @@ export function groupImportPlanImagesByAlbum(images: ImportPlanImage[]): ImportP
     groups.set(image.album_id, current);
   }
   return [...groups.values()];
-}
-
-function planAlbumsForDisplay(plan: ImportPlan): ImportPlanAlbumGroup[] {
-  if (plan.albums.length > 0) {
-    return plan.albums.map((album: ImportPlanAlbum) => ({
-      albumId: album.album_id,
-      albumName: album.album_name,
-      included: album.included,
-      imageCount: album.images.filter((image) => image.included).length,
-      skippedImageCount: album.images.filter((image) => !image.included).length,
-      totalSize: album.images
-        .filter((image) => image.included)
-        .reduce((sum, image) => sum + image.file_size, 0),
-      images: album.images,
-    }));
-  }
-  return groupImportPlanImagesByAlbum(plan.kept_images);
 }
 
 function formatBytes(bytes: number): string {
@@ -334,7 +310,7 @@ function GroupMemberCard({
         {libraryReadonly ? (
           <small>库内成员只读，并始终保留。</small>
         ) : groupResolved ? (
-          <small>这是已保存的草稿；冻结导入计划前仍可调整。</small>
+          <small>这是已保存的草稿；生成入库计划前仍可调整。</small>
         ) : null}
       </div>
     </article>
@@ -435,183 +411,18 @@ function GroupEvidence({ detail }: { detail: ReviewGroupDetail }) {
   );
 }
 
-function PlanView({
-  plan,
-  busy,
-  freezing,
-  onEditAlbum,
-  onEditImage,
-  onMode,
-  onFreeze,
-  onCommit,
-  onAbandon,
-}: {
-  plan: ImportPlan;
-  busy: boolean;
-  freezing: boolean;
-  onEditAlbum: (album: ImportPlanAlbumGroup) => void;
-  onEditImage: (album: ImportPlanAlbumGroup, image: ImportPlanImage) => void;
-  onMode: (mode: SourceFileMode) => void;
-  onFreeze: () => void;
-  onCommit: () => void;
-  onAbandon: () => void;
-}) {
-  const [visibleAlbums, setVisibleAlbums] = useState(50);
-  const albums = useMemo(() => planAlbumsForDisplay(plan), [plan]);
-  const displayed = albums.slice(0, visibleAlbums);
-  const moveMode = plan.source_file_mode === 'move_selected_without_backup';
-  const locked = Boolean(plan.plan_hash);
-  return (
-    <div className="review-page plan-page--m3">
-      <PageHeader
-        title={locked ? '入库计划已锁定' : '人工复核入库计划'}
-        description={
-          locked
-            ? `计划包含 ${plan.total_albums} 个图集、${plan.total_images} 张图片；确认入库页只读取这份计划。`
-            : `检查 ${plan.total_albums} 个图集、${plan.total_images} 张图片，并在锁定前调整导入选择。`
-        }
-        meta={
-          <StatusBadge tone={locked ? 'success' : 'warning'}>
-            {locked ? '计划已锁定' : '尚未锁定'}
-          </StatusBadge>
-        }
-        actions={
-          locked ? (
-            <Button variant="primary" onClick={onCommit} disabled={busy}>
-              前往确认入库
-            </Button>
-          ) : (
-            <Button
-              variant="primary"
-              onClick={onFreeze}
-              disabled={busy || plan.kept_images.length === 0}
-              loading={freezing}
-              loadingLabel="正在锁定…"
-            >
-              锁定入库计划
-            </Button>
-          )
-        }
-      />
-
-      <section className={`plan-source-mode ${moveMode ? 'plan-source-mode--danger' : ''}`}>
-        <div>
-          <h2>源文件处理</h2>
-          <p>
-            {moveMode
-              ? '移动入库：发布并写入数据库成功后，仅删除计划中已入库的源图片，不创建备份。'
-              : '复制并归档：保留默认安全行为，整图集完成后归档源目录。'}
-          </p>
-        </div>
-        <label className="plan-source-mode__toggle">
-          <input
-            type="checkbox"
-            checked={moveMode}
-            disabled={busy || locked}
-            onChange={(event) =>
-              onMode(event.target.checked ? 'move_selected_without_backup' : 'copy_and_archive')
-            }
-          />
-          <span>移动已选源图片（无备份）</span>
-        </label>
-        {moveMode && (
-          <StatusBanner tone="warning" title="不可撤销的源文件操作">
-            仅在发布文件、manifest 和数据库记录全部校验通过后执行。排除图片、sidecar
-            和目录不会删除。
-          </StatusBanner>
-        )}
-      </section>
-
-      <section
-        className="plan-album-list"
-        aria-label={locked ? '已锁定计划图集' : '待复核计划图集'}
-      >
-        {displayed.map((album) => (
-          <details className="plan-album-card" key={album.albumId}>
-            <summary>
-              <span>
-                <strong>{album.albumName}</strong>
-                <small>
-                  {album.imageCount} 张保留 · {album.skippedImageCount} 张排除 ·{' '}
-                  {formatBytes(album.totalSize)}
-                </small>
-              </span>
-              <Button
-                variant={album.included ? 'secondary' : 'primary'}
-                disabled={busy || locked}
-                onClick={(event) => {
-                  event.preventDefault();
-                  onEditAlbum(album);
-                }}
-              >
-                {album.included ? '排除整组' : '恢复整组'}
-              </Button>
-            </summary>
-            <div className="plan-image-grid">
-              {album.images.slice(0, 100).map((image) => (
-                <button
-                  type="button"
-                  className={`plan-image-row ${image.included ? '' : 'plan-image-row--excluded'}`}
-                  key={image.image_id}
-                  disabled={busy || locked}
-                  onClick={() => onEditImage(album, image)}
-                >
-                  <span>{image.relative_path}</span>
-                  <span>{image.included ? '保留' : '排除'}</span>
-                </button>
-              ))}
-            </div>
-          </details>
-        ))}
-      </section>
-      {visibleAlbums < albums.length && (
-        <Button onClick={() => setVisibleAlbums((count) => count + 50)}>加载更多图集</Button>
-      )}
-      <div className="plan-footer-actions">
-        <Button variant="danger" disabled={busy} onClick={onAbandon}>
-          放弃这次导入
-        </Button>
-        {locked ? (
-          <Button variant="primary" disabled={busy} onClick={onCommit}>
-            前往确认入库
-          </Button>
-        ) : (
-          <Button
-            variant="primary"
-            disabled={busy || plan.kept_images.length === 0}
-            loading={freezing}
-            loadingLabel="正在锁定…"
-            onClick={onFreeze}
-          >
-            锁定入库计划
-          </Button>
-        )}
-      </div>
-    </div>
-  );
-}
-
 export function ReviewPage({
   onNavigate,
-  onGoCommit,
+  onGoPlan,
   onWorkflowAbandoned,
-  onPlanEditPendingChange,
   initialImportRunId = null,
-  initialPlan = null,
-  initialShowPlan = false,
   enablePolling = true,
 }: ReviewPageProps) {
   const queryClient = useQueryClient();
-  const [importRunId, setImportRunId] = useState<string | null>(
-    initialImportRunId ?? initialPlan?.import_run_id ?? null,
-  );
-  const [plan, setPlan] = useState<ImportPlan | null>(initialPlan);
-  const [showPlan, setShowPlan] = useState(initialShowPlan || initialPlan !== null);
+  const [importRunId, setImportRunId] = useState<string | null>(initialImportRunId);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [actions, setActions] = useState<Record<string, ReviewGroupMemberAction>>({});
   const [message, setMessage] = useState<string | null>(null);
-  const [planBusy, setPlanBusy] = useState(false);
-  const planEditActive = useRef(false);
   const actionsGroupIdRef = useRef<string | null>(null);
   const actionsDirtyRef = useRef(false);
   const reviewRefreshBoundaryRef = useRef<{
@@ -627,7 +438,7 @@ export function ReviewPage({
   const latestRun = useQuery({
     queryKey: ['latestReviewableImportRun'],
     queryFn: api.getLatestReviewableImportRun,
-    enabled: !importRunId && !initialPlan,
+    enabled: !importRunId,
     refetchInterval: enablePolling ? 2000 : false,
   });
   useEffect(() => {
@@ -637,22 +448,19 @@ export function ReviewPage({
   const groupsQuery = useQuery({
     queryKey: ['reviewGroups', importRunId],
     queryFn: () => api.getReviewGroups(importRunId!),
-    enabled: !!importRunId && !showPlan,
-    // Loading groups is the explicit on-demand reconciliation boundary while
-    // analysis is active. Progress may poll, but the complete connected graph
-    // must not be rebuilt every 1.5 seconds.
+    enabled: !!importRunId,
     refetchInterval: false,
   });
   const progressQuery = useQuery({
     queryKey: ['reviewProgress', importRunId],
     queryFn: () => api.getReviewProgress(importRunId!),
-    enabled: !!importRunId && !showPlan,
+    enabled: !!importRunId,
     refetchInterval: enablePolling ? 1500 : false,
   });
   const runsQuery = useQuery({
     queryKey: ['import-runs-dashboard'],
     queryFn: api.getImportRunsDashboard,
-    enabled: !!importRunId && !showPlan,
+    enabled: !!importRunId,
     refetchInterval: enablePolling ? 1500 : false,
   });
   const activeRun = runsQuery.data?.find((run) => run.import_run_id === importRunId) ?? null;
@@ -663,28 +471,6 @@ export function ReviewPage({
     activeRun.failed_albums === 0 &&
     activeRun.analyzed_albums + activeRun.review_required_albums === activeRun.total_albums,
   );
-  const frozenQuery = useQuery({
-    queryKey: ['reviewFrozenImportPlanSummary', importRunId],
-    queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
-    enabled: !!importRunId && !initialPlan,
-  });
-  useEffect(() => {
-    if (frozenQuery.data) {
-      setPlan(frozenQuery.data);
-      setShowPlan(true);
-    }
-  }, [frozenQuery.data]);
-  const draftQuery = useQuery({
-    queryKey: ['reviewImportPlanDraftSummary', importRunId],
-    queryFn: () => api.getImportPlanDraftSummary(importRunId!),
-    enabled: !!importRunId && !initialPlan,
-  });
-  useEffect(() => {
-    if (draftQuery.data && !frozenQuery.data) {
-      setPlan(draftQuery.data);
-      setShowPlan(true);
-    }
-  }, [draftQuery.data, frozenQuery.data]);
 
   const manualGroups = useMemo(
     () => (groupsQuery.data ?? []).filter((group) => group.requires_manual_review),
@@ -703,7 +489,7 @@ export function ReviewPage({
   const detailQuery = useQuery({
     queryKey: ['reviewGroupDetail', selectedGroupId],
     queryFn: () => api.getReviewGroupDetail(selectedGroupId!),
-    enabled: !!selectedGroupId && !showPlan,
+    enabled: !!selectedGroupId,
   });
   useEffect(() => {
     const currentBoundary = activeRun
@@ -770,8 +556,6 @@ export function ReviewPage({
     },
     onSuccess: async () => {
       setMessage(null);
-      setPlan(null);
-      setShowPlan(false);
       await invalidateReviewWorkflowQueries(queryClient, importRunId ?? undefined);
       actionsGroupIdRef.current = null;
       actionsDirtyRef.current = false;
@@ -783,98 +567,12 @@ export function ReviewPage({
   const generate = useMutation({
     mutationFn: () => api.generateImportPlan(importRunId!),
     onSuccess: (nextPlan) => {
-      setPlan(nextPlan);
-      setShowPlan(true);
-      queryClient.setQueryData(['reviewImportPlanDraftSummary', nextPlan.import_run_id], nextPlan);
+      queryClient.setQueryData(['importPlanDraftSummary', nextPlan.import_run_id], nextPlan);
+      if (onGoPlan) onGoPlan(nextPlan.import_run_id);
+      else onNavigate('plan');
     },
     onError: (error) => setMessage(String(error)),
   });
-
-  const freeze = useMutation({
-    mutationFn: () => api.freezeImportPlan(importRunId!),
-    onMutate: () => onPlanEditPendingChange?.(true),
-    onSuccess: (nextPlan) => {
-      setPlan(nextPlan);
-      setShowPlan(true);
-      queryClient.setQueryData(['reviewImportPlanDraftSummary', nextPlan.import_run_id], null);
-      queryClient.setQueryData(['reviewFrozenImportPlanSummary', nextPlan.import_run_id], nextPlan);
-      queryClient.setQueryData(['frozenImportPlanSummary', nextPlan.import_run_id], nextPlan);
-      if (onGoCommit) onGoCommit(nextPlan.import_run_id);
-      else onNavigate('commit');
-    },
-    onError: (error) => setMessage(String(error)),
-    onSettled: () => onPlanEditPendingChange?.(false),
-  });
-
-  const applyPlanEdit = useCallback(
-    async (edit: () => Promise<ImportPlan>) => {
-      if (planEditActive.current) return;
-      planEditActive.current = true;
-      setPlanBusy(true);
-      onPlanEditPendingChange?.(true);
-      setMessage(null);
-      try {
-        const next = await edit();
-        setPlan(next);
-        queryClient.setQueryData(['reviewImportPlanDraftSummary', next.import_run_id], next);
-      } catch (error) {
-        setMessage(String(error));
-      } finally {
-        planEditActive.current = false;
-        setPlanBusy(false);
-        onPlanEditPendingChange?.(false);
-      }
-    },
-    [onPlanEditPendingChange, queryClient],
-  );
-
-  if (plan && showPlan) {
-    return (
-      <>
-        {message && (
-          <StatusBanner tone="danger" title="计划更新失败">
-            {message}
-          </StatusBanner>
-        )}
-        <PlanView
-          plan={plan}
-          busy={planBusy || freeze.isPending}
-          freezing={freeze.isPending}
-          onEditAlbum={(album) =>
-            void applyPlanEdit(() =>
-              api.setImportPlanAlbumIncluded(plan.import_run_id, album.albumId, !album.included),
-            )
-          }
-          onEditImage={(album, image) =>
-            void applyPlanEdit(() =>
-              api.setImportPlanImageIncluded(
-                plan.import_run_id,
-                image.image_id,
-                album.albumId,
-                !image.included,
-              ),
-            )
-          }
-          onMode={(mode) =>
-            void applyPlanEdit(() => api.setImportPlanSourceFileMode(plan.import_run_id, mode))
-          }
-          onFreeze={() => freeze.mutate()}
-          onCommit={() => (onGoCommit ? onGoCommit(plan.import_run_id) : onNavigate('commit'))}
-          onAbandon={() => {
-            void api
-              .abandonFrozenImportWorkflow(plan.import_run_id)
-              .then(() => {
-                setPlan(null);
-                setShowPlan(false);
-                onWorkflowAbandoned?.();
-                onNavigate('dashboard');
-              })
-              .catch((error) => setMessage(String(error)));
-          }}
-        />
-      </>
-    );
-  }
 
   if (!importRunId && latestRun.isLoading) {
     return (
@@ -914,7 +612,7 @@ export function ReviewPage({
       )),
   );
   const allResolved = progressQuery.data?.all_decided ?? false;
-  const canFreeze = Boolean(
+  const canGeneratePlan = Boolean(
     allResolved &&
     analysisComplete &&
     activeRun &&
@@ -934,7 +632,7 @@ export function ReviewPage({
           </StatusBadge>
         }
         actions={
-          canFreeze ? (
+          canGeneratePlan ? (
             <Button
               variant="primary"
               loading={generate.isPending}
@@ -1010,7 +708,7 @@ export function ReviewPage({
           </div>
           <p className="review-group-instructions">
             {detail.state === 'resolved'
-              ? '该审核组已有已保存草稿；冻结导入计划前仍可继续调整。'
+              ? '该审核组已有已保存草稿；生成入库计划前仍可继续调整。'
               : '默认全部保留。库内图片为只读；组内至少需要保留一张图片。'}
           </p>
           <section className="review-group-grid" aria-label="重复图片组成员">
@@ -1032,7 +730,7 @@ export function ReviewPage({
           </section>
           <GroupEvidence detail={detail} />
         </main>
-      ) : canFreeze ? (
+      ) : canGeneratePlan ? (
         <EmptyState
           title="所有审核组均已完成"
           description="现在可以生成入库计划，并在锁定前进行人工复核。"

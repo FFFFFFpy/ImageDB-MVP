@@ -273,7 +273,7 @@ test('allows a resolved group draft to be adjusted until the plan is frozen', as
   renderReview();
 
   expect(
-    await screen.findByText('该审核组已有已保存草稿；冻结导入计划前仍可继续调整。'),
+    await screen.findByText('该审核组已有已保存草稿；生成入库计划前仍可继续调整。'),
   ).toBeInTheDocument();
   const groupHeading = document.querySelector('.review-group-heading') as HTMLElement;
   expect(within(groupHeading).getByText('草稿已保存')).toBeInTheDocument();
@@ -371,7 +371,7 @@ test('refreshes review groups once when an analyzing run becomes reviewable', as
   expect(api.getReviewGroupDetail).toHaveBeenCalledTimes(2);
 });
 
-test('generates an editable draft before the plan can be locked', async () => {
+test('generates a draft and navigates to the plan page', async () => {
   const resolvedDetail = { ...detail, state: 'resolved' as const };
   const resolvedGroups = [{ ...groups[0], state: 'resolved' as const }];
   setupReviewMocks(
@@ -381,59 +381,13 @@ test('generates an editable draft before the plan can be locked', async () => {
   );
   const draftPlan = { ...importPlanFixture, plan_hash: null };
   vi.spyOn(api, 'generateImportPlan').mockResolvedValue(draftPlan);
-  renderReview();
+  const onGoPlan = vi.fn();
+  renderReview({ onGoPlan });
 
   fireEvent.click(await screen.findByRole('button', { name: '生成人工复核入库计划' }));
 
-  expect(await screen.findByRole('heading', { name: '人工复核入库计划' })).toBeVisible();
-  expect(screen.getByText('尚未锁定')).toBeVisible();
-  expect(screen.getAllByRole('button', { name: '锁定入库计划' })[0]).toBeEnabled();
-  expect(draftPlan.plan_hash).toBeNull();
-});
-
-test('edits the draft without a hash and creates the hash only when locking', async () => {
-  const draftPlan = { ...importPlanFixture, plan_hash: null };
-  const editedDraft = {
-    ...draftPlan,
-    source_file_mode: 'move_selected_without_backup' as const,
-  };
-  const frozenPlan = { ...editedDraft, plan_hash: 'locked-plan-hash' };
-  vi.spyOn(api, 'setImportPlanSourceFileMode').mockResolvedValue(editedDraft);
-  vi.spyOn(api, 'freezeImportPlan').mockResolvedValue(frozenPlan);
-  const onGoCommit = vi.fn();
-  renderReview({
-    initialImportRunId: draftPlan.import_run_id,
-    initialPlan: draftPlan,
-    initialShowPlan: true,
-    onGoCommit,
-  });
-
-  const toggle = screen.getByRole('checkbox', { name: '移动已选源图片（无备份）' });
-  expect(toggle).toBeEnabled();
-  fireEvent.click(toggle);
-  await waitFor(() =>
-    expect(api.setImportPlanSourceFileMode).toHaveBeenCalledWith(
-      importPlanFixture.import_run_id,
-      'move_selected_without_backup',
-    ),
-  );
-  expect(await screen.findByText('不可撤销的源文件操作')).toBeVisible();
-  expect(screen.queryByText(/计划哈希/)).not.toBeInTheDocument();
-
-  fireEvent.click(screen.getAllByRole('button', { name: '锁定入库计划' })[0]);
-  await waitFor(() => expect(api.freezeImportPlan).toHaveBeenCalledWith(draftPlan.import_run_id));
-  await waitFor(() => expect(onGoCommit).toHaveBeenCalledWith(draftPlan.import_run_id));
-});
-
-test('makes every plan adjustment read-only after locking', () => {
-  renderReview({ initialPlan: importPlanFixture, initialShowPlan: true });
-
-  expect(screen.getByRole('heading', { name: '入库计划已锁定' })).toBeVisible();
-  const toggle = screen.getByRole('checkbox', { name: '移动已选源图片（无备份）' });
-  expect(toggle).toBeDisabled();
-  for (const button of screen.getAllByRole('button', { name: '排除整组' })) {
-    expect(button).toBeDisabled();
-  }
+  await waitFor(() => expect(api.generateImportPlan).toHaveBeenCalledWith(runId));
+  await waitFor(() => expect(onGoPlan).toHaveBeenCalledWith(draftPlan.import_run_id));
 });
 
 test('invalidates group-level review workflow queries', async () => {

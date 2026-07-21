@@ -36,6 +36,7 @@ import type {
   StorageCapabilities,
   LibraryAlbumPage,
   LibraryImagePage,
+  WorkflowStage,
 } from './types';
 
 export const api = {
@@ -184,6 +185,8 @@ export const api = {
   getLatestReviewableImportRun: () => invoke<string | null>('get_latest_reviewable_import_run'),
 
   getLatestCommittableImportRun: () => invoke<string | null>('get_latest_committable_import_run'),
+
+  getImportWorkflowStage: () => invoke<WorkflowStage>('get_import_workflow_stage'),
 
   getImagePreview: (candidateId: string, imageSide: string) =>
     invoke<ImagePreview>('get_image_preview', { candidateId, imageSide }),

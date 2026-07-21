@@ -8,6 +8,7 @@ import { CommitPage } from '../pages/CommitPage';
 import { DashboardPage } from '../pages/DashboardPage';
 import { LibraryPage } from '../pages/LibraryPage';
 import { OnboardingPage } from '../pages/OnboardingPage';
+import { PlanPage } from '../pages/PlanPage';
 import { ProbesPage } from '../pages/ProbesPage';
 import { RecoveryPage } from '../pages/RecoveryPage';
 import { ReviewPage } from '../pages/ReviewPage';
@@ -29,7 +30,7 @@ export function App() {
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
   const handleLayoutNavigate = (nextRoute: Parameters<typeof navigate>[0]) => {
-    if (nextRoute === 'scan' || nextRoute === 'review' || nextRoute === 'commit') {
+    if (nextRoute === 'scan' || nextRoute === 'review' || nextRoute === 'plan' || nextRoute === 'commit') {
       setWorkflowImportRunId(null);
     }
     navigate(nextRoute);
@@ -50,10 +51,6 @@ export function App() {
       });
     }
 
-    // Invalidate settings + database status so first_run_completed and the
-    // connected DB state are re-fetched fresh, then navigate without a full
-    // page reload (a reload would drop all in-memory React state and force
-    // the user to re-wait while the DB status poll repopulates).
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ['settings'] }),
       queryClient.invalidateQueries({ queryKey: ['database-status'] }),
@@ -107,22 +104,29 @@ export function App() {
             <ReviewPage
               initialImportRunId={workflowImportRunId}
               onNavigate={navigate}
+              onGoPlan={(importRunId) => {
+                setWorkflowImportRunId(importRunId);
+                navigate('plan');
+              }}
+              onWorkflowAbandoned={handleWorkflowAbandoned}
+            />
+          )}
+          {route === 'plan' && (
+            <PlanPage
+              initialImportRunId={workflowImportRunId}
+              onNavigate={navigate}
               onGoCommit={(importRunId) => {
                 setWorkflowImportRunId(importRunId);
                 navigate('commit');
               }}
               onWorkflowAbandoned={handleWorkflowAbandoned}
-              onPlanEditPendingChange={setWorkflowNavigationBlocked}
+              onNavigationBlockedChange={setWorkflowNavigationBlocked}
             />
           )}
           {route === 'commit' && (
             <CommitPage
               initialImportRunId={workflowImportRunId}
               onNavigate={navigate}
-              onGoReview={(importRunId) => {
-                setWorkflowImportRunId(importRunId);
-                navigate('review');
-              }}
               onWorkflowAbandoned={handleWorkflowAbandoned}
               onNavigationBlockedChange={setWorkflowNavigationBlocked}
             />
