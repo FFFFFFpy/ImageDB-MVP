@@ -48,7 +48,8 @@ async fn plan_contract_single_draft_and_cross_album_move() {
         .get(0);
     assert_eq!(draft_count, 1, "generate must produce exactly one draft");
 
-    // Cross-album move: move img1 from album_a to album_b.
+    // Cross-album move must be rejected until the independent transaction
+    // architecture version implements safe cross-album commit support.
     let img1 = plan
         .kept_images
         .iter()
@@ -59,41 +60,20 @@ async fn plan_contract_single_draft_and_cross_album_move() {
         .iter()
         .find(|a| a.album_name.contains("album_b"))
         .or_else(|| plan.albums.iter().find(|a| a.album_id != img1.album_id))
-        .expect("must have a second album to move to");
+        .expect("must have a second album to attempt move to");
 
-    let moved_plan = crate::commands::set_import_plan_image_included_for_state(
+    let move_result = crate::commands::set_import_plan_image_included_for_state(
         &app_state,
         run_id.to_string(),
         img1.image_id.clone(),
         target_album_b.album_id.clone(),
         true,
     )
-    .await
-    .unwrap();
-
-    // Source image identity unchanged, target album changed.
-    let moved_img = moved_plan
-        .kept_images
-        .iter()
-        .find(|i| i.image_id == img1.image_id)
-        .expect("moved image must still exist in plan");
-    assert_eq!(moved_img.source_path, img1.source_path);
-    assert_eq!(moved_img.target_album_id, target_album_b.album_id);
-    assert_ne!(moved_img.target_album_id, img1.album_id);
-
-    // Verify in DB: the plan_image row moved to a different plan_album.
-    let plan_album_for_moved: String = client
-        .query_one(
-            "SELECT pa.import_album_id::text FROM import_plan_images pi
-             JOIN import_plan_albums pa ON pa.id = pi.plan_album_id
-             WHERE pi.import_image_id = $1::uuid
-               AND pa.plan_id IN (SELECT id FROM import_plans WHERE import_run_id = $2 AND state = 'draft')",
-            &[&uuid::Uuid::parse_str(&img1.image_id).unwrap(), &run_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(plan_album_for_moved, target_album_b.album_id);
+    .await;
+    assert!(
+        move_result.is_err(),
+        "cross-album move must be rejected by the plan service"
+    );
 
     drop(client);
     handle.abort();

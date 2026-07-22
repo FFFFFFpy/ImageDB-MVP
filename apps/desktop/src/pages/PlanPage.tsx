@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { Route } from '../hooks/use-router';
-import type { ImportPlan, ImportPlanAlbum, ImportPlanImage, ImportAlbumStatus, SourceFileMode } from '../lib/ipc/types';
+import type { ImportPlan, ImportPlanAlbum, ImportPlanImage, SourceFileMode } from '../lib/ipc/types';
 import { Button, EmptyState, PageHeader, Skeleton, StatusBadge, StatusBanner } from '../components/ui';
 
 interface PlanPageProps {
@@ -89,12 +89,6 @@ export function PlanPage({
   const frozenQuery = useQuery({
     queryKey: ['frozenImportPlanSummary', importRunId],
     queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
-    enabled: !!importRunId,
-  });
-
-  const runAlbumsQuery = useQuery({
-    queryKey: ['importRunAlbums', importRunId],
-    queryFn: () => api.getImportRunAlbums(importRunId!),
     enabled: !!importRunId,
   });
 
@@ -306,29 +300,9 @@ export function PlanPage({
                     <span>{image.included ? '保留' : '排除'}</span>
                   </button>
                   {!locked && image.included && (
-                    <label className="plan-image-row__target">
-                      <select
-                        value={image.target_album_id}
-                        disabled={busy}
-                        onChange={(event) =>
-                          void applyEdit(() =>
-                            api.setImportPlanImageIncluded(
-                              plan.import_run_id,
-                              image.image_id,
-                              event.target.value,
-                              true,
-                            ),
-                          )
-                        }
-                      >
-                        {(runAlbumsQuery.data ?? []).map((a: ImportAlbumStatus) => (
-                          <option key={a.id} value={a.id}>
-                            {a.source_name}
-                          </option>
-                        ))}
-                      </select>
-                      <small>{image.target_relative_path}</small>
-                    </label>
+                    <span className="plan-image-row__target">
+                      <small>{image.target_album_name} / {image.target_relative_path}</small>
+                    </span>
                   )}
                 </div>
               ))}

@@ -44,8 +44,21 @@ pub async fn resolve_workflow_stage(client: &Client) -> Result<WorkflowStage, Ap
              FROM import_runs r
              WHERE r.state IN (
                  'committing', 'recovery_required', 'ready_to_commit',
-                 'cancelled', 'review_required',
+                 'review_required',
                  'created', 'scanning', 'fingerprinting', 'detecting_duplicates', 'analyzing'
+             )
+             OR (
+                 r.state = 'cancelled'
+                 AND EXISTS (
+                     SELECT 1 FROM import_plans p2
+                     WHERE p2.import_run_id = r.id
+                       AND p2.state IN ('frozen', 'consumed')
+                       AND p2.plan_hash IS NOT NULL
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM file_transactions ft2
+                     WHERE ft2.import_run_id = r.id
+                 )
              )
              ORDER BY CASE r.state
                  WHEN 'committing' THEN 0

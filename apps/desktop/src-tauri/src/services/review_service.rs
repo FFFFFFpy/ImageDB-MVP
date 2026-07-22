@@ -1414,6 +1414,11 @@ async fn include_image_in_album(
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Internal(format!("import image {image_id} not found")))?;
+    if image.import_album_id != target_album_id {
+        return Err(AppError::Internal(
+            "跨图集调整暂不可用，将在独立事务架构版本中实现".to_string(),
+        ));
+    }
     let album = ImportRepository::get_import_album_by_id(client, target_album_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("import album {target_album_id} not found")))?;
