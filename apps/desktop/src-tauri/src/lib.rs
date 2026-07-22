@@ -558,6 +558,7 @@ pub fn run() {
             commands::get_latest_reviewable_import_run,
             commands::get_latest_committable_import_run,
             commands::get_import_workflow_stage,
+            commands::get_import_workflow_stage_for_run,
             commands::get_image_preview,
             commands::get_review_group_member_preview,
             commands::get_import_plan_image_preview,

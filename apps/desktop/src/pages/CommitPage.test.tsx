@@ -181,4 +181,49 @@ describe('commit progress semantics', () => {
     ).toBeVisible();
     await waitFor(() => expect(onNavigationBlockedChange).toHaveBeenLastCalledWith(false));
   });
+
+  test('restores committing phase on refresh when backend reports committing', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.spyOn(api, 'getImportWorkflowStageForRun').mockResolvedValue({
+      stage: 'committing',
+      import_run_id: 'run-a',
+    });
+    vi.spyOn(api, 'getCommitProgress').mockResolvedValue(progress('committing'));
+    const startCommit = vi.spyOn(api, 'startImportCommit').mockResolvedValue('started');
+
+    render(
+      <QueryClientProvider client={client}>
+        <CommitPage
+          initialImportRunId="run-a"
+          enablePolling={false}
+          onNavigate={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole('heading', { name: '正在入库' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '确认并开始入库' })).not.toBeInTheDocument();
+    expect(startCommit).not.toHaveBeenCalled();
+  });
+
+  test('navigates to recovery on refresh when backend reports recovery stage', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.spyOn(api, 'getImportWorkflowStageForRun').mockResolvedValue({
+      stage: 'recovery',
+      import_run_id: 'run-a',
+    });
+    const onNavigate = vi.fn();
+
+    render(
+      <QueryClientProvider client={client}>
+        <CommitPage
+          initialImportRunId="run-a"
+          enablePolling={false}
+          onNavigate={onNavigate}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(onNavigate).toHaveBeenCalledWith('recovery'));
+  });
 });

@@ -251,6 +251,12 @@ export function PlanPage({
         )}
       </section>
 
+      {!locked && (
+        <StatusBanner tone="info" title="跨图集调整暂不可用">
+          将图片移动到其他目标图集的功能将在独立事务架构版本中实现。当前每张图片只能保留在其源图集中。
+        </StatusBanner>
+      )}
+
       <section className="plan-album-list" aria-label={locked ? '已锁定计划图集' : '待复核计划图集'}>
         {displayed.map((album) => (
           <details className="plan-album-card" key={album.albumId}>

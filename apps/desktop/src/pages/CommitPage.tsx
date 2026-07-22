@@ -227,6 +227,27 @@ export function CommitPage({
 
   const committableRunId = importRunId;
 
+  useEffect(() => {
+    if (!committableRunId) return;
+    let cancelled = false;
+    api.getImportWorkflowStageForRun(committableRunId).then((stage) => {
+      if (cancelled) return;
+      switch (stage.stage) {
+        case 'committing':
+          setPhase('committing');
+          break;
+        case 'recovery':
+          onNavigate('recovery');
+          break;
+        case 'completed':
+        case 'failed':
+          onNavigate('dashboard');
+          break;
+      }
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [committableRunId, onNavigate]);
+
   const planQuery = useQuery({
     queryKey: ['frozenImportPlanSummary', committableRunId],
     queryFn: () => api.getFrozenImportPlanSummary(committableRunId!),

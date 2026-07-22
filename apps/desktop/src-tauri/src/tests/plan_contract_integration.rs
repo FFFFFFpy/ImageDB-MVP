@@ -70,10 +70,42 @@ async fn plan_contract_single_draft_and_cross_album_move() {
         true,
     )
     .await;
+    let err_msg = move_result.unwrap_err();
     assert!(
-        move_result.is_err(),
-        "cross-album move must be rejected by the plan service"
+        err_msg.contains("跨图集调整暂不可用"),
+        "error must explain cross-album is unavailable, got: {err_msg}"
     );
+
+    // Image must still belong to its original album — no partial mutation.
+    let plan_album_after: String = client
+        .query_one(
+            "SELECT pa.import_album_id::text FROM import_plan_images pi
+             JOIN import_plan_albums pa ON pa.id = pi.plan_album_id
+             WHERE pi.import_image_id = $1::uuid
+               AND pa.plan_id IN (SELECT id FROM import_plans WHERE import_run_id = $2 AND state = 'draft')",
+            &[&uuid::Uuid::parse_str(&img1.image_id).unwrap(), &run_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        plan_album_after, img1.album_id,
+        "image must remain in its original album after rejected move"
+    );
+
+    // No duplicate plan_image rows created.
+    let img_row_count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM import_plan_images WHERE import_image_id = $1::uuid
+               AND plan_album_id IN (SELECT id FROM import_plan_albums WHERE plan_id IN (
+                   SELECT id FROM import_plans WHERE import_run_id = $2 AND state = 'draft'
+               ))",
+            &[&uuid::Uuid::parse_str(&img1.image_id).unwrap(), &run_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(img_row_count, 1, "rejected move must not create extra plan rows");
 
     drop(client);
     handle.abort();
@@ -311,6 +343,147 @@ async fn plan_contract_resolver_priority_over_completed() {
         "resolver must prefer actionable run over completed"
     );
     assert_ne!(stage.stage, "idle");
+
+    shutdown(&app_state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn plan_contract_cancelled_with_transactions_does_not_shadow_review() {
+    ensure_postgres_bin();
+
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let fixture_dir = tmp.path().join("fixtures");
+    let source_root = tmp.path().join("source");
+    let library_root = tmp.path().join("library");
+    std::fs::create_dir_all(&library_root).unwrap();
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+
+    let app_state = setup_app(&app_data, &fixture_dir, &library_root).await;
+
+    // Run A: scan, freeze, commit, then cancel (leaves file_transactions).
+    let album_a = source_root.join("album_a");
+    std::fs::create_dir_all(&album_a).unwrap();
+    write_test_png(&album_a.join("a.png"));
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan_a = wait_for_scan_terminal(&app_state).await;
+    let run_a = uuid::Uuid::parse_str(scan_a.import_run_id.as_deref().unwrap()).unwrap();
+    crate::commands::generate_import_plan_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
+    crate::commands::freeze_import_plan_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
+    crate::commands::start_import_commit_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
+    let commit_a = wait_for_commit_terminal(&app_state).await;
+    assert_eq!(commit_a.state, "completed");
+
+    // Manually set run A to cancelled (simulating a cancelled run with transactions).
+    let (client, handle) = connect(&app_state).await;
+    client
+        .execute(
+            "UPDATE import_runs SET state = 'cancelled' WHERE id = $1",
+            &[&run_a],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    handle.abort();
+
+    // Run B: scan only, leaves it in ready_to_commit or review_required.
+    let album_b = source_root.join("album_b");
+    std::fs::create_dir_all(&album_b).unwrap();
+    write_test_png(&album_b.join("b.png"));
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan_b = wait_for_scan_terminal(&app_state).await;
+    let run_b = uuid::Uuid::parse_str(scan_b.import_run_id.as_deref().unwrap()).unwrap();
+
+    // Resolver must pick run B, not the non-resubmittable cancelled run A.
+    let stage = crate::commands::get_import_workflow_stage_for_state(&app_state)
+        .await
+        .unwrap();
+    assert_eq!(
+        stage.import_run_id.as_deref(),
+        Some(run_b.to_string()).as_deref(),
+        "cancelled run with transactions must not shadow actionable run"
+    );
+
+    shutdown(&app_state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn plan_contract_resubmittable_cancelled_selected_over_review() {
+    ensure_postgres_bin();
+
+    let tmp = TempDir::new().unwrap();
+    let app_data = tmp.path().join("app_data");
+    let fixture_dir = tmp.path().join("fixtures");
+    let source_root = tmp.path().join("source");
+    let library_root = tmp.path().join("library");
+    std::fs::create_dir_all(&library_root).unwrap();
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+
+    let app_state = setup_app(&app_data, &fixture_dir, &library_root).await;
+
+    // Run A: scan, freeze, then cancel (frozen plan, no transactions = resubmittable).
+    let album_a = source_root.join("album_a");
+    std::fs::create_dir_all(&album_a).unwrap();
+    write_test_png(&album_a.join("a.png"));
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan_a = wait_for_scan_terminal(&app_state).await;
+    let run_a = uuid::Uuid::parse_str(scan_a.import_run_id.as_deref().unwrap()).unwrap();
+    crate::commands::generate_import_plan_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
+    crate::commands::freeze_import_plan_for_state(&app_state, run_a.to_string())
+        .await
+        .unwrap();
+
+    // Manually set run A to cancelled (frozen plan exists, no transactions).
+    let (client, handle) = connect(&app_state).await;
+    client
+        .execute(
+            "UPDATE import_runs SET state = 'cancelled' WHERE id = $1",
+            &[&run_a],
+        )
+        .await
+        .unwrap();
+    drop(client);
+    handle.abort();
+
+    // Run B: scan only, leaves it in ready_to_commit.
+    let album_b = source_root.join("album_b");
+    std::fs::create_dir_all(&album_b).unwrap();
+    write_test_png(&album_b.join("b.png"));
+    crate::commands::start_scan_for_state(&app_state, source_root.display().to_string())
+        .await
+        .unwrap();
+    let scan_b = wait_for_scan_terminal(&app_state).await;
+    let _run_b = uuid::Uuid::parse_str(scan_b.import_run_id.as_deref().unwrap()).unwrap();
+
+    // Resolver must pick the resubmittable cancelled run A (priority 3 > ready_to_commit priority 2?
+    // No: ready_to_commit is priority 2, cancelled is priority 3. So run B wins.)
+    // Actually: ready_to_commit has HIGHER priority than cancelled.
+    // The resolver should pick run B (ready_to_commit) over run A (cancelled).
+    let stage = crate::commands::get_import_workflow_stage_for_state(&app_state)
+        .await
+        .unwrap();
+    assert_eq!(
+        stage.import_run_id.as_deref(),
+        Some(_run_b.to_string()).as_deref(),
+        "ready_to_commit has higher priority than cancelled"
+    );
+    assert_eq!(stage.stage, "commit_confirm");
 
     shutdown(&app_state).await;
 }

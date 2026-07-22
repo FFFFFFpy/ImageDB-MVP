@@ -188,6 +188,9 @@ export const api = {
 
   getImportWorkflowStage: () => invoke<WorkflowStage>('get_import_workflow_stage'),
 
+  getImportWorkflowStageForRun: (importRunId: string) =>
+    invoke<WorkflowStage>('get_import_workflow_stage_for_run', { importRunId }),
+
   getImagePreview: (candidateId: string, imageSide: string) =>
     invoke<ImagePreview>('get_image_preview', { candidateId, imageSide }),
 

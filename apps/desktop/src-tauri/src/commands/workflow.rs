@@ -22,3 +22,21 @@ pub(crate) async fn get_import_workflow_stage_for_state(
     handle.abort();
     result
 }
+
+#[tauri::command]
+pub async fn get_import_workflow_stage_for_run(
+    state: State<'_, AppState>,
+    import_run_id: String,
+) -> Result<workflow_service::WorkflowStage, String> {
+    let run_id = uuid::Uuid::parse_str(&import_run_id)
+        .map_err(|e| format!("invalid import_run_id: {e}"))?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = workflow_service::resolve_workflow_stage_for_run(&client, run_id)
+        .await
+        .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
