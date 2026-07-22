@@ -8,9 +8,10 @@ pub struct WorkflowStage {
     pub import_run_id: Option<String>,
 }
 
-/// Resolve the current import workflow stage by inspecting the latest
-/// actionable run. This is the single entry point used by the frontend
-/// router when no explicit runId is carried by the navigation.
+/// Resolve the current import workflow stage by selecting the highest-priority
+/// actionable run. Priority: committing > recovery_required > ready_to_commit >
+/// cancelled > review_required > analysis states. Completed/failed runs are not
+/// actionable and never shadow an in-progress workflow.
 pub async fn resolve_workflow_stage(client: &Client) -> Result<WorkflowStage, AppError> {
     let row = client
         .query_opt(
@@ -38,11 +39,22 @@ pub async fn resolve_workflow_stage(client: &Client) -> Result<WorkflowStage, Ap
                 NOT EXISTS (
                     SELECT 1 FROM import_albums ia
                     WHERE ia.import_run_id = r.id
-                      AND ia.state IN ('pending', 'analyzing')
+                      AND ia.state IN ('pending', 'analyzing', 'failed')
                 ) AS analysis_complete
              FROM import_runs r
-             WHERE r.state <> 'abandoned'
-             ORDER BY r.started_at DESC
+             WHERE r.state IN (
+                 'committing', 'recovery_required', 'ready_to_commit',
+                 'cancelled', 'review_required',
+                 'created', 'scanning', 'fingerprinting', 'detecting_duplicates', 'analyzing'
+             )
+             ORDER BY CASE r.state
+                 WHEN 'committing' THEN 0
+                 WHEN 'recovery_required' THEN 1
+                 WHEN 'ready_to_commit' THEN 2
+                 WHEN 'cancelled' THEN 3
+                 WHEN 'review_required' THEN 4
+                 ELSE 5
+             END, r.started_at DESC
              LIMIT 1",
             &[],
         )
@@ -90,16 +102,13 @@ pub async fn resolve_workflow_stage(client: &Client) -> Result<WorkflowStage, Ap
         }
         "committing" => "committing",
         "recovery_required" => "recovery",
-        "completed" => "completed",
-        "failed" => "failed",
         "cancelled" => {
             if has_frozen_plan && !has_transactions {
                 "commit_confirm"
             } else {
-                "abandoned"
+                "idle"
             }
         }
-        "abandoned" => "abandoned",
         _ => "idle",
     };
 

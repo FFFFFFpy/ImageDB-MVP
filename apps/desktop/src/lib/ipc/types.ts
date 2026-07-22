@@ -432,6 +432,9 @@ export interface ImportPlanImage {
   album_id: string;
   source_album_id: string;
   included: boolean;
+  target_album_id: string;
+  target_album_name: string;
+  target_relative_path: string;
 }
 
 export interface ImportPlanAlbum {

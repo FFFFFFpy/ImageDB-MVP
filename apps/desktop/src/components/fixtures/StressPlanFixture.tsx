@@ -35,7 +35,6 @@ export function StressPlanFixture() {
       <Layout currentRoute="plan" onNavigate={() => undefined} enablePolling={false}>
         <PlanPage
           initialImportRunId={plan.import_run_id}
-          enablePolling={false}
           onNavigate={() => undefined}
         />
       </Layout>

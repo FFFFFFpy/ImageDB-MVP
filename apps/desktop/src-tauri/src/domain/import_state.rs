@@ -464,6 +464,9 @@ pub struct ImportPlanImage {
     pub album_id: String,
     pub source_album_id: String,
     pub included: bool,
+    pub target_album_id: String,
+    pub target_album_name: String,
+    pub target_relative_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

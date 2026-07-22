@@ -1414,11 +1414,6 @@ async fn include_image_in_album(
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Internal(format!("import image {image_id} not found")))?;
-    if image.import_album_id != target_album_id {
-        return Err(AppError::Internal(
-            "cross-source album move is blocked by the current file transaction model".to_string(),
-        ));
-    }
     let album = ImportRepository::get_import_album_by_id(client, target_album_id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("import album {target_album_id} not found")))?;
@@ -1583,6 +1578,9 @@ pub fn build_import_plan_from_group_actions(
             album_id: image.album_id.to_string(),
             source_album_id: image.album_id.to_string(),
             included: true,
+            target_album_id: image.album_id.to_string(),
+            target_album_name: image.album_name.clone(),
+            target_relative_path: image.relative_path.clone(),
         })
         .collect();
     let kept_ids: HashSet<Uuid> = kept_images
@@ -1604,6 +1602,9 @@ pub fn build_import_plan_from_group_actions(
                     album_id: album.id.to_string(),
                     source_album_id: image.album_id.to_string(),
                     included: kept_ids.contains(&image.id),
+                    target_album_id: album.id.to_string(),
+                    target_album_name: album.source_name.clone(),
+                    target_relative_path: image.relative_path.clone(),
                 })
                 .collect();
             images.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -1727,6 +1728,9 @@ pub fn build_import_plan(
             album_id: img.album_id.to_string(),
             source_album_id: img.album_id.to_string(),
             included: true,
+            target_album_id: img.album_id.to_string(),
+            target_album_name: img.album_name.clone(),
+            target_relative_path: img.relative_path.clone(),
         })
         .collect();
 
@@ -1758,6 +1762,9 @@ pub fn build_import_plan(
                         album_id: album.id.to_string(),
                         source_album_id: img.album_id.to_string(),
                         included,
+                        target_album_id: album.id.to_string(),
+                        target_album_name: album.source_name.clone(),
+                        target_relative_path: img.relative_path.clone(),
                     }
                 })
                 .collect();

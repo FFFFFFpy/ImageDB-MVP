@@ -135,65 +135,8 @@ describe('commit progress semantics', () => {
     await waitFor(() => expect(startCommit).toHaveBeenCalledWith('run-a', 'hash-run-a'));
   });
 
-  test('uses the latest committable run only when no explicit run was provided', async () => {
+  test('shows empty state when no run is provided', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    vi.spyOn(api, 'getLatestCommittableImportRun').mockResolvedValue('run-b');
-    const getPlan = vi
-      .spyOn(api, 'getFrozenImportPlanSummary')
-      .mockImplementation(async (runId) => planForRun(runId));
-    const startCommit = vi.spyOn(api, 'startImportCommit').mockResolvedValue('commit started');
-
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(await screen.findByText('计划哈希：hash-run-b')).toBeVisible();
-    expect(getPlan).toHaveBeenCalledWith('run-b');
-    fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
-    await waitFor(() => expect(startCommit).toHaveBeenCalledWith('run-b', 'hash-run-b'));
-  });
-
-  test('shows loading while the latest committable run query is pending', () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    vi.spyOn(api, 'getLatestCommittableImportRun').mockImplementation(() => new Promise(() => {}));
-
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(screen.getByRole('status', { name: '正在加载可提交的导入任务' })).toBeVisible();
-    expect(screen.queryByText('没有可提交的计划')).not.toBeInTheDocument();
-  });
-
-  test('distinguishes latest-run query errors from empty state and supports retry', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const latest = vi
-      .spyOn(api, 'getLatestCommittableImportRun')
-      .mockRejectedValueOnce(new Error('database unavailable'))
-      .mockResolvedValueOnce(null);
-
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(await screen.findByText('无法查询可提交任务')).toBeVisible();
-    expect(screen.getByText(/database unavailable/)).toBeVisible();
-    expect(screen.queryByText('没有可提交的计划')).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
-    await waitFor(() => expect(latest).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText('没有可提交的计划')).toBeVisible();
-  });
-
-  test('shows the true empty state only after a successful null latest-run response', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    vi.spyOn(api, 'getLatestCommittableImportRun').mockResolvedValue(null);
 
     render(
       <QueryClientProvider client={client}>
@@ -202,7 +145,6 @@ describe('commit progress semantics', () => {
     );
 
     expect(await screen.findByText('没有可提交的计划')).toBeVisible();
-    expect(screen.queryByText('无法查询可提交任务')).not.toBeInTheDocument();
   });
 
   test('blocks global navigation while commit starts and runs, then releases on terminal state', async () => {

@@ -276,6 +276,13 @@ pub async fn abandon_frozen_import_workflow(
     state: State<'_, AppState>,
     import_run_id: String,
 ) -> Result<(), String> {
+    abandon_frozen_import_workflow_for_state(&state, import_run_id).await
+}
+
+pub(crate) async fn abandon_frozen_import_workflow_for_state(
+    state: &AppState,
+    import_run_id: String,
+) -> Result<(), String> {
     let run_id = parse_uuid(&import_run_id)?;
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
@@ -316,6 +323,16 @@ pub async fn set_import_plan_image_included(
     target_album_id: String,
     included: bool,
 ) -> Result<ImportPlan, String> {
+    set_import_plan_image_included_for_state(&state, import_run_id, image_id, target_album_id, included).await
+}
+
+pub(crate) async fn set_import_plan_image_included_for_state(
+    state: &AppState,
+    import_run_id: String,
+    image_id: String,
+    target_album_id: String,
+    included: bool,
+) -> Result<ImportPlan, String> {
     let run_id = parse_uuid(&import_run_id)?;
     let iid = parse_uuid(&image_id)?;
     let aid = parse_uuid(&target_album_id)?;
@@ -333,6 +350,14 @@ pub async fn set_import_plan_image_included(
 #[tauri::command]
 pub async fn set_import_plan_source_file_mode(
     state: State<'_, AppState>,
+    import_run_id: String,
+    source_file_mode: String,
+) -> Result<ImportPlan, String> {
+    set_import_plan_source_file_mode_for_state(&state, import_run_id, source_file_mode).await
+}
+
+pub(crate) async fn set_import_plan_source_file_mode_for_state(
+    state: &AppState,
     import_run_id: String,
     source_file_mode: String,
 ) -> Result<ImportPlan, String> {

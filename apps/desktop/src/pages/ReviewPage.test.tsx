@@ -188,6 +188,9 @@ describe('groupImportPlanImagesByAlbum', () => {
         album_id: 'album-a',
         source_album_id: 'album-a',
         included: true,
+        target_album_id: 'album-a',
+        target_album_name: 'A',
+        target_relative_path: 'a.jpg',
       },
       {
         image_id: 'b',
@@ -198,6 +201,9 @@ describe('groupImportPlanImagesByAlbum', () => {
         album_id: 'album-a',
         source_album_id: 'album-a',
         included: false,
+        target_album_id: 'album-a',
+        target_album_name: 'A',
+        target_relative_path: 'b.jpg',
       },
     ];
     expect(groupImportPlanImagesByAlbum(images)).toMatchObject([

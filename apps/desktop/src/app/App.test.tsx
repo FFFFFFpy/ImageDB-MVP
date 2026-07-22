@@ -118,6 +118,9 @@ vi.mock('@tauri-apps/api/core', () => ({
     if (cmd === 'get_latest_committable_import_run') {
       return Promise.resolve(mockState.latestCommittableRunId);
     }
+    if (cmd === 'get_import_workflow_stage') {
+      return Promise.resolve({ stage: 'idle', import_run_id: null });
+    }
     if (cmd === 'get_review_queue') {
       return Promise.resolve([]);
     }
@@ -507,7 +510,9 @@ test('sidebar new import clears a run selected from the dashboard', async () => 
 
   fireEvent.click(screen.getByRole('button', { name: '新建导入' }));
 
-  expect(screen.queryByRole('button', { name: '继续分析' })).not.toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.queryByRole('button', { name: '继续分析' })).not.toBeInTheDocument(),
+  );
   expect(await screen.findByText('暂无图集状态。验证源目录后开始分析。')).toBeInTheDocument();
 });
 

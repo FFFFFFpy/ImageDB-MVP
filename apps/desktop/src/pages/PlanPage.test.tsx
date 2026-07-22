@@ -20,7 +20,6 @@ function renderPlan(props: Partial<React.ComponentProps<typeof PlanPage>> = {}) 
     <QueryClientProvider client={client}>
       <PlanPage
         initialImportRunId={runId}
-        enablePolling={false}
         onNavigate={vi.fn()}
         {...props}
       />
@@ -139,7 +138,7 @@ describe('PlanPage draft editing', () => {
     fireEvent.click(summary);
 
     const imageButtons = await screen.findAllByRole('button', { name: /IMG_0001\.jpg/ });
-    expect(imageButtons[0]).toHaveClass('plan-image-row--excluded');
+    expect(imageButtons[0].closest('.plan-image-row')).toHaveClass('plan-image-row--excluded');
     fireEvent.click(imageButtons[0]);
 
     await waitFor(() =>

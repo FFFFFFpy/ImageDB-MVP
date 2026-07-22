@@ -195,7 +195,6 @@ export function ReviewFixture({ view = 'review' }: ReviewFixtureProps) {
         {showPlan ? (
           <PlanPage
             initialImportRunId={importPlanFixture.import_run_id}
-            enablePolling={false}
             onNavigate={() => undefined}
           />
         ) : (

@@ -1,8 +1,9 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { Layout } from '../components/Layout';
 import { useRouter } from '../hooks/use-router';
+import type { Route } from '../hooks/use-router';
 import { api } from '../lib/ipc/api';
 import { CommitPage } from '../pages/CommitPage';
 import { DashboardPage } from '../pages/DashboardPage';
@@ -15,11 +16,32 @@ import { ReviewPage } from '../pages/ReviewPage';
 import { ScanPage } from '../pages/ScanPage';
 import { SettingsPage } from '../pages/SettingsPage';
 
+const WORKFLOW_ROUTES: Route[] = ['review', 'plan', 'commit'];
+
+function stageToRoute(stage: string): Route {
+  switch (stage) {
+    case 'analysis':
+      return 'scan';
+    case 'review':
+    case 'generate_plan':
+      return 'review';
+    case 'plan_draft':
+      return 'plan';
+    case 'commit_confirm':
+    case 'committing':
+      return 'commit';
+    case 'recovery':
+      return 'recovery';
+    default:
+      return 'dashboard';
+  }
+}
+
 export function App() {
-  const { route, navigate } = useRouter();
+  const { route, runId, navigate } = useRouter();
   const queryClient = useQueryClient();
-  const [workflowImportRunId, setWorkflowImportRunId] = useState<string | null>(null);
   const [workflowNavigationBlocked, setWorkflowNavigationBlocked] = useState(false);
+  const resolvingRef = useRef(false);
 
   const settings = useQuery({
     queryKey: ['settings'],
@@ -29,15 +51,30 @@ export function App() {
   const needsOnboarding = settings.data ? !settings.data.first_run_completed : false;
   const showOnboarding = route === 'onboarding' || (needsOnboarding && route === 'dashboard');
 
-  const handleLayoutNavigate = (nextRoute: Parameters<typeof navigate>[0]) => {
-    if (nextRoute === 'scan' || nextRoute === 'review' || nextRoute === 'plan' || nextRoute === 'commit') {
-      setWorkflowImportRunId(null);
-    }
+  useEffect(() => {
+    if (!WORKFLOW_ROUTES.includes(route) || runId || resolvingRef.current) return;
+    resolvingRef.current = true;
+    api
+      .getImportWorkflowStage()
+      .then((stage) => {
+        if (stage.import_run_id) {
+          const target = stageToRoute(stage.stage);
+          navigate(target, stage.import_run_id);
+        } else {
+          navigate('dashboard');
+        }
+      })
+      .catch(() => navigate('dashboard'))
+      .finally(() => {
+        resolvingRef.current = false;
+      });
+  }, [route, runId, navigate]);
+
+  const handleLayoutNavigate = (nextRoute: Route) => {
     navigate(nextRoute);
   };
 
   const handleWorkflowAbandoned = () => {
-    setWorkflowImportRunId(null);
     setWorkflowNavigationBlocked(false);
     navigate('dashboard');
   };
@@ -73,18 +110,9 @@ export function App() {
             <DashboardPage
               needsOnboarding={needsOnboarding}
               onConfigureDatabase={() => navigate('settings')}
-              onGoScan={(importRunId) => {
-                setWorkflowImportRunId(importRunId ?? null);
-                navigate('scan');
-              }}
-              onGoReview={(importRunId) => {
-                setWorkflowImportRunId(importRunId);
-                navigate('review');
-              }}
-              onGoCommit={(importRunId) => {
-                setWorkflowImportRunId(importRunId);
-                navigate('commit');
-              }}
+              onGoScan={(importRunId) => navigate('scan', importRunId)}
+              onGoReview={(importRunId) => navigate('review', importRunId)}
+              onGoCommit={(importRunId) => navigate('commit', importRunId)}
               onGoRecovery={() => navigate('recovery')}
               onGoLibrary={() => navigate('library')}
             />
@@ -92,40 +120,35 @@ export function App() {
           {route === 'library' && <LibraryPage onNavigate={navigate} />}
           {route === 'scan' && (
             <ScanPage
-              initialImportRunId={workflowImportRunId}
+              key={runId ?? 'none'}
+              initialImportRunId={runId}
               onNavigate={navigate}
-              onGoReview={(importRunId) => {
-                setWorkflowImportRunId(importRunId);
-                navigate('review');
-              }}
+              onGoReview={(importRunId) => navigate('review', importRunId)}
             />
           )}
           {route === 'review' && (
             <ReviewPage
-              initialImportRunId={workflowImportRunId}
+              key={runId ?? 'none'}
+              initialImportRunId={runId}
               onNavigate={navigate}
-              onGoPlan={(importRunId) => {
-                setWorkflowImportRunId(importRunId);
-                navigate('plan');
-              }}
+              onGoPlan={(importRunId) => navigate('plan', importRunId)}
               onWorkflowAbandoned={handleWorkflowAbandoned}
             />
           )}
           {route === 'plan' && (
             <PlanPage
-              initialImportRunId={workflowImportRunId}
+              key={runId ?? 'none'}
+              initialImportRunId={runId}
               onNavigate={navigate}
-              onGoCommit={(importRunId) => {
-                setWorkflowImportRunId(importRunId);
-                navigate('commit');
-              }}
+              onGoCommit={(importRunId) => navigate('commit', importRunId)}
               onWorkflowAbandoned={handleWorkflowAbandoned}
               onNavigationBlockedChange={setWorkflowNavigationBlocked}
             />
           )}
           {route === 'commit' && (
             <CommitPage
-              initialImportRunId={workflowImportRunId}
+              key={runId ?? 'none'}
+              initialImportRunId={runId}
               onNavigate={navigate}
               onWorkflowAbandoned={handleWorkflowAbandoned}
               onNavigationBlockedChange={setWorkflowNavigationBlocked}

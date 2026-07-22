@@ -6,6 +6,12 @@ use tauri::State;
 pub async fn get_import_workflow_stage(
     state: State<'_, AppState>,
 ) -> Result<workflow_service::WorkflowStage, String> {
+    get_import_workflow_stage_for_state(&state).await
+}
+
+pub(crate) async fn get_import_workflow_stage_for_state(
+    state: &AppState,
+) -> Result<workflow_service::WorkflowStage, String> {
     let (client, handle) = {
         let mgr = state.postgres_manager.lock().await;
         mgr.connect().await.map_err(|e| format!("{e}"))?

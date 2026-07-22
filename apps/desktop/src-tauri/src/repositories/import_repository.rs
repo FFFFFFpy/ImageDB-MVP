@@ -4016,6 +4016,9 @@ impl ImportRepository {
                     album_id: album.import_album_id.to_string(),
                     source_album_id: source_album_id.to_string(),
                     included: true,
+                    target_album_id: album.import_album_id.to_string(),
+                    target_album_name: album.target_relative_path.clone(),
+                    target_relative_path: img.target_relative_path.clone(),
                 };
                 kept_images.push(plan_image.clone());
                 album_images.push(plan_image);
@@ -4045,6 +4048,9 @@ impl ImportRepository {
                     album_id: source_album.id.to_string(),
                     source_album_id: img.album_id.to_string(),
                     included: false,
+                    target_album_id: source_album.id.to_string(),
+                    target_album_name: source_album.source_name.clone(),
+                    target_relative_path: img.relative_path.clone(),
                 })
                 .collect();
 

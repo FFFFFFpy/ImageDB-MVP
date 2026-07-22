@@ -21,6 +21,9 @@ function albumImages(albumId: string, albumName: string, count: number): ImportP
       album_id: albumId,
       source_album_id: albumId,
       included: true,
+      target_album_id: albumId,
+      target_album_name: albumName,
+      target_relative_path: `${albumName}/${filename}`,
     };
   });
 }

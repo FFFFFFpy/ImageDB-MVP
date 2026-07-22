@@ -36,3 +36,7 @@ mod m9_performance_integration;
 #[cfg(test)]
 #[cfg(all(feature = "real-db-tests", feature = "fail-injection"))]
 mod cancellation_recovery_integration;
+
+#[cfg(test)]
+#[cfg(feature = "real-db-tests")]
+mod plan_contract_integration;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/ipc/api';
 import type { Route } from '../hooks/use-router';
-import type { ImportPlan, ImportPlanAlbum, ImportPlanImage, SourceFileMode } from '../lib/ipc/types';
+import type { ImportPlan, ImportPlanAlbum, ImportPlanImage, ImportAlbumStatus, SourceFileMode } from '../lib/ipc/types';
 import { Button, EmptyState, PageHeader, Skeleton, StatusBadge, StatusBanner } from '../components/ui';
 
 interface PlanPageProps {
@@ -11,7 +11,6 @@ interface PlanPageProps {
   onWorkflowAbandoned?: () => void;
   onNavigationBlockedChange?: (blocked: boolean) => void;
   initialImportRunId?: string | null;
-  enablePolling?: boolean;
 }
 
 interface PlanAlbumGroup {
@@ -72,25 +71,14 @@ export function PlanPage({
   onWorkflowAbandoned,
   onNavigationBlockedChange,
   initialImportRunId = null,
-  enablePolling = true,
 }: PlanPageProps) {
   const queryClient = useQueryClient();
-  const [importRunId, setImportRunId] = useState<string | null>(initialImportRunId);
+  const [importRunId] = useState<string | null>(initialImportRunId);
   const [plan, setPlan] = useState<ImportPlan | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [visibleAlbums, setVisibleAlbums] = useState(50);
   const editActive = useRef(false);
-
-  const latestRun = useQuery({
-    queryKey: ['latestReviewableImportRun'],
-    queryFn: api.getLatestReviewableImportRun,
-    enabled: !importRunId,
-    refetchInterval: enablePolling ? 2000 : false,
-  });
-  useEffect(() => {
-    if (!importRunId && latestRun.data) setImportRunId(latestRun.data);
-  }, [importRunId, latestRun.data]);
 
   const draftQuery = useQuery({
     queryKey: ['importPlanDraftSummary', importRunId],
@@ -101,6 +89,12 @@ export function PlanPage({
   const frozenQuery = useQuery({
     queryKey: ['frozenImportPlanSummary', importRunId],
     queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
+    enabled: !!importRunId,
+  });
+
+  const runAlbumsQuery = useQuery({
+    queryKey: ['importRunAlbums', importRunId],
+    queryFn: () => api.getImportRunAlbums(importRunId!),
     enabled: !!importRunId,
   });
 
@@ -153,15 +147,6 @@ export function PlanPage({
   const albums = useMemo(() => (plan ? planAlbumsForDisplay(plan) : []), [plan]);
   const displayed = albums.slice(0, visibleAlbums);
   const moveMode = plan?.source_file_mode === 'move_selected_without_backup';
-
-  if (!importRunId && latestRun.isLoading) {
-    return (
-      <div className="review-page plan-page--m3">
-        <PageHeader title="人工复核入库计划" description="正在查找可操作的导入任务。" />
-        <Skeleton width="100%" height={280} />
-      </div>
-    );
-  }
 
   if (!importRunId) {
     return (
@@ -298,25 +283,54 @@ export function PlanPage({
             </summary>
             <div className="plan-image-grid">
               {album.images.slice(0, 100).map((image) => (
-                <button
-                  type="button"
+                <div
                   className={`plan-image-row ${image.included ? '' : 'plan-image-row--excluded'}`}
                   key={image.image_id}
-                  disabled={busy || locked}
-                  onClick={() =>
-                    void applyEdit(() =>
-                      api.setImportPlanImageIncluded(
-                        plan.import_run_id,
-                        image.image_id,
-                        album.albumId,
-                        !image.included,
-                      ),
-                    )
-                  }
                 >
-                  <span>{image.relative_path}</span>
-                  <span>{image.included ? '保留' : '排除'}</span>
-                </button>
+                  <button
+                    type="button"
+                    className="plan-image-row__toggle"
+                    disabled={busy || locked}
+                    onClick={() =>
+                      void applyEdit(() =>
+                        api.setImportPlanImageIncluded(
+                          plan.import_run_id,
+                          image.image_id,
+                          image.target_album_id || album.albumId,
+                          !image.included,
+                        ),
+                      )
+                    }
+                  >
+                    <span>{image.relative_path}</span>
+                    <span>{image.included ? '保留' : '排除'}</span>
+                  </button>
+                  {!locked && image.included && (
+                    <label className="plan-image-row__target">
+                      <select
+                        value={image.target_album_id}
+                        disabled={busy}
+                        onChange={(event) =>
+                          void applyEdit(() =>
+                            api.setImportPlanImageIncluded(
+                              plan.import_run_id,
+                              image.image_id,
+                              event.target.value,
+                              true,
+                            ),
+                          )
+                        }
+                      >
+                        {(runAlbumsQuery.data ?? []).map((a: ImportAlbumStatus) => (
+                          <option key={a.id} value={a.id}>
+                            {a.source_name}
+                          </option>
+                        ))}
+                      </select>
+                      <small>{image.target_relative_path}</small>
+                    </label>
+                  )}
+                </div>
               ))}
             </div>
           </details>
@@ -330,8 +344,10 @@ export function PlanPage({
           variant="danger"
           disabled={busy}
           onClick={() => {
-            void api
-              .abandonFrozenImportWorkflow(plan.import_run_id)
+            const abandon = locked
+              ? api.abandonFrozenImportWorkflow(plan.import_run_id)
+              : api.abandonImportRun(plan.import_run_id);
+            void abandon
               .then(() => {
                 setPlan(null);
                 onWorkflowAbandoned?.();

@@ -225,20 +225,7 @@ export function CommitPage({
   const [workflowAbandonConfirm, setWorkflowAbandonConfirm] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Keep this aligned with ImportRepository::get_latest_committable_run:
-  // only `ready_to_commit` and resubmittable `cancelled` runs with a frozen
-  // or consumed plan and non-empty plan_hash enter the default Commit page.
-  // `completed`, `failed`, and `recovery_required` do not.
-  const latestRun = useQuery({
-    queryKey: ['latestCommittableImportRun'],
-    queryFn: api.getLatestCommittableImportRun,
-    enabled: !initialImportRunId,
-  });
-
-  // An explicit workflow selection is authoritative. A disabled React Query
-  // can still expose stale cached data, so the latest-run fallback must never
-  // be read before the run carried by Dashboard / Review.
-  const committableRunId = importRunId ?? (!latestRun.isError ? (latestRun.data ?? null) : null);
+  const committableRunId = importRunId;
 
   const planQuery = useQuery({
     queryKey: ['frozenImportPlanSummary', committableRunId],
@@ -451,25 +438,7 @@ export function CommitPage({
           </StatusBanner>
         )}
 
-        {!importRunId && latestRun.isLoading && !plan && (
-          <div className="commit-loading" role="status" aria-label="正在加载可提交的导入任务">
-            <Skeleton height={96} radius="var(--radius-panel)" />
-          </div>
-        )}
-        {!importRunId && latestRun.isError && !plan && (
-          <StatusBanner
-            tone="danger"
-            title="无法查询可提交任务"
-            actions={<Button onClick={() => latestRun.refetch()}>重新加载</Button>}
-          >
-            {String(latestRun.error)}
-          </StatusBanner>
-        )}
-        {!importRunId &&
-          !latestRun.isLoading &&
-          !latestRun.isError &&
-          !committableRunId &&
-          !plan && (
+        {!committableRunId && !plan && (
             <EmptyState
               title="没有可提交的计划"
               description="当前没有已冻结计划的可提交任务。请先完成审核并生成导入计划。"
