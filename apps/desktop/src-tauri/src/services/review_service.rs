@@ -1208,6 +1208,9 @@ pub async fn set_plan_image_included(
         if included {
             include_image_in_album(client, draft.plan_id, image_id, target_album_id).await?;
         } else {
+            // TODO(workflow-restoration-v3): Preserve excluded draft rows and their target
+            // assignment once the schema can represent an explicit `included` state.
+            // Deleting the row is the current schema's only non-committable representation.
             client
                 .execute(
                     "DELETE FROM import_plan_images WHERE import_image_id = $1 AND plan_album_id IN (
@@ -1414,6 +1417,9 @@ async fn include_image_in_album(
         .into_iter()
         .next()
         .ok_or_else(|| AppError::Internal(format!("import image {image_id} not found")))?;
+    // TODO(workflow-restoration-v3): Cross-source album reassignment requires a separate
+    // Commit/Recovery design because file transactions and source cleanup are currently
+    // anchored to import_album_id. Do not remove this guard in the UI workflow branch.
     if image.import_album_id != target_album_id {
         return Err(AppError::Internal(
             "cross-source album move is blocked by the current file transaction model".to_string(),
