@@ -2977,6 +2977,260 @@ mod tests {
         assert_eq!(plan.excluded_count, 0);
     }
 
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_draft_edit_and_freeze_contract() {
+        use crate::domain::import_state::{DecodeState, ImportImageState};
+        use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+        use crate::repositories::import_repository::NewImportImage;
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            panic!("IMAGEDB_POSTGRES_BIN is not set; cannot run the real Draft/Freeze test");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let app_data = tmp.path().join("app_data");
+        let source_root = tmp.path().join("source");
+        let album_path = source_root.join("album");
+        std::fs::create_dir_all(&album_path).unwrap();
+        let first_path = album_path.join("first.png");
+        let second_path = album_path.join("second.png");
+        std::fs::write(&first_path, b"first").unwrap();
+        std::fs::write(&second_path, b"second").unwrap();
+
+        let mut manager = PostgresManager::new(&app_data);
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            &source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            &album_path.display().to_string(),
+            "album",
+        )
+        .await
+        .unwrap();
+
+        let first_image_id = ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id,
+                source_path: first_path.display().to_string(),
+                relative_path: "album/first.png".to_string(),
+                file_size: 5,
+                modified_at: None,
+                width: Some(1),
+                height: Some(1),
+                format: Some("png".to_string()),
+                decode_state: DecodeState::Decoded,
+                blake3: Some(vec![1; 32]),
+                pixel_hash: Some(vec![2; 32]),
+                block_hash_16: Some(vec![3; 32]),
+                double_gradient_hash_32: Some(vec![4; 68]),
+                perceptual_eligible: true,
+                fingerprint_version: Some("2".to_string()),
+                state: ImportImageState::Fingerprinted,
+            },
+        )
+        .await
+        .unwrap();
+        let second_image_id = ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id,
+                source_path: second_path.display().to_string(),
+                relative_path: "album/second.png".to_string(),
+                file_size: 6,
+                modified_at: None,
+                width: Some(1),
+                height: Some(1),
+                format: Some("png".to_string()),
+                decode_state: DecodeState::Decoded,
+                blake3: Some(vec![5; 32]),
+                pixel_hash: Some(vec![6; 32]),
+                block_hash_16: Some(vec![7; 32]),
+                double_gradient_hash_32: Some(vec![8; 68]),
+                perceptual_eligible: true,
+                fingerprint_version: Some("2".to_string()),
+                state: ImportImageState::Fingerprinted,
+            },
+        )
+        .await
+        .unwrap();
+
+        ImportRepository::mark_import_album_analyzing(&client, album_id)
+            .await
+            .unwrap();
+        ImportRepository::finalize_import_album_analysis(&client, album_id)
+            .await
+            .unwrap();
+        ImportRepository::update_import_run_state(
+            &client,
+            import_run_id,
+            &ImportRunState::ReviewRequired,
+        )
+        .await
+        .unwrap();
+
+        let generated = generate_import_plan(&client, import_run_id)
+            .await
+            .expect("plan generation must persist a complete Draft");
+        assert_eq!(generated.total_images, 2);
+        assert_eq!(generated.kept_images.len(), 2);
+
+        let draft_plan_id: Uuid = client
+            .query_one(
+                "SELECT id FROM import_plans
+                 WHERE import_run_id = $1 AND state = 'draft'",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let initial_rows = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT AS row_count, BOOL_AND(ipi.included) AS all_included
+                 FROM import_plan_images ipi
+                 JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
+                 WHERE ipa.plan_id = $1",
+                &[&draft_plan_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial_rows.get::<_, i64>("row_count"), 2);
+        assert!(initial_rows.get::<_, bool>("all_included"));
+
+        set_plan_image_included(&client, import_run_id, second_image_id, album_id, false)
+            .await
+            .expect("Draft image must remain editable while excluded");
+
+        let edited_target_path = "custom/second.png";
+        set_plan_image_target_path(
+            &client,
+            import_run_id,
+            second_image_id,
+            album_id,
+            edited_target_path,
+        )
+        .await
+        .expect("an excluded Draft image must retain editable target data");
+
+        let reenabled =
+            set_plan_image_included(&client, import_run_id, second_image_id, album_id, true)
+                .await
+                .expect("excluded Draft image must be re-enabled in place");
+        let reenabled_image = reenabled
+            .albums
+            .iter()
+            .flat_map(|album| &album.images)
+            .find(|image| image.image_id == second_image_id.to_string())
+            .expect("re-enabled image must still exist in the Draft");
+        assert!(reenabled_image.included);
+        assert_eq!(reenabled_image.relative_path, edited_target_path);
+
+        set_plan_image_included(&client, import_run_id, second_image_id, album_id, false)
+            .await
+            .expect("image must be excludable again before Freeze");
+        let excluded_row = client
+            .query_one(
+                "SELECT ipi.included, ipi.target_relative_path
+                 FROM import_plan_images ipi
+                 JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
+                 WHERE ipa.plan_id = $1 AND ipi.import_image_id = $2",
+                &[&draft_plan_id, &second_image_id],
+            )
+            .await
+            .unwrap();
+        assert!(!excluded_row.get::<_, bool>("included"));
+        assert_eq!(
+            excluded_row.get::<_, String>("target_relative_path"),
+            edited_target_path
+        );
+
+        let transactions_before_freeze: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(transactions_before_freeze, 0);
+
+        let frozen = freeze_import_plan(&client, import_run_id)
+            .await
+            .expect("Draft with one included image must Freeze");
+        assert!(frozen.plan_hash.is_some());
+        assert_eq!(frozen.kept_images.len(), 1);
+        assert_eq!(frozen.kept_images[0].image_id, first_image_id.to_string());
+
+        let frozen_state: String = client
+            .query_one(
+                "SELECT state FROM import_plans WHERE id = $1",
+                &[&draft_plan_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(frozen_state, "frozen");
+
+        let excluded_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM import_plan_images ipi
+                 JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
+                 WHERE ipa.plan_id = $1 AND ipi.import_image_id = $2",
+                &[&draft_plan_id, &second_image_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(excluded_count, 0);
+
+        let frozen_rows = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT AS row_count, BOOL_AND(ipi.included) AS all_included
+                 FROM import_plan_images ipi
+                 JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
+                 WHERE ipa.plan_id = $1",
+                &[&draft_plan_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(frozen_rows.get::<_, i64>("row_count"), 1);
+        assert!(frozen_rows.get::<_, bool>("all_included"));
+
+        let transactions_after_freeze: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(transactions_after_freeze, 0);
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
     /// Real PostgreSQL review integration test.
     ///
     /// Invocation:

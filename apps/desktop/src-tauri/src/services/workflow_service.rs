@@ -47,15 +47,22 @@ fn resolve_stage(
         return ImportWorkflowStage::Recovery;
     }
 
-    if transaction_states
+    if run_state == "recovery_required" {
+        return ImportWorkflowStage::Recovery;
+    }
+
+    let has_active_transaction = transaction_states
         .iter()
-        .any(|state| !matches!(state.as_str(), "source_archived" | "source_files_removed"))
-    {
-        return ImportWorkflowStage::Committing;
+        .any(|state| !matches!(state.as_str(), "source_archived" | "source_files_removed"));
+    if has_active_transaction {
+        return if run_state == "committing" {
+            ImportWorkflowStage::Committing
+        } else {
+            ImportWorkflowStage::Recovery
+        };
     }
 
     match run_state {
-        "recovery_required" => return ImportWorkflowStage::Recovery,
         "completed" => return ImportWorkflowStage::Completed,
         "failed" => return ImportWorkflowStage::Failed,
         "committing" => return ImportWorkflowStage::Committing,
@@ -181,6 +188,15 @@ mod tests {
             ImportWorkflowStage::Recovery
         );
         assert_eq!(
+            resolve_stage(
+                "recovery_required",
+                Some("frozen"),
+                &["staging".to_string()],
+                0,
+            ),
+            ImportWorkflowStage::Recovery
+        );
+        assert_eq!(
             resolve_stage("abandoned", None, &[], 0),
             ImportWorkflowStage::Abandoned
         );
@@ -256,6 +272,47 @@ mod tests {
             .unwrap();
         assert_eq!(resolution.stage, ImportWorkflowStage::Recovery);
         assert_eq!(resolution.file_transaction_count, 1);
+
+        let recovery_run_id = ImportRepository::create_import_run(
+            &client,
+            "C:/workflow-resolver/recovery-source",
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let recovery_album_id = ImportRepository::insert_import_album(
+            &client,
+            recovery_run_id,
+            "C:/workflow-resolver/recovery-source/album",
+            "album",
+        )
+        .await
+        .unwrap();
+        ImportRepository::update_import_run_state(
+            &client,
+            recovery_run_id,
+            &ImportRunState::RecoveryRequired,
+        )
+        .await
+        .unwrap();
+        ImportRepository::insert_file_transaction(
+            &client,
+            Uuid::new_v4(),
+            recovery_run_id,
+            recovery_album_id,
+            &TransactionState::Staging,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let recovery_resolution = resolve_import_workflow(&client, Some(recovery_run_id))
+            .await
+            .unwrap();
+        assert_eq!(recovery_resolution.stage, ImportWorkflowStage::Recovery);
+        assert_eq!(recovery_resolution.file_transaction_count, 1);
 
         drop(client);
         handle.abort();

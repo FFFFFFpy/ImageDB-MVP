@@ -538,6 +538,226 @@ mod tests {
         apply_migration_prefix(client, 11).await;
     }
 
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_migration_0018_invalidates_only_legacy_drafts() {
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            panic!("IMAGEDB_POSTGRES_BIN is not set; cannot run the real migration 0018 test");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = crate::infrastructure::postgres::PostgresManager::new(tmp.path());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
+        apply_migration_prefix(&mut client, 17).await;
+
+        let library_root_id = Uuid::new_v4();
+        let import_run_id = Uuid::new_v4();
+        let import_album_id = Uuid::new_v4();
+        let import_image_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO library_roots (id, path, display_name)
+                 VALUES ($1, $2, 'migration-0018')",
+                &[
+                    &library_root_id,
+                    &format!("C:/migration-0018/{library_root_id}"),
+                ],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_runs
+                    (id, source_root, library_root_id, state, policy_version)
+                 VALUES ($1, $2, $3, 'review_required', 'migration-0018')",
+                &[
+                    &import_run_id,
+                    &format!("C:/migration-0018/source/{import_run_id}"),
+                    &library_root_id,
+                ],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_albums
+                    (id, import_run_id, source_path, source_name, state)
+                 VALUES ($1, $2, $3, 'album', 'analyzed')",
+                &[
+                    &import_album_id,
+                    &import_run_id,
+                    &format!("C:/migration-0018/source/{import_run_id}/album"),
+                ],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO import_images
+                    (id, import_album_id, source_path, relative_path, file_size,
+                     width, height, format, decode_state, blake3, pixel_hash,
+                     block_hash_16, double_gradient_hash_32, perceptual_eligible,
+                     fingerprint_version, state)
+                 VALUES ($1, $2, $3, 'album/image.png', 7, 1, 1, 'png',
+                         'decoded', $4, $5, $6, $7, TRUE, '2', 'fingerprinted')",
+                &[
+                    &import_image_id,
+                    &import_album_id,
+                    &format!("C:/migration-0018/source/{import_run_id}/album/image.png"),
+                    &vec![1_u8; 32],
+                    &vec![2_u8; 32],
+                    &vec![3_u8; 32],
+                    &vec![4_u8; 68],
+                ],
+            )
+            .await
+            .unwrap();
+
+        let draft_plan_id = Uuid::new_v4();
+        let frozen_plan_id = Uuid::new_v4();
+        let consumed_plan_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO import_plans
+                    (id, import_run_id, version, state, policy_version, library_root_id)
+                 VALUES
+                    ($1, $4, 1, 'draft', 'migration-0018', $5),
+                    ($2, $4, 2, 'frozen', 'migration-0018', $5),
+                    ($3, $4, 3, 'consumed', 'migration-0018', $5)",
+                &[
+                    &draft_plan_id,
+                    &frozen_plan_id,
+                    &consumed_plan_id,
+                    &import_run_id,
+                    &library_root_id,
+                ],
+            )
+            .await
+            .unwrap();
+
+        for (plan_id, suffix) in [
+            (draft_plan_id, "draft"),
+            (frozen_plan_id, "frozen"),
+            (consumed_plan_id, "consumed"),
+        ] {
+            let plan_album_id = Uuid::new_v4();
+            client
+                .execute(
+                    "INSERT INTO import_plan_albums
+                        (id, plan_id, import_album_id, target_relative_path,
+                         expected_image_count)
+                     VALUES ($1, $2, $3, $4, 1)",
+                    &[
+                        &plan_album_id,
+                        &plan_id,
+                        &import_album_id,
+                        &format!("album-{suffix}"),
+                    ],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "INSERT INTO import_plan_images
+                        (id, plan_album_id, import_image_id, source_path,
+                         source_relative_path, target_relative_path,
+                         expected_file_size, expected_blake3, width, height, format)
+                     VALUES ($1, $2, $3, $4, 'album/image.png', $5, 7, $6, 1, 1, 'png')",
+                    &[
+                        &Uuid::new_v4(),
+                        &plan_album_id,
+                        &import_image_id,
+                        &format!("C:/migration-0018/source/{import_run_id}/album/image.png"),
+                        &format!("album-{suffix}/image.png"),
+                        &vec![1_u8; 32],
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let transaction_id = Uuid::new_v4();
+        client
+            .execute(
+                "INSERT INTO file_transactions
+                    (id, import_run_id, import_album_id, state)
+                 VALUES ($1, $2, $3, 'planned')",
+                &[&transaction_id, &import_run_id, &import_album_id],
+            )
+            .await
+            .unwrap();
+
+        let applied = MigrationRunner::run_pending(&mut client).await.unwrap();
+        assert_eq!(
+            applied,
+            vec!["0018_import_plan_draft_inclusion".to_string()]
+        );
+
+        for (plan_id, expected_state) in [
+            (draft_plan_id, "invalidated"),
+            (frozen_plan_id, "frozen"),
+            (consumed_plan_id, "consumed"),
+        ] {
+            let actual_state: String = client
+                .query_one("SELECT state FROM import_plans WHERE id = $1", &[&plan_id])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(actual_state, expected_state);
+        }
+
+        let transaction_state: String = client
+            .query_one(
+                "SELECT state FROM file_transactions WHERE id = $1",
+                &[&transaction_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(transaction_state, "planned");
+
+        let included_rows = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT AS row_count, BOOL_AND(included) AS all_included
+                 FROM import_plan_images",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(included_rows.get::<_, i64>("row_count"), 3);
+        assert!(included_rows.get::<_, bool>("all_included"));
+
+        let included_column = client
+            .query_one(
+                "SELECT column_default, is_nullable
+                 FROM information_schema.columns
+                 WHERE table_schema = 'public'
+                   AND table_name = 'import_plan_images'
+                   AND column_name = 'included'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let column_default: Option<String> = included_column.get("column_default");
+        assert!(column_default
+            .as_deref()
+            .is_some_and(|default| default.contains("true")));
+        assert_eq!(included_column.get::<_, String>("is_nullable"), "NO");
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
+    }
+
     #[cfg(feature = "real-db-tests")]
     async fn insert_duplicate_pair_fixture(
         client: &Client,
