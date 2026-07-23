@@ -61,7 +61,9 @@ export function Layout({
           {NAV_ITEMS.map((item) => {
             const isCurrentPage = currentRoute === item.route;
             const isVisuallyActive =
-              isCurrentPage || (currentRoute === 'library' && item.route === 'dashboard');
+              isCurrentPage ||
+              (currentRoute === 'library' && item.route === 'dashboard') ||
+              (currentRoute === 'plan' && item.route === 'review');
             const count = counts[item.route] ?? 0;
             return (
               <button

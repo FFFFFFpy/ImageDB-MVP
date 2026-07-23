@@ -428,6 +428,7 @@ export interface ImportPlanImage {
   source_path: string;
   relative_path: string;
   file_size: number;
+  source_album_name: string;
   album_name: string;
   album_id: string;
   source_album_id: string;
@@ -436,6 +437,7 @@ export interface ImportPlanImage {
 
 export interface ImportPlanAlbum {
   album_id: string;
+  source_album_name: string;
   album_name: string;
   included: boolean;
   image_count: number;
@@ -447,12 +449,33 @@ export interface ImportPlan {
   import_run_id: string;
   plan_hash: string | null;
   source_file_mode: SourceFileMode;
+  library_root_path: string | null;
   total_albums: number;
   total_images: number;
   kept_images: ImportPlanImage[];
   excluded_count: number;
   skipped_albums: string[];
   albums: ImportPlanAlbum[];
+}
+
+export type ImportWorkflowStage =
+  | 'analysis'
+  | 'review'
+  | 'generate_plan'
+  | 'plan_draft'
+  | 'commit_confirm'
+  | 'committing'
+  | 'recovery'
+  | 'completed'
+  | 'failed'
+  | 'abandoned';
+
+export interface ImportWorkflowResolution {
+  import_run_id: string | null;
+  stage: ImportWorkflowStage;
+  run_state: string | null;
+  plan_state: string | null;
+  file_transaction_count: number;
 }
 
 export interface LibraryAlbumSummary {

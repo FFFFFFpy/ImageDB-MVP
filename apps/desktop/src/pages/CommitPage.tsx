@@ -23,13 +23,13 @@ import {
 
 interface CommitPageProps {
   onNavigate: (route: Route) => void;
-  onGoReview?: (importRunId: string) => void;
   onWorkflowAbandoned?: () => void;
   onNavigationBlockedChange?: (blocked: boolean) => void;
   initialPhase?: Phase;
   initialPlan?: ImportPlan | null;
   initialProgress?: CommitProgress | null;
   initialImportRunId?: string | null;
+  fileTransactionCount?: number;
   enablePolling?: boolean;
 }
 
@@ -43,6 +43,7 @@ function formatFileSize(bytes: number): string {
 
 interface CommitPlanAlbumGroup {
   albumId: string;
+  sourceAlbumName: string;
   albumName: string;
   included: boolean;
   imageCount: number;
@@ -55,6 +56,7 @@ function planAlbumsForDisplay(plan: ImportPlan): CommitPlanAlbumGroup[] {
   if (plan.albums?.length) {
     return plan.albums.map((album: ImportPlanAlbum) => ({
       albumId: album.album_id,
+      sourceAlbumName: album.source_album_name,
       albumName: album.album_name,
       included: album.included,
       imageCount: album.image_count,
@@ -76,6 +78,7 @@ function planAlbumsForDisplay(plan: ImportPlan): CommitPlanAlbumGroup[] {
     }
     groups.set(albumId, {
       albumId,
+      sourceAlbumName: image.source_album_name,
       albumName: image.album_name || '未命名图集',
       included: true,
       imageCount: 1,
@@ -202,13 +205,13 @@ function stageLabel(stage: string | undefined): string {
 
 export function CommitPage({
   onNavigate,
-  onGoReview,
   onWorkflowAbandoned,
   onNavigationBlockedChange,
   initialPhase = 'confirm',
   initialPlan = null,
   initialProgress = null,
   initialImportRunId = null,
+  fileTransactionCount = 0,
   enablePolling = true,
 }: CommitPageProps) {
   const queryClient = useQueryClient();
@@ -216,7 +219,7 @@ export function CommitPage({
   const [plan, setPlan] = useState<ImportPlan | null>(initialPlan);
   const [progress, setProgress] = useState<CommitProgress | null>(initialProgress);
   const [error, setError] = useState<string | null>(null);
-  const [importRunId, setImportRunId] = useState<string | null>(initialImportRunId);
+  const importRunId = initialImportRunId ?? initialPlan?.import_run_id ?? null;
   const [openPlanAlbums, setOpenPlanAlbums] = useState<Set<string>>(new Set());
   const [planImageLimits, setPlanImageLimits] = useState<Record<string, number>>({});
   const [planAlbumLimit, setPlanAlbumLimit] = useState(PLAN_ALBUM_BATCH_SIZE);
@@ -226,33 +229,17 @@ export function CommitPage({
   } | null>(null);
   const [workflowAbandonConfirm, setWorkflowAbandonConfirm] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Keep this aligned with ImportRepository::get_latest_committable_run:
-  // only `ready_to_commit` and resubmittable `cancelled` runs with a frozen
-  // or consumed plan and non-empty plan_hash enter the default Commit page.
-  // `completed`, `failed`, and `recovery_required` do not.
-  const latestRun = useQuery({
-    queryKey: ['latestCommittableImportRun'],
-    queryFn: api.getLatestCommittableImportRun,
-    enabled: !initialImportRunId,
-  });
-
-  // An explicit workflow selection is authoritative. A disabled React Query
-  // can still expose stale cached data, so the latest-run fallback must never
-  // be read before the run carried by Dashboard / Review.
-  const committableRunId = importRunId ?? (!latestRun.isError ? (latestRun.data ?? null) : null);
+  const startRequestedRef = useRef(false);
 
   const planQuery = useQuery({
-    queryKey: ['frozenImportPlanSummary', committableRunId],
-    queryFn: () => api.getFrozenImportPlanSummary(committableRunId!),
-    enabled: !!committableRunId && phase === 'confirm' && !initialPlan,
+    queryKey: ['frozenImportPlanSummary', importRunId],
+    queryFn: () => api.getFrozenImportPlanSummary(importRunId!),
+    enabled: !!importRunId && phase === 'confirm' && !initialPlan,
+    retry: false,
   });
 
   useEffect(() => {
-    if (planQuery.data) {
-      setPlan(planQuery.data);
-      setImportRunId(planQuery.data.import_run_id);
-    }
+    if (planQuery.data) setPlan(planQuery.data);
   }, [planQuery.data]);
 
   useEffect(() => {
@@ -280,11 +267,14 @@ export function CommitPage({
   const commitMutation = useMutation({
     mutationFn: ({ runId, planHash }: { runId: string; planHash: string }) =>
       api.startImportCommit(runId, planHash),
+    retry: false,
     onSuccess: () => {
       setError(null);
       setPhase('committing');
+      void queryClient.invalidateQueries({ queryKey: ['workflow-resolution'] });
     },
     onError: (err) => {
+      startRequestedRef.current = false;
       setError(String(err));
     },
   });
@@ -306,6 +296,7 @@ export function CommitPage({
         queryClient.invalidateQueries({ queryKey: ['latestCommittableImportRun'] }),
         queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
         queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
+        queryClient.invalidateQueries({ queryKey: ['workflow-resolution'] }),
       ]);
       if (onWorkflowAbandoned) onWorkflowAbandoned();
       else onNavigate('dashboard');
@@ -330,9 +321,17 @@ export function CommitPage({
   );
 
   const handleStartCommit = useCallback(() => {
-    if (!importRunId || !plan?.plan_hash) return;
+    if (
+      startRequestedRef.current ||
+      !importRunId ||
+      !plan?.plan_hash ||
+      fileTransactionCount !== 0
+    ) {
+      return;
+    }
+    startRequestedRef.current = true;
     commitMutation.mutate({ runId: importRunId, planHash: plan.plan_hash });
-  }, [commitMutation, importRunId, plan?.plan_hash]);
+  }, [commitMutation, fileTransactionCount, importRunId, plan?.plan_hash]);
 
   const handleCancel = useCallback(async () => {
     try {
@@ -375,29 +374,22 @@ export function CommitPage({
     return (
       <div className="commit-page commit-page--m3">
         <PageHeader
-          title="提交入库"
-          description="确认 frozen plan 摘要后，才会开始 staging、校验、发布与数据库提交。"
-          meta={plan ? <StatusBadge tone="success">读取 frozen plan</StatusBadge> : undefined}
+          title="最后一次只读审阅"
+          description="此页只读取已锁定计划。只有明确确认后，才会开始文件事务。"
+          meta={plan ? <StatusBadge tone="success">Frozen · 只读</StatusBadge> : undefined}
           actions={
             plan ? (
               <>
                 <Button
-                  variant="danger"
-                  disabled={commitMutation.isPending || abandonWorkflowMutation.isPending}
+                  variant="quiet"
+                  disabled={
+                    commitMutation.isPending ||
+                    abandonWorkflowMutation.isPending ||
+                    fileTransactionCount !== 0
+                  }
                   onClick={() => setWorkflowAbandonConfirm(true)}
                 >
-                  撤销这次导入
-                </Button>
-                <Button
-                  variant="quiet"
-                  disabled={commitMutation.isPending || abandonWorkflowMutation.isPending}
-                  onClick={() =>
-                    committableRunId && onGoReview
-                      ? onGoReview(committableRunId)
-                      : onNavigate('review')
-                  }
-                >
-                  查看锁定计划
+                  放弃本次导入
                 </Button>
                 <Button
                   variant="primary"
@@ -406,7 +398,8 @@ export function CommitPage({
                     plan.kept_images.length === 0 ||
                     !plan.plan_hash ||
                     workflowAbandonConfirm ||
-                    abandonWorkflowMutation.isPending
+                    abandonWorkflowMutation.isPending ||
+                    fileTransactionCount !== 0
                   }
                   loading={commitMutation.isPending}
                   loadingLabel="正在启动…"
@@ -425,14 +418,28 @@ export function CommitPage({
           >
             {plan.plan_hash
               ? `计划哈希：${plan.plan_hash}`
-              : '无法确认当前页面展示的计划与后端即将提交的计划一致，提交已阻止。请返回审核页重新生成 frozen plan。'}
+              : '无法确认当前页面展示的计划与后端即将提交的计划一致，提交已阻止。请放弃本次导入并重新分析。'}
+          </StatusBanner>
+        )}
+        {plan && (
+          <StatusBanner
+            tone={fileTransactionCount === 0 ? 'success' : 'danger'}
+            title={
+              fileTransactionCount === 0
+                ? '确认边界已就绪：文件事务数量为 0'
+                : '检测到已有文件事务，禁止再次启动'
+            }
+          >
+            {fileTransactionCount === 0
+              ? '加载、刷新或查看本页都不会创建文件事务。'
+              : `当前任务已有 ${fileTransactionCount} 个文件事务，请等待现有入库或按恢复流程处理。`}
           </StatusBanner>
         )}
 
         {plan && workflowAbandonConfirm && (
           <StatusBanner
             tone="warning"
-            title="确认撤销这次导入任务？"
+            title="确认放弃本次导入？"
             actions={
               <>
                 <Button
@@ -441,7 +448,7 @@ export function CommitPage({
                   loadingLabel="正在撤销任务…"
                   onClick={() => abandonWorkflowMutation.mutate(plan.import_run_id)}
                 >
-                  撤销并返回工作台
+                  确认放弃并返回工作台
                 </Button>
                 <Button
                   variant="quiet"
@@ -453,51 +460,18 @@ export function CommitPage({
               </>
             }
           >
-            这会结束当前导入任务并回到可新建导入的状态。已经完成的扫描、审核和计划将不再继续；源图片和图库内容不会被删除，任务记录仍会保留用于审计。
+            这会将当前工作流标记为 abandoned。源图片和图库内容不会被删除或修改，
+            但该 Frozen 计划将不再提供继续提交入口。
           </StatusBanner>
         )}
 
-        {!importRunId && latestRun.isLoading && !plan && (
-          <div className="commit-loading" role="status" aria-label="正在加载可提交的导入任务">
-            <Skeleton height={96} radius="var(--radius-panel)" />
-          </div>
+        {!importRunId && !plan && (
+          <EmptyState
+            title="没有指定可提交任务"
+            description="中央工作流路由没有找到处于最终确认阶段的任务。"
+            action={<Button onClick={() => onNavigate('dashboard')}>返回工作台</Button>}
+          />
         )}
-        {!importRunId && latestRun.isError && !plan && (
-          <StatusBanner
-            tone="danger"
-            title="无法查询可提交任务"
-            actions={<Button onClick={() => latestRun.refetch()}>重新加载</Button>}
-          >
-            {String(latestRun.error)}
-          </StatusBanner>
-        )}
-        {!importRunId &&
-          !latestRun.isLoading &&
-          !latestRun.isError &&
-          !committableRunId &&
-          !plan && (
-            <EmptyState
-              title="没有可提交的计划"
-              description="当前没有已冻结计划的可提交任务。请先完成审核并生成导入计划。"
-              action={
-                <div className="commit-empty-actions">
-                  <Button
-                    variant="primary"
-                    onClick={() =>
-                      committableRunId && onGoReview
-                        ? onGoReview(committableRunId)
-                        : onNavigate('review')
-                    }
-                  >
-                    前往审核 / 生成计划
-                  </Button>
-                  <Button variant="quiet" onClick={() => onNavigate('scan')}>
-                    前往扫描
-                  </Button>
-                </div>
-              }
-            />
-          )}
 
         {planQuery.isLoading && !plan && (
           <div className="commit-loading" role="status" aria-label="正在读取 frozen plan">
@@ -505,25 +479,17 @@ export function CommitPage({
           </div>
         )}
         {planQuery.isError && (
-          <StatusBanner
-            tone="danger"
-            title="无法读取 frozen plan"
-            actions={<Button onClick={() => onNavigate('review')}>前往审核</Button>}
-          >
+          <StatusBanner tone="danger" title="无法读取 Frozen 计划">
             {String(planQuery.error)}
           </StatusBanner>
         )}
         {!planQuery.isLoading &&
           !planQuery.isError &&
-          committableRunId &&
+          importRunId &&
           !planQuery.data &&
           !plan && (
-            <StatusBanner
-              tone="warning"
-              title="计划尚未冻结"
-              actions={<Button onClick={() => onNavigate('review')}>返回审核</Button>}
-            >
-              该导入任务没有可读取的 frozen plan；为保证提交输入稳定，入库操作已阻止。
+            <StatusBanner tone="warning" title="无法读取 Frozen 计划">
+              当前任务不具备只读确认输入；入库操作已阻止。
             </StatusBanner>
           )}
 
@@ -542,6 +508,28 @@ export function CommitPage({
                 : '发布成功并完成完整性校验前不会归档源图集；取消后可能需要通过恢复页继续处理。'}
             </StatusBanner>
             <div className="import-plan-summary">
+              <dl className="commit-boundary-details">
+                <div>
+                  <dt>目标图库位置</dt>
+                  <dd className="mono">{plan.library_root_path ?? '未提供目标图库路径'}</dd>
+                </div>
+                <div>
+                  <dt>源文件处理模式</dt>
+                  <dd>
+                    {plan.source_file_mode === 'copy_and_archive'
+                      ? '复制并归档'
+                      : '移动已选图片且不备份'}
+                  </dd>
+                </div>
+                <div>
+                  <dt>目标图集</dt>
+                  <dd>{albumGroups.filter((album) => album.included).map((album) => album.albumName).join('、') || '无'}</dd>
+                </div>
+                <div>
+                  <dt>事务启动状态</dt>
+                  <dd>{fileTransactionCount === 0 ? '尚未启动' : `已有 ${fileTransactionCount} 个事务`}</dd>
+                </div>
+              </dl>
               <div className="import-plan-stats">
                 <div className="plan-stat">
                   <span>图集数</span>
@@ -599,7 +587,7 @@ export function CommitPage({
                               album.included ? '' : 'is-skipped'
                             }`}
                           >
-                            {album.albumName}
+                            {album.sourceAlbumName} → {album.albumName}
                           </span>
                           <span className="import-plan-album-meta">
                             导入 {album.imageCount} 张 / 跳过 {album.skippedImageCount} 张 ·{' '}
@@ -630,7 +618,10 @@ export function CommitPage({
                                     className="import-plan-image-info"
                                     onClick={() => openPlanImagePreview(image, null)}
                                   >
-                                    <span className="mono">{image.relative_path}</span>
+                                    <span className="mono">
+                                      {image.source_album_name} → {image.album_name}/
+                                      {image.relative_path}
+                                    </span>
                                     <span>{formatFileSize(image.file_size)}</span>
                                   </button>
                                   <span

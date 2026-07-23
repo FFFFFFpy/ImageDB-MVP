@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { importPlanFixture } from '../components/fixtures/importPlanFixture';
 import { api } from '../lib/ipc/api';
-import type { CommitProgress } from '../lib/ipc/types';
+import type { CommitProgress, ImportPlan } from '../lib/ipc/types';
 import { PLAN_ALBUM_BATCH_SIZE, PLAN_IMAGE_BATCH_SIZE } from '../lib/import-plan-ui';
 import {
   CommitPage,
@@ -32,7 +32,7 @@ function progress(state: string): CommitProgress {
   };
 }
 
-function planForRun(importRunId: string) {
+function planForRun(importRunId: string): ImportPlan {
   return {
     ...importPlanFixture,
     import_run_id: importRunId,
@@ -48,6 +48,24 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function renderCommit(
+  props: Partial<React.ComponentProps<typeof CommitPage>> = {},
+) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <CommitPage
+        initialImportRunId="run-a"
+        enablePolling={false}
+        onNavigate={vi.fn()}
+        {...props}
+      />
+    </QueryClientProvider>,
+  );
 }
 
 describe('commit progress semantics', () => {
@@ -85,128 +103,100 @@ describe('commit progress semantics', () => {
     expect(PLAN_IMAGE_BATCH_SIZE).toBeLessThan(100);
   });
 
-  test('requires confirmation before abandoning the whole pending import workflow', async () => {
+  test('loads only the explicit Frozen plan and never starts Commit on load', async () => {
+    const getPlan = vi
+      .spyOn(api, 'getFrozenImportPlanSummary')
+      .mockResolvedValue(planForRun('run-a'));
+    const latest = vi.spyOn(api, 'getLatestCommittableImportRun');
+    const startCommit = vi.spyOn(api, 'startImportCommit').mockResolvedValue('commit started');
+
+    renderCommit();
+
+    expect(await screen.findByText('计划哈希：hash-run-a')).toBeVisible();
+    expect(getPlan).toHaveBeenCalledExactlyOnceWith('run-a');
+    expect(startCommit).not.toHaveBeenCalled();
+    expect(latest).not.toHaveBeenCalled();
+  });
+
+  test('starts Commit only after the explicit confirmation click', async () => {
+    const startCommit = vi.spyOn(api, 'startImportCommit').mockResolvedValue('commit started');
+    renderCommit({ initialPlan: planForRun('run-a'), fileTransactionCount: 0 });
+
+    expect(startCommit).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
+
+    await waitFor(() =>
+      expect(startCommit).toHaveBeenCalledExactlyOnceWith('run-a', 'hash-run-a'),
+    );
+  });
+
+  test('coalesces a double click into one Commit start request', async () => {
+    const start = deferred<string>();
+    const startCommit = vi.spyOn(api, 'startImportCommit').mockReturnValue(start.promise);
+    renderCommit({ initialPlan: planForRun('run-a'), fileTransactionCount: 0 });
+
+    const button = screen.getByRole('button', { name: '确认并开始入库' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(startCommit).toHaveBeenCalledTimes(1));
+    start.resolve('commit started');
+    expect(await screen.findByRole('heading', { name: '正在入库' })).toBeVisible();
+  });
+
+  test('blocks confirmation when a file transaction already exists', () => {
+    const startCommit = vi.spyOn(api, 'startImportCommit').mockResolvedValue('commit started');
+    renderCommit({ initialPlan: planForRun('run-a'), fileTransactionCount: 1 });
+
+    expect(screen.getByText('检测到已有文件事务，禁止再次启动')).toBeVisible();
+    expect(screen.getByRole('button', { name: '确认并开始入库' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
+    expect(startCommit).not.toHaveBeenCalled();
+  });
+
+  test('renders the Frozen plan as a read-only source-to-target allocation', () => {
+    renderCommit({ initialPlan: planForRun('run-a') });
+
+    expect(screen.getByRole('heading', { name: '最后一次只读审阅' })).toBeVisible();
+    expect(screen.getByText('D:/ImageDB/Library')).toBeVisible();
+    expect(screen.getByText('复制并归档')).toBeVisible();
+    expect(screen.getByText('确认边界已就绪：文件事务数量为 0')).toBeVisible();
+    expect(screen.queryByRole('radio')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    for (const name of ['导入', '跳过', '移动到其他目标图集', '保存路径', '解锁', '返回编辑']) {
+      expect(screen.queryByRole('button', { name })).not.toBeInTheDocument();
+    }
+  });
+
+  test('requires a second confirmation before abandoning a Frozen workflow', async () => {
     const abandon = vi.spyOn(api, 'abandonFrozenImportWorkflow').mockResolvedValue(undefined);
     const onWorkflowAbandoned = vi.fn();
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderCommit({
+      initialPlan: planForRun('run-a'),
+      onWorkflowAbandoned,
+    });
 
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage
-          initialPlan={importPlanFixture}
-          initialImportRunId={importPlanFixture.import_run_id}
-          enablePolling={false}
-          onNavigate={vi.fn()}
-          onWorkflowAbandoned={onWorkflowAbandoned}
-        />
-      </QueryClientProvider>,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: '撤销这次导入' }));
+    fireEvent.click(screen.getByRole('button', { name: '放弃本次导入' }));
     expect(abandon).not.toHaveBeenCalled();
-    expect(screen.getByText('确认撤销这次导入任务？')).toBeVisible();
+    expect(screen.getByText('确认放弃本次导入？')).toBeVisible();
     expect(screen.getByRole('button', { name: '确认并开始入库' })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole('button', { name: '撤销并返回工作台' }));
-    await waitFor(() => expect(abandon).toHaveBeenCalledWith(importPlanFixture.import_run_id));
+    fireEvent.click(screen.getByRole('button', { name: '确认放弃并返回工作台' }));
+    await waitFor(() => expect(abandon).toHaveBeenCalledWith('run-a'));
     await waitFor(() => expect(onWorkflowAbandoned).toHaveBeenCalledOnce());
   });
 
-  test('prefers an explicit commit run over stale latest-run cache data', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    client.setQueryData(['latestCommittableImportRun'], 'run-b');
-    const getPlan = vi
-      .spyOn(api, 'getFrozenImportPlanSummary')
-      .mockImplementation(async (runId) => planForRun(runId));
-    const startCommit = vi.spyOn(api, 'startImportCommit').mockResolvedValue('commit started');
+  test('shows an explicit empty state when no runId is supplied', () => {
+    const latest = vi.spyOn(api, 'getLatestCommittableImportRun');
+    const getPlan = vi.spyOn(api, 'getFrozenImportPlanSummary');
+    renderCommit({ initialImportRunId: null });
 
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage initialImportRunId="run-a" enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(await screen.findByText('计划哈希：hash-run-a')).toBeVisible();
-    expect(getPlan).toHaveBeenCalledTimes(1);
-    expect(getPlan).toHaveBeenCalledWith('run-a');
-    expect(getPlan).not.toHaveBeenCalledWith('run-b');
-
-    fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
-    await waitFor(() => expect(startCommit).toHaveBeenCalledWith('run-a', 'hash-run-a'));
+    expect(screen.getByText('没有指定可提交任务')).toBeVisible();
+    expect(latest).not.toHaveBeenCalled();
+    expect(getPlan).not.toHaveBeenCalled();
   });
 
-  test('uses the latest committable run only when no explicit run was provided', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    vi.spyOn(api, 'getLatestCommittableImportRun').mockResolvedValue('run-b');
-    const getPlan = vi
-      .spyOn(api, 'getFrozenImportPlanSummary')
-      .mockImplementation(async (runId) => planForRun(runId));
-    const startCommit = vi.spyOn(api, 'startImportCommit').mockResolvedValue('commit started');
-
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(await screen.findByText('计划哈希：hash-run-b')).toBeVisible();
-    expect(getPlan).toHaveBeenCalledWith('run-b');
-    fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
-    await waitFor(() => expect(startCommit).toHaveBeenCalledWith('run-b', 'hash-run-b'));
-  });
-
-  test('shows loading while the latest committable run query is pending', () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    vi.spyOn(api, 'getLatestCommittableImportRun').mockImplementation(() => new Promise(() => {}));
-
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(screen.getByRole('status', { name: '正在加载可提交的导入任务' })).toBeVisible();
-    expect(screen.queryByText('没有可提交的计划')).not.toBeInTheDocument();
-  });
-
-  test('distinguishes latest-run query errors from empty state and supports retry', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const latest = vi
-      .spyOn(api, 'getLatestCommittableImportRun')
-      .mockRejectedValueOnce(new Error('database unavailable'))
-      .mockResolvedValueOnce(null);
-
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(await screen.findByText('无法查询可提交任务')).toBeVisible();
-    expect(screen.getByText(/database unavailable/)).toBeVisible();
-    expect(screen.queryByText('没有可提交的计划')).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
-    await waitFor(() => expect(latest).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText('没有可提交的计划')).toBeVisible();
-  });
-
-  test('shows the true empty state only after a successful null latest-run response', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    vi.spyOn(api, 'getLatestCommittableImportRun').mockResolvedValue(null);
-
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage enablePolling={false} onNavigate={vi.fn()} />
-      </QueryClientProvider>,
-    );
-
-    expect(await screen.findByText('没有可提交的计划')).toBeVisible();
-    expect(screen.queryByText('无法查询可提交任务')).not.toBeInTheDocument();
-  });
-
-  test('blocks global navigation while commit starts and runs, then releases on terminal state', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  test('blocks global navigation while Commit starts and runs, then releases on terminal state', async () => {
     const start = deferred<string>();
     vi.spyOn(api, 'startImportCommit').mockReturnValue(start.promise);
     vi.spyOn(api, 'getCommitProgress').mockResolvedValue({
@@ -216,16 +206,11 @@ describe('commit progress semantics', () => {
     });
     const onNavigationBlockedChange = vi.fn();
 
-    render(
-      <QueryClientProvider client={client}>
-        <CommitPage
-          initialPlan={planForRun('run-a')}
-          initialImportRunId="run-a"
-          onNavigate={vi.fn()}
-          onNavigationBlockedChange={onNavigationBlockedChange}
-        />
-      </QueryClientProvider>,
-    );
+    renderCommit({
+      initialPlan: planForRun('run-a'),
+      enablePolling: true,
+      onNavigationBlockedChange,
+    });
 
     fireEvent.click(screen.getByRole('button', { name: '确认并开始入库' }));
     await waitFor(() => expect(onNavigationBlockedChange).toHaveBeenLastCalledWith(true));

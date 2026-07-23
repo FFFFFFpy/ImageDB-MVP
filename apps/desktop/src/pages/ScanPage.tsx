@@ -17,6 +17,7 @@ interface ScanPageProps {
   enablePolling?: boolean;
   onNavigate: (route: Route) => void;
   onGoReview?: (importRunId: string) => void;
+  onRunStarted?: (importRunId: string) => void;
 }
 
 interface ScanProgressEvent {
@@ -148,6 +149,7 @@ export function ScanPage({
   enablePolling = true,
   onNavigate,
   onGoReview,
+  onRunStarted,
 }: ScanPageProps) {
   const queryClient = useQueryClient();
   const [sourcePath, setSourcePath] = useState(() => loadScanDraft().sourcePath);
@@ -353,14 +355,23 @@ export function ScanPage({
     let unlisten: (() => void) | null = null;
     try {
       unlisten = await attachScanListener();
-      await api.startScan(sourcePath.trim());
+      const importRunId = await api.startScan(sourcePath.trim());
+      setActiveImportRunId(importRunId);
+      onRunStarted?.(importRunId);
     } catch (e) {
       setScanError(String(e));
       setIsScanning(false);
       unlisten?.();
       if (eventListenerRef.current === unlisten) eventListenerRef.current = null;
     }
-  }, [activeImportRunId, attachScanListener, globalScanBusyRunId, sourceInfo, sourcePath]);
+  }, [
+    activeImportRunId,
+    attachScanListener,
+    globalScanBusyRunId,
+    onRunStarted,
+    sourceInfo,
+    sourcePath,
+  ]);
 
   const handleResumeScan = useCallback(async () => {
     if (!activeImportRunId || globalScanBusyRunId) return;
@@ -410,7 +421,9 @@ export function ScanPage({
       setProgress(null);
       setIsScanning(true);
       unlisten = await attachScanListener();
-      await api.startScan(activeRun.source_root);
+      const importRunId = await api.startScan(activeRun.source_root);
+      setActiveImportRunId(importRunId);
+      onRunStarted?.(importRunId);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['import-runs-dashboard'] }),
         queryClient.invalidateQueries({ queryKey: ['database-info-dashboard'] }),
@@ -423,7 +436,14 @@ export function ScanPage({
     } finally {
       setIsAbandoning(false);
     }
-  }, [activeImportRunId, activeRun, attachScanListener, globalScanBusyRunId, queryClient]);
+  }, [
+    activeImportRunId,
+    activeRun,
+    attachScanListener,
+    globalScanBusyRunId,
+    onRunStarted,
+    queryClient,
+  ]);
 
   useEffect(() => {
     if (!enablePolling || (!isScanning && !globalScanBusyRunId)) return;

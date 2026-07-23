@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReviewProgress } from '../../lib/ipc/types';
-import { ReviewPage } from '../../pages/ReviewPage';
+import { PlanPage } from '../../pages/PlanPage';
 import { Layout } from '../Layout';
 import { createLargeImportPlanFixture } from './importPlanFixture';
 
@@ -32,12 +32,10 @@ export function StressPlanFixture() {
 
   return (
     <QueryClientProvider client={client}>
-      <Layout currentRoute="review" onNavigate={() => undefined} enablePolling={false}>
-        <ReviewPage
+      <Layout currentRoute="plan" onNavigate={() => undefined} enablePolling={false}>
+        <PlanPage
           initialImportRunId={plan.import_run_id}
           initialPlan={plan}
-          initialShowPlan
-          enablePolling={false}
           onNavigate={() => undefined}
         />
       </Layout>

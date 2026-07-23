@@ -17,6 +17,7 @@ function albumImages(albumId: string, albumName: string, count: number): ImportP
       source_path: `D:/照片归档/2026 夏日旅行（待整理）/${albumName}/${filename}`,
       relative_path: `${albumName}/${filename}`,
       file_size: 180_000 + ((index * 73_121) % 2_400_000),
+      source_album_name: albumName,
       album_name: albumName,
       album_id: albumId,
       source_album_id: albumId,
@@ -32,6 +33,7 @@ export function createLargeImportPlanFixture(albumCount = 1_000, imagesPerAlbum 
     const images = albumImages(albumId, albumName, imagesPerAlbum);
     return {
       album_id: albumId,
+      source_album_name: albumName,
       album_name: albumName,
       included: true,
       image_count: images.length,
@@ -44,6 +46,7 @@ export function createLargeImportPlanFixture(albumCount = 1_000, imagesPerAlbum 
     import_run_id: 'fixture-run-stress-plan',
     plan_hash: 'fixture-stress-plan-hash',
     source_file_mode: 'copy_and_archive',
+    library_root_path: 'D:/ImageDB/Library',
     total_albums: albumCount,
     total_images: albumCount * imagesPerAlbum,
     kept_images: largeAlbums.flatMap((album) => album.images),
@@ -57,6 +60,7 @@ const albums: ImportPlanAlbum[] = albumDefinitions.map(([albumId, albumName, cou
   const images = albumImages(albumId, albumName, count);
   return {
     album_id: albumId,
+    source_album_name: albumName,
     album_name: albumName,
     included: true,
     image_count: count,
@@ -69,6 +73,7 @@ export const importPlanFixture: ImportPlan = {
   import_run_id: 'fixture-run-plan',
   plan_hash: 'fixture-plan-hash',
   source_file_mode: 'copy_and_archive',
+  library_root_path: 'D:/ImageDB/Library',
   total_albums: 6,
   total_images: 808,
   kept_images: albums.flatMap((album) => album.images),

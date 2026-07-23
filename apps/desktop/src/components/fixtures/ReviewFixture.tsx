@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReviewGroupDetail, ReviewGroupSummary, ReviewProgress } from '../../lib/ipc/types';
+import { PlanPage } from '../../pages/PlanPage';
 import { ReviewPage } from '../../pages/ReviewPage';
 import { Layout } from '../Layout';
 import { importPlanFixture } from './importPlanFixture';
@@ -190,14 +191,24 @@ export function ReviewFixture({ view = 'review' }: ReviewFixtureProps) {
   const showPlan = view === 'plan';
   return (
     <QueryClientProvider client={fixtureClient}>
-      <Layout currentRoute="review" onNavigate={() => undefined} enablePolling={false}>
-        <ReviewPage
-          initialImportRunId={showPlan ? importPlanFixture.import_run_id : importRunId}
-          initialPlan={showPlan ? draftPlanFixture : null}
-          initialShowPlan={showPlan}
-          enablePolling={false}
-          onNavigate={() => undefined}
-        />
+      <Layout
+        currentRoute={showPlan ? 'plan' : 'review'}
+        onNavigate={() => undefined}
+        enablePolling={false}
+      >
+        {showPlan ? (
+          <PlanPage
+            initialImportRunId={importPlanFixture.import_run_id}
+            initialPlan={draftPlanFixture}
+            onNavigate={() => undefined}
+          />
+        ) : (
+          <ReviewPage
+            initialImportRunId={importRunId}
+            enablePolling={false}
+            onNavigate={() => undefined}
+          />
+        )}
       </Layout>
     </QueryClientProvider>
   );

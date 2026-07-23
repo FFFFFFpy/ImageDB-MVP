@@ -15,6 +15,7 @@ import type {
   FileTransactionProbeResult,
   ImportAlbumStatus,
   ImportRunDashboard,
+  ImportWorkflowResolution,
   ScanProgress,
   ScanSourceInfo,
   ReviewCandidateSummary,
@@ -109,6 +110,11 @@ export const api = {
 
   getScanProgress: () => invoke<ScanProgress>('get_scan_progress'),
 
+  resolveImportWorkflow: (importRunId?: string | null) =>
+    invoke<ImportWorkflowResolution>('resolve_import_workflow', {
+      importRunId: importRunId ?? null,
+    }),
+
   getImportRunsDashboard: () => invoke<ImportRunDashboard[]>('get_import_runs_dashboard'),
 
   getImportRunAlbums: (importRunId: string) =>
@@ -178,6 +184,30 @@ export const api = {
 
   setImportPlanSourceFileMode: (importRunId: string, sourceFileMode: SourceFileMode) =>
     invoke<ImportPlan>('set_import_plan_source_file_mode', { importRunId, sourceFileMode }),
+
+  setImportPlanAlbumTargetPath: (
+    importRunId: string,
+    albumId: string,
+    targetRelativePath: string,
+  ) =>
+    invoke<ImportPlan>('set_import_plan_album_target_path', {
+      importRunId,
+      albumId,
+      targetRelativePath,
+    }),
+
+  setImportPlanImageTargetPath: (
+    importRunId: string,
+    imageId: string,
+    targetAlbumId: string,
+    targetRelativePath: string,
+  ) =>
+    invoke<ImportPlan>('set_import_plan_image_target_path', {
+      importRunId,
+      imageId,
+      targetAlbumId,
+      targetRelativePath,
+    }),
 
   getLatestCompletedImportRun: () => invoke<string | null>('get_latest_completed_import_run'),
 

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { App } from './App';
+import { App, routeForWorkflowStage } from './App';
 
 const mockState = vi.hoisted(() => ({
   settings: {
@@ -37,6 +37,19 @@ const mockState = vi.hoisted(() => ({
   databaseInfo: null as Record<string, unknown> | null,
   latestReviewableRunId: 'run-newer-b' as string | null,
   latestCommittableRunId: 'run-newer-b' as string | null,
+  workflowStage: 'review' as
+    | 'analysis'
+    | 'review'
+    | 'generate_plan'
+    | 'plan_draft'
+    | 'commit_confirm'
+    | 'committing'
+    | 'recovery'
+    | 'completed'
+    | 'failed'
+    | 'abandoned',
+  currentWorkflowRunId: 'run-newer-b' as string | null,
+  requestedWorkflowRunIds: [] as Array<string | null>,
   requestedReviewRunIds: [] as string[],
   requestedPlanRunIds: [] as string[],
   commitRequests: [] as Array<Record<string, unknown>>,
@@ -112,6 +125,24 @@ vi.mock('@tauri-apps/api/core', () => ({
     if (cmd === 'get_import_run_albums') {
       return Promise.resolve([]);
     }
+    if (cmd === 'resolve_import_workflow') {
+      const requestedRunId = (args?.importRunId as string | null | undefined) ?? null;
+      mockState.requestedWorkflowRunIds.push(requestedRunId);
+      const importRunId = requestedRunId ?? mockState.currentWorkflowRunId;
+      return Promise.resolve({
+        import_run_id: importRunId,
+        stage: importRunId ? mockState.workflowStage : 'completed',
+        run_state: importRunId ? 'ready_to_commit' : null,
+        plan_state:
+          mockState.workflowStage === 'plan_draft'
+            ? 'draft'
+            : mockState.workflowStage === 'commit_confirm' ||
+                mockState.workflowStage === 'committing'
+              ? 'frozen'
+              : null,
+        file_transaction_count: mockState.workflowStage === 'committing' ? 1 : 0,
+      });
+    }
     if (cmd === 'get_latest_reviewable_import_run') {
       return Promise.resolve(mockState.latestReviewableRunId);
     }
@@ -125,11 +156,14 @@ vi.mock('@tauri-apps/api/core', () => ({
       mockState.requestedReviewRunIds.push(String(args?.importRunId));
       return Promise.resolve({
         import_run_id: args?.importRunId,
-        total_review_candidates: 0,
-        decided_count: 0,
+        total_review_groups: 0,
+        resolved_count: 0,
         remaining_count: 0,
         all_decided: false,
       });
+    }
+    if (cmd === 'get_review_groups') {
+      return Promise.resolve([]);
     }
     if (cmd === 'get_frozen_import_plan_summary') {
       const importRunId = String(args?.importRunId);
@@ -137,6 +171,8 @@ vi.mock('@tauri-apps/api/core', () => ({
       return Promise.resolve({
         import_run_id: importRunId,
         plan_hash: `hash-${importRunId}`,
+        source_file_mode: 'copy_and_archive',
+        library_root_path: 'D:/ImageDB/Library',
         total_albums: 1,
         total_images: 1,
         kept_images: [
@@ -145,6 +181,7 @@ vi.mock('@tauri-apps/api/core', () => ({
             source_path: 'D:/Source/image.jpg',
             relative_path: 'Album/image.jpg',
             file_size: 100,
+            source_album_name: 'Album',
             album_name: 'Album',
             album_id: 'album-a',
             source_album_id: 'album-a',
@@ -266,6 +303,9 @@ beforeEach(() => {
   mockState.databaseInfo = null;
   mockState.latestReviewableRunId = 'run-newer-b';
   mockState.latestCommittableRunId = 'run-newer-b';
+  mockState.workflowStage = 'review';
+  mockState.currentWorkflowRunId = 'run-newer-b';
+  mockState.requestedWorkflowRunIds = [];
   mockState.requestedReviewRunIds = [];
   mockState.requestedPlanRunIds = [];
   mockState.commitRequests = [];
@@ -314,6 +354,8 @@ function setActionableDashboard(nextAction: 'review' | 'resume_commit', importRu
     duplicate_candidates: nextAction === 'review' ? 1 : 0,
   };
   mockState.databaseStatus = { ...mockState.databaseStatus, status: 'Connected' };
+  mockState.workflowStage = nextAction === 'review' ? 'review' : 'commit_confirm';
+  mockState.currentWorkflowRunId = importRunId;
   mockState.databaseInfo = {
     database: {
       mode: 'managed_local',
@@ -351,9 +393,38 @@ test('keeps the dashboard-selected review run when a newer second run exists', a
 
   fireEvent.click(await screen.findByRole('button', { name: '继续审核' }));
 
-  expect(await screen.findByRole('heading', { name: '入库计划已锁定' })).toBeInTheDocument();
+  expect(await screen.findByRole('heading', { name: '按组审核重复图片' })).toBeInTheDocument();
+  await waitFor(() => expect(mockState.requestedWorkflowRunIds).toContain('run-older-a'));
   await waitFor(() => expect(mockState.requestedReviewRunIds).toContain('run-older-a'));
   expect(mockState.requestedReviewRunIds).not.toContain('run-newer-b');
+});
+
+test('resolves a workflow route without runId through the single resolver', async () => {
+  mockState.currentWorkflowRunId = 'run-current-review';
+  mockState.workflowStage = 'review';
+  window.location.hash = '#/commit';
+
+  renderApp();
+
+  expect(await screen.findByRole('heading', { name: '按组审核重复图片' })).toBeInTheDocument();
+  await waitFor(() =>
+    expect(window.location.hash).toBe('#/review?runId=run-current-review'),
+  );
+  expect(mockState.requestedWorkflowRunIds).toContain(null);
+  expect(mockState.requestedReviewRunIds).toContain('run-current-review');
+});
+
+test('maps every persisted workflow stage to its owning page', () => {
+  expect(routeForWorkflowStage('analysis')).toBe('scan');
+  expect(routeForWorkflowStage('review')).toBe('review');
+  expect(routeForWorkflowStage('generate_plan')).toBe('review');
+  expect(routeForWorkflowStage('plan_draft')).toBe('plan');
+  expect(routeForWorkflowStage('commit_confirm')).toBe('commit');
+  expect(routeForWorkflowStage('committing')).toBe('commit');
+  expect(routeForWorkflowStage('recovery')).toBe('recovery');
+  expect(routeForWorkflowStage('failed')).toBe('scan');
+  expect(routeForWorkflowStage('completed')).toBe('dashboard');
+  expect(routeForWorkflowStage('abandoned')).toBe('dashboard');
 });
 
 test('keeps the dashboard-selected commit run when a newer second run exists', async () => {
@@ -362,7 +433,7 @@ test('keeps the dashboard-selected commit run when a newer second run exists', a
 
   fireEvent.click(await screen.findByRole('button', { name: '继续入库' }));
 
-  expect(await screen.findByRole('heading', { name: '提交入库' })).toBeInTheDocument();
+  expect(await screen.findByRole('heading', { name: '最后一次只读审阅' })).toBeInTheDocument();
   await waitFor(() => expect(mockState.requestedPlanRunIds).toContain('run-older-a'));
   expect(mockState.requestedPlanRunIds).not.toContain('run-newer-b');
   expect(await screen.findByText('计划哈希：hash-run-older-a')).toBeInTheDocument();
@@ -403,8 +474,8 @@ test('abandoning a frozen workflow clears its context and returns to new import'
   fireEvent.click(await screen.findByRole('button', { name: '继续入库' }));
   await screen.findByText('计划哈希：hash-run-older-a');
 
-  fireEvent.click(screen.getByRole('button', { name: '撤销这次导入' }));
-  fireEvent.click(screen.getByRole('button', { name: '撤销并返回工作台' }));
+  fireEvent.click(screen.getByRole('button', { name: '放弃本次导入' }));
+  fireEvent.click(screen.getByRole('button', { name: '确认放弃并返回工作台' }));
 
   await waitFor(() => expect(mockState.abandonedWorkflowRunIds).toContain('run-older-a'));
   expect(await screen.findByRole('heading', { name: '工作台' })).toBeInTheDocument();
@@ -437,6 +508,8 @@ test('renders sidebar navigation', async () => {
 });
 
 test('sidebar new import clears a run selected from the dashboard', async () => {
+  mockState.workflowStage = 'analysis';
+  mockState.currentWorkflowRunId = 'run-selected';
   mockState.databaseStatus = {
     ...mockState.databaseStatus,
     status: 'Connected',
@@ -507,7 +580,9 @@ test('sidebar new import clears a run selected from the dashboard', async () => 
 
   fireEvent.click(screen.getByRole('button', { name: '新建导入' }));
 
-  expect(screen.queryByRole('button', { name: '继续分析' })).not.toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.queryByRole('button', { name: '继续分析' })).not.toBeInTheDocument(),
+  );
   expect(await screen.findByText('暂无图集状态。验证源目录后开始分析。')).toBeInTheDocument();
 });
 
