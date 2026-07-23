@@ -34,27 +34,32 @@ fn resolve_stage(
     transaction_states: &[String],
     unresolved_reviews: u32,
 ) -> ImportWorkflowStage {
+    if run_state == "abandoned" {
+        return ImportWorkflowStage::Abandoned;
+    }
+
+    if transaction_states.iter().any(|state| {
+        matches!(
+            state.as_str(),
+            "cleanup_required" | "conflict" | "failed" | "cancelled"
+        )
+    }) {
+        return ImportWorkflowStage::Recovery;
+    }
+
+    if transaction_states
+        .iter()
+        .any(|state| !matches!(state.as_str(), "source_archived" | "source_files_removed"))
+    {
+        return ImportWorkflowStage::Committing;
+    }
+
     match run_state {
-        "abandoned" => return ImportWorkflowStage::Abandoned,
-        "completed" => return ImportWorkflowStage::Completed,
         "recovery_required" => return ImportWorkflowStage::Recovery,
+        "completed" => return ImportWorkflowStage::Completed,
         "failed" => return ImportWorkflowStage::Failed,
         "committing" => return ImportWorkflowStage::Committing,
         _ => {}
-    }
-
-    if !transaction_states.is_empty() {
-        return if run_state == "cancelled"
-            || transaction_states.iter().any(|state| {
-                matches!(
-                    state.as_str(),
-                    "cleanup_required" | "conflict" | "failed" | "cancelled"
-                )
-            }) {
-            ImportWorkflowStage::Recovery
-        } else {
-            ImportWorkflowStage::Committing
-        };
     }
 
     match plan_state {
@@ -172,6 +177,10 @@ mod tests {
             ImportWorkflowStage::Failed
         );
         assert_eq!(
+            resolve_stage("failed", None, &["conflict".to_string()], 0),
+            ImportWorkflowStage::Recovery
+        );
+        assert_eq!(
             resolve_stage("abandoned", None, &[], 0),
             ImportWorkflowStage::Abandoned
         );
@@ -183,5 +192,73 @@ mod tests {
             resolve_stage("cancelled", Some("frozen"), &[], 0),
             ImportWorkflowStage::CommitConfirm
         );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    #[cfg(feature = "real-db-tests")]
+    async fn real_failed_run_with_conflict_transaction_routes_to_recovery() {
+        use crate::domain::import_state::ImportRunState;
+        use crate::domain::state_machine::TransactionState;
+        use crate::infrastructure::postgres::{MigrationRunner, PostgresManager};
+        use tempfile::TempDir;
+
+        if std::env::var("IMAGEDB_POSTGRES_BIN")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            panic!("IMAGEDB_POSTGRES_BIN is not set; cannot run the real workflow resolver test");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut manager = PostgresManager::new(tmp.path());
+        let probe = manager.initialize().await.unwrap();
+        assert!(probe.connection_ok, "diagnostics: {:?}", probe.diagnostics);
+        let (mut client, handle) = manager.connect_raw().await.unwrap();
+        MigrationRunner::run_pending(&mut client).await.unwrap();
+
+        let library_root_id = ImportRepository::upsert_default_library_root(&client)
+            .await
+            .unwrap();
+        let import_run_id = ImportRepository::create_import_run(
+            &client,
+            "C:/workflow-resolver/source",
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let import_album_id = ImportRepository::insert_import_album(
+            &client,
+            import_run_id,
+            "C:/workflow-resolver/source/album",
+            "album",
+        )
+        .await
+        .unwrap();
+        ImportRepository::update_import_run_state(&client, import_run_id, &ImportRunState::Failed)
+            .await
+            .unwrap();
+        ImportRepository::insert_file_transaction(
+            &client,
+            Uuid::new_v4(),
+            import_run_id,
+            import_album_id,
+            &TransactionState::Conflict,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let resolution = resolve_import_workflow(&client, Some(import_run_id))
+            .await
+            .unwrap();
+        assert_eq!(resolution.stage, ImportWorkflowStage::Recovery);
+        assert_eq!(resolution.file_transaction_count, 1);
+
+        drop(client);
+        handle.abort();
+        manager.shutdown().await.unwrap();
     }
 }

@@ -902,6 +902,11 @@ pub(crate) fn validate_and_hash_frozen_plan(
         )));
     }
     for (album, images) in &frozen.albums {
+        if images.iter().any(|image| !image.included) {
+            return Err(AppError::Internal(
+                "frozen plan contains excluded image rows".to_string(),
+            ));
+        }
         // Every album must resolve to a valid relative path.
         let _ = normalize_relative_path(&album.target_relative_path)?;
         check_target_path_conflicts(images)?;
@@ -4546,6 +4551,38 @@ mod tests {
         frozen.source_file_mode = SourceFileMode::MoveSelectedWithoutBackup;
         let move_hash = compute_plan_hash(&frozen).unwrap();
         assert_ne!(copy_hash, move_hash);
+    }
+
+    #[test]
+    fn frozen_plan_rejects_excluded_image_rows() {
+        let root_id = Uuid::new_v4();
+        let mut image = plan_image("image.jpg", &[1; 32]);
+        image.included = false;
+        let album = PlanAlbumRow {
+            plan_album_id: Uuid::new_v4(),
+            import_album_id: Uuid::new_v4(),
+            target_relative_path: "album".to_string(),
+            expected_image_count: 1,
+            album_plan_hash: None,
+        };
+        let mut frozen = FrozenPlanRow {
+            plan_id: Uuid::new_v4(),
+            import_run_id: Uuid::new_v4(),
+            library_root_id: root_id,
+            plan_state: "frozen".to_string(),
+            plan_hash: None,
+            policy_version: "2.0".to_string(),
+            source_file_mode: SourceFileMode::CopyAndArchive,
+            albums: vec![(album, vec![image])],
+        };
+        frozen.plan_hash = Some(compute_plan_hash(&frozen).unwrap());
+
+        let error = validate_and_hash_frozen_plan(&frozen, root_id)
+            .expect_err("a frozen plan must never contain excluded rows");
+        assert_eq!(
+            error.to_string(),
+            "internal error: frozen plan contains excluded image rows"
+        );
     }
 
     /// Real PostgreSQL + filesystem integration test for the full new commit

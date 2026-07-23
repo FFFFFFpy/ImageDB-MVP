@@ -449,6 +449,8 @@ mod tests {
         assert!(MIGRATION_0016.contains("source_file_cleanup_operations"));
         assert!(MIGRATION_0016.contains("move_selected_without_backup"));
         assert!(MIGRATION_0017.contains("quarantine_path"));
+        assert!(MIGRATION_0018.contains("SET state = 'invalidated'"));
+        assert!(MIGRATION_0018.contains("WHERE state = 'draft'"));
         assert!(MIGRATION_0018.contains("included BOOLEAN NOT NULL DEFAULT TRUE"));
     }
 
