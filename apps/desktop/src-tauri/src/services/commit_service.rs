@@ -4337,6 +4337,7 @@ mod tests {
 
     fn plan_image(rel: &str, blake3: &[u8]) -> PlanImageRow {
         PlanImageRow {
+            included: true,
             id: Uuid::new_v4(),
             plan_album_id: Uuid::new_v4(),
             import_image_id: Uuid::new_v4(),
@@ -4680,6 +4681,18 @@ mod tests {
         )
         .await
         .unwrap();
+        let transactions_before_confirm: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            transactions_before_confirm, 0,
+            "a Frozen plan must not create file transactions before Commit is called"
+        );
 
         drop(client);
         db_handle.abort();
@@ -4741,6 +4754,18 @@ mod tests {
             )
             .await
             .unwrap();
+        let transactions_after_confirm: i64 = client2
+            .query_one(
+                "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            transactions_after_confirm > 0,
+            "calling Commit must persist at least one file transaction"
+        );
         let count: i64 = library_row.get("image_count");
         assert_eq!(
             count, 2,
@@ -4831,6 +4856,7 @@ mod tests {
         blake3: &[u8],
     ) -> PlanImageRow {
         PlanImageRow {
+            included: true,
             id: Uuid::new_v4(),
             plan_album_id: Uuid::new_v4(),
             import_image_id: Uuid::new_v4(),

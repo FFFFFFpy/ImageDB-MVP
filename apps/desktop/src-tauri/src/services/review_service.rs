@@ -895,18 +895,20 @@ pub async fn generate_import_plan(
         );
 
         let kept_ids = parse_kept_image_ids(&plan)?;
-        let full_images = ImportRepository::get_import_images_by_ids(client, &kept_ids).await?;
+        let included_image_ids: HashSet<Uuid> = kept_ids.iter().copied().collect();
+        let all_image_ids: Vec<Uuid> = all_images.iter().map(|image| image.id).collect();
+        let full_images = ImportRepository::get_import_images_by_ids(client, &all_image_ids).await?;
         let image_by_id: HashMap<Uuid, ImportImageFullRow> =
             full_images.into_iter().map(|img| (img.id, img)).collect();
-        let mut kept_images_by_album: HashMap<Uuid, Vec<ImportImageFullRow>> = HashMap::new();
+        let mut images_by_album: HashMap<Uuid, Vec<ImportImageFullRow>> = HashMap::new();
         for album in &albums {
-            let album_images: Vec<ImportImageFullRow> = kept_ids
+            let album_images: Vec<ImportImageFullRow> = all_image_ids
                 .iter()
                 .filter_map(|id| image_by_id.get(id).cloned())
                 .filter(|img| img.import_album_id == album.id)
                 .collect();
             if !album_images.is_empty() {
-                kept_images_by_album.insert(album.id, album_images);
+                images_by_album.insert(album.id, album_images);
             }
         }
 
@@ -914,7 +916,8 @@ pub async fn generate_import_plan(
             client,
             import_run_id,
             &albums,
-            &kept_images_by_album,
+            &images_by_album,
+            &included_image_ids,
             &import_run.policy_version,
             import_run.library_root_id,
         )
@@ -966,11 +969,22 @@ pub async fn freeze_import_plan(
                         .to_string(),
                 )
             })?;
-        if draft.albums.iter().all(|(_, images)| images.is_empty()) {
+        if draft
+            .albums
+            .iter()
+            .all(|(_, images)| images.iter().all(|image| !image.included))
+        {
             return Err(AppError::Internal(
                 "cannot freeze an import plan with no included images".to_string(),
             ));
         }
+        ImportRepository::delete_excluded_plan_images(client, draft.plan_id).await?;
+        delete_empty_plan_albums(client, draft.plan_id).await?;
+        let draft = ImportRepository::load_draft_plan(client, import_run_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal("draft plan disappeared during freeze".to_string())
+            })?;
         for (album, _) in &draft.albums {
             refresh_plan_album_count(client, album.plan_album_id).await?;
         }
@@ -1169,17 +1183,20 @@ pub async fn set_plan_album_included(
     let result = async {
         ensure_plan_mutation_allowed(client, import_run_id, "edit import plan").await?;
         let draft = require_draft_plan(client, import_run_id).await?;
-        if included {
-            include_album_images(client, draft.plan_id, album_id).await?;
-        } else {
-            client
-                .execute(
-                    "DELETE FROM import_plan_albums WHERE plan_id = $1 AND import_album_id = $2",
-                    &[&draft.plan_id, &album_id],
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to skip plan album: {e}")))?;
+        let plan_album_id = require_plan_album_id(client, draft.plan_id, album_id).await?;
+        let updated = ImportRepository::set_plan_album_images_included(
+            client,
+            draft.plan_id,
+            album_id,
+            included,
+        )
+        .await?;
+        if updated == 0 {
+            return Err(AppError::Internal(format!(
+                "plan album {album_id} contains no editable images"
+            )));
         }
+        refresh_plan_album_count(client, plan_album_id).await?;
         Ok(())
     }
     .await;
@@ -1205,23 +1222,25 @@ pub async fn set_plan_image_included(
     let result = async {
         ensure_plan_mutation_allowed(client, import_run_id, "edit import plan").await?;
         let draft = require_draft_plan(client, import_run_id).await?;
-        if included {
-            include_image_in_album(client, draft.plan_id, image_id, target_album_id).await?;
-        } else {
-            // TODO(workflow-restoration-v3): Preserve excluded draft rows and their target
-            // assignment once the schema can represent an explicit `included` state.
-            // Deleting the row is the current schema's only non-committable representation.
-            client
-                .execute(
-                    "DELETE FROM import_plan_images WHERE import_image_id = $1 AND plan_album_id IN (
-                        SELECT id FROM import_plan_albums WHERE plan_id = $2
-                    )",
-                    &[&image_id, &draft.plan_id],
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to skip plan image: {e}")))?;
-            delete_empty_plan_albums(client, draft.plan_id).await?;
+        let (_, source_album_id) = require_plan_image(client, draft.plan_id, image_id).await?;
+        // TODO(workflow-restoration-v3): Cross-source album reassignment requires a separate
+        // Commit/Recovery design because file transactions and source cleanup are currently
+        // anchored to import_album_id. Do not remove this guard in the UI workflow branch.
+        if source_album_id != target_album_id {
+            return Err(AppError::Internal(
+                "cross-source album move is blocked by the current file transaction model"
+                    .to_string(),
+            ));
         }
+        let updated =
+            ImportRepository::set_plan_image_included(client, draft.plan_id, image_id, included)
+                .await?;
+        if updated != 1 {
+            return Err(AppError::Internal(format!(
+                "plan image {image_id} is not part of the editable draft"
+            )));
+        }
+        refresh_plan_album_counts(client, draft.plan_id).await?;
         Ok(())
     }
     .await;
@@ -1252,6 +1271,115 @@ pub async fn set_plan_source_file_mode(
             )
             .await
             .map_err(|e| AppError::Internal(format!("failed to update source file mode: {e}")))?;
+        Ok(())
+    }
+    .await;
+
+    finish_plan_edit_transaction(client, result).await?;
+    get_draft_plan_summary(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("draft plan {import_run_id} not found")))
+}
+
+pub async fn set_plan_album_target_path(
+    client: &Client,
+    import_run_id: Uuid,
+    album_id: Uuid,
+    target_relative_path: &str,
+) -> Result<ImportPlan, AppError> {
+    let normalized =
+        crate::services::commit_service::normalize_relative_path(target_relative_path)?;
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin album path edit: {e}")))?;
+
+    let result = async {
+        ensure_plan_mutation_allowed(client, import_run_id, "change target album path").await?;
+        let draft = require_draft_plan(client, import_run_id).await?;
+        require_plan_album_id(client, draft.plan_id, album_id).await?;
+        if ImportRepository::plan_album_target_path_conflicts(
+            client,
+            draft.plan_id,
+            album_id,
+            &normalized,
+        )
+        .await?
+        {
+            return Err(AppError::Internal(format!(
+                "target album path '{normalized}' is already used by another album"
+            )));
+        }
+        let updated = ImportRepository::update_plan_album_target_path(
+            client,
+            draft.plan_id,
+            album_id,
+            &normalized,
+        )
+        .await?;
+        if updated != 1 {
+            return Err(AppError::Internal(format!(
+                "target album {album_id} is not part of the editable draft"
+            )));
+        }
+        Ok(())
+    }
+    .await;
+
+    finish_plan_edit_transaction(client, result).await?;
+    get_draft_plan_summary(client, import_run_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("draft plan {import_run_id} not found")))
+}
+
+pub async fn set_plan_image_target_path(
+    client: &Client,
+    import_run_id: Uuid,
+    image_id: Uuid,
+    target_album_id: Uuid,
+    target_relative_path: &str,
+) -> Result<ImportPlan, AppError> {
+    let normalized =
+        crate::services::commit_service::normalize_relative_path(target_relative_path)?;
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin image path edit: {e}")))?;
+
+    let result = async {
+        ensure_plan_mutation_allowed(client, import_run_id, "change target image path").await?;
+        let draft = require_draft_plan(client, import_run_id).await?;
+        let (_, source_album_id) = require_plan_image(client, draft.plan_id, image_id).await?;
+        if source_album_id != target_album_id {
+            return Err(AppError::Internal(
+                "cross-source album move is blocked by the current file transaction model"
+                    .to_string(),
+            ));
+        }
+        if ImportRepository::plan_image_target_path_conflicts(
+            client,
+            draft.plan_id,
+            image_id,
+            &normalized,
+        )
+        .await?
+        {
+            return Err(AppError::Internal(format!(
+                "target image path '{normalized}' is already used in this target album"
+            )));
+        }
+        let updated = ImportRepository::update_plan_image_target_path(
+            client,
+            draft.plan_id,
+            image_id,
+            &normalized,
+        )
+        .await?;
+        if updated != 1 {
+            return Err(AppError::Internal(format!(
+                "plan image {image_id} is not part of the editable draft"
+            )));
+        }
         Ok(())
     }
     .await;
@@ -1356,132 +1484,49 @@ async fn require_draft_plan(
     Ok(draft)
 }
 
-async fn include_album_images(
+async fn require_plan_album_id(
     client: &Client,
     plan_id: Uuid,
     album_id: Uuid,
-) -> Result<(), AppError> {
-    let album = ImportRepository::get_import_album_by_id(client, album_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(format!("import album {album_id} not found")))?;
-    let plan_album_id = ensure_plan_album(client, plan_id, album_id, &album.source_name).await?;
-    let images = ImportRepository::get_import_images_by_album(client, album_id).await?;
-    for img in images {
-        let already_planned: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM import_plan_images ipi
-                 JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
-                 WHERE ipa.plan_id = $1 AND ipi.import_image_id = $2",
-                &[&plan_id, &img.id],
-            )
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to check plan image: {e}")))?
-            .get(0);
-        if already_planned > 0 {
-            continue;
-        }
-        let expected_blake3 = img.blake3.as_deref().ok_or_else(|| {
-            AppError::Internal(format!(
-                "cannot include image {} without BLAKE3 fingerprint",
-                img.id
-            ))
-        })?;
-        let target_relative_path =
-            target_relative_path_for_album(&album.source_name, &img.relative_path)?;
-        ImportRepository::insert_plan_image(
-            client,
-            plan_album_id,
-            img.id,
-            &img.source_path,
-            &img.relative_path,
-            &target_relative_path,
-            img.file_size,
-            expected_blake3,
-            img.width,
-            img.height,
-            img.format.as_deref(),
-        )
-        .await?;
-    }
-    refresh_plan_album_count(client, plan_album_id).await
-}
-
-async fn include_image_in_album(
-    client: &Client,
-    plan_id: Uuid,
-    image_id: Uuid,
-    target_album_id: Uuid,
-) -> Result<(), AppError> {
-    let image = ImportRepository::get_import_images_by_ids(client, &[image_id])
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal(format!("import image {image_id} not found")))?;
-    // TODO(workflow-restoration-v3): Cross-source album reassignment requires a separate
-    // Commit/Recovery design because file transactions and source cleanup are currently
-    // anchored to import_album_id. Do not remove this guard in the UI workflow branch.
-    if image.import_album_id != target_album_id {
-        return Err(AppError::Internal(
-            "cross-source album move is blocked by the current file transaction model".to_string(),
-        ));
-    }
-    let album = ImportRepository::get_import_album_by_id(client, target_album_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(format!("import album {target_album_id} not found")))?;
-    let plan_album_id =
-        ensure_plan_album(client, plan_id, target_album_id, &album.source_name).await?;
-    client
-        .execute(
-            "DELETE FROM import_plan_images WHERE import_image_id = $1 AND plan_album_id IN (
-                SELECT id FROM import_plan_albums WHERE plan_id = $2
-            )",
-            &[&image_id, &plan_id],
-        )
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to replace plan image: {e}")))?;
-    let expected_blake3 = image.blake3.as_deref().ok_or_else(|| {
-        AppError::Internal(format!(
-            "cannot include image {} without BLAKE3 fingerprint",
-            image.id
-        ))
-    })?;
-    let target_relative_path =
-        target_relative_path_for_album(&album.source_name, &image.relative_path)?;
-    ImportRepository::insert_plan_image(
-        client,
-        plan_album_id,
-        image.id,
-        &image.source_path,
-        &image.relative_path,
-        &target_relative_path,
-        image.file_size,
-        expected_blake3,
-        image.width,
-        image.height,
-        image.format.as_deref(),
-    )
-    .await?;
-    refresh_plan_album_count(client, plan_album_id).await?;
-    delete_empty_plan_albums(client, plan_id).await
-}
-
-async fn ensure_plan_album(
-    client: &Client,
-    plan_id: Uuid,
-    album_id: Uuid,
-    album_name: &str,
 ) -> Result<Uuid, AppError> {
-    if let Some(row) = client
+    client
         .query_opt(
-            "SELECT id FROM import_plan_albums WHERE plan_id = $1 AND import_album_id = $2",
+            "SELECT id
+             FROM import_plan_albums
+             WHERE plan_id = $1 AND import_album_id = $2",
             &[&plan_id, &album_id],
         )
         .await
-        .map_err(|e| AppError::Internal(format!("failed to query plan album: {e}")))?
-    {
-        return Ok(row.get("id"));
-    }
-    ImportRepository::insert_plan_album(client, plan_id, album_id, album_name, 0).await
+        .map_err(|e| AppError::Internal(format!("failed to query editable plan album: {e}")))?
+        .map(|row| row.get("id"))
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "target album {album_id} is not part of the editable draft"
+            ))
+        })
+}
+
+async fn require_plan_image(
+    client: &Client,
+    plan_id: Uuid,
+    image_id: Uuid,
+) -> Result<(Uuid, Uuid), AppError> {
+    client
+        .query_opt(
+            "SELECT ipi.plan_album_id, ipa.import_album_id
+             FROM import_plan_images ipi
+             JOIN import_plan_albums ipa ON ipa.id = ipi.plan_album_id
+             WHERE ipa.plan_id = $1 AND ipi.import_image_id = $2",
+            &[&plan_id, &image_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query editable plan image: {e}")))?
+        .map(|row| (row.get("plan_album_id"), row.get("import_album_id")))
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "plan image {image_id} is not part of the editable draft"
+            ))
+        })
 }
 
 async fn refresh_plan_album_count(client: &Client, plan_album_id: Uuid) -> Result<(), AppError> {
@@ -1489,13 +1534,29 @@ async fn refresh_plan_album_count(client: &Client, plan_album_id: Uuid) -> Resul
         .execute(
             "UPDATE import_plan_albums
              SET expected_image_count = (
-                SELECT COUNT(*)::INTEGER FROM import_plan_images WHERE plan_album_id = $1
+                SELECT COUNT(*)::INTEGER
+                FROM import_plan_images
+                WHERE plan_album_id = $1 AND included = TRUE
              )
              WHERE id = $1",
             &[&plan_album_id],
         )
         .await
         .map_err(|e| AppError::Internal(format!("failed to refresh plan album count: {e}")))?;
+    Ok(())
+}
+
+async fn refresh_plan_album_counts(client: &Client, plan_id: Uuid) -> Result<(), AppError> {
+    let rows = client
+        .query(
+            "SELECT id FROM import_plan_albums WHERE plan_id = $1",
+            &[&plan_id],
+        )
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to load plan album counts: {e}")))?;
+    for row in rows {
+        refresh_plan_album_count(client, row.get("id")).await?;
+    }
     Ok(())
 }
 
@@ -1555,19 +1616,6 @@ fn parse_kept_image_ids(plan: &ImportPlan) -> Result<Vec<Uuid>, AppError> {
         .collect()
 }
 
-fn target_relative_path_for_album(
-    album_name: &str,
-    source_relative_path: &str,
-) -> Result<String, AppError> {
-    let slash_prefix = format!("{album_name}/");
-    let backslash_prefix = format!("{album_name}\\");
-    let rel = source_relative_path
-        .strip_prefix(&slash_prefix)
-        .or_else(|| source_relative_path.strip_prefix(&backslash_prefix))
-        .unwrap_or(source_relative_path);
-    crate::services::commit_service::normalize_relative_path(rel)
-}
-
 /// Build the initial draft plan exclusively from persisted group-member
 /// final actions. Candidate-edge decisions are evidence only and never enter
 /// this calculation.
@@ -1585,6 +1633,7 @@ pub fn build_import_plan_from_group_actions(
             source_path: image.source_path.clone(),
             relative_path: image.relative_path.clone(),
             file_size: image.file_size,
+            source_album_name: image.album_name.clone(),
             album_name: image.album_name.clone(),
             album_id: image.album_id.to_string(),
             source_album_id: image.album_id.to_string(),
@@ -1606,6 +1655,7 @@ pub fn build_import_plan_from_group_actions(
                     source_path: image.source_path.clone(),
                     relative_path: image.relative_path.clone(),
                     file_size: image.file_size,
+                    source_album_name: album.source_name.clone(),
                     album_name: album.source_name.clone(),
                     album_id: album.id.to_string(),
                     source_album_id: image.album_id.to_string(),
@@ -1621,6 +1671,7 @@ pub fn build_import_plan_from_group_actions(
                 .sum();
             ImportPlanAlbum {
                 album_id: album.id.to_string(),
+                source_album_name: album.source_name.clone(),
                 album_name: album.source_name.clone(),
                 included: image_count > 0,
                 image_count,
@@ -1641,6 +1692,7 @@ pub fn build_import_plan_from_group_actions(
         import_run_id,
         plan_hash: None,
         source_file_mode: SourceFileMode::CopyAndArchive,
+        library_root_path: None,
         total_albums: albums.len() as u32,
         total_images,
         excluded_count: total_images.saturating_sub(kept_images.len() as u32),
@@ -1729,6 +1781,7 @@ pub fn build_import_plan(
             source_path: img.source_path.clone(),
             relative_path: img.relative_path.clone(),
             file_size: img.file_size,
+            source_album_name: img.album_name.clone(),
             album_name: img.album_name.clone(),
             album_id: img.album_id.to_string(),
             source_album_id: img.album_id.to_string(),
@@ -1760,6 +1813,7 @@ pub fn build_import_plan(
                         source_path: img.source_path.clone(),
                         relative_path: img.relative_path.clone(),
                         file_size: img.file_size,
+                        source_album_name: album.source_name.clone(),
                         album_name: album.source_name.clone(),
                         album_id: album.id.to_string(),
                         source_album_id: img.album_id.to_string(),
@@ -1777,6 +1831,7 @@ pub fn build_import_plan(
                 .sum();
             ImportPlanAlbum {
                 album_id: album.id.to_string(),
+                source_album_name: album.source_name.clone(),
                 album_name: album.source_name.clone(),
                 included,
                 image_count,
@@ -1791,6 +1846,7 @@ pub fn build_import_plan(
         import_run_id,
         plan_hash: None,
         source_file_mode: SourceFileMode::CopyAndArchive,
+        library_root_path: None,
         total_albums: albums.len() as u32,
         total_images,
         excluded_count: total_images.saturating_sub(kept_images.len() as u32),
@@ -3486,6 +3542,84 @@ mod tests {
             candidate_b_id.to_string()
         );
 
+        let target_path = "custom/candidate-b.png";
+        let path_edited = set_plan_image_target_path(
+            &client,
+            import_run_id,
+            candidate_b_id,
+            album_b_id,
+            target_path,
+        )
+        .await
+        .expect("draft image target path must be editable");
+        let path_edited_image = path_edited
+            .albums
+            .iter()
+            .flat_map(|album| &album.images)
+            .find(|image| image.image_id == candidate_b_id.to_string())
+            .expect("edited image must remain represented in the draft");
+        assert_eq!(path_edited_image.source_album_id, album_b_id.to_string());
+        assert_eq!(path_edited_image.album_id, album_b_id.to_string());
+        assert_eq!(path_edited_image.relative_path, target_path);
+
+        let skipped =
+            set_plan_image_included(&client, import_run_id, candidate_b_id, album_b_id, false)
+                .await
+                .expect("draft image must be skippable without deleting its record");
+        assert!(skipped.kept_images.is_empty());
+        let skipped_image = skipped
+            .albums
+            .iter()
+            .flat_map(|album| &album.images)
+            .find(|image| image.image_id == candidate_b_id.to_string())
+            .expect("skipped image record must remain in the draft");
+        assert!(!skipped_image.included);
+        assert_eq!(skipped_image.relative_path, target_path);
+
+        let reenabled =
+            set_plan_image_included(&client, import_run_id, candidate_b_id, album_b_id, true)
+                .await
+                .expect("skipped image must be re-enabled in place");
+        let reenabled_image = reenabled
+            .albums
+            .iter()
+            .flat_map(|album| &album.images)
+            .find(|image| image.image_id == candidate_b_id.to_string())
+            .expect("re-enabled image must remain represented");
+        assert!(reenabled_image.included);
+        assert_eq!(
+            reenabled_image.relative_path, target_path,
+            "re-enabling must restore the prior target path"
+        );
+
+        let cross_source_move =
+            set_plan_image_included(&client, import_run_id, candidate_b_id, album_id, true)
+                .await
+                .expect_err("the current file transaction model must reject cross-source moves");
+        assert!(cross_source_move
+            .to_string()
+            .contains("cross-source album move"));
+        let after_rejected_move = get_draft_plan_summary(&client, import_run_id)
+            .await
+            .unwrap()
+            .expect("rejected cross-source move must preserve the draft");
+        let unmoved_image = after_rejected_move
+            .albums
+            .iter()
+            .flat_map(|album| &album.images)
+            .find(|image| image.image_id == candidate_b_id.to_string())
+            .unwrap();
+        assert_eq!(unmoved_image.source_album_id, album_b_id.to_string());
+        assert_eq!(unmoved_image.album_id, album_b_id.to_string());
+
+        let album_path_edited =
+            set_plan_album_target_path(&client, import_run_id, album_b_id, "renamed_album_b")
+                .await
+                .expect("draft album target path must be editable");
+        assert!(album_path_edited.albums.iter().any(|album| {
+            album.album_id == album_b_id.to_string() && album.album_name == "renamed_album_b"
+        }));
+
         let edited_draft = set_plan_source_file_mode(
             &client,
             import_run_id,
@@ -3499,15 +3633,84 @@ mod tests {
             SourceFileMode::MoveSelectedWithoutBackup
         );
 
+        let transactions_before_freeze: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(transactions_before_freeze, 0);
+
         let plan = freeze_import_plan(&client, import_run_id)
             .await
             .expect("reviewed draft must freeze");
         assert!(plan.plan_hash.is_some());
+        let repeated_freeze = freeze_import_plan(&client, import_run_id)
+            .await
+            .expect("repeated freeze must return the same frozen plan");
+        assert_eq!(repeated_freeze.plan_hash, plan.plan_hash);
+        assert_eq!(repeated_freeze.kept_images, plan.kept_images);
+        let plan_states = client
+            .query(
+                "SELECT state, COUNT(*)::BIGINT AS count
+                 FROM import_plans WHERE import_run_id = $1
+                 GROUP BY state ORDER BY state",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            plan_states
+                .iter()
+                .filter(|row| row.get::<_, String>("state") == "frozen")
+                .map(|row| row.get::<_, i64>("count"))
+                .sum::<i64>(),
+            1,
+            "repeated freeze must not create a second Frozen plan"
+        );
+        let transactions_after_freeze: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+                &[&import_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            transactions_after_freeze, 0,
+            "Freeze must not create file transactions"
+        );
         let locked_edit =
             set_plan_source_file_mode(&client, import_run_id, SourceFileMode::CopyAndArchive)
                 .await
                 .expect_err("a frozen plan must reject further edits");
         assert!(locked_edit.to_string().contains("draft plan"));
+        assert!(
+            set_plan_album_included(&client, import_run_id, album_b_id, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_plan_image_included(&client, import_run_id, candidate_b_id, album_b_id, false,)
+                .await
+                .is_err()
+        );
+        assert!(
+            set_plan_album_target_path(&client, import_run_id, album_b_id, "locked-album")
+                .await
+                .is_err()
+        );
+        assert!(set_plan_image_target_path(
+            &client,
+            import_run_id,
+            candidate_b_id,
+            album_b_id,
+            "locked.png",
+        )
+        .await
+        .is_err());
         let reloaded_plan = get_frozen_plan_summary(&client, import_run_id)
             .await
             .unwrap()
@@ -3589,6 +3792,98 @@ mod tests {
             plan.excluded_count
         );
         assert_eq!(reloaded_while_committing.kept_images, plan.kept_images);
+
+        let abandon_source_root = tmp.path().join("abandon-source");
+        let abandon_album_path = abandon_source_root.join("album_abandon");
+        std::fs::create_dir_all(&abandon_album_path).unwrap();
+        std::fs::write(abandon_album_path.join("photo.png"), b"abandon").unwrap();
+        let abandon_run_id = ImportRepository::create_import_run(
+            &client,
+            &abandon_source_root.display().to_string(),
+            library_root_id,
+        )
+        .await
+        .unwrap();
+        let abandon_album_id = ImportRepository::insert_import_album(
+            &client,
+            abandon_run_id,
+            &abandon_album_path.display().to_string(),
+            "album_abandon",
+        )
+        .await
+        .unwrap();
+        ImportRepository::insert_import_image(
+            &client,
+            NewImportImage {
+                album_id: abandon_album_id,
+                source_path: abandon_album_path.join("photo.png").display().to_string(),
+                relative_path: "album_abandon/photo.png".to_string(),
+                file_size: 7,
+                modified_at: None,
+                width: Some(10),
+                height: Some(10),
+                format: Some("png".to_string()),
+                decode_state: DecodeState::Decoded,
+                blake3: Some(vec![9; 32]),
+                pixel_hash: Some(vec![9; 32]),
+                block_hash_16: Some(vec![9; 32]),
+                double_gradient_hash_32: Some(vec![9; 68]),
+                perceptual_eligible: true,
+                fingerprint_version: Some("2".to_string()),
+                state: ImportImageState::Fingerprinted,
+            },
+        )
+        .await
+        .unwrap();
+        ImportRepository::mark_import_album_analyzing(&client, abandon_album_id)
+            .await
+            .unwrap();
+        ImportRepository::finalize_import_album_analysis(&client, abandon_album_id)
+            .await
+            .unwrap();
+        ImportRepository::update_import_run_state(
+            &client,
+            abandon_run_id,
+            &ImportRunState::ReviewRequired,
+        )
+        .await
+        .unwrap();
+        generate_import_plan(&client, abandon_run_id)
+            .await
+            .expect("abandon test Draft must generate");
+        freeze_import_plan(&client, abandon_run_id)
+            .await
+            .expect("abandon test plan must freeze");
+        abandon_frozen_import_workflow(&client, abandon_run_id)
+            .await
+            .expect("Frozen workflow with no transactions must be abandonable");
+        let abandoned_state: String = client
+            .query_one(
+                "SELECT state FROM import_runs WHERE id = $1",
+                &[&abandon_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(abandoned_state, "abandoned");
+        let abandoned_plan_state: String = client
+            .query_one(
+                "SELECT state FROM import_plans WHERE import_run_id = $1",
+                &[&abandon_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(abandoned_plan_state, "invalidated");
+        let abandoned_transactions: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM file_transactions WHERE import_run_id = $1",
+                &[&abandon_run_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(abandoned_transactions, 0);
 
         drop(client);
         db_handle.abort();

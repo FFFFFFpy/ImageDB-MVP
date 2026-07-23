@@ -2573,6 +2573,7 @@ mod tests {
 
     fn img(source_path: &str, source_rel: &str, target_rel: &str) -> PlanImageRow {
         PlanImageRow {
+            included: true,
             id: Uuid::new_v4(),
             plan_album_id: Uuid::new_v4(),
             import_image_id: Uuid::new_v4(),

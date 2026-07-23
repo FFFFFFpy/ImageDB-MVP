@@ -460,6 +460,7 @@ pub struct ImportPlanImage {
     pub source_path: String,
     pub relative_path: String,
     pub file_size: i64,
+    pub source_album_name: String,
     pub album_name: String,
     pub album_id: String,
     pub source_album_id: String,
@@ -469,6 +470,7 @@ pub struct ImportPlanImage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportPlanAlbum {
     pub album_id: String,
+    pub source_album_name: String,
     pub album_name: String,
     pub included: bool,
     pub image_count: u32,
@@ -481,6 +483,7 @@ pub struct ImportPlan {
     pub import_run_id: String,
     pub plan_hash: Option<String>,
     pub source_file_mode: SourceFileMode,
+    pub library_root_path: Option<String>,
     pub total_albums: u32,
     pub total_images: u32,
     pub kept_images: Vec<ImportPlanImage>,

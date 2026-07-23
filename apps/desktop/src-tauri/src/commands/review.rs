@@ -351,6 +351,59 @@ pub async fn set_import_plan_source_file_mode(
 }
 
 #[tauri::command]
+pub async fn set_import_plan_album_target_path(
+    state: State<'_, AppState>,
+    import_run_id: String,
+    album_id: String,
+    target_relative_path: String,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let album_id = parse_uuid(&album_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::set_plan_album_target_path(
+        &client,
+        run_id,
+        album_id,
+        &target_relative_path,
+    )
+    .await
+    .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
+pub async fn set_import_plan_image_target_path(
+    state: State<'_, AppState>,
+    import_run_id: String,
+    image_id: String,
+    target_album_id: String,
+    target_relative_path: String,
+) -> Result<ImportPlan, String> {
+    let run_id = parse_uuid(&import_run_id)?;
+    let image_id = parse_uuid(&image_id)?;
+    let target_album_id = parse_uuid(&target_album_id)?;
+    let (client, handle) = {
+        let mgr = state.postgres_manager.lock().await;
+        mgr.connect().await.map_err(|e| format!("{e}"))?
+    };
+    let result = review_service::set_plan_image_target_path(
+        &client,
+        run_id,
+        image_id,
+        target_album_id,
+        &target_relative_path,
+    )
+    .await
+    .map_err(|e| format!("{e}"));
+    handle.abort();
+    result
+}
+
+#[tauri::command]
 pub async fn get_latest_completed_import_run(
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {

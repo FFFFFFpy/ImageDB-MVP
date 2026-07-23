@@ -443,6 +443,7 @@ pub struct PlanImageRow {
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub format: Option<String>,
+    pub included: bool,
 }
 
 /// Full frozen plan: header + albums (each with its images).
@@ -2808,7 +2809,7 @@ impl ImportRepository {
             .collect())
     }
 
-    async fn get_latest_actionable_run_summary(
+    pub(crate) async fn get_latest_actionable_run_summary(
         client: &Client,
     ) -> Result<Option<DashboardActionableRun>, AppError> {
         let row = client.query_opt(
@@ -3695,6 +3696,180 @@ impl ImportRepository {
             .map_err(|e| AppError::Internal(format!("failed to invalidate draft plan: {e}")))
     }
 
+    pub async fn get_latest_plan_state(
+        client: &Client,
+        import_run_id: Uuid,
+    ) -> Result<Option<String>, AppError> {
+        client
+            .query_opt(
+                "SELECT state
+                 FROM import_plans
+                 WHERE import_run_id = $1
+                   AND state IN ('draft', 'frozen', 'consumed')
+                 ORDER BY version DESC
+                 LIMIT 1",
+                &[&import_run_id],
+            )
+            .await
+            .map(|row| row.map(|value| value.get("state")))
+            .map_err(|e| AppError::Internal(format!("failed to query plan lifecycle state: {e}")))
+    }
+
+    pub async fn set_plan_album_images_included(
+        client: &Client,
+        plan_id: Uuid,
+        import_album_id: Uuid,
+        included: bool,
+    ) -> Result<u64, AppError> {
+        client
+            .execute(
+                "UPDATE import_plan_images
+                 SET included = $3
+                 WHERE plan_album_id IN (
+                     SELECT id FROM import_plan_albums
+                     WHERE plan_id = $1 AND import_album_id = $2
+                 )",
+                &[&plan_id, &import_album_id, &included],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to update plan album inclusion: {e}")))
+    }
+
+    pub async fn set_plan_image_included(
+        client: &Client,
+        plan_id: Uuid,
+        import_image_id: Uuid,
+        included: bool,
+    ) -> Result<u64, AppError> {
+        client
+            .execute(
+                "UPDATE import_plan_images
+                 SET included = $3
+                 WHERE import_image_id = $2
+                   AND plan_album_id IN (
+                       SELECT id FROM import_plan_albums WHERE plan_id = $1
+                   )",
+                &[&plan_id, &import_image_id, &included],
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to update plan image inclusion: {e}")))
+    }
+
+    pub async fn update_plan_album_target_path(
+        client: &Client,
+        plan_id: Uuid,
+        import_album_id: Uuid,
+        target_relative_path: &str,
+    ) -> Result<u64, AppError> {
+        client
+            .execute(
+                "UPDATE import_plan_albums
+                 SET target_relative_path = $3
+                 WHERE plan_id = $1 AND import_album_id = $2",
+                &[&plan_id, &import_album_id, &target_relative_path],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to update plan album target path: {e}"))
+            })
+    }
+
+    pub async fn update_plan_image_target_path(
+        client: &Client,
+        plan_id: Uuid,
+        import_image_id: Uuid,
+        target_relative_path: &str,
+    ) -> Result<u64, AppError> {
+        client
+            .execute(
+                "UPDATE import_plan_images
+                 SET target_relative_path = $3
+                 WHERE import_image_id = $2
+                   AND plan_album_id IN (
+                       SELECT id FROM import_plan_albums WHERE plan_id = $1
+                   )",
+                &[&plan_id, &import_image_id, &target_relative_path],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to update plan image target path: {e}"))
+            })
+    }
+
+    pub async fn plan_album_target_path_conflicts(
+        client: &Client,
+        plan_id: Uuid,
+        import_album_id: Uuid,
+        target_relative_path: &str,
+    ) -> Result<bool, AppError> {
+        client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1 FROM import_plan_albums
+                    WHERE plan_id = $1
+                      AND import_album_id <> $2
+                      AND LOWER(target_relative_path) = LOWER($3)
+                 )",
+                &[&plan_id, &import_album_id, &target_relative_path],
+            )
+            .await
+            .map(|row| row.get(0))
+            .map_err(|e| {
+                AppError::Internal(format!("failed to validate plan album target path: {e}"))
+            })
+    }
+
+    pub async fn plan_image_target_path_conflicts(
+        client: &Client,
+        plan_id: Uuid,
+        import_image_id: Uuid,
+        target_relative_path: &str,
+    ) -> Result<bool, AppError> {
+        client
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM import_plan_images candidate
+                    JOIN import_plan_albums target_album
+                      ON target_album.id = candidate.plan_album_id
+                    JOIN import_plan_images current
+                      ON current.import_image_id = $2
+                    JOIN import_plan_albums current_album
+                      ON current_album.id = current.plan_album_id
+                    WHERE target_album.plan_id = $1
+                      AND current_album.plan_id = $1
+                      AND target_album.id = current_album.id
+                      AND candidate.import_image_id <> $2
+                      AND LOWER(candidate.target_relative_path) = LOWER($3)
+                 )",
+                &[&plan_id, &import_image_id, &target_relative_path],
+            )
+            .await
+            .map(|row| row.get(0))
+            .map_err(|e| {
+                AppError::Internal(format!("failed to validate plan image target path: {e}"))
+            })
+    }
+
+    pub async fn delete_excluded_plan_images(
+        client: &Client,
+        plan_id: Uuid,
+    ) -> Result<u64, AppError> {
+        client
+            .execute(
+                "DELETE FROM import_plan_images
+                 WHERE included = FALSE
+                   AND plan_album_id IN (
+                       SELECT id FROM import_plan_albums WHERE plan_id = $1
+                   )",
+                &[&plan_id],
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to finalize excluded draft images: {e}"))
+            })
+    }
+
     pub async fn get_frozen_plan_for_run(
         client: &Client,
         import_run_id: Uuid,
@@ -3744,13 +3919,46 @@ impl ImportRepository {
         height: Option<i32>,
         format: Option<&str>,
     ) -> Result<Uuid, AppError> {
+        Self::insert_plan_image_with_included(
+            client,
+            plan_album_id,
+            import_image_id,
+            source_path,
+            source_relative_path,
+            target_relative_path,
+            expected_file_size,
+            expected_blake3,
+            width,
+            height,
+            format,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_plan_image_with_included(
+        client: &Client,
+        plan_album_id: Uuid,
+        import_image_id: Uuid,
+        source_path: &str,
+        source_relative_path: &str,
+        target_relative_path: &str,
+        expected_file_size: i64,
+        expected_blake3: &[u8],
+        width: Option<i32>,
+        height: Option<i32>,
+        format: Option<&str>,
+        included: bool,
+    ) -> Result<Uuid, AppError> {
         let id = Uuid::new_v4();
         client
             .execute(
                 "INSERT INTO import_plan_images
                  (id, plan_album_id, import_image_id, source_path, source_relative_path,
-                  target_relative_path, expected_file_size, expected_blake3, width, height, format)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                  target_relative_path, expected_file_size, expected_blake3, width, height, format,
+                  included)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 &[
                     &id,
                     &plan_album_id,
@@ -3763,6 +3971,7 @@ impl ImportRepository {
                     &width,
                     &height,
                     &format,
+                    &included,
                 ],
             )
             .await
@@ -3809,7 +4018,8 @@ impl ImportRepository {
         client: &Client,
         import_run_id: Uuid,
         albums: &[AlbumRow],
-        kept_images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+        images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+        included_image_ids: &HashSet<Uuid>,
         policy_version: &str,
         library_root_id: Uuid,
     ) -> Result<Uuid, AppError> {
@@ -3826,7 +4036,14 @@ impl ImportRepository {
             library_root_id,
         )
         .await?;
-        Self::populate_import_plan(client, plan_id, albums, kept_images_by_album).await?;
+        Self::populate_import_plan(
+            client,
+            plan_id,
+            albums,
+            images_by_album,
+            Some(included_image_ids),
+        )
+        .await?;
         Ok(plan_id)
     }
 
@@ -3864,7 +4081,7 @@ impl ImportRepository {
         )
         .await?;
 
-        Self::populate_import_plan(client, plan_id, albums, kept_images_by_album).await?;
+        Self::populate_import_plan(client, plan_id, albums, kept_images_by_album, None).await?;
 
         Self::set_plan_hash(client, plan_id, plan_hash).await?;
         Self::update_import_plan_state(client, plan_id, &PlanState::Frozen).await?;
@@ -3886,21 +4103,30 @@ impl ImportRepository {
         client: &Client,
         plan_id: Uuid,
         albums: &[AlbumRow],
-        kept_images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+        images_by_album: &HashMap<Uuid, Vec<ImportImageFullRow>>,
+        included_image_ids: Option<&HashSet<Uuid>>,
     ) -> Result<(), AppError> {
         for album in albums {
-            let Some(images) = kept_images_by_album.get(&album.id) else {
+            let Some(images) = images_by_album.get(&album.id) else {
                 continue;
             };
             if images.is_empty() {
                 continue;
             }
+            let expected_image_count = included_image_ids
+                .map(|included| {
+                    images
+                        .iter()
+                        .filter(|img| included.contains(&img.id))
+                        .count()
+                })
+                .unwrap_or(images.len());
             let plan_album_id = Self::insert_plan_album(
                 client,
                 plan_id,
                 album.id,
                 &album.source_name,
-                images.len() as i32,
+                expected_image_count as i32,
             )
             .await?;
 
@@ -3913,7 +4139,7 @@ impl ImportRepository {
                 })?;
                 let target_relative_path =
                     target_relative_path_for_album_name(&album.source_name, &img.relative_path)?;
-                Self::insert_plan_image(
+                Self::insert_plan_image_with_included(
                     client,
                     plan_album_id,
                     img.id,
@@ -3925,6 +4151,9 @@ impl ImportRepository {
                     img.width,
                     img.height,
                     img.format.as_deref(),
+                    included_image_ids
+                        .map(|included| included.contains(&img.id))
+                        .unwrap_or(true),
                 )
                 .await?;
             }
@@ -3995,38 +4224,52 @@ impl ImportRepository {
             .map(|img| (img.id, (img.album_id, img.album_name.clone())))
             .collect();
         let source_albums = Self::get_albums_for_run(client, import_run_id).await?;
+        let library_root_path = Self::get_library_root_path(client, frozen.library_root_id).await?;
 
         let mut kept_images: Vec<ImportPlanImage> = Vec::new();
-        let mut included_image_ids: HashSet<Uuid> = HashSet::new();
+        let mut represented_image_ids: HashSet<Uuid> = HashSet::new();
         let mut albums: Vec<ImportPlanAlbum> = Vec::new();
         for (album, images) in &frozen.albums {
+            let source_album_name = source_albums
+                .iter()
+                .find(|source| source.id == album.import_album_id)
+                .map(|source| source.source_name.clone())
+                .unwrap_or_else(|| album.target_relative_path.clone());
             let mut album_images = Vec::new();
             for img in images {
-                included_image_ids.insert(img.import_image_id);
-                let source_album_id = image_source_album
+                represented_image_ids.insert(img.import_image_id);
+                let (source_album_id, image_source_album_name) = image_source_album
                     .get(&img.import_image_id)
-                    .map(|(album_id, _)| *album_id)
-                    .unwrap_or(album.import_album_id);
+                    .cloned()
+                    .unwrap_or((album.import_album_id, source_album_name.clone()));
                 let plan_image = ImportPlanImage {
                     image_id: img.import_image_id.to_string(),
                     source_path: img.source_path.clone(),
                     relative_path: img.target_relative_path.clone(),
                     file_size: img.expected_file_size,
+                    source_album_name: image_source_album_name,
                     album_name: album.target_relative_path.clone(),
                     album_id: album.import_album_id.to_string(),
                     source_album_id: source_album_id.to_string(),
-                    included: true,
+                    included: img.included,
                 };
-                kept_images.push(plan_image.clone());
+                if img.included {
+                    kept_images.push(plan_image.clone());
+                }
                 album_images.push(plan_image);
             }
             album_images.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
             albums.push(ImportPlanAlbum {
                 album_id: album.import_album_id.to_string(),
+                source_album_name,
                 album_name: album.target_relative_path.clone(),
-                included: !album_images.is_empty(),
-                image_count: album_images.len() as u32,
-                total_size: album_images.iter().map(|img| img.file_size).sum(),
+                included: album_images.iter().any(|image| image.included),
+                image_count: album_images.iter().filter(|image| image.included).count() as u32,
+                total_size: album_images
+                    .iter()
+                    .filter(|image| image.included)
+                    .map(|img| img.file_size)
+                    .sum(),
                 images: album_images,
             });
         }
@@ -4035,12 +4278,13 @@ impl ImportRepository {
             let skipped_images: Vec<ImportPlanImage> = all_images
                 .iter()
                 .filter(|img| img.album_id == source_album.id)
-                .filter(|img| !included_image_ids.contains(&img.id))
+                .filter(|img| !represented_image_ids.contains(&img.id))
                 .map(|img| ImportPlanImage {
                     image_id: img.id.to_string(),
                     source_path: img.source_path.clone(),
                     relative_path: img.relative_path.clone(),
                     file_size: img.file_size,
+                    source_album_name: source_album.source_name.clone(),
                     album_name: source_album.source_name.clone(),
                     album_id: source_album.id.to_string(),
                     source_album_id: img.album_id.to_string(),
@@ -4055,6 +4299,7 @@ impl ImportRepository {
                 {
                     albums.push(ImportPlanAlbum {
                         album_id: source_album.id.to_string(),
+                        source_album_name: source_album.source_name.clone(),
                         album_name: source_album.source_name.clone(),
                         included: false,
                         image_count: 0,
@@ -4076,6 +4321,7 @@ impl ImportRepository {
             } else {
                 albums.push(ImportPlanAlbum {
                     album_id: source_album.id.to_string(),
+                    source_album_name: source_album.source_name.clone(),
                     album_name: source_album.source_name.clone(),
                     included: false,
                     image_count: 0,
@@ -4112,36 +4358,17 @@ impl ImportRepository {
             .map_err(|e| AppError::Internal(format!("failed to count import albums: {e}")))?
             .get(0);
 
-        // Skipped albums: import albums with no plan album in the frozen plan.
-        let plan_album_ids: Vec<Uuid> = frozen
-            .albums
+        let included_album_ids: HashSet<String> = albums
             .iter()
-            .map(|(a, _)| a.import_album_id)
+            .filter(|album| album.included)
+            .map(|album| album.album_id.clone())
             .collect();
-        let skipped_rows = if plan_album_ids.is_empty() {
-            client
-                .query(
-                    "SELECT source_name FROM import_albums WHERE import_run_id = $1
-                     ORDER BY source_name",
-                    &[&import_run_id],
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to query skipped albums: {e}")))?
-        } else {
-            client
-                .query(
-                    "SELECT source_name FROM import_albums WHERE import_run_id = $1
-                     AND id <> ALL($2)
-                     ORDER BY source_name",
-                    &[&import_run_id, &plan_album_ids],
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to query skipped albums: {e}")))?
-        };
-        let skipped_albums: Vec<String> = skipped_rows
+        let mut skipped_albums: Vec<String> = source_albums
             .iter()
-            .map(|r| r.get::<_, String>("source_name"))
+            .filter(|album| !included_album_ids.contains(&album.id.to_string()))
+            .map(|album| album.source_name.clone())
             .collect();
+        skipped_albums.sort();
 
         let kept_count = kept_images.len() as u64;
         Ok(Some(ImportPlan {
@@ -4152,6 +4379,7 @@ impl ImportRepository {
                     .collect::<String>()
             }),
             source_file_mode: frozen.source_file_mode,
+            library_root_path: Some(library_root_path),
             total_albums: total_albums as u32,
             total_images: total_images as u32,
             kept_images,
@@ -4225,7 +4453,7 @@ impl ImportRepository {
                 .query(
                     "SELECT id, plan_album_id, import_image_id, source_path, source_relative_path,
                             target_relative_path, expected_file_size, expected_blake3,
-                            width, height, format
+                            width, height, format, included
                      FROM import_plan_images WHERE plan_album_id = $1
                      ORDER BY target_relative_path",
                     &[&plan_album_id],
@@ -4253,6 +4481,7 @@ impl ImportRepository {
                     width: r.get("width"),
                     height: r.get("height"),
                     format: r.get("format"),
+                    included: r.get("included"),
                 })
                 .collect();
             albums.push((album, imgs));
